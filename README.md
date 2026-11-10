@@ -44,7 +44,7 @@ A name in Rust means something only where it is written. When a proc macro copie
 ```rust
 use syn::visit_mut::VisitMut;
 use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Signature};
-use type_leak::{array_const, ImplSelf, Leaker, UseSite};
+use type_leak::{ImplSelf, Leaker, RepeaterSlots, UseSite};
 
 let item: ItemTrait = parse_quote! {
     pub trait MyLeaker<T> {
@@ -59,14 +59,16 @@ let top_level = leaker.intern_trait(&item, true);
 let referrer = leaker.result().finish().unwrap();
 
 // Crate A, step 2: one Repeater impl per entry (`42` is the ID).
+let slots = RepeaterSlots::new(parse_quote!(path::Repeater));
 let self_param: Ident = parse_quote!(__S);
 let impls: Vec<ItemImpl> = (0..referrer.iter().count())
     .map(|ix| {
-        let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param), array_const).unwrap();
+        let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param), slots.const_fn()).unwrap();
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+        let (self_ty, ty) = (&r.self_ty, &r.ty);
+        let repeater = slots.trait_path(&r.args, 42, ix);
         parse_quote! {
-            impl #impl_generics path::Repeater<#args, 42u64, #ix> for #self_ty #where_clause {
+            impl #impl_generics #repeater for #self_ty #where_clause {
                 type Type = #ty;
             }
         }
@@ -79,21 +81,21 @@ let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
 let site = UseSite::substituting(&item.generics.params, &trait_args);
 let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
 referrer
-    .clone()
     .visitor(top_level, |_ty, ix| {
-        let args = referrer.entry_args(ix, &site, array_const).unwrap();
-        parse_quote!(<Self as path::Repeater<#args, 42u64, #ix>>::Type)
+        let args = referrer.entry_args(ix, &site, slots.const_fn()).unwrap();
+        slots.projection(&parse_quote!(Self), &args, 42, ix)
     })
     .visit_signature_mut(&mut sig);
 assert_eq!(
     sig,
     parse_quote!(fn f(&self, t: T) -> <Self as path::Repeater<(u8,), 42u64, 0usize>>::Type)
 );
+assert_eq!(site.substitute(&parse_quote!(T)), parse_quote!(u8));
 ```
 
-Only the entries are rewritten: `t: T` is left for you to write as `u8`.
+Only the entries are rewritten: `t: T` is left for you to write, and `site.substitute(&parse_quote!(T))` writes `u8`.
 
-If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err`, and `into_referrer()` is still the `Referrer` of the rest. Report the errors with `ErrorItem::to_compile_error()`.
+If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err`, and `into_referrer()` is still the `Referrer` of the rest. Report each with `ErrorItem::emit()` (on nightly, a diagnostic with the notes and the help at their own spans), or all with `to_syn_error()`.
 
 In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (`ToTokens` / `Parse`), usually through an exported `macro_rules!`. [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros) is a complete, tested setup.
 

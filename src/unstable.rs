@@ -75,13 +75,13 @@ impl Why {
             Why::SelfAssoc(path) => format!(
                 "names `{}`, which rustc normalizes to the associated type of the host in the \
                  impl of the Repeater, but not yet in the environment (E0277, E0271)",
-                path
+                tidy_str(path)
             ),
             Why::Projection(path) => format!(
                 "names `{}`, which rustc normalizes in the impl of the Repeater (an impl, a \
                  predicate of the item that equates it, or a supertrait of a bound of its \
                  generic, defines it), but not yet in the environment (E0277, E0271, E0275)",
-                path
+                tidy_str(path)
             ),
         }
     }
@@ -100,7 +100,7 @@ impl Why {
     pub(crate) fn names(&self) -> String {
         match self {
             Why::SelfType => "`Self`, which is a leaked type".to_string(),
-            Why::SelfAssoc(path) | Why::Projection(path) => format!("`{}`", path),
+            Why::SelfAssoc(path) | Why::Projection(path) => format!("`{}`", tidy_str(path)),
         }
     }
 }

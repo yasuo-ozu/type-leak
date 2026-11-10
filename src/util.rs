@@ -610,12 +610,9 @@ pub(crate) fn tidy(tokens: &TokenStream) -> String {
 
 /// Like [`tidy()`] for the text of tokens.
 pub(crate) fn tidy_str(text: &str) -> String {
-    let mut text = text.to_string();
+    let mut text = join_angles(&join_paths(text));
     for (from, to) in [
-        (" :: ", "::"),
         (":: ", "::"),
-        (" ::", "::"),
-        (" <", "<"),
         ("< ", "<"),
         (" >", ">"),
         ("& ", "&"),
@@ -641,6 +638,68 @@ pub(crate) fn tidy_str(text: &str) -> String {
         text = joined;
     }
     text
+}
+
+/// Joins the segments of the paths in `text` (`Rel :: new` is `Rel::new`), but keeps the space
+/// before a path that starts after a keyword or a separator (`dyn ::p::Tr`, `A, ::p::X`, `T:
+/// ::p::Tr`, `-> ::p::X`).
+fn join_paths(text: &str) -> String {
+    const KEYWORDS: [&str; 8] = ["as", "dyn", "impl", "for", "in", "mut", "const", "where"];
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut joined = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(" :: ") {
+        joined.push_str(&rest[..at]);
+        let word = joined.rsplit(|c: char| !is_word(c)).next().unwrap_or("");
+        let after_path = match joined.chars().next_back() {
+            Some(c) if is_word(c) => !KEYWORDS.contains(&word),
+            Some('>') => !joined.ends_with("->") && !ends_with_binder(&joined),
+            Some(')' | ']') => true,
+            _ => false,
+        };
+        joined.push_str(if after_path { "::" } else { " ::" });
+        rest = &rest[at + " :: ".len()..];
+    }
+    joined.push_str(rest);
+    joined
+}
+
+/// Joins `<` to the name before it (`Rel < T >` is `Rel<T>`), but not to a lifetime (`&'a <T as
+/// Tr>::A`).
+fn join_angles(text: &str) -> String {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut joined = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(" <") {
+        joined.push_str(&rest[..at]);
+        let name = joined.trim_end_matches(is_word).len();
+        let lifetime = name < joined.len() && joined[..name].ends_with('\'');
+        joined.push_str(if lifetime { " <" } else { "<" });
+        rest = &rest[at + " <".len()..];
+    }
+    joined.push_str(rest);
+    joined
+}
+
+/// Returns `true` if `text` ends with the binder of lifetimes `for < 'a >`.
+fn ends_with_binder(text: &str) -> bool {
+    let mut depth = 0usize;
+    for (at, c) in text.char_indices().rev() {
+        match c {
+            '>' if !text[..at].ends_with('-') => depth += 1,
+            '<' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let head = text[..at].trim_end();
+                    return head.strip_suffix("for").map_or(false, |before| {
+                        !before.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+                    });
+                }
+            }
+            _ => (),
+        }
+    }
+    false
 }
 
 /// The path without the segments that name a place in the crate (`crate`, `self`, `super`), for
@@ -1000,6 +1059,38 @@ impl<'a> syn::fold::Fold for ReplaceSelf<'a> {
         Macro {
             tokens: self.replace_tokens(i.tokens),
             ..i
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tidy_str;
+
+    #[test]
+    fn tidy_writes_tokens_as_one_does() {
+        for (tokens, written) in [
+            ("Rel < '_ , u8 >", "Rel<'_, u8>"),
+            ("Vec < & '_ u8 > :: new", "Vec<&'_ u8>::new"),
+            ("I1 < & 'a < Self as Tr > :: A >", "I1<&'a <Self as Tr>::A>"),
+            (":: p :: Wrap < Rel >", "::p::Wrap<Rel>"),
+            ("Self :: A", "Self::A"),
+            ("< Self as :: p :: Tr > :: A", "<Self as ::p::Tr>::A"),
+            ("dyn :: core :: fmt :: Debug", "dyn ::core::fmt::Debug"),
+            ("Other < '_ , :: core :: u8 >", "Other<'_, ::core::u8>"),
+            ("T : :: p :: Tr < Self >", "T : ::p::Tr<Self>"),
+            ("fn () -> :: p :: X", "fn () -> ::p::X"),
+            (
+                "for < 'a > :: core :: ops :: Fn (& 'a u8)",
+                "for<'a> ::core::ops::Fn (&'a u8)",
+            ),
+            (
+                "Tr < for < 'a > Fn (& 'a u8) > :: A",
+                "Tr<for<'a> Fn (&'a u8)>::A",
+            ),
+            ("m ! (Self)", "m!(Self)"),
+        ] {
+            assert_eq!(tidy_str(tokens), written, "{}", tokens);
         }
     }
 }

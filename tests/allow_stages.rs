@@ -75,8 +75,7 @@ fn stages<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     rule: Rule,
 ) -> (LeakerResult, LeakerResult) {
     let before = rule.analyze_with(item, base(Allow::new()), false);
-    let mut after = analyze(item, base(Allow::new()));
-    rule.on_result(&mut after);
+    let after = rule.on_result(analyze(item, base(Allow::new())));
     (before, after)
 }
 
@@ -99,8 +98,7 @@ fn allow_prelude_reports_the_part_before_and_the_whole_after() {
     assert!(entries(&before).is_empty());
     assert_eq!(entries(&after), ["Vec < u8 >"]);
     // The result with the same rule once more, and with the config's, is the same result.
-    let mut twice = after.clone();
-    twice.allow_prelude();
+    let twice = after.clone().allow_prelude();
     assert_eq!(causes(&twice), causes(&after));
 }
 
@@ -194,13 +192,13 @@ fn allow_path_agrees_where_every_path_of_an_error_is_allowed_or_not() {
     assert_eq!(plain.errors().len(), 2);
     assert_eq!(wrapped(&plain).unwrap(), ["Wrap", "my :: Foo"]);
     assert_eq!(wrapped(&after).unwrap(), ["Wrap"]);
-    let mut wrap_only = plain.clone();
-    wrap_only.allow_path_if(starts_with(parse_quote!(Wrap)));
+    let wrap_only = plain.clone().allow_path_if(starts_with(parse_quote!(Wrap)));
     assert_eq!(wrapped(&wrap_only).unwrap(), ["my :: Foo"]);
-    wrap_only.allow_path_if(starts_with(parse_quote!(my)));
+    let wrap_only = wrap_only.allow_path_if(starts_with(parse_quote!(my)));
     assert!(wrap_only.errors().is_empty());
-    let mut both = plain.clone();
-    both.allow_path_if(starts_with(parse_quote!(my)))
+    let both = plain
+        .clone()
+        .allow_path_if(starts_with(parse_quote!(my)))
         .allow_path_if(starts_with(parse_quote!(Wrap)));
     assert!(both.errors().is_empty());
     let config = Allow::new()
@@ -227,11 +225,12 @@ fn an_absolute_path_is_no_path_of_an_error() {
         .collect();
     assert_eq!(paths, ["RelTr"]);
     // So a path rule that allows the trait drops the error, and `allow_prelude()` does not.
-    let mut dropped = result.clone();
-    dropped.allow_path_if(starts_with(parse_quote!(RelTr)));
+    let dropped = result
+        .clone()
+        .allow_path_if(starts_with(parse_quote!(RelTr)));
     assert!(dropped.errors().is_empty());
-    let mut kept = result;
-    kept.allow_prelude()
+    let kept = result
+        .allow_prelude()
         .allow_primitive()
         .allow_std_crates()
         .allow_crate();
@@ -246,7 +245,7 @@ fn a_cause_that_is_no_path_has_none_and_no_path_rule_drops_it() {
     let result = analyze(&item, Allow::new());
     assert_eq!(result.errors().len(), 1);
     let mut after = result.clone();
-    after
+    after = after
         .allow_prelude()
         .allow_primitive()
         .allow_std_crates()
@@ -306,9 +305,9 @@ fn allow_values_and_allow_default_give_the_same_result_at_both_stages() {
     for (name, item) in places() {
         for rule in [Rule::Values, Rule::Default] {
             let before = rule.analyze_with(&item, reading_values(), true);
-            let mut after = analyze_values(&item, reading_values());
+            let after = analyze_values(&item, reading_values());
             let all = after.errors().len();
-            rule.on_result(&mut after);
+            let after = rule.on_result(after);
             dropped += all - after.errors().len();
             let ser = |r: &LeakerResult| {
                 r.errors()
@@ -337,7 +336,7 @@ fn a_trait_default_body_is_a_value_and_a_default() {
     assert!(error.in_value && error.in_default);
     // An impl's value is a value, not a default.
     let item: ItemImpl = parse_quote!(impl ::p::Tr for X { fn f(&self) { let _ = inner::f(); } });
-    let mut leaker = Leaker::from_config(reading_values(), true, false);
+    let mut leaker = Leaker::from_config(reading_values(), Options::new().check_values());
     leaker.intern_impl(&item, true);
     let result = leaker.result();
     let error = &result.errors()[0];
@@ -350,11 +349,9 @@ fn a_trait_default_body_is_a_value_and_a_default() {
     let error = &result.errors()[0];
     assert!(!error.in_value && error.in_default);
     // `allow_values()` drops the first two and leaves the third, `allow_default()` the reverse.
-    let mut values = result.clone();
-    values.allow_values();
+    let values = result.clone().allow_values();
     assert_eq!(values.errors().len(), 1);
-    let mut defaults = result;
-    defaults.allow_default();
+    let defaults = result.allow_default();
     assert!(defaults.errors().is_empty());
 }
 

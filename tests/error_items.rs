@@ -6,7 +6,8 @@
 //! - `every_error_is_written_and_read_back` is a round trip of every error above: the tokens
 //!   that are written again are the same, and so are the fields. `the_serialized_form_is_*` pin
 //!   the grammar, and what the parser refuses.
-//! - `to_compile_error()`, `to_syn_error()`, and the other ways to take an error as a whole.
+//! - `to_compile_error()`, `emit()`, `to_syn_error()`, and the other ways to take an error as a
+//!   whole.
 //!
 //! The errors are reported at the same places after the round trip: see `tests/diagnostic.rs` (a
 //! macro that does it, and rustc) and `tests/crates/spans` (the lines and the columns).
@@ -41,7 +42,7 @@ fn configured<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
 fn leaker_from<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     config: Allow<P, E>,
 ) -> Leaker<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
-    Leaker::from_config(configured(config), false, false)
+    Leaker::from_config(configured(config), Options::new())
 }
 
 /// Runs `f` with `rules` added to the config of the triggers.
@@ -135,7 +136,10 @@ fn help_of(item: &ErrorItem) -> Option<(String, String)> {
 fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     let item: ItemTrait = parse_str(source).unwrap();
     if check_values {
-        let leaker = Leaker::from_config(configured(reading_values_config()), true, false);
+        let leaker = Leaker::from_config(
+            configured(reading_values_config()),
+            Options::new().check_values(),
+        );
         run(leaker, |leaker| leaker.intern_trait(&item, true))
     } else {
         run(leaker_from(allowing_config()), |leaker| {
@@ -502,7 +506,7 @@ fn the_cause_of_a_macro_is_its_path_and_that_of_a_qualified_trait_is_a_trait() {
     assert_item(&items[0], Reason::RelativePath, "macro", "mac !");
     assert!(matches!(&items[0].cause, Cause::Macro(path) if path.is_ident("mac")));
     assert_item(&items[1], Reason::RelativePath, "trait", "Rel");
-    assert_eq!(items[0].message, "use absolute path: 'mac !'");
+    assert_eq!(items[0].message, "use absolute path: 'mac!'");
 }
 
 /// A lifetime that no scope declares, in the supertrait of a trait where `Self` is denied.
@@ -905,10 +909,9 @@ fn the_serialized_form_is_one_brace_group_for_each_item() {
     // the notes and the help as string literals.
     assert_eq!(
         items[1].to_token_stream().to_string(),
-        "{ type (MyType < '_ >) RelativePath \"use absolute path: 'MyType < '_ >'\" \
+        "{ type (MyType < '_ >) RelativePath \"use absolute path: 'MyType<'_>'\" \
          [('_) \"it cannot be leaked as a whole because of `'_`\"] \
-         (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it \
-         with `Allow::allow_path_if()`\" paths [MyType] }"
+         (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\" paths [MyType] }"
     );
     // A serialization is not a report: it is no `compile_error!`.
     let all: proc_macro2::TokenStream = items.iter().map(ToTokens::to_token_stream).collect();
@@ -1109,10 +1112,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
     );
     assert_eq!(
         item.help_text(),
-        Some(
-            "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `Allow::allow_path_if()`"
-        )
+        Some("write `MyType` with an absolute path (e.g. `::my_crate::MyType`)")
     );
     // It is a `std::error::Error`, and `From<ErrorItem>` is the `syn::Error` of the layout of
     // rustc: the notes, then the help, after the message.
@@ -1121,10 +1121,9 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
     let syn_error: syn::Error = item.clone().into();
     assert_eq!(
         syn_error.to_string(),
-        "use absolute path: 'MyType < '_ >'\n\n\
+        "use absolute path: 'MyType<'_>'\n\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
-         \x20 = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it \
-         with `Allow::allow_path_if()`\n"
+         \x20 = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n"
     );
 }
 
@@ -1141,6 +1140,17 @@ fn to_compile_error_is_the_error_of_syn() {
             "{}",
             tokens
         );
+    }
+}
+
+/// `to_compile_error()` is pure and `emit()` is the same outside a proc macro, on every toolchain
+/// (inside one, nightly's `emit()` reports a `Diagnostic` instead: `tests/diagnostic.rs`).
+#[test]
+fn emit_is_to_compile_error_outside_a_macro() {
+    for item in &errors(relative_path) {
+        let tokens = item.to_compile_error().to_string();
+        assert_eq!(item.to_compile_error().to_string(), tokens);
+        assert_eq!(item.emit().to_string(), tokens);
     }
 }
 
@@ -1196,7 +1206,7 @@ fn messages(items: &[ErrorItem]) -> Vec<&str> {
 fn allowing_causes(trigger: Trigger, causes: &[Cause]) -> LeakerResult {
     let mut result = trigger();
     for cause in causes {
-        result.allow(|e| e.cause == cause.clone());
+        result = result.allow(|e| e.cause == cause.clone());
     }
     result
 }
@@ -1208,9 +1218,8 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
         let items = errors(trigger);
         reasons.extend(items.iter().map(|item| item.reason));
         let causes: Vec<Cause> = items.iter().map(|item| item.cause.clone()).collect();
-        let mut result = allowing_causes(trigger, &causes);
         // What a dropped error has nested comes up, and its cause is allowed in turn.
-        allow_every_cause(&mut result);
+        let (result, _) = allow_every_cause(allowing_causes(trigger, &causes));
         if !result.errors().is_empty() {
             panic!("{}: {:?} are left", name, messages(result.errors()));
         }
@@ -1273,7 +1282,7 @@ fn assert_stages_agree(name: &str, trigger: Trigger, rules: &[Rule]) -> usize {
     let mut after = trigger();
     let dropped = after.errors().len();
     for rule in rules {
-        rule.on_result(&mut after);
+        after = rule.on_result(after);
     }
     let dropped = dropped - after.errors().len();
     assert_eq!(serialized(&before), serialized(&after), "{}", name);
@@ -1325,8 +1334,9 @@ fn a_path_rule_leaves_the_errors_that_have_a_path_it_does_not_allow() {
     }
     // Allowing the first path of an error that has several leaves it.
     let result = relative_path();
-    let mut left = result.clone();
-    left.allow_path_if(starts_with(parse_quote!(MyType)));
+    let left = result
+        .clone()
+        .allow_path_if(starts_with(parse_quote!(MyType)));
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
     assert_eq!(text(&left.errors()[0].cause), "Clone");
@@ -1361,8 +1371,7 @@ fn allowing_the_causes_of_every_trigger_leaves_the_recovered_referrer() {
         let referrer = result.clone().into_referrer();
         // The same analysis with the causes allowed reports nothing, and has the same entries and
         // parts: allowing drops errors only.
-        let mut allowed = allowing_causes(trigger, &causes);
-        allow_every_cause(&mut allowed);
+        let (allowed, _) = allow_every_cause(allowing_causes(trigger, &causes));
         assert!(allowed.errors().is_empty(), "{}", name);
         assert_same_referrer(&referrer, &allowed.into_referrer(), name);
         // And it is a Referrer like any other: it round-trips.
@@ -1400,7 +1409,6 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
     );
     let mut copy = item.clone();
     referrer
-        .clone()
         .visitor(id, |_, ix| parse_quote!(Entry<#ix>))
         .visit_item_struct_mut(&mut copy);
     let expected: ItemStruct = parse_quote!(
@@ -1411,7 +1419,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
     );
     assert_eq!(copy, expected);
     // Allowing the cause drops the error and leaves the Referrer.
-    result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
+    result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
     assert_same_referrer(&referrer, &result.finish().unwrap(), "S");
 }
 
@@ -1454,17 +1462,15 @@ fn the_errors_of_self_are_reported_with_the_others() {
     assert_eq!(referrer.iter().count(), 0);
     let mut allowed = analyze();
     for cause in causes_of(&errors) {
-        allowed.allow(|e| e.cause == cause);
+        allowed = allowed.allow(|e| e.cause == cause);
     }
     assert!(allowed.errors().is_empty());
     assert_same_referrer(&referrer, &allowed.into_referrer(), "Self");
     // Allowing the conflict leaves the mention, and the other way round.
-    let mut left = analyze();
-    left.allow(|e| e.cause == errors[0].cause.clone());
+    let left = analyze().allow(|e| e.cause == errors[0].cause.clone());
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::SelfWithoutMeaning);
-    let mut left = analyze();
-    left.allow(|e| e.cause == errors[1].cause.clone());
+    let left = analyze().allow(|e| e.cause == errors[1].cause.clone());
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
 }

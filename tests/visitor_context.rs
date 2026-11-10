@@ -89,10 +89,7 @@ fn a_mod_item_visited_alone_is_nested_in_the_module_of_the_context() {
             _ => None,
         })
         .unwrap();
-    referrer
-        .clone()
-        .visitor(m, replace)
-        .visit_item_mod_mut(&mut item);
+    referrer.visitor(m, replace).visit_item_mod_mut(&mut item);
     let expected: ItemMod = {
         let ix = proc_macro2::Literal::usize_unsuffixed(in_inner);
         parse_quote!(
@@ -115,7 +112,7 @@ fn the_items_of_a_module_visited_one_by_one_are_in_it() {
     // Each item of `m`, with the context of `m`: the struct is in `m`, the `mod` is `m::inner`.
     let mut items = items_of(&two_rels());
     for item in &mut items {
-        referrer.clone().visitor(m, replace).visit_item_mut(item);
+        referrer.visitor(m, replace).visit_item_mut(item);
     }
     let (ix_m, ix_inner) = (
         proc_macro2::Literal::usize_unsuffixed(in_m),
@@ -147,10 +144,7 @@ fn the_items_of_a_module_visited_one_by_one_are_in_it() {
     };
     let mut copy = inner_items.clone();
     for item in &mut copy {
-        referrer
-            .clone()
-            .visitor(inner, replace)
-            .visit_item_mut(item);
+        referrer.visitor(inner, replace).visit_item_mut(item);
     }
     assert_eq!(
         s(&copy[1]),
@@ -164,7 +158,7 @@ fn the_items_of_a_module_visited_one_by_one_are_in_it() {
     // `inner`, but the one of `m` (as the entries of no module would be found too).
     let mut copy = inner_items;
     for item in &mut copy {
-        referrer.clone().visitor(m, replace).visit_item_mut(item);
+        referrer.visitor(m, replace).visit_item_mut(item);
     }
     assert_eq!(
         s(&copy[1]),
@@ -189,10 +183,7 @@ fn a_file_of_the_items_of_a_module_is_in_it() {
         attrs: Vec::new(),
         items: items_of(&two_rels()),
     };
-    referrer
-        .clone()
-        .visitor(m, replace)
-        .visit_file_mut(&mut file);
+    referrer.visitor(m, replace).visit_file_mut(&mut file);
     let expected: File = parse_quote!(
         struct D {
             a: P<#ix_m>,
@@ -216,10 +207,7 @@ fn a_file_of_the_items_of_a_module_is_in_it() {
         struct Rel;
         struct S(Rel);
     );
-    referrer
-        .clone()
-        .visitor(scope, replace)
-        .visit_file_mut(&mut file);
+    referrer.visitor(scope, replace).visit_file_mut(&mut file);
     assert_eq!(
         s(&file),
         s(&parse_quote!(
@@ -258,7 +246,6 @@ fn a_scope_in_a_module_is_in_that_module() {
     assert_eq!(referrer.context_module(module), None);
     let mut sig: Signature = parse_quote!(fn f(x: Wrap<T>, y: Rel));
     referrer
-        .clone()
         .visitor(scope, replace)
         .visit_signature_mut(&mut sig);
     let rewritten = s(&sig);
@@ -325,7 +312,6 @@ fn self_is_taken_from_the_context() {
     for (context, name) in [(c1, "Tr1"), (c2, "Tr2")] {
         let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> Rel<Self>);
         referrer
-            .clone()
             .visitor(context, replace)
             .visit_signature_mut(&mut sig);
         assert_eq!(s(&sig), expected(context), "{}", name);
@@ -333,7 +319,6 @@ fn self_is_taken_from_the_context() {
     // The copy of the struct is rewritten with its own entry, whatever the order of the entries.
     let mut copy = st.clone();
     referrer
-        .clone()
         .visitor(c3, replace)
         .visit_item_struct_mut(&mut copy);
     let ix = proc_macro2::Literal::usize_unsuffixed(ix_of(c3));
@@ -373,7 +358,6 @@ fn a_nested_item_declares_its_own_self() {
         }
     );
     referrer
-        .clone()
         .visitor(context, replace)
         .visit_item_fn_mut(&mut item);
     assert!(s(&item).contains("Rel < Self >"), "{}", s(&item));
@@ -447,7 +431,6 @@ fn a_nested_function_or_type_alias_keeps_the_self_around() {
             }
         );
         referrer
-            .clone()
             .visitor(context, replace)
             .visit_item_impl_mut(&mut copy);
         let (rel, rel2) = (
@@ -480,7 +463,6 @@ fn a_nested_function_or_type_alias_keeps_the_self_around() {
             }
         );
         referrer
-            .clone()
             .visitor(context, replace)
             .visit_item_fn_mut(&mut copy);
         let expected: ItemFn = parse_quote!(
@@ -587,7 +569,6 @@ fn the_generics_are_taken_from_the_context() {
     for context in [c1, c2] {
         let mut sig: Signature = parse_quote!(fn f(&self, x: Wrap<T>));
         referrer
-            .clone()
             .visitor(context, replace)
             .visit_signature_mut(&mut sig);
         let ix = entry(context);
@@ -597,10 +578,7 @@ fn the_generics_are_taken_from_the_context() {
     // A generic that neither the context nor the visited syntax declares is not the Leaker's
     // (every undeclared generic was taken to be, when the visitor did not know the scope).
     let mut sig: Signature = parse_quote!(fn f(&self, x: Wrap<U>));
-    referrer
-        .clone()
-        .visitor(c1, replace)
-        .visit_signature_mut(&mut sig);
+    referrer.visitor(c1, replace).visit_signature_mut(&mut sig);
     assert_eq!(
         s(&sig),
         s(&parse_quote!(fn f(&self, x: Wrap<U>)) as &Signature)
@@ -609,7 +587,6 @@ fn the_generics_are_taken_from_the_context() {
     // exactly those of the context is the scope itself.
     let mut item = tr2.clone();
     referrer
-        .clone()
         .visitor(c2, replace)
         .visit_item_trait_mut(&mut item);
     let ix = entry(c2);
@@ -626,13 +603,11 @@ fn the_generics_are_taken_from_the_context() {
     );
     let mut declared = other.clone();
     referrer
-        .clone()
         .visitor(c2, replace)
         .visit_item_impl_mut(&mut declared);
     assert_eq!(s(&declared), s(&other));
     let mut leakers = other.clone();
     referrer
-        .clone()
         .visitor(c2, replace)
         .with_outermost_generics_as_leakers()
         .visit_item_impl_mut(&mut leakers);
@@ -658,7 +633,6 @@ fn a_local_generic_is_declared_by_the_visited_syntax() {
     let rewrite = |sig: Signature| {
         let mut sig = sig;
         referrer
-            .clone()
             .visitor(context, replace)
             .visit_signature_mut(&mut sig);
         s(&sig)
@@ -709,7 +683,6 @@ fn a_bound_on_self_alone_need_not_be_written_by_the_copy() {
         };
         let mut item = item;
         referrer
-            .clone()
             .visitor(context, replace)
             .with_self(parse_quote!(S))
             .visit_item_fn_mut(&mut item);
@@ -818,7 +791,7 @@ fn the_id_of_a_dropped_context_is_unknown_too() {
     assert!(!missing.is_empty());
     for context in missing {
         let result = std::panic::catch_unwind(|| {
-            referrer.clone().visitor(context, replace);
+            let _ = referrer.visitor(context, replace);
         });
         assert!(result.is_err(), "{}", context);
     }
@@ -891,7 +864,6 @@ fn a_trait_is_rewritten_whole_and_part_by_part() {
     };
     let mut whole = tr.clone();
     referrer
-        .clone()
         .visitor(context, replace)
         .visit_item_trait_mut(&mut whole);
     assert_eq!(s(&whole), s(&expected));
@@ -899,7 +871,7 @@ fn a_trait_is_rewritten_whole_and_part_by_part() {
     // Part by part: the supertraits, the associated types and the signatures, as a macro that
     // keeps the trait and replaces what it chooses to does.
     let mut parts = tr.clone();
-    let mut visitor = referrer.clone().visitor(context, replace);
+    let mut visitor = referrer.visitor(context, replace);
     for bound in parts.supertraits.iter_mut() {
         visitor.visit_type_param_bound_mut(bound);
     }
@@ -950,7 +922,7 @@ fn a_signature_visited_by_itself_is_a_nested_item() {
     ] {
         let mut sig: Signature = parse_str(sig).unwrap();
         let expected: Signature = parse_str(expected).unwrap();
-        let mut visitor = referrer.clone().visitor(context, replace);
+        let mut visitor = referrer.visitor(context, replace);
         if as_leakers {
             visitor = visitor.with_outermost_generics_as_leakers();
         }

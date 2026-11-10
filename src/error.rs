@@ -2,7 +2,7 @@
 //! an item that cannot be interned ([recovery](crate::Leaker#errors-and-recovery)).
 
 use crate::analysis::{CheckResult, SelfMention};
-use crate::util::{or_list, without_crate_prefix, KNOWN_NAMES};
+use crate::util::{or_list, tidy, without_crate_prefix, KNOWN_NAMES};
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
@@ -31,7 +31,7 @@ pub enum Cause {
     /// qualified path in a value (`<u8 as Rel>::f()`).
     Trait(Path),
     /// An expression: a path in a const expression (an array length, a discriminant) or, with
-    /// [`check_values`](crate::Leaker::from_config), in a value; also an expression that
+    /// [`check_values()`](crate::Options::check_values), in a value; also an expression that
     /// cannot be leaked (a closure in an array length). A path is an [`Expr::Path`], as written.
     Expr(Expr),
     /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`). A macro that is a
@@ -103,21 +103,6 @@ impl Cause {
                 qself: None, path, ..
             })) => Some(path),
             _ => None,
-        }
-    }
-
-    /// Returns `true` if the cause is `Self` or a path that starts with it (`Self::A`), not `<Self
-    /// as Tr>::A`.
-    pub(crate) fn is_self_path(&self) -> bool {
-        match self {
-            Cause::Macro(_) => false,
-            other => other.as_path().map_or(false, |path| {
-                path.leading_colon.is_none()
-                    && path
-                        .segments
-                        .first()
-                        .map_or(false, |seg| seg.ident == "Self")
-            }),
         }
     }
 
@@ -276,10 +261,12 @@ impl Hash for Cause {
 #[non_exhaustive]
 pub enum Reason {
     /// A path or type that depends on the context but cannot be leaked, so it must be written in
-    /// full (`MyType` in `MyType<'_>`, a trait in a bound), or a relative path in a value.
+    /// full (`MyType` in `MyType<'_>`, a trait in a bound), or a relative path in a value. A macro
+    /// can accept a path with [`Allow::allow_path_if()`](crate::Allow::allow_path_if).
     RelativePath,
     /// `Self` where no scope gives it a meaning: in a module, or in generics that no struct, enum,
-    /// union, impl or trait encloses.
+    /// union, impl or trait encloses. A macro can enter such a scope
+    /// ([`Leaker::enter_type()`](crate::Leaker::enter_type), `enter_impl()`, `enter_trait()`).
     SelfWithoutMeaning,
     /// Syntax that the Leaker cannot read, with `check_values`: a macro whose arguments are not
     /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed.
@@ -300,12 +287,12 @@ pub enum Reason {
     /// only if a bound of the generics names `Self` too (E0735).
     SelfInDefault,
     /// A type that uses a generic whose bound mentions a `Self` that cannot be leaked, because
-    /// `allow_self` is `false`.
+    /// `allow_self` is `false`: a macro can analyze the item with `allow_self = true`.
     DeniedSelfInBounds,
     /// A type that names the `Self` of a nested struct, enum or union and uses a generic whose
     /// bound names it too (`Wrap<Self, T>` with `T: AsRef<Self>`). Write it with an absolute path,
-    /// or accept it with
-    /// [`nested_self_entries`](crate::Leaker::from_config).
+    /// or accept it with [`nested_self_entries()`](crate::Options::nested_self_entries), or give
+    /// the item its own `intern_*` call.
     NestedSelfInBounds,
     /// A type in a bound or where predicate that the copy cannot write through the Repeater
     /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)).
@@ -392,8 +379,9 @@ impl Reason {
 /// assert_eq!(items[1].to_string(), items[1].message);
 /// ```
 ///
-/// Report an item with [`to_compile_error()`](ErrorItem::to_compile_error), or all of them with
-/// [`to_syn_error()`]. [`ToTokens`] and [`Parse`] serialize an item as one brace group, to pass it
+/// Report an item from a macro with [`emit()`](ErrorItem::emit), or all of them with
+/// [`to_syn_error()`]; [`to_compile_error()`](ErrorItem::to_compile_error) is the same without the
+/// nightly diagnostic. [`ToTokens`] and [`Parse`] serialize an item as one brace group, to pass it
 /// to another macro of the same type-leak version.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -407,11 +395,14 @@ pub struct ErrorItem {
     /// What is wrong: `use absolute path: '..'` for a relative path, else the reason's headline.
     pub message: String,
     /// Why, each with the tokens it is about, the most useful first: the note of the reason, then
-    /// the causes that stop the type from being leaked whole or depend on the context.
+    /// the causes that stop the type from being leaked whole or depend on the context. A relative
+    /// path that would be leaked once the cause is fixed is no note (`Local` in `Base<Local>`): it
+    /// is in [`paths`](ErrorItem::paths).
     pub notes: Vec<(TokenStream, String)>,
-    /// What to write instead, with the tokens it is about. Every error has one.
+    /// What to write instead, with the tokens it is about. The analysis gives every error one; it
+    /// is `None` only in an item that [`Parse`] read without.
     pub help: Option<(TokenStream, String)>,
-    /// Found while reading a value ([`check_values`](crate::Leaker::from_config)); see
+    /// Found while reading a value ([`check_values()`](crate::Options::check_values)); see
     /// [`allow_values()`](crate::LeakerResult::allow_values).
     pub in_value: bool,
     /// Found in a default: of a trait's method or const, or of a parameter; see
@@ -436,9 +427,18 @@ impl ErrorItem {
         self.help.as_ref().map(|(_, help)| help.as_str())
     }
 
-    /// Returns a `compile_error!` that reports the error with its notes and help. On nightly,
-    /// inside a proc macro, it emits a `Diagnostic` with them at their own spans instead.
+    /// Returns a `compile_error!` that reports the error, with the notes and the help in its
+    /// message. Pure: use it to build or compare tokens; a macro reports with [`emit()`](ErrorItem::emit).
+    #[must_use]
     pub fn to_compile_error(&self) -> TokenStream {
+        self.to_syn_error().to_compile_error()
+    }
+
+    /// Reports the error from a proc macro, and returns the tokens to give back. On nightly it
+    /// emits a `Diagnostic` with the notes and the help at their own spans and returns no tokens;
+    /// elsewhere it returns [`to_compile_error()`](ErrorItem::to_compile_error).
+    #[must_use]
+    pub fn emit(&self) -> TokenStream {
         // Only compiled on nightly, so the MSRV does not apply.
         #[cfg(type_leak_diagnostic)]
         #[allow(clippy::incompatible_msrv)]
@@ -446,7 +446,7 @@ impl ErrorItem {
             self.emit_diagnostic();
             return TokenStream::new();
         }
-        self.to_syn_error().to_compile_error()
+        self.to_compile_error()
     }
 
     fn to_syn_error(&self) -> syn::Error {
@@ -493,7 +493,8 @@ impl ErrorItem {
 }
 
 /// Converts the errors into one [`syn::Error`], with the notes and the help appended to each
-/// message. An empty slice gives an error at the call site.
+/// message. Pass at least one: an empty slice gives an error "not internable" at the call site.
+#[must_use]
 pub fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
     items
         .iter()
@@ -605,7 +606,7 @@ impl Parse for ErrorItem {
 }
 
 /// Writes the [`ErrorItem`] as one brace group, to be read by its [`Parse`]: a serialization, not a
-/// report (see [`to_compile_error()`](ErrorItem::to_compile_error)).
+/// report (see [`emit()`](ErrorItem::emit)).
 impl ToTokens for ErrorItem {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let kind = Ident::new(self.cause.kind(), Span::call_site());
@@ -642,9 +643,7 @@ pub(crate) const SELF_NOTE: &str =
     "`Self` has no meaning here: it is declared only by a struct, an enum, a \
                          union, an impl or a trait, not by a module or generics";
 
-pub(crate) const SELF_HELP: &str =
-    "write the type instead of `Self`, or enter a scope that declares `Self` around it \
-     (`Leaker::enter_type`, `enter_impl` or `enter_trait`)";
+pub(crate) const SELF_HELP: &str = "write the type instead of `Self`";
 
 /// The error of a mention of `Self` that has no meaning where it is written.
 pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
@@ -681,7 +680,10 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
         let shown = cause.shown();
         notes.push((
             shown.clone(),
-            format!("it cannot be leaked as a whole because of `{}`", shown),
+            format!(
+                "it cannot be leaked as a whole because of `{}`",
+                tidy(&shown)
+            ),
         ));
         if is_default_lifetime_object(cause) {
             default_object = true;
@@ -695,17 +697,13 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
     }
     let help = match &conflict.help {
         Some(help) => (tokens.clone(), help.clone()),
-        None => absolute_path_help(
-            first,
-            default_object,
-            conflict.impossible.iter().any(Cause::is_self_path),
-        ),
+        None => absolute_path_help(first, default_object),
     };
     notes.extend(others.iter().map(|other| {
         let shown = other.shown();
         (
             shown.clone(),
-            format!("`{}` also depends on the type context", shown),
+            format!("`{}` also depends on the type context", tidy(&shown)),
         )
     }));
     Some(ErrorItem {
@@ -714,7 +712,7 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
         message: conflict
             .headline
             .clone()
-            .unwrap_or_else(|| format!("use absolute path: '{}'", tokens)),
+            .unwrap_or_else(|| format!("use absolute path: '{}'", tidy(&tokens))),
         notes,
         help: Some(help),
         in_value: conflict.place.value,
@@ -766,12 +764,8 @@ fn prelude_help(path: &syn::Path) -> Option<String> {
 
 /// The help for the path of `cause`: the absolute path of a prelude item, else how to write the
 /// path in full, at its first segment. `default_object`: a trait object takes its lifetime from the
-/// path around it. `denied_self`: a `Self` that `allow_self = false` denies is among the causes.
-fn absolute_path_help(
-    cause: &Cause,
-    default_object: bool,
-    denied_self: bool,
-) -> (TokenStream, String) {
+/// path around it.
+fn absolute_path_help(cause: &Cause, default_object: bool) -> (TokenStream, String) {
     let tokens = cause.shown();
     let path = offending_path(cause);
     // The help is about the name of the path: its first segment.
@@ -797,24 +791,16 @@ fn absolute_path_help(
                     "write `{}` with an absolute path (e.g. `{}`)",
                     name, example
                 ));
-                options.push("allow it with `Allow::allow_path_if()`".to_string());
             }
             Some(path) => {
                 let (name, _) = path_names(path);
-                options.push(format!(
-                    "write `{}` where it is not leaked, or allow it with \
-                     `Allow::allow_path_if()`",
-                    name
-                ));
+                options.push(format!("write `{}` where it is not leaked", name));
             }
             None => options.push(format!(
                 "write the paths in `{}` as absolute paths",
-                crate::util::tidy(&tokens)
+                tidy(&tokens)
             )),
         },
-    }
-    if denied_self {
-        options.push("analyze the item with `allow_self = true`".to_string());
     }
     if default_object {
         options.push(

@@ -121,6 +121,57 @@ fn the_repeater_definition_has_the_documented_shape() {
     ));
 }
 
+/// `RepeaterSlots::repeater()` is the path it was made with, and `const_fn()` is `encode_const()`
+/// on the type of the parameter: as `Referrer::entry_args()` and `repeater_impl()` take it, for
+/// every const type, and with the error of an unsupported one.
+#[test]
+fn the_slots_give_their_path_and_the_const_fn() {
+    use type_leak::*;
+    let path: Path = parse_quote!(crate::Repeater);
+    let slots = RepeaterSlots::new(path.clone());
+    assert_eq!(slots.repeater(), &path);
+
+    let mut const_fn = slots.const_fn();
+    for (param, value) in [
+        (parse_quote!(const B: bool), "true"),
+        (parse_quote!(const C: char), "'x'"),
+        (parse_quote!(const N: usize), "3"),
+        (parse_quote!(const K: u64), "9"),
+        (parse_quote!(const I: i128), "-1"),
+    ] {
+        let param: ConstParam = param;
+        let value: Expr = parse_str(value).unwrap();
+        assert_eq!(
+            const_fn(&value, &param).unwrap(),
+            slots.encode_const(&value, &param.ty).unwrap(),
+            "{}",
+            quote!(#param)
+        );
+    }
+    let alias: ConstParam = parse_quote!(const A: Alias);
+    assert!(matches!(
+        const_fn(&parse_quote!(A), &alias),
+        Err(EncodeError::UnsupportedConstType(_))
+    ));
+
+    // In the helpers of the Referrer, as the closure of `array_const` is.
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<const N: usize, const B: bool> {
+            fn f(&self) -> Wrap<N, B>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
+    let args = referrer
+        .entry_args(0, &UseSite::identity(), slots.const_fn())
+        .unwrap();
+    assert_eq!(
+        args,
+        parse_quote!((*const dyn crate::Repeater<(), 0, 0, B, Type = ()>, [(); N]))
+    );
+}
+
 #[test]
 fn test_const_args_are_braced_when_needed() {
     use type_leak::*;

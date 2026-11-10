@@ -860,11 +860,11 @@ pub(crate) struct AnalyzeVisitor<P> {
     /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
     /// effects, like `self_errors`.
     env_errors: Vec<CheckResult>,
-    /// The values of an item are read too (see [`check_values`](crate::Leaker::from_config)).
+    /// The values of an item are read too (see [`check_values()`](crate::Options::check_values)).
     check_values: bool,
     /// An entry whose type names the `Self` of a struct, an enum or a union nested in the analyzed
     /// syntax, and a bound of whose generics does, is for any type (see
-    /// [`nested_self_entries`](crate::Leaker::from_config)).
+    /// [`nested_self_entries()`](crate::Options::nested_self_entries)).
     nested_self_entries: bool,
     /// A value is being read ([`AnalyzeVisitor::place()`]).
     in_value: bool,
@@ -968,7 +968,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     }
 
     /// Makes the visitor read the values of the items it visits, or not (see
-    /// [`check_values`](crate::Leaker::from_config)).
+    /// [`check_values()`](crate::Options::check_values)).
     pub(crate) fn reading_values(mut self, check_values: bool) -> Self {
         self.check_values = check_values;
         self
@@ -976,7 +976,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
 
     /// Accepts an entry whose type names the `Self` of a nested struct, enum or union together with
     /// a bound that does, as an entry for any type (see
-    /// [`nested_self_entries`](crate::Leaker::from_config)), or not.
+    /// [`nested_self_entries()`](crate::Options::nested_self_entries)), or not.
     pub(crate) fn with_nested_self_entries(mut self, nested_self_entries: bool) -> Self {
         self.nested_self_entries = nested_self_entries;
         self
@@ -1305,7 +1305,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does not hold for in
     /// the copy, whose own type has it (E0277), and the impl cannot be for any type unless the
     /// Leaker is configured to accept the risk: what the type needs of `Self` to be well-formed is
-    /// not known ([`nested_self_entries`](crate::Leaker::from_config); see `own_context()`). A
+    /// not known ([`nested_self_entries()`](crate::Options::nested_self_entries); see `own_context()`). A
     /// predicate on another type, which an impl proves (`Self: Sized`, `Vec<Self>: Clone`), and
     /// `Self: 'a` are fine.
     fn self_in_bounds(&self, context: &Context) -> Option<Cause> {
@@ -2056,7 +2056,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 headline: Some(format!(
                     "`{}` is in the default of a parameter, and it and a bound of its generics \
                      name `Self`",
-                    quote!(#ty)
+                    tidy(&quote!(#ty))
                 )),
                 cause: None,
                 reason: Reason::SelfInDefault,
@@ -2080,18 +2080,15 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 ),
                 help: Some(format!(
                     "write the bound of the generics of `{}` without `{}`, write the type \
-                     without `Self`, write the type with an absolute path (it is copied as \
-                     written, and its `Self` is the copy's own), analyze the item with its own \
-                     `intern_*` call, which writes its `Self` as the Leaker's type, or accept \
-                     the entry for any type with the `nested_self_entries` argument of \
-                     `Leaker::from_config()`",
+                     without `Self`, or write the type with an absolute path (it is copied as \
+                     written, and its `Self` is the copy's own)",
                     tidy(&quote!(#ty)),
                     tidy(&self_path.shown())
                 )),
                 // The fault is the bound, not the path of the type that uses it.
                 headline: Some(format!(
                     "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
-                    quote!(#ty)
+                    tidy(&quote!(#ty))
                 )),
                 cause: None,
                 reason: Reason::NestedSelfInBounds,
@@ -2110,15 +2107,14 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     "the bounds of its generics mention `Self`, which cannot be leaked".to_string(),
                 ),
                 help: Some(format!(
-                    "write the bound of the generics of `{}` without `{}`, or analyze the item \
-                     with `allow_self = true`",
+                    "write the bound of the generics of `{}` without `{}`",
                     tidy(&quote!(#ty)),
                     tidy(&self_path.shown())
                 )),
                 // The fault is the bound, not the path of the type that uses it.
                 headline: Some(format!(
                     "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
-                    quote!(#ty)
+                    tidy(&quote!(#ty))
                 )),
                 cause: None,
                 reason: Reason::DeniedSelfInBounds,
@@ -2272,7 +2268,6 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
              const)",
             name
         );
-        let denied_self = !self.allow_self && conflict.impossible.iter().any(Cause::is_self_path);
         conflict.help = Some(match conflict.help.take() {
             // The advice of the cause may name the path already: a const needs braces.
             Some(help) => {
@@ -2283,23 +2278,10 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     // It lists the options already: ours comes first.
                     format!("{}, {}", absolute, help)
                 } else {
-                    let mut options = vec![absolute, help];
-                    if denied_self {
-                        options.push("analyze the item with `allow_self = true`".to_string());
-                    }
-                    or_list(options)
+                    or_list(vec![absolute, help])
                 }
             }
-            None => {
-                let mut options = vec![
-                    absolute,
-                    "allow it with `Allow::allow_path_if()`".to_string(),
-                ];
-                if denied_self {
-                    options.push("analyze the item with `allow_self = true`".to_string());
-                }
-                or_list(options)
-            }
+            None => absolute,
         });
         conflict.headline = Some(format!(
             "`{}` may be a const, and the type that holds it cannot be leaked as a whole",
@@ -2329,7 +2311,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     covered: false,
                     path: None,
                 });
-                let advice = self_elision_advice(&added, &elision, true, self.allow_self);
+                let advice = self_elision_advice(&added, &elision, true);
                 inner.elision = Some((elision.owner, advice));
                 inner.min_depth = inner.min_depth.min(elision.owner);
                 return self.decide_as_owner(elision.owner, inner);
@@ -2344,7 +2326,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
-            self_elision_advice(&added, &elision, false, self.allow_self).give(&mut conflict);
+            self_elision_advice(&added, &elision, false).give(&mut conflict);
             self_conflict = Some(conflict);
         }
         // A bare identifier argument may be a const, so the type holding it is leaked whole if it
@@ -2404,8 +2386,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     .map(|ident| tidy(&quote!(#ident)))
                     .unwrap_or_default();
                 conflict.help = Some(format!(
-                    "import `{0}` with an absolute `use` (`use ::my_crate::{0};`), or allow it \
-                     with `Allow::allow_path_if()`",
+                    "import `{0}` with an absolute `use` (`use ::my_crate::{0};`)",
                     name
                 ));
             }
@@ -2795,11 +2776,11 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                          writes both as paths through the Repeater, and rustc cannot normalize the \
                          one in a bound or where predicate while it checks the bounds (E0277, \
                          E0275)",
-                        unstable.bound
+                        tidy(&unstable.bound)
                     ),
                     Instability::Named(named) => format!(
                         "the bound `{}` of its generics {}",
-                        unstable.bound,
+                        tidy(&unstable.bound),
                         named.explain()
                     ),
                 };
@@ -2811,12 +2792,12 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     "the copy writes it as a path through the Repeater, whose impl is for the \
                      implementors of the trait (`{}`), and rustc cannot prove that the host \
                      implements the trait while it checks this predicate (E0275)",
-                    bound
+                    tidy(&bound)
                 );
                 let mut error = self.cycle_error(ty, why);
                 error.headline = Some(format!(
                     "`{}` names `Self` in a bound or where predicate of its trait",
-                    quote!(#ty)
+                    tidy(&quote!(#ty))
                 ));
                 error.reason = Reason::SelfInTraitPredicate;
                 // The type names `Self`, so an absolute path is no fix.
@@ -2831,8 +2812,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     }
 
     /// Like `env_cycle()` for an entry in a predicate that names the `Self` of a nested struct, enum
-    /// or union and is for any type (the `nested_self_entries` argument of
-    /// `Leaker::from_config()`). Its impl leaves out the generics the type does not use, so
+    /// or union and is for any type ([`Options::nested_self_entries()`](crate::Options::nested_self_entries)). Its impl leaves out the generics the type does not use, so
     /// `context` does not have a bound that names a leaked type (`T: AsRef<Rel<Self>>`), but the
     /// impl of an entry that uses the generic has it, and the copy has only the rewritten form in
     /// its environment (E0277, `Rel<(Self, T)>` beside it). So the type is judged with the generics
@@ -2871,8 +2851,8 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                  which needs the bound `{}` of {}, where the copy writes the leaked type \
                  as a path through the Repeater, and rustc cannot normalize the one in a bound or \
                  where predicate while it checks the bounds (E0277, E0275)",
-                quote!(#ty),
-                unstable.bound,
+                tidy(&quote!(#ty)),
+                tidy(&unstable.bound),
                 owner
             ),
             (Instability::Leaked, false) => format!(
@@ -2880,20 +2860,20 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                  as paths through the Repeater, and the bound `{}` of their generics names a type \
                  that is leaked too, and rustc cannot normalize the one in a bound or where \
                  predicate while it checks the bounds (E0277, E0275)",
-                unstable.bound
+                tidy(&unstable.bound)
             ),
             (Instability::Named(named), true) => format!(
                 "the copy for a concrete implementor resolves `{}` by the impl of the trait, \
                  which needs the bound `{}` of {}, which {}",
-                quote!(#ty),
-                unstable.bound,
+                tidy(&quote!(#ty)),
+                tidy(&unstable.bound),
                 owner,
                 named.explain()
             ),
             (Instability::Named(named), false) => format!(
                 "`Self` is the self type of the impl, which the copy writes with its leaked types \
                  as paths through the Repeater, and the bound `{}` of their generics {}",
-                unstable.bound,
+                tidy(&unstable.bound),
                 named.explain()
             ),
         };
@@ -2932,7 +2912,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             headline: Some(format!(
                 "`{}` is in a bound or where predicate, and a bound of its generics names a leaked \
                  type",
-                quote!(#ty)
+                tidy(&quote!(#ty))
             )),
             cause: None,
             reason: Reason::UnprovableBound,
@@ -2964,7 +2944,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             )),
             headline: Some(format!(
                 "`{}` is in a bound or where predicate, and a bound of its generics names {}",
-                quote!(#ty),
+                tidy(&quote!(#ty)),
                 named.names()
             )),
             cause: None,
@@ -5645,13 +5625,14 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         _ => return None,
     };
     let cause = declared_self_mention(declared, context)?;
-    let shown = quote!(#ty).to_string();
-    let what = if quote!(#self_ty).to_string() == shown {
+    let plain = quote!(#ty).to_string();
+    let shown = tidy(&quote!(#ty));
+    let what = if quote!(#self_ty).to_string() == plain {
         format!("`Self` is `{}`, the self type of the impl", shown)
     } else {
         format!(
             "`Self` is the self type `{}` of the impl, which contains `{}`",
-            quote!(#self_ty),
+            tidy(&quote!(#self_ty)),
             shown
         )
     };
@@ -5728,7 +5709,7 @@ fn unconstrained_headline(conflict: &CheckResult, lifetime: &Lifetime) -> Option
     let cause = conflict.must.first()?;
     Some(format!(
         "`{}` leaves the lifetime `{}` of the method unconstrained in the copy (E0195)",
-        cause.shown(),
+        tidy(&cause.shown()),
         lifetime
     ))
 }
@@ -5841,7 +5822,7 @@ fn elision_advice(added: &[Lifetime], elision: &Elision, ty: &Type, owned: bool)
         "the output `{}` has an elided lifetime, which elision takes from {}, but a leaked type in \
          the inputs has {} among its generics, and the copy names {} in the arguments of its \
          projection, so the inputs have more than one lifetime{} (E0106){}",
-        elision.output.shown(),
+        tidy(&elision.output.shown()),
         elision_source(elision),
         added.join(", "),
         if added.len() == 1 { "it" } else { "them" },
@@ -5865,21 +5846,16 @@ fn elision_advice(added: &[Lifetime], elision: &Elision, ty: &Type, owned: bool)
 
 /// The advice for a signature whose elision the copy breaks by writing a type with `added`
 /// lifetimes for `Self`.
-fn self_elision_advice(
-    added: &[Lifetime],
-    elision: &Elision,
-    owned: bool,
-    allow_self: bool,
-) -> Advice {
+fn self_elision_advice(added: &[Lifetime], elision: &Elision, owned: bool) -> Advice {
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
         .collect();
     let note = format!(
         "the output `{}` has an elided lifetime, which elision takes from {}, but `Self` in the \
-         inputs is a type that has {} among its generics, and the copy writes that type for `Self` \
-         (`Visitor::with_self()`), so the inputs have more than one lifetime (E0106){}",
-        elision.output.shown(),
+         inputs is a type that has {} among its generics, and the copy writes that type for `Self`, \
+         so the inputs have more than one lifetime (E0106){}",
+        tidy(&elision.output.shown()),
         elision_source(elision),
         added.join(", "),
         if owned {
@@ -5888,14 +5864,9 @@ fn self_elision_advice(
             ""
         }
     );
-    let mut options = elision_options(elision, None);
-    // With `allow_self = true`, the holder keeps `Self` as written, if it can be leaked.
-    if !allow_self {
-        options.push("analyze the item with `allow_self = true`".to_string());
-    }
     Advice {
         note,
-        help: or_list(options),
+        help: or_list(elision_options(elision, None)),
     }
 }
 

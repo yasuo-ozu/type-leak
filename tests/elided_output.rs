@@ -27,11 +27,11 @@ mod common;
 use common::check_in;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, Cause, ErrorItem, Leaker, Referrer};
+use type_leak::{to_syn_error, Allow, Cause, ErrorItem, Leaker, Options, Referrer};
 
 fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
     let config = Allow::new().allow_primitive().allow_prelude();
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {
@@ -94,7 +94,7 @@ fn help(item: &ItemTrait) -> String {
 }
 
 /// The note of the error where nothing holds the signature.
-const NOTE: &str = "the output `& u8` has an elided lifetime, which elision takes from the only \
+const NOTE: &str = "the output `&u8` has an elided lifetime, which elision takes from the only \
                     lifetime of the inputs, but a leaked type in the inputs has `'a` among its \
                     generics, and the copy names it in the arguments of its projection, so the \
                     inputs have more than one lifetime (E0106)";
@@ -108,7 +108,7 @@ const HELP_METHOD: &str = "name the lifetime of the inputs and of the output, gi
                            receiver (`&self`), or write `Rel<T>` with an absolute path";
 
 /// The note of the error where the holder cannot be leaked.
-const NOTE_OWNED: &str = "the output `& u8` has an elided lifetime, which elision takes from the \
+const NOTE_OWNED: &str = "the output `&u8` has an elided lifetime, which elision takes from the \
                           only lifetime of the inputs, but a leaked type in the inputs has `'a` \
                           among its generics, and the copy names it in the arguments of its \
                           projection, so the inputs have more than one lifetime (E0106), so a \
@@ -416,7 +416,7 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
     ] {
         let item: ItemTrait = item;
         let (message, note) = error(item.clone());
-        assert_eq!(message, "use absolute path: 'Rel < T >'", "{}", s(&item));
+        assert_eq!(message, "use absolute path: 'Rel<T>'", "{}", s(&item));
         assert_eq!(note, NOTE, "{}", s(&item));
         assert_eq!(help(&item), HELP_METHOD, "{}", s(&item));
     }
@@ -424,18 +424,18 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
     for (item, output) in [
         (
             parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> ::p::Ref<'_, u8>; } },
-            ":: p :: Ref < '_ , u8 >",
+            "::p::Ref<'_, u8>",
         ),
         (
             parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> Box<dyn Iterator<Item = &u8>>; } },
-            "Box < dyn Iterator < Item = & u8 > >",
+            "Box<dyn Iterator<Item = &u8>>",
         ),
     ] {
         let item: ItemTrait = item;
         let (_, note) = error(item.clone());
         assert_eq!(
             note,
-            NOTE.replace("`& u8`", &format!("`{}`", output)),
+            NOTE.replace("`&u8`", &format!("`{}`", output)),
             "{}",
             s(&item)
         );
@@ -447,8 +447,8 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
     assert_eq!(
         to_syn_error(&err).to_string(),
         format!(
-            "use absolute path: 'Rel < T >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
-             whole because of `& u8`\n  = help: {}\n",
+            "use absolute path: 'Rel<T>'\n\n  = note: {}\n  = note: it cannot be leaked as a \
+             whole because of `&u8`\n  = help: {}\n",
             NOTE, HELP_METHOD
         )
     );
@@ -493,7 +493,7 @@ fn a_bound_with_the_elision_is_an_error() {
     ] {
         let item: ItemTrait = item;
         let (message, note) = error(item.clone());
-        assert_eq!(message, "use absolute path: 'Rel < T >'", "{}", s(&item));
+        assert_eq!(message, "use absolute path: 'Rel<T>'", "{}", s(&item));
         assert_eq!(note, NOTE, "{}", s(&item));
         assert_eq!(help(&item), HELP, "{}", s(&item));
     }
@@ -514,7 +514,7 @@ fn a_holder_that_cannot_be_leaked_is_an_error() {
     let (message, note) = error(parse_quote! {
         trait Tr<'a, T: 'a> { fn f(&self, x: impl Fn(&Rel<T>) -> &u8); }
     });
-    assert_eq!(message, "use absolute path: 'Rel < T >'");
+    assert_eq!(message, "use absolute path: 'Rel<T>'");
     assert_eq!(note, NOTE_OWNED);
     // A trait object under an elided reference takes its lifetime from it, so it cannot be leaked
     // alone, and the reference has no lifetime to name.
@@ -526,8 +526,8 @@ fn a_holder_that_cannot_be_leaked_is_an_error() {
     assert_eq!(
         to_syn_error(&err).to_string(),
         format!(
-            "use absolute path: 'Rel < T >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
-             whole because of `dyn Fn (& Rel < T >) -> & u8`\n  = note: the lifetime of the trait \
+            "use absolute path: 'Rel<T>'\n\n  = note: {}\n  = note: it cannot be leaked as a \
+             whole because of `dyn Fn (&Rel<T>) -> &u8`\n  = note: the lifetime of the trait \
              object defaults to that of the enclosing reference or path\n  = help: {}\n",
             NOTE_OWNED, HELP
         )
@@ -571,8 +571,8 @@ fn an_elided_lifetime_of_the_holder_is_its_own() {
     let (message, note) = error(parse_quote! {
         trait Tr { fn f(&self, f: Box<dyn Fn(Rel<&Rel2>) -> u8>); }
     });
-    assert_eq!(message, "use absolute path: 'Rel < & Rel2 >'");
-    assert_eq!(note, "it cannot be leaked as a whole because of `& Rel2`");
+    assert_eq!(message, "use absolute path: 'Rel<&Rel2>'");
+    assert_eq!(note, "it cannot be leaked as a whole because of `&Rel2`");
     // The holder is not an entry for that reason alone: with no cause in it, it is copied.
     let referrer = analyze(&parse_quote! {
         trait Tr { fn f(&self, f: Box<dyn Fn(&u8) -> &u8>, g: for<'x> fn(&'x u8, &u8)); }
@@ -704,7 +704,7 @@ fn an_elided_output_may_take_the_lifetime_of_the_binder() {
     ] {
         let item: ItemTrait = item;
         let (message, _) = error(item.clone());
-        assert_eq!(message, "use absolute path: 'Rel < 'x >'", "{}", s(&item));
+        assert_eq!(message, "use absolute path: 'Rel<'x>'", "{}", s(&item));
     }
     // The lifetime of the trait is not declared by the binder, so it is not at stake.
     assert_eq!(

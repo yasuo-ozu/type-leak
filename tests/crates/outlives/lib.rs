@@ -860,7 +860,7 @@ pub mod m {
         }
     }
     check_leak! {
-        { error: "use absolute path: 'Hr < 'x >'" }
+        { error: "use absolute path: 'Hr<'x>'" }
         { }
         trait ExternalAnchorBound {
             fn bound<F: for<'x> ::core::ops::Fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>, Hr<'x>) -> &'x u8>(&self, f: F) -> usize;
@@ -908,7 +908,7 @@ pub mod m {
         }
     }
     check_leak! {
-        { error: "use absolute path: 'Rel2 < & 'x u8 >'" }
+        { error: "use absolute path: 'Rel2<&'x u8>'" }
         { }
         trait LostBound {
             fn f<F: for<'x> ::core::ops::Fn(Rel2<&'x u8>) -> &'x u8>(&self, f: F) -> usize;
@@ -917,7 +917,7 @@ pub mod m {
     // A bound, which cannot be leaked as a whole, is an error, as the copy of `Hr<'x>` would not
     // compile.
     check_leak! {
-        { error: "use absolute path: 'Hr < 'x >'" }
+        { error: "use absolute path: 'Hr<'x>'" }
         { }
         trait BoundOutput {
             fn f<F: for<'x> ::core::ops::Fn(Hr<'x>) -> &'x u8>(&self, f: F) -> usize;

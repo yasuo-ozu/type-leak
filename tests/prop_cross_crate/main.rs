@@ -1429,11 +1429,11 @@ fn reason_head(detail: &str) -> String {
         return "a type in the self type of an impl that a bound of the impl makes depend on `Self`"
             .to_string();
     }
-    // "use absolute path: 'Vec < X >'" is counted by the start of the type.
-    match detail.find('\'') {
-        Some(at) => {
-            let ty: String = detail[at + 1..].chars().take(24).collect();
-            format!("{} '{}", detail[..at].trim(), ty)
+    // "use absolute path: 'Vec<X>'" is counted by the start of the type.
+    match detail.strip_prefix("use absolute path: '") {
+        Some(rest) => {
+            let ty: String = rest.chars().take(24).collect();
+            format!("use absolute path: '{}", ty)
         }
         None => detail.chars().take(60).collect(),
     }
@@ -3539,17 +3539,13 @@ mod checks {
         );
         assert_eq!(
             tags_of(
-                "use absolute path: 'for < 'h3 > Fn(& 'h3 u8) -> & 'h3 u8'",
+                "use absolute path: 'for<'h3> Fn(&'h3 u8) -> &'h3 u8'",
                 "for < 'h3 > Fn(& 'h3 u8) -> & 'h3 u8"
             ),
             Some(vec!["bare:Fn".to_string()])
         );
         // A path can be several reasons at once: the shapes of any of them explain it.
-        let tags = tags_of(
-            "use absolute path: 'Into < Self :: A0 >'",
-            "Into < Self :: A0 >",
-        )
-        .unwrap();
+        let tags = tags_of("use absolute path: 'Into<Self::A0>'", "Into < Self :: A0 >").unwrap();
         assert!(tags.contains(&"bare:Into".to_string()), "{:?}", tags);
         assert!(
             tags.contains(&gen::TAG_SELF_ASSOC.to_string()),
@@ -3558,7 +3554,7 @@ mod checks {
         );
         // The binder of a bound is not a type that names one.
         let tags = tags_of(
-            "use absolute path: 'for < 'h1 > Fn(& 'h1 u8) -> & 'h1 u8'",
+            "use absolute path: 'for<'h1> Fn(&'h1 u8) -> &'h1 u8'",
             "for < 'h1 > Fn(& 'h1 u8) -> & 'h1 u8",
         )
         .unwrap();
@@ -3579,14 +3575,11 @@ mod checks {
         );
         // The other reasons.
         assert_eq!(
-            tags_of("use absolute path: 'Rl < 'h5 >'", "Rl < 'h5 >"),
+            tags_of("use absolute path: 'Rl<'h5>'", "Rl < 'h5 >"),
             Some(vec![gen::TAG_BINDER_NO_ANCHOR.to_string()])
         );
         assert_eq!(
-            tags_of(
-                "use absolute path: 'Tr1_1 < 'a > :: A0'",
-                "Tr1_1 < 'a > :: A0"
-            ),
+            tags_of("use absolute path: 'Tr1_1<'a>::A0'", "Tr1_1 < 'a > :: A0"),
             Some(vec![gen::TAG_SELF_ASSOC.to_string()])
         );
         assert_eq!(
@@ -3598,14 +3591,14 @@ mod checks {
         );
         assert_eq!(
             tags_of(
-                "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a leaked type",
+                "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked type",
                 "Wrap < T >"
             ),
             Some(vec![gen::TAG_BOUND_CYCLE.to_string()])
         );
         assert_eq!(
             tags_of(
-                "use absolute path: 'crate :: base :: BLEN'",
+                "use absolute path: 'crate::base::BLEN'",
                 "crate :: base :: BLEN"
             )
             .map(|tags| tags.contains(&gen::TAG_CONST_DEFAULT.to_string())),
@@ -3794,7 +3787,7 @@ mod checks {
         let rejected = Report {
             kind: "struct".into(),
             rejections: vec![rejection(
-                "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked",
+                "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked",
                 "Wrap < T >",
             )],
             ..Default::default()

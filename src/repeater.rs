@@ -45,6 +45,7 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
 /// # use template_quote::ToTokens;
 /// assert!(def.to_token_stream().to_string().starts_with("pub trait Repeater <"));
 /// ```
+#[must_use]
 pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     let slots = REPEATER_SLOTS
         .iter()
@@ -66,23 +67,78 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     }
 }
 
-/// Encodes const values into the const slots of the Repeater from [`repeater_definition()`].
+/// Encodes const values into the const slots of the Repeater from [`repeater_definition()`], and
+/// writes the paths through it.
 ///
-/// Pass `|value, param| slots.encode_const(value, &param.ty)` as the `const_fn` of
+/// Pass [`slots.const_fn()`](RepeaterSlots::const_fn) as the `const_fn` of
 /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
 /// [`Referrer::entry_args()`](crate::Referrer::entry_args). `const N: usize` is `[(); N]`,
 /// `const X: u64` uses `ID`, and any other primitive is a trait object of the Repeater with its
 /// slot filled. A const parameter of an alias type is an [`EncodeError::UnsupportedConstType`].
+/// [`trait_path()`](RepeaterSlots::trait_path) and [`projection()`](RepeaterSlots::projection)
+/// write the Repeater with its arguments, for the impl and for the use.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepeaterSlots {
-    /// The path of the Repeater trait, which [`repeater_definition()`] defines.
-    pub repeater: Path,
+    repeater: Path,
 }
 
 impl RepeaterSlots {
     /// Creates the encoder for the Repeater at the path `repeater`.
     pub fn new(repeater: Path) -> Self {
         Self { repeater }
+    }
+
+    /// Returns the path of the Repeater trait, which [`repeater_definition()`] defines.
+    pub fn repeater(&self) -> &Path {
+        &self.repeater
+    }
+
+    /// Returns the path of the Repeater with the arguments of the entry `ix` of the Leaker `id`:
+    /// `Repeater<args, IDu64, IXusize>`.
+    ///
+    /// `args` is the first argument: [`RepeaterImpl::args`](crate::RepeaterImpl::args) for the
+    /// impl, [`Referrer::entry_args()`](crate::Referrer::entry_args) for a use. Write the impl for
+    /// this path and the projection ([`RepeaterSlots::projection()`]) with it, so that a change of
+    /// the parameters of the Repeater does not reach your macro.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    /// let path = slots.trait_path(&parse_quote!((&'a (), T)), 7, 0);
+    /// assert_eq!(path, parse_quote!(crate::Repeater<(&'a (), T), 7u64, 0usize>));
+    /// ```
+    #[must_use]
+    pub fn trait_path(&self, args: &Type, id: u64, ix: usize) -> Path {
+        let repeater = &self.repeater;
+        parse_quote!(#repeater<#args, #id, #ix>)
+    }
+
+    /// Returns `<self_ty as Repeater<args, IDu64, IXusize>>::Type`: the type that stands for the
+    /// entry `ix` of the Leaker `id` at a use ([`RepeaterSlots::trait_path()`]).
+    ///
+    /// `self_ty` is what the path is written for: `Self` in the copy, or the host.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    /// let ty = slots.projection(&parse_quote!(Self), &parse_quote!((T,)), 7, 1);
+    /// assert_eq!(ty, parse_quote!(<Self as crate::Repeater<(T,), 7u64, 1usize>>::Type));
+    /// ```
+    #[must_use]
+    pub fn projection(&self, self_ty: &Type, args: &Type, id: u64, ix: usize) -> Type {
+        let path = self.trait_path(args, id, ix);
+        parse_quote!(<#self_ty as #path>::Type)
+    }
+
+    /// Returns `|value, param| self.encode_const(value, &param.ty)`: the `const_fn` of
+    /// [`Referrer::entry_args()`](crate::Referrer::entry_args) and
+    /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl).
+    pub fn const_fn(
+        &self,
+    ) -> impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError> + '_ {
+        move |value, param| self.encode_const(value, &param.ty)
     }
 
     /// Encodes the const `value` of type `ty`. Fails with [`EncodeError::UnsupportedConstType`] if

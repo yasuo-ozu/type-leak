@@ -102,9 +102,7 @@ impl Slotted for RepeaterSlots {
         iter: impl IntoIterator<Item = &'a GenericArgument>,
         params: &Punctuated<GenericParam, Token![,]>,
     ) -> std::result::Result<Type, EncodeError> {
-        encode_generics_args_with_params(iter, params, None, |value, cp| {
-            self.encode_const(value, &cp.ty)
-        })
+        encode_generics_args_with_params(iter, params, None, self.const_fn())
     }
     fn encode_generics_args_to_ty_with_self<'a>(
         &self,
@@ -117,7 +115,7 @@ impl Slotted for RepeaterSlots {
             iter,
             params,
             Some((self_ty, self_outlives)),
-            |value, cp| self.encode_const(value, &cp.ty),
+            self.const_fn(),
         )
     }
 }
@@ -1217,7 +1215,12 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
         encode_generics_args_to_ty_with(&args.args, params, |_, _| unreachable!()).unwrap_err();
     assert!(matches!(err, EncodeError::UnexpectedArgument(_)), "{}", err);
     let completed = parsed
-        .complete_args(&args.args, &tr.generics.params, |_, _, _| unreachable!())
+        .complete_args(
+            parsed_top_level,
+            &tr.generics.params,
+            &args.args,
+            |_, _, _| unreachable!(),
+        )
         .unwrap();
     let args = parsed
         .context_generic_args(parsed_top_level, &tr.generics.params, &completed)
@@ -1253,7 +1256,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
 
 // ── The helpers against what a macro wrote by hand before them ───────────────────────────────
 
-use crate::{Allow, ErrorItem, ImplSelf, SelfRequirement, UseSite};
+use crate::{Allow, ErrorItem, ImplSelf, Options, SelfRequirement, UseSite};
 
 fn t(ty: Type) -> String {
     s(&ty)
@@ -1265,7 +1268,7 @@ fn config() -> Allow<impl Fn(&Path) -> bool> {
 
 /// Analyzes a whole item the way a downstream macro does.
 fn analyze(item: &Item) -> (Referrer, ContextId) {
-    let mut leaker = Leaker::from_config(config(), false, false);
+    let mut leaker = Leaker::from_config(config(), Options::new());
     let context = match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
         Item::Enum(i) => leaker.intern_enum(i, true),
@@ -1485,9 +1488,7 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
         let (referrer, _) = analyze(&item);
         for ix in 0..referrer.iter().count() {
             let r = referrer
-                .repeater_impl(ix, ImplSelf::Param(&self_param), |value, param| {
-                    slots().encode_const(value, &param.ty)
-                })
+                .repeater_impl(ix, ImplSelf::Param(&self_param), slots().const_fn())
                 .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
             let (generics, self_ty, args, ty) = by_hand(&referrer, ix, &self_param);
             let what = format!("{}: {}", s(&item), s(&referrer.iter().nth(ix)));
@@ -1522,15 +1523,15 @@ fn entry_args_is_what_a_macro_writes_by_hand() {
         let root_args = arguments_for(&generics);
         for ix in 0..referrer.iter().count() {
             let what = format!("{}: {}", s(&item), s(&referrer.iter().nth(ix)));
-            let encode = |value: &Expr, param: &ConstParam| slots().encode_const(value, &param.ty);
+            let slots = slots();
             // Substituted, with a `Self`.
             let site = UseSite::substituting(&generics.params, &root_args).with_self(host.clone());
-            let got = referrer.entry_args(ix, &site, encode).unwrap();
+            let got = referrer.entry_args(ix, &site, slots.const_fn()).unwrap();
             let expected = args_by_hand(&referrer, ix, &generics.params, &root_args, &host);
             assert_eq!(s(&got), s(&expected), "{}", what);
             // In the scope of the analysis (nothing substituted), with the default `Self`.
             let got = referrer
-                .entry_args(ix, &UseSite::identity(), encode)
+                .entry_args(ix, &UseSite::identity(), slots.const_fn())
                 .unwrap();
             let expected =
                 args_by_hand(&referrer, ix, &Punctuated::new(), &[], &parse_quote!(Self));
@@ -1538,14 +1539,18 @@ fn entry_args_is_what_a_macro_writes_by_hand() {
             // The same as the impl, for the generics by their own names.
             let param: Ident = parse_quote!(__S);
             let r = referrer
-                .repeater_impl(ix, ImplSelf::Param(&param), encode)
+                .repeater_impl(ix, ImplSelf::Param(&param), slots.const_fn())
                 .unwrap();
             let self_in_impl = match referrer.context_self(referrer.context(ix)) {
                 Some(SelfRequirement::Type(_)) => parse_quote!(Self),
                 _ => parse_quote!(#param),
             };
             let got = referrer
-                .entry_args(ix, &UseSite::identity().with_self(self_in_impl), encode)
+                .entry_args(
+                    ix,
+                    &UseSite::identity().with_self(self_in_impl),
+                    slots.const_fn(),
+                )
                 .unwrap();
             assert_eq!(s(&got), s(&r.args), "{}", what);
             checked += 1;
@@ -1801,7 +1806,7 @@ fn f09_fn_pointer_self_predicate_print_in_the_generics_of_an_entry() {
             fn r(&self) -> Rel<Self> where Self: Clone;
         }
     };
-    let mut leaker = Leaker::from_config(config(), false, false);
+    let mut leaker = Leaker::from_config(config(), Options::new());
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let self_tys: Vec<Type> = vec![

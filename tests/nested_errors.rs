@@ -123,19 +123,17 @@ fn a_bound_copied_whole_has_the_error_inside_it_nested() {
 fn every_rule_that_drops_the_error_brings_the_nested_error_up() {
     // The cause, the path, and the prelude (which has `Into`) drop the bound; the entry `String` is
     // there all the same, and the error is the one found inside the bound.
-    let mut by_cause = analyze(&reduced(), Allow::new());
-    by_cause.allow(|e| e.cause == into_cause());
-    let mut by_path = analyze(&reduced(), Allow::new());
-    by_path.allow_path_if(starts_with(parse_quote!(Into)));
-    let mut by_prelude = analyze(&reduced(), Allow::new());
-    by_prelude.allow_prelude();
+    let by_cause = analyze(&reduced(), Allow::new()).allow(|e| e.cause == into_cause());
+    let by_path = analyze(&reduced(), Allow::new()).allow_path_if(starts_with(parse_quote!(Into)));
+    let by_prelude = analyze(&reduced(), Allow::new()).allow_prelude();
     for left in [&by_cause, &by_path, &by_prelude] {
         assert_eq!(shape(left.errors()), "Self :: A0 [UnprovableBound]");
         assert!(left.errors()[0].paths.is_empty());
     }
     // A rule that drops nothing leaves the bound, with the nested error still in it.
-    let mut other = analyze(&reduced(), Allow::new());
-    other.allow_primitive().allow_std_crates();
+    let other = analyze(&reduced(), Allow::new())
+        .allow_primitive()
+        .allow_std_crates();
     assert_eq!(
         shape(other.errors()),
         "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
@@ -153,8 +151,8 @@ fn every_rule_that_drops_the_error_brings_the_nested_error_up() {
         "Self :: A0 [UnprovableBound]"
     );
     // Allowing the cause of that error drops it, and nothing else is left: `allow_every_cause()`.
-    let mut all = by_cause.clone();
-    assert_eq!(allow_every_cause(&mut all), 1);
+    let (all, rounds) = allow_every_cause(by_cause.clone());
+    assert_eq!(rounds, 1);
     assert!(all.errors().is_empty());
 }
 
@@ -162,14 +160,13 @@ fn every_rule_that_drops_the_error_brings_the_nested_error_up() {
 fn a_rule_that_drops_the_nested_error_first_leaves_nothing_when_the_bound_is_dropped() {
     // The rules add up in any order: what a rule accepts is accepted inside a bound that stays, so
     // it does not come up when the bound goes.
-    let mut result = analyze(&reduced(), Allow::new());
-    result.allow(|e| e.cause == Cause::Type(parse_quote!(Self::A0)));
+    let result =
+        analyze(&reduced(), Allow::new()).allow(|e| e.cause == Cause::Type(parse_quote!(Self::A0)));
     assert_eq!(shape(result.errors()), "Into < Self :: A0 > [RelativePath]");
     assert!(result.errors()[0].nested.is_empty());
-    result.allow_prelude();
+    let result = result.allow_prelude();
     assert!(result.errors().is_empty());
-    let mut other = analyze(&reduced(), Allow::new());
-    other
+    let other = analyze(&reduced(), Allow::new())
         .allow_prelude()
         .allow(|e| e.cause == Cause::Type(parse_quote!(Self::A0)));
     assert!(other.errors().is_empty());
@@ -202,8 +199,7 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
         Rule::Path(parse_quote!(Into)),
     ] {
         let before = rule.analyze_with(&item, base.clone(), true);
-        let mut after = analyze_values(&item, base.clone());
-        rule.on_result(&mut after);
+        let after = rule.on_result(analyze_values(&item, base.clone()));
         let both = |result: &LeakerResult| {
             result
                 .errors()
@@ -227,8 +223,7 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
     }
     // `allow_values()` drops the error in the body and what is nested in it, which is in the body
     // too; the bound stays. Allowing the cause of the path brings `Rel<'_>` up.
-    let mut result = analyze_values(&item, base.clone());
-    result.allow_values();
+    let result = analyze_values(&item, base.clone()).allow_values();
     assert_eq!(
         shape(result.errors()),
         "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
@@ -238,7 +233,7 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
     let mut result = analyze_values(&item, base);
     assert_eq!(paths(&result.errors()[1]), ["inner :: f", "Rel"]);
     assert!(result.errors()[1].nested.is_empty());
-    result.allow(|e| e.cause == Cause::Expr(parse_quote!(inner::f::<Rel<'_>>)));
+    result = result.allow(|e| e.cause == Cause::Expr(parse_quote!(inner::f::<Rel<'_>>)));
     assert_eq!(
         shape(result.errors()),
         "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
@@ -271,8 +266,7 @@ fn a_part_with_nothing_wrong_inside_has_no_nested_errors() {
     }
     assert_eq!(paths(&result.errors()[2]), ["Vec", "Rel"]);
     // Dropping them leaves nothing.
-    let mut all = result.clone();
-    assert_eq!(allow_every_cause(&mut all), 1);
+    assert_eq!(allow_every_cause(result.clone()).1, 1);
 }
 
 #[test]
@@ -317,8 +311,7 @@ fn a_type_that_cannot_be_leaked_has_what_is_wrong_inside_it_nested() {
     // The config that allows `Rel` has the second error and not the first: the nested error is the
     // second one of the result, which comes up when the first is dropped and is skipped, as the
     // second is identical to it. So the result has one, as the config.
-    let mut result_after = result.clone();
-    result_after.allow_path_if(starts_with(parse_quote!(Rel)));
+    let result_after = result.clone().allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(shape(result_after.errors()), "Self :: A0 [UnprovableBound]");
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(
@@ -347,13 +340,12 @@ fn the_arguments_of_a_value_path_are_paths_of_its_error() {
     assert!(error.in_value);
     assert!(error.nested.is_empty());
     // The rules take the paths off one by one, and the error goes with the last.
-    let mut result = result;
-    result.allow_path_if(starts_with(parse_quote!(inner)));
+    let result = result.allow_path_if(starts_with(parse_quote!(inner)));
     assert_eq!(paths(&result.errors()[0]), ["Rel", "Wrap", "Rel2"]);
-    result.allow_path_if(starts_with(parse_quote!(Rel)));
+    let result = result.allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(paths(&result.errors()[0]), ["Wrap", "Rel2"]);
-    result.allow_path_if(starts_with(parse_quote!(Wrap)));
-    result.allow_path_if(starts_with(parse_quote!(Rel2)));
+    let result = result.allow_path_if(starts_with(parse_quote!(Wrap)));
+    let result = result.allow_path_if(starts_with(parse_quote!(Rel2)));
     assert!(result.errors().is_empty());
     // The config that allows the path leaks the types in the arguments, which conflict; the rule
     // after the analysis keeps the error until they are allowed too.
@@ -386,12 +378,13 @@ fn deep() -> LeakerResult {
     parse2(quote_all(referrer, errors)).unwrap()
 }
 
+/// The Referrer, then the error groups in `@ [ .. ]`, as a result writes them.
 fn quote_all(
     first: proc_macro2::TokenStream,
     second: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     let mut all = first;
-    all.extend(second);
+    all.extend(quote!(@ [#second]));
     all
 }
 
@@ -404,39 +397,37 @@ fn dropping_an_error_brings_up_its_nested_errors_down_to_the_last() {
          { D1 [Unreadable] } } }, E1 [RelativePath]"
     );
     // One level at a time.
-    let mut result = result;
-    result.allow(|e| e.cause == Cause::Trait(parse_quote!(A1)));
+    let result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(A1)));
     assert_eq!(
         shape(result.errors()),
         "B1 [RelativePath] { C1 [UnprovableBound], C2 [UnprovableBound] { D1 [Unreadable] } }, \
          E1 [RelativePath]"
     );
-    result.allow(|e| e.cause == Cause::Type(parse_quote!(B1)));
+    let result = result.allow(|e| e.cause == Cause::Type(parse_quote!(B1)));
     assert_eq!(
         shape(result.errors()),
         "C1 [UnprovableBound], C2 [UnprovableBound] { D1 [Unreadable] }, E1 [RelativePath]"
     );
-    result.allow(|e| e.cause == Cause::Type(parse_quote!(C2)));
+    let result = result.allow(|e| e.cause == Cause::Type(parse_quote!(C2)));
     assert_eq!(
         shape(result.errors()),
         "C1 [UnprovableBound], D1 [Unreadable], E1 [RelativePath]"
     );
     // A rule drops a nested error that comes up, and the error it was in too: `allow_values()` is
     // the place of `D1`.
-    result.allow_values();
+    let result = result.allow_values();
     assert_eq!(
         shape(result.errors()),
         "C1 [UnprovableBound], E1 [RelativePath]"
     );
     // All of them: one round for each level.
-    assert_eq!(allow_every_cause(&mut deep()), 4);
+    assert_eq!(allow_every_cause(deep()).1, 4);
 }
 
 #[test]
 fn a_rule_filters_the_nested_errors_of_an_error_that_stays() {
     // `allow_values()` drops `D1` inside `C2`, which stays, so it does not come up later.
-    let mut result = deep();
-    result.allow_values();
+    let result = deep().allow_values();
     assert_eq!(
         shape(result.errors()),
         "A1 [RelativePath] { B1 [RelativePath] { C1 [UnprovableBound], C2 [UnprovableBound] } }, \
@@ -444,28 +435,27 @@ fn a_rule_filters_the_nested_errors_of_an_error_that_stays() {
     );
     // And a path rule removes the paths it allows from the nested errors too, so rules add up: `Z`
     // is all that `C2` has, so it goes, and `B1` loses `B2` and then goes with its own path.
-    result.allow_path_if(starts_with(parse_quote!(Z)));
+    let result = result.allow_path_if(starts_with(parse_quote!(Z)));
     assert_eq!(
         shape(result.errors()),
         "A1 [RelativePath] { B1 [RelativePath] { C1 [UnprovableBound] } }, E1 [RelativePath]"
     );
-    result.allow_path_if(starts_with(parse_quote!(B2)));
+    let result = result.allow_path_if(starts_with(parse_quote!(B2)));
     assert_eq!(paths(&result.errors()[0].nested[0]), ["B1"]);
-    result.allow_path_if(starts_with(parse_quote!(B1)));
+    let result = result.allow_path_if(starts_with(parse_quote!(B1)));
     assert_eq!(
         shape(result.errors()),
         "A1 [RelativePath] { C1 [UnprovableBound] }, E1 [RelativePath]"
     );
     // In one set, in any order, as a config has them.
-    let mut first = deep();
-    first.allow_values();
-    let mut second = first.clone();
-    first
-        .allow_path_if(starts_with(parse_quote!(Z)))
-        .allow_path_if(starts_with(parse_quote!(A1)));
-    second
+    let first = deep().allow_values();
+    let second = first
+        .clone()
         .allow_path_if(starts_with(parse_quote!(A1)))
         .allow_path_if(starts_with(parse_quote!(Z)));
+    let first = first
+        .allow_path_if(starts_with(parse_quote!(Z)))
+        .allow_path_if(starts_with(parse_quote!(A1)));
     assert_eq!(shape(first.errors()), shape(second.errors()));
     assert_eq!(
         shape(first.errors()),
@@ -514,10 +504,8 @@ fn a_nested_error_that_the_analysis_also_reports_beside_it_is_listed_once() {
     );
     let sibling = result.errors()[1].to_token_stream().to_string();
     // After the analysis, whichever rule drops the first error: the sibling is the only one left.
-    let mut by_cause = result.clone();
-    by_cause.allow(|e| e.cause == rel.clone());
-    let mut by_path = result.clone();
-    by_path.allow_path_if(starts_with(parse_quote!(Rel)));
+    let by_cause = result.clone().allow(|e| e.cause == rel.clone());
+    let by_path = result.clone().allow_path_if(starts_with(parse_quote!(Rel)));
     for result in [&by_cause, &by_path] {
         assert_eq!(shape(result.errors()), "Self :: A0 [UnprovableBound]");
         assert_eq!(result.errors()[0].to_token_stream().to_string(), sibling);
@@ -528,7 +516,7 @@ fn a_nested_error_that_the_analysis_also_reports_beside_it_is_listed_once() {
     assert_eq!(shape(by_config.errors()), "Self :: A0 [UnprovableBound]");
     assert_eq!(by_config.errors()[0].to_token_stream().to_string(), sibling);
     // Allowing the cause that is left drops it, and nothing comes up again.
-    assert_eq!(allow_every_cause(&mut by_cause.clone()), 1);
+    assert_eq!(allow_every_cause(by_cause.clone()).1, 1);
 }
 
 #[test]
@@ -544,7 +532,7 @@ fn the_errors_that_did_not_come_up_are_never_merged() {
     assert_eq!(result.errors().len(), 2);
     assert_eq!(text(&result.errors()[0]), text(&result.errors()[1]));
     let mut other = result.clone();
-    other
+    other = other
         .allow_prelude()
         .allow(|e| e.cause == Cause::Type(parse_quote!(Other)));
     assert_eq!(other.errors().len(), 2);
@@ -565,7 +553,7 @@ fn the_errors_that_did_not_come_up_are_never_merged() {
         "Rel < Self :: A0 > [UnprovableBound] { Self :: A0 [UnprovableBound] }, \
          Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
     );
-    result.allow_path_if(starts_with(parse_quote!(Rel)));
+    result = result.allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(
         shape(result.errors()),
         "Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
@@ -574,13 +562,12 @@ fn the_errors_that_did_not_come_up_are_never_merged() {
     let s = plain("S");
     let mut result = with_errors(&format!("{s} {s} {}", outer("O", &[&s])));
     assert_eq!(result.errors().len(), 3);
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    result = result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound]"
     );
-    let mut result = with_errors(&format!("{s} {s}"));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result = with_errors(&format!("{s} {s}")).allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(result.errors().len(), 2);
 }
 
@@ -589,12 +576,12 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
     let (s, t) = (plain("S"), plain("T"));
     let first = |nested: &[&str]| outer("O", nested);
     // The sibling before the outer error.
-    let mut result = with_errors(&format!("{s} {}", first(&[&s])));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result =
+        with_errors(&format!("{s} {}", first(&[&s]))).allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(shape(result.errors()), "S [UnprovableBound]");
     // The sibling after it.
-    let mut result = with_errors(&format!("{} {s}", first(&[&s])));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result =
+        with_errors(&format!("{} {s}", first(&[&s]))).allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(shape(result.errors()), "S [UnprovableBound]");
     // The order is kept: what comes up takes the place of its outer error, and what is skipped
     // leaves the sibling where it was.
@@ -604,7 +591,7 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
         first(&[&s, &plain("B"), &t]),
         plain("C"),
     ));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    result = result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "A [UnprovableBound], B [UnprovableBound], C [UnprovableBound], T [UnprovableBound], \
@@ -612,14 +599,13 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
     );
     // Identical errors that come up are both kept, whether they come from one outer error or from
     // two: only an error that stays skips them (`T` is the sibling that follows).
-    let mut result = with_errors(&first(&[&s, &s]));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result = with_errors(&first(&[&s, &s])).allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound]"
     );
-    let mut result = with_errors(&format!("{} {}", first(&[&s]), outer("O2", &[&s])));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result = with_errors(&format!("{} {}", first(&[&s]), outer("O2", &[&s])))
+        .allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound]"
@@ -629,7 +615,7 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
         first(&[&s, &t]),
         outer("O2", &[&s, &plain("U")])
     ));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    result = result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound], U [UnprovableBound], T [UnprovableBound]"
@@ -637,15 +623,15 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
     // Down the levels: what comes up from an error that comes up and is dropped too is compared
     // with a sibling that follows the outer error.
     let inner = outer("M", &[&s]);
-    let mut result = with_errors(&format!("{} {s}", first(&[&inner])));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result = with_errors(&format!("{} {s}", first(&[&inner])))
+        .allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(shape(result.errors()), "S [UnprovableBound]");
     // Only what stays in the list is compared, not what a dropped error would have brought up: an
     // error that stays, with the same nested error, does not hide one that comes up.
     let stays =
         r#"{ type ( K ) RelativePath "o" [] paths [ Q ] nested [ NESTED ] }"#.replace("NESTED", &s);
-    let mut result = with_errors(&format!("{stays} {}", first(&[&s])));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    let result = with_errors(&format!("{stays} {}", first(&[&s])))
+        .allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "K [RelativePath] { S [UnprovableBound] }, S [UnprovableBound]"
@@ -656,8 +642,8 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
 fn a_nested_error_that_differs_in_what_it_says_is_kept() {
     let same = plain("S");
     let differ = |other: String| {
-        let mut result = with_errors(&format!("{} {}", outer("O", &[&other]), same));
-        result.allow_path_if(starts_with(parse_quote!(P)));
+        let result = with_errors(&format!("{} {}", outer("O", &[&other]), same))
+            .allow_path_if(starts_with(parse_quote!(P)));
         result.errors().len()
     };
     assert_eq!(differ(plain("S")), 1);
@@ -682,7 +668,7 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
         "{} {same}",
         outer("O", &[&same.replace(r#""n""#, r#""n2""#)])
     ));
-    result.allow_path_if(starts_with(parse_quote!(P)));
+    result = result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
         Some("n2")
@@ -714,8 +700,8 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
         (&with_x, &with_y, 2),
         (&tail("value paths [ Z ]"), &tail("paths [ Z ] value"), 1),
     ] {
-        let mut result = with_errors(&format!("{} {}", outer("O", &[up]), stays));
-        result.allow_path_if(starts_with(parse_quote!(P)));
+        let result = with_errors(&format!("{} {}", outer("O", &[up]), stays))
+            .allow_path_if(starts_with(parse_quote!(P)));
         assert_eq!(result.errors().len(), kept, "{} / {}", up, stays);
     }
     let deep_x = tail(&format!(
@@ -724,8 +710,8 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
     ));
     let deep_y = deep_x.replacen("( Z )", "( W )", 1);
     for (other, kept) in [(&deep_x, 1), (&deep_y, 2)] {
-        let mut result = with_errors(&format!("{} {}", outer("O", &[other]), deep_x));
-        result.allow_path_if(starts_with(parse_quote!(P)));
+        let result = with_errors(&format!("{} {}", outer("O", &[other]), deep_x))
+            .allow_path_if(starts_with(parse_quote!(P)));
         assert_eq!(result.errors().len(), kept, "{}", other);
     }
 }
@@ -800,8 +786,8 @@ fn nested_errors_are_written_and_read_back_with_every_field() {
     // A result with an error that has nested errors takes the rules after the trip as before it.
     let mut after = parse2::<LeakerResult>(result.to_token_stream()).unwrap();
     let mut before = result;
-    after.allow_prelude();
-    before.allow_prelude();
+    after = after.allow_prelude();
+    before = before.allow_prelude();
     assert_eq!(shape(after.errors()), "Self :: A0 [UnprovableBound]");
     assert_eq!(shape(before.errors()), shape(after.errors()));
 }

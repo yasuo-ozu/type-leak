@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, ErrorItem, Leaker};
+use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options};
 
 #[test]
 fn test_reduce_roots_empty_leaker() {
@@ -253,7 +253,7 @@ fn test_reduce_roots_allowed_path_is_neutral() {
     // A type under an explicitly allowed path prefix is neutral → empty.
     let item: ItemStruct = parse_quote! { struct S { a: some_mod::SomeType } };
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(some_mod)));
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
@@ -334,9 +334,7 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     let string_ix = strings.iter().position(|ty| ty.contains("String")).unwrap();
     let mut replaced = copy.clone();
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut referrer
-            .clone()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemStruct = syn::parse2(quote! {
@@ -349,8 +347,7 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
     // The Referrer which does not trust the names of the crates replaces them as well: the `Vec`
     // as a whole, and the `String`, with `Rel` inside the tuple.
-    let mut strict = result;
-    strict.deny_ambiguous_crate_name();
+    let strict = result.deny_ambiguous_crate_name();
     syn::visit_mut::VisitMut::visit_item_struct_mut(
         &mut strict
             .finish()
@@ -1536,7 +1533,6 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     // The copy of the trait declares `<'a>` as the context does, so it does not declare it again.
     let by_scope = rewrite(&mut |copy| {
         referrer
-            .clone()
             .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
             .visit_item_trait_mut(copy)
     });
@@ -1544,7 +1540,6 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     // With the generics of the trait as those of the context, whatever the copy declares.
     let by_leakers = rewrite(&mut |copy| {
         referrer
-            .clone()
             .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
             .with_outermost_generics_as_leakers()
             .visit_item_trait_mut(copy)
@@ -1558,7 +1553,7 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
             seen.push(ty_string(ty));
             parse_quote!(P<#ix>)
         };
-        let visitor = referrer.clone().visitor(top_level, record);
+        let visitor = referrer.visitor(top_level, record);
         if leakers {
             visitor
                 .with_outermost_generics_as_leakers()
@@ -1576,7 +1571,6 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
         fn f<'b>(&'b self, x: &'b dyn RelTr, y: &'a mut dyn RelTr) -> &'b dyn RelTr
     };
     referrer
-        .clone()
         .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut sig);
     let expected: Signature = parse_quote! {

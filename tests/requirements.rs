@@ -555,7 +555,7 @@ fn self_in_the_bounds_of_the_generics() {
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
-    assert!(err[0].message.contains("Wrap < T >"));
+    assert!(err[0].message.contains("Wrap<T>"));
     // A failed call adds no entry.
     assert!(result.into_referrer().is_empty());
 
@@ -628,7 +628,7 @@ fn generic_args_of_the_root_and_local_generics() {
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }
 
-fn rewrite<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<F>, sig: &str) -> String {
+fn rewrite<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<'_, F>, sig: &str) -> String {
     let mut sig: Signature = parse_str(sig).unwrap();
     visitor.visit_signature_mut(&mut sig);
     s(&sig)
@@ -660,7 +660,7 @@ fn matching_with_the_generics_of_the_context() {
     // declares them.
     assert_eq!(
         rewrite(
-            referrer.clone().visitor(context, placeholder),
+            referrer.visitor(context, placeholder),
             "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
         ),
         rewritten(
@@ -671,7 +671,7 @@ fn matching_with_the_generics_of_the_context() {
     // assumed to be the Leaker's), but what uses none is found.
     assert_eq!(
         rewrite(
-            referrer.clone().visitor(none, placeholder),
+            referrer.visitor(none, placeholder),
             "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
         ),
         rewritten("fn f<const B: bool>(&self, a: Wrap<T>, b: P<1usize>, c: P<2usize>, d: Wrap<U>)")
@@ -687,7 +687,7 @@ fn matching_with_the_generics_of_the_context() {
         let sig = format!("fn f{}(&self, a: Wrap<T>)", generics);
         let expected = format!("fn f{}(&self, a: {})", generics, a);
         assert_eq!(
-            rewrite(referrer.clone().visitor(context, placeholder), &sig),
+            rewrite(referrer.visitor(context, placeholder), &sig),
             rewritten(&expected),
             "{}",
             generics
@@ -696,14 +696,14 @@ fn matching_with_the_generics_of_the_context() {
     // `Wrap<B>` is for a `bool`.
     assert_eq!(
         rewrite(
-            referrer.clone().visitor(context, placeholder),
+            referrer.visitor(context, placeholder),
             "fn f<const B: bool>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: bool>(&self, b: P<1usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.clone().visitor(context, placeholder),
+            referrer.visitor(context, placeholder),
             "fn f<const B: u8>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: u8>(&self, b: Wrap<B>)")
@@ -723,7 +723,7 @@ fn matching_is_exact_where_a_name_is_declared_or_not() {
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
         rewrite(
-            referrer.clone().visitor(contexts[0], placeholder),
+            referrer.visitor(contexts[0], placeholder),
             "fn g(&self) -> Wrap<B>"
         ),
         rewritten("fn g(&self) -> P<1usize>")
@@ -769,7 +769,7 @@ fn matching_with_the_generics_of_each_scope() {
     let sig = "fn f(&self) -> Wrap<T>";
     for (context, ix) in [(contexts[0], 0usize), (contexts[1], 1)] {
         assert_eq!(
-            rewrite(referrer.clone().visitor(context, placeholder), sig),
+            rewrite(referrer.visitor(context, placeholder), sig),
             rewritten(&format!("fn f(&self) -> P<{}usize>", ix))
         );
     }
@@ -822,18 +822,18 @@ fn matching_self() {
     // `Self` is that of the context, as it records it: the entries that do not mention `Self` are
     // not affected by it.
     assert_eq!(
-        rewrite(referrer.clone().visitor(contexts[0], placeholder), sig),
+        rewrite(referrer.visitor(contexts[0], placeholder), sig),
         rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
-        rewrite(referrer.clone().visitor(contexts[1], placeholder), sig),
+        rewrite(referrer.visitor(contexts[1], placeholder), sig),
         rewritten("fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>)")
     );
     // The context of `Z` has no `Self` that an entry names, and the one of `enter_generics()` has
     // none at all: `Rel<Self>` is not found.
     for context in [contexts[2], generics] {
         assert_eq!(
-            rewrite(referrer.clone().visitor(context, placeholder), sig),
+            rewrite(referrer.visitor(context, placeholder), sig),
             rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
         );
     }

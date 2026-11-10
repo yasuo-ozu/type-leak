@@ -254,8 +254,7 @@ fn a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted() {
     assert!(result.errors().iter().all(|error| error.cause == cause));
     let referrer = result.clone().into_referrer();
     // Accepting the causes drops the errors, and neither the ids nor the Referrer change.
-    let mut accepted = result.clone();
-    accepted.allow(|e| e.cause == cause);
+    let accepted = result.clone().allow(|e| e.cause == cause);
     assert!(accepted.errors().is_empty());
     let accepted_referrer = accepted.finish().unwrap();
     assert_eq!(referrer, accepted_referrer);
@@ -491,7 +490,6 @@ fn lookups_work_with_gaps() {
     let mut item: ItemStruct =
         parse_quote! { struct S<T, U> { a: Rel0, b: (Rel1, T), c: Wrap<U> } };
     referrer
-        .clone()
         .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
         .visit_item_struct_mut(&mut item);
     let expected: ItemStruct =

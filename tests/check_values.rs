@@ -40,7 +40,7 @@ fn messages_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     source: &str,
 ) -> Vec<String> {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
-    let mut leaker = Leaker::from_config(config, true, false);
+    let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     leaker
         .result()
@@ -139,7 +139,7 @@ fn a_name_is_local_only_where_it_is_in_scope() {
         // the items of a block are not visible outside it
         ("{ fn helper() {} } helper();", "helper"),
         // `Self` and the generics are not names to declare: another name is relative
-        ("let _ = V::default();", "V :: default"),
+        ("let _ = V::default();", "V::default"),
     ] {
         assert_eq!(body_messages(body), rejected(path), "{}", body);
     }
@@ -149,18 +149,18 @@ fn a_name_is_local_only_where_it_is_in_scope() {
 fn a_relative_path_is_rejected_wherever_it_is() {
     for (body, path) in [
         ("rel();", "rel"),
-        ("let _ = Rel::new();", "Rel :: new"),
-        ("let _ = size_of::<u8>();", "size_of :: < u8 >"),
+        ("let _ = Rel::new();", "Rel::new"),
+        ("let _ = size_of::<u8>();", "size_of::<u8>"),
         ("let _ = <u8 as Rel>::f();", "Rel"),
         // the arguments of a path whose own path is relative are not read
-        ("let _ = Vec2::<Rel>::new();", "Vec2 :: < Rel > :: new"),
+        ("let _ = Vec2::<Rel>::new();", "Vec2::<Rel>::new"),
         ("let _ = Rel { a: 1 };", "Rel"),
         ("let Rel { a } = x; let _ = a;", "Rel"),
-        ("let _ = || Rel::new();", "Rel :: new"),
-        ("let _ = [Rel::new()];", "Rel :: new"),
-        ("let _ = crate::f();", "crate :: f"),
-        ("let _ = super::f();", "super :: f"),
-        ("let _ = self::f();", "self :: f"),
+        ("let _ = || Rel::new();", "Rel::new"),
+        ("let _ = [Rel::new()];", "Rel::new"),
+        ("let _ = crate::f();", "crate::f"),
+        ("let _ = super::f();", "super::f"),
+        ("let _ = self::f();", "self::f"),
         ("fn inner() -> Rel { todo() } ", "Rel"),
         ("struct L(Rel);", "Rel"),
         ("impl Rel for L {}", "Rel"),
@@ -185,7 +185,7 @@ fn body_entries(body: &str) -> Vec<String> {
         body
     );
     let item: ItemTrait = parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", source, e));
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let referrer = leaker
         .result()
@@ -237,7 +237,7 @@ fn every_relative_path_of_a_value_is_reported() {
     assert_eq!(
         body_messages("let a = Rel::new(); let b = other(); let _ = (a, b);"),
         [
-            "use absolute path: 'Rel :: new'",
+            "use absolute path: 'Rel::new'",
             "use absolute path: 'other'"
         ]
     );
@@ -254,14 +254,14 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     let none = Allow::new();
     assert_eq!(
         messages_of(none.clone(), source),
-        ["use absolute path: 'Vec :: new'"]
+        ["use absolute path: 'Vec::new'"]
     );
     fn entries<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
         config: Allow<P, E>,
         source: &str,
     ) -> Vec<String> {
         let item: ItemTrait = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(config, true, false);
+        let mut leaker = Leaker::from_config(config, Options::new().check_values());
         leaker.intern_trait(&item, true);
         let mut entries: Vec<String> = leaker
             .result()
@@ -279,7 +279,7 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     let only_primitive = || Allow::new().allow_primitive();
     assert_eq!(
         messages_of(only_primitive(), source),
-        ["use absolute path: 'Vec :: new'"]
+        ["use absolute path: 'Vec::new'"]
     );
     assert_eq!(entries(only_primitive(), types), ["Vec < u8 >"]);
     let only_prelude = || Allow::new().allow_prelude();
@@ -295,7 +295,7 @@ fn the_name_of_the_item_itself_is_relative() {
             config(),
             "trait Tr { fn g(&self); fn f(&self) { Tr::g(self) } }"
         ),
-        rejected("Tr :: g")
+        rejected("Tr::g")
     );
 }
 
@@ -318,9 +318,9 @@ fn the_variants_of_the_prelude_are_allowed_in_a_value() {
     let none = Allow::new();
     for (path, body) in [
         ("Some", "let _ = Some(1u8);"),
-        ("None :: < u8 >", "let _ = None::<u8>;"),
-        ("Ok :: < u8 , u8 >", "let _ = Ok::<u8, u8>(1);"),
-        ("Err :: < u8 , u8 >", "let _ = Err::<u8, u8>(1);"),
+        ("None::<u8>", "let _ = None::<u8>;"),
+        ("Ok::<u8, u8>", "let _ = Ok::<u8, u8>(1);"),
+        ("Err::<u8, u8>", "let _ = Err::<u8, u8>(1);"),
     ] {
         let source = format!("trait Tr {{ fn f(&self) {{ {} }} }}", body);
         let got = messages_of(none.clone(), &source);
@@ -335,13 +335,13 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
     for (body, path, first, absolute) in [
         (
             "let _: u32 = TryFrom::try_from(p).unwrap();",
-            "TryFrom :: try_from",
+            "TryFrom::try_from",
             "TryFrom",
             "::core::convert::TryFrom",
         ),
         (
             "let _ = size_of::<u8>();",
-            "size_of :: < u8 >",
+            "size_of::<u8>",
             "size_of",
             "::core::mem::size_of",
         ),
@@ -349,7 +349,7 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
         assert_eq!(body_messages(body), rejected(path), "{}", body);
         let item: ItemTrait =
             parse_str(&format!("trait Tr {{ fn f(&self, p: u8) {{ {} }} }}", body)).unwrap();
-        let mut leaker = Leaker::from_config(config(), true, false);
+        let mut leaker = Leaker::from_config(config(), Options::new().check_values());
         leaker.intern_trait(&item, true);
         let result = leaker.result();
         assert_eq!(
@@ -358,7 +358,7 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
         );
         // An allowed path is accepted.
         let config = config().allow_path_if(starts_with(parse_str(first).unwrap()));
-        let mut leaker = Leaker::from_config(config, true, false);
+        let mut leaker = Leaker::from_config(config, Options::new().check_values());
         leaker.intern_trait(&item, true);
         assert!(leaker.result().finish().is_ok(), "{}", body);
     }
@@ -371,7 +371,7 @@ fn a_primitive_name_in_a_value_is_assumed() {
             const N: u8 = 1 as u8;
         }
     );
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     assert!(
         leaker.assertions().to_string().contains("u8"),
@@ -416,13 +416,13 @@ fn a_relative_macro_path_says_what_to_write() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let err = result.errors();
     let items = &err;
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].message, "use absolute path: 'println !'");
+    assert_eq!(items[0].message, "use absolute path: 'println!'");
     assert_eq!(
         items[0].help_text(),
         Some("use `::std::println!` instead of `println!`")
@@ -435,16 +435,13 @@ fn a_relative_macro_path_says_what_to_write() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(
         err[0].help_text(),
-        Some(
-            "write `my_mac!` with an absolute path (e.g. `::my_crate::my_mac!`), or allow it with \
-             `Allow::allow_path_if()`"
-        )
+        Some("write `my_mac!` with an absolute path (e.g. `::my_crate::my_mac!`)")
     );
 }
 
@@ -526,7 +523,7 @@ fn what_the_leaker_cannot_read_is_rejected() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let err = result.errors();
@@ -568,8 +565,8 @@ fn an_associated_const_default_is_read() {
         );
     }
     for (source, path) in [
-        ("trait Tr { const A: usize = inner::X; }", "inner :: X"),
-        ("trait Tr { const A: Rel = Rel::new(); }", "Rel :: new"),
+        ("trait Tr { const A: usize = inner::X; }", "inner::X"),
+        ("trait Tr { const A: Rel = Rel::new(); }", "Rel::new"),
         ("trait Tr { const A: usize = <u8 as Rel>::N; }", "Rel"),
         (
             "trait Tr { const A: usize = { let x = 1; x + rel() }; }",
@@ -585,7 +582,7 @@ fn an_associated_const_default_is_read() {
 fn the_note_says_which_value() {
     let notes = |source: &str| -> Vec<String> {
         let item: Item = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(config(), true, false);
+        let mut leaker = Leaker::from_config(config(), Options::new().check_values());
         match &item {
             Item::Trait(i) => leaker.intern_trait(i, true),
             Item::Impl(i) => leaker.intern_impl(i, true),
@@ -647,7 +644,7 @@ fn a_module_is_read_with_its_declared_names() {
             pub mod inner { pub const D: usize = 2; pub fn g() -> usize { D } }
         }
     };
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_mod(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 
@@ -659,7 +656,7 @@ fn a_module_is_read_with_its_declared_names() {
             pub fn g() -> usize { Other::N }
         }
     };
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_mod(&item);
     let result = leaker.result();
     let messages: Vec<String> = result
@@ -667,7 +664,7 @@ fn a_module_is_read_with_its_declared_names() {
         .iter()
         .map(|item| item.message.clone())
         .collect();
-    assert_eq!(messages, ["use absolute path: 'Other :: N'"]);
+    assert_eq!(messages, ["use absolute path: 'Other::N'"]);
 }
 
 #[test]
@@ -679,7 +676,7 @@ fn an_impl_is_read() {
             fn g(&self) -> usize { Self::N }
         }
     };
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_impl(&item, true);
     assert!(leaker.result().errors().is_empty());
 
@@ -689,7 +686,7 @@ fn an_impl_is_read() {
             fn f(&self) -> u8 { Rel::f() }
         }
     };
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_impl(&item, true);
     let result = leaker.result();
     let messages: Vec<String> = result
@@ -699,16 +696,13 @@ fn an_impl_is_read() {
         .collect();
     assert_eq!(
         messages,
-        [
-            "use absolute path: 'Rel :: N'",
-            "use absolute path: 'Rel :: f'"
-        ]
+        ["use absolute path: 'Rel::N'", "use absolute path: 'Rel::f'"]
     );
 }
 
 #[test]
 fn a_nested_item_is_read_through_the_view() {
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.enter_generics(&parse_quote!(<T: ::core::default::Default>), |view| {
         view.visit_item(&parse_quote!(
             const N: usize = 1;
@@ -720,7 +714,7 @@ fn a_nested_item_is_read_through_the_view() {
         ));
     });
     assert!(leaker.result().errors().is_empty());
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.enter_generics(&parse_quote!(<T>), |view| {
         view.visit_item(&parse_quote!(
             fn f<V>() -> usize {
@@ -734,14 +728,14 @@ fn a_nested_item_is_read_through_the_view() {
         .iter()
         .map(|item| item.message.clone())
         .collect();
-    assert_eq!(messages, ["use absolute path: 'Rel :: f :: < T , V >'"]);
+    assert_eq!(messages, ["use absolute path: 'Rel::f::<T, V>'"]);
 }
 
 /// A scope with a bad value has an error, as for a bad type, and keeps what it found: the list of
 /// the call has it once.
 #[test]
 fn a_bad_value_is_an_error_of_its_scope_and_the_one_around_it() {
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Wrap<u8>));
         view.enter_generics(&Generics::default(), |view| {
@@ -771,7 +765,7 @@ fn self_without_meaning_in_a_value() {
             pub const X: usize = Self::N;
         }
     );
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_mod(&item);
     let result = leaker.result();
     let err = result.errors();
@@ -785,7 +779,7 @@ fn self_without_meaning_in_a_value() {
     );
     // The value is not read without the option.
     let plain = Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(plain, false, false);
+    let mut leaker = Leaker::from_config(plain, Options::new());
     leaker.intern_mod(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
@@ -807,7 +801,14 @@ fn the_types_are_leaked_as_ever() {
         check_values: bool,
         source: &ItemTrait,
     ) -> Vec<String> {
-        let mut leaker = Leaker::from_config(config, check_values, false);
+        let mut leaker = Leaker::from_config(
+            config,
+            if check_values {
+                Options::new().check_values()
+            } else {
+                Options::new()
+            },
+        );
         leaker.intern_trait(source, true);
         leaker
             .result()
@@ -878,7 +879,7 @@ fn ordinary_bodies_are_accepted() {
         .collect();
     let config = config()
         .allow_path_if(move |path| names.iter().any(|name| starts_with(name.clone())(path)));
-    let mut leaker = Leaker::from_config(config, true, false);
+    let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     // The types of the signatures are in the prelude: nothing is leaked.
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
@@ -899,15 +900,15 @@ fn the_option_is_off_by_default() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Allow::new(), false, false);
+    let mut leaker = Leaker::from_config(Allow::new(), Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Allow::default(), false, false);
+    let mut leaker = Leaker::from_config(Allow::default(), Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Allow::new(), true, false);
+    let mut leaker = Leaker::from_config(Allow::new(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_err());

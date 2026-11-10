@@ -4,13 +4,14 @@
 use crate::context::{ContextId, SelfRequirement};
 use crate::encode::{
     encode_generics_args_with_params, encode_generics_params_with, without_encoded_bounds,
-    EncodeError,
+    EncodeError, SubstituteParams, SubstituteSite,
 };
 use crate::referrer::Referrer;
 #[cfg(doc)]
 use crate::repeater::repeater_definition;
 use crate::util::{first_self_in_generics, ReplaceSelf};
 use proc_macro2::Span;
+use syn::fold::Fold;
 use syn::punctuated::Punctuated;
 use syn::*;
 
@@ -19,6 +20,7 @@ use syn::*;
 /// An entry that [needs `Self`](Referrer::needs_self) is always implemented for what `Self` stands
 /// for, so the choice only matters for the others.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum ImplSelf<'a> {
     /// A type parameter that the impl declares (`impl<.., __S: ?Sized> .. for __S`).
     ///
@@ -60,7 +62,8 @@ pub struct RepeaterImpl {
     /// The type that the impl is for.
     pub self_ty: Type,
     /// The first argument of the Repeater: what [`Referrer::entry_args()`] writes for
-    /// [`UseSite::identity()`].
+    /// [`UseSite::identity()`], but with the self type of the impl for `Self` (`&'a __S`, not
+    /// `&'a Self`, for `Self: 'a`).
     pub args: Type,
     /// The leaked type, which is the `Type` of the impl.
     pub ty: Type,
@@ -75,6 +78,7 @@ pub struct RepeaterImpl {
 /// [`UseSite::substituting()`] if the generics of the analyzed item get arguments
 /// (`impl Tr<u8> for ..`), and [`UseSite::with_self()`] to say what `Self` is.
 #[derive(Clone, Debug)]
+#[must_use]
 pub struct UseSite {
     root_params: Punctuated<GenericParam, Token![,]>,
     completed_args: Vec<GenericArgument>,
@@ -101,7 +105,8 @@ impl UseSite {
     /// each ([`Referrer::complete_args()`]).
     ///
     /// A generic of an entry that no root parameter names (a method's) is passed by its own name,
-    /// so the copy must declare it.
+    /// so the copy must declare it. Nothing is checked here: [`Referrer::entry_args()`] fails if the
+    /// arguments do not fit the parameters by position and kind.
     pub fn substituting(
         root_params: &Punctuated<GenericParam, Token![,]>,
         completed_args: &[GenericArgument],
@@ -121,6 +126,23 @@ impl UseSite {
         self.self_ty = self_ty;
         self
     }
+
+    /// Writes `ty` as it is at this site: the generics of the analyzed item replaced by their
+    /// arguments, and `Self` by [`with_self()`](UseSite::with_self).
+    ///
+    /// For the parts of a copy that are not entries, which [`Referrer::visitor()`] leaves as
+    /// written (`t: T` in `impl Tr<u8> for ..`). A trait object with several bounds that a reference
+    /// or pointer points to gets the parentheses it needs (`&'a (dyn Debug + 'a)`). A generic with
+    /// no argument stays as it is, and `Self` in a macro is replaced, other tokens of it are not.
+    #[must_use]
+    pub fn substitute(&self, ty: &Type) -> Type {
+        let is_self = matches!(&self.self_ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
+        SubstituteSite {
+            params: SubstituteParams::of(&self.root_params, &self.completed_args),
+            self_ty: (!is_self).then(|| &self.self_ty),
+        }
+        .fold_type(ty.clone())
+    }
 }
 
 impl Referrer {
@@ -129,8 +151,7 @@ impl Referrer {
     /// It is [`RepeaterImpl::args`] with the arguments the site gives the generics.
     /// `const_fn(value, param)` encodes the const parameter `param` with the argument `value`: pass
     /// [`array_const`](crate::array_const), or for the slots of [`repeater_definition()`]
-    /// `|value, param| slots.encode_const(value, &param.ty)` of a
-    /// [`RepeaterSlots`](crate::RepeaterSlots).
+    /// [`RepeaterSlots::const_fn()`](crate::RepeaterSlots::const_fn).
     ///
     /// Fails with [`EncodeError::MissingArgument`] if `site` gives too few arguments, with
     /// [`EncodeError::UnboundedTraitObject`] if an argument is a trait object without the lifetime
@@ -176,7 +197,8 @@ impl Referrer {
 
     /// Returns `true` if the `ix`-th entry needs what `Self` stands for.
     ///
-    /// That is so if it names `Self`, or its generics do (`trait Tr<T: AsRef<Self>, U = Rel<T>>`).
+    /// That is so if it names `Self`, or its generics do (`trait Tr<T: AsRef<Self>, U = Rel<T>>`),
+    /// even if it is only in `Self: 'a` (`trait Tr<'a> where Self: 'a`).
     /// Then [`ImplSelf::Marker`] fails and [`Referrer::bucket_self()`] is `None`: the impl is for
     /// [`ImplSelf::Param`], and the use site writes what `Self` stands for (the host or the type).
     pub fn needs_self(&self, ix: usize) -> bool {
@@ -190,6 +212,7 @@ impl Referrer {
     ///
     /// It is `None` if the entry [needs `Self`](Referrer::needs_self): write what `Self` stands for
     /// there.
+    #[must_use]
     pub fn bucket_self(&self, ix: usize, id: u64) -> Option<Type> {
         (!self.needs_self(ix)).then(|| bucket_type(id, ix))
     }
@@ -215,12 +238,14 @@ impl Referrer {
     /// leaker.intern_trait(&tr, true);
     /// let referrer = leaker.result().finish().unwrap();
     ///
+    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     /// let param: Ident = parse_quote!(__S);
-    /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param), array_const).unwrap();
+    /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param), slots.const_fn()).unwrap();
     /// let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-    /// let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    /// let (self_ty, ty) = (&r.self_ty, &r.ty);
+    /// let path = slots.trait_path(&r.args, 7, 0);
     /// let imp: ItemImpl = parse_quote! {
-    ///     impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+    ///     impl #impl_generics #path for #self_ty #where_clause {
     ///         type Type = #ty;
     ///     }
     /// };
@@ -240,7 +265,6 @@ impl Referrer {
         target: ImplSelf<'_>,
         mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
     ) -> std::result::Result<RepeaterImpl, EncodeError> {
-        use syn::fold::Fold;
         let context = self.contexts[ix];
         let bucket;
         // An entry that needs `Self` has none for a marker, even if `context_self()` is `None`: the
@@ -371,7 +395,7 @@ fn bucket_type(id: u64, ix: usize) -> Type {
 ///
 /// `declared` are the generics of the impl without `param`, in which `param` replaced `Self`, and
 /// `ty` is the type of the impl. A type that names `Self` (`Rel2<Self, T>`, with
-/// [`nested_self_entries`](crate::Leaker::from_config)) needs it as
+/// [`nested_self_entries()`](crate::Options::nested_self_entries)) needs it as
 /// the bounds do: `Rel2<__S, T>` is well-formed for `__S: Sized` only, unless the declaration of
 /// `Rel2` relaxes it, which the Leaker cannot see. They need no `Sized` if every use of `param` is
 ///

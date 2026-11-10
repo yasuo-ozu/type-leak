@@ -7,7 +7,7 @@ mod common;
 use common::{check_in, starts_with};
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Referrer, SelfRequirement};
+use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options, Referrer, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -22,7 +22,7 @@ fn leak_trait_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     config: Allow<P, E>,
     item: &ItemTrait,
 ) -> std::result::Result<Referrer, String> {
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(item, true);
     leaker
         .result()
@@ -40,7 +40,7 @@ fn assertions_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     config: Allow<P, E>,
     item: &ItemTrait,
 ) -> String {
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(item, true);
     let assertions = leaker.assertions().to_string();
     leaker.result().finish().unwrap();
@@ -52,7 +52,7 @@ fn leak_module_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     config: Allow<P, E>,
     item: &ItemMod,
 ) -> std::result::Result<Referrer, String> {
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_mod(item);
     leaker
         .result()
@@ -207,8 +207,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     // The help says how to name it, among the other fixes.
     assert!(
         err.contains(
-            "= help: write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it \
-             with `Allow::allow_path_if()`, or name the lifetime of the trait object (e.g. \
+            "= help: write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)\n"
         ),
         "{}",
@@ -473,10 +472,10 @@ fn type_macros() {
     let item: ItemStruct = parse_quote! {
         struct S { f: ::p::Wrap<::p::m!(Self)> }
     };
-    let mut leaker = Leaker::from_config(config(), false, false);
+    let mut leaker = Leaker::from_config(config(), Options::new());
     leaker.intern_struct(&item, true);
     assert!(leaker.result().finish().is_ok());
-    let mut leaker = Leaker::from_config(config(), false, false);
+    let mut leaker = Leaker::from_config(config(), Options::new());
     leaker.intern_struct(&item, false);
     let result = leaker.result();
     assert!(!result.errors().is_empty());
@@ -507,7 +506,7 @@ fn primitives_are_assumed_when_the_type_is_copied() {
     );
     assert!(assertions.contains("__type_leak_assert_u16_is_primitive"));
     // The analysis recovers from an error, so what it found is recorded: `u8` is copied.
-    let mut leaker = Leaker::from_config(config(), false, false);
+    let mut leaker = Leaker::from_config(config(), Options::new());
     let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> u8; } };
     leaker.intern_trait(&item, true);
     assert!(leaker
@@ -609,12 +608,12 @@ fn notes_of_defaults_and_impl_trait() {
     .err()
     .unwrap();
     assert!(
-        err.contains("use absolute path: 'Wrap < impl Into < u8 > >'"),
+        err.contains("use absolute path: 'Wrap<impl Into<u8>>'"),
         "{}",
         err
     );
     assert!(
-        err.contains("it cannot be leaked as a whole because of `impl Into < u8 >`"),
+        err.contains("it cannot be leaked as a whole because of `impl Into<u8>`"),
         "{}",
         err
     );

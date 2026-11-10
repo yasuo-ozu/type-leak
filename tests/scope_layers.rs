@@ -339,12 +339,12 @@ fn bad_generics() -> Generics {
 }
 
 /// Accepts the causes of the errors of the scope which fails in `failing()`.
-fn accept_failing(result: &mut LeakerResult) {
+fn accept_failing(result: LeakerResult) -> LeakerResult {
     result
         .allow(|e| e.cause == Cause::Type(parse_quote!(Bad1<'_>)))
         .allow(|e| e.cause == Cause::Type(parse_quote!(Bad<'_, A>)))
         // A module declares no `Self`.
-        .allow(|e| e.cause == Cause::Type(parse_quote!(Self)));
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Self)))
 }
 
 /// Enters a module with a scope around which succeeds, one which does not if `fail` (`kind` is the
@@ -397,8 +397,7 @@ fn a_failing_scope_of_an_item_or_a_module_keeps_its_corrected_result() {
         // The scope keeps what it recorded, and the ids it took (the module, the contexts of the
         // types and of the generics). It is more than there is without the scope. Accepting the
         // causes of its errors afterwards drops them and changes nothing else.
-        let mut accepted = result.clone();
-        accept_failing(&mut accepted);
+        let accepted = accept_failing(result.clone());
         assert!(accepted.errors().is_empty(), "{}", kind);
         assert_eq!(dump(&accepted.into_referrer(), &ids), left, "{}", kind);
         assert_ne!(left, ok, "{}", kind);
@@ -449,23 +448,23 @@ entry 2: Rel in 4
 entry 3: RelK in 5
 "#;
 const FAILING_ERRORS: &str = r#"
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
 --
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
 --
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
 --
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
 --
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
 --
 `Self` has no meaning here
-use absolute path: 'Bad1 < '_ >'
+use absolute path: 'Bad1<'_>'
 "#;
 
 /// A failing outermost scope keeps its corrected result: the ids and the Referrer are the same
@@ -488,8 +487,7 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
     let result = leaker.result();
     let tokens = result.clone().into_referrer().to_token_stream().to_string();
     // Accepting the causes drops the errors only.
-    let mut accepted = result.clone();
-    accept_failing(&mut accepted);
+    let accepted = accept_failing(result.clone());
     assert!(accepted.errors().is_empty());
     assert_eq!(
         accepted.into_referrer().to_token_stream().to_string(),
@@ -506,18 +504,18 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
 }
 
 const OUTERMOST_ERRORS: &str = r#"
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
-use absolute path: 'Bad1 < '_ >'
-use absolute path: 'Bad < '_ , A >'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
+use absolute path: 'Bad1<'_>'
+use absolute path: 'Bad<'_, A>'
 `Self` has no meaning here
-use absolute path: 'Bad1 < '_ >'
+use absolute path: 'Bad1<'_>'
 "#;
 
 // ── a panic in a scope ───────────────────────────────────────────────────────────────────────
@@ -651,7 +649,7 @@ entry 1: Wrap < U , Lost > in 2
 entry 2: RelK in 3
 "#;
 const PANICKING_SELF: &str = r#"
-use absolute path: 'Wrap2 < Self >'
+use absolute path: 'Wrap2<Self>'
 --
 entry 0: Rel < T > in 1
 entry 1: Wrap < U , Lost > in 2
@@ -891,9 +889,9 @@ struct default: `Rel<Self>` is in the default of a parameter, and names `Self` (
 mod, struct: ok (1)
 struct, generics: ok (1)
 struct, mod, generics: Self without meaning: Self, Self (0)
-struct not allowed: use absolute path: 'Rel < Self >' (0)
-struct not allowed, struct allowed: use absolute path: 'Rel2 < Self >' (1)
-struct not allowed, then: use absolute path: 'Rel < Self >' (0)
+struct not allowed: use absolute path: 'Rel<Self>' (0)
+struct not allowed, struct allowed: use absolute path: 'Rel2<Self>' (1)
+struct not allowed, then: use absolute path: 'Rel<Self>' (0)
 struct not allowed, mod, item: ok (1)
 struct not allowed, item: ok (1)
 impl bound: ok (0)
@@ -902,9 +900,9 @@ impl default: `Rel<Self>` is in the default of a parameter, and names `Self` (0)
 mod, impl: ok (1)
 impl, generics: ok (1)
 impl, mod, generics: Self without meaning: Self, Self (0)
-impl not allowed: use absolute path: 'Rel < Self >' (0)
-impl not allowed, impl allowed: use absolute path: 'Rel2 < Self >' (1)
-impl not allowed, then: use absolute path: 'Rel < Self >' (0)
+impl not allowed: use absolute path: 'Rel<Self>' (0)
+impl not allowed, impl allowed: use absolute path: 'Rel2<Self>' (1)
+impl not allowed, then: use absolute path: 'Rel<Self>' (0)
 impl not allowed, mod, item: ok (1)
 impl not allowed, item: ok (1)
 trait bound: ok (0)
@@ -913,9 +911,9 @@ trait default: `Rel<Self>` is in the default of a parameter, and names `Self` (0
 mod, trait: ok (1)
 trait, generics: ok (1)
 trait, mod, generics: Self without meaning: Self, Self (0)
-trait not allowed: use absolute path: 'Rel < Self >' (0)
-trait not allowed, trait allowed: use absolute path: 'Rel2 < Self >' (1)
-trait not allowed, then: use absolute path: 'Rel < Self >' (0)
+trait not allowed: use absolute path: 'Rel<Self>' (0)
+trait not allowed, trait allowed: use absolute path: 'Rel2<Self>' (1)
+trait not allowed, then: use absolute path: 'Rel<Self>' (0)
 trait not allowed, mod, item: ok (1)
 trait not allowed, item: ok (1)
 "#;

@@ -19,7 +19,7 @@
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{Allow, ContextId, Leaker, Referrer, SelfRequirement};
+use type_leak::{Allow, ContextId, Leaker, Options, Referrer, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -27,7 +27,7 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 
 fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
     let config = Allow::new().allow_primitive().allow_prelude();
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 fn referrer_of(item: &ItemTrait) -> Referrer {
@@ -509,10 +509,7 @@ fn rewrite(referrer: &Referrer, context: ContextId, item: &Item) -> String {
         let ix = proc_macro2::Literal::usize_unsuffixed(ix);
         parse_quote!(P<#ix>)
     };
-    referrer
-        .clone()
-        .visitor(context, replace)
-        .visit_item_mut(&mut item);
+    referrer.visitor(context, replace).visit_item_mut(&mut item);
     s(&item)
 }
 
@@ -524,7 +521,6 @@ fn rewrite_as_leakers(referrer: &Referrer, context: ContextId, item: &Item) -> S
         parse_quote!(P<#ix>)
     };
     referrer
-        .clone()
         .visitor(context, replace)
         .with_outermost_generics_as_leakers()
         .visit_item_mut(&mut item);
@@ -753,10 +749,9 @@ fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_context() {
         parse_quote!(P<#ix>)
     };
     for mut visitor in [
-        referrer.clone().visitor(context, replace),
+        referrer.visitor(context, replace),
         // The signature declares no generics, which are those of the context in any case.
         referrer
-            .clone()
             .visitor(context, replace)
             .with_outermost_generics_as_leakers(),
     ] {
@@ -821,7 +816,7 @@ fn the_referrer_finds_the_entry_with_a_lifetime_of_the_method() {
         let ix = proc_macro2::Literal::usize_unsuffixed(ix);
         parse_quote!(P<#ix>)
     };
-    let mut visitor = referrer.clone().visitor(context, replace);
+    let mut visitor = referrer.visitor(context, replace);
     let mut copy = sig.clone();
     visitor.visit_signature_mut(&mut copy);
     let copy = s(&copy);
@@ -1166,7 +1161,6 @@ mod projection_paths {
         let rewrite_sig = |sig: Signature| -> String {
             let mut sig = sig;
             referrer
-                .clone()
                 .visitor(context, replace)
                 .visit_signature_mut(&mut sig);
             s(&sig)
@@ -1210,7 +1204,6 @@ mod projection_paths {
         let rewrite_sig = |sig: Signature| -> String {
             let mut sig = sig;
             referrer
-                .clone()
                 .visitor(context, replace)
                 .visit_signature_mut(&mut sig);
             s(&sig)

@@ -47,5 +47,6 @@ features = [
 ]
 
 [dev-dependencies]
+quote = "1"
 type-leak-test-leaker = { path = "tests/crates/leaker" }
 type-leak-test-referrer = { path = "tests/crates/referrer" }

@@ -1,5 +1,5 @@
-//! Checks how rustc renders the errors of the Leaker (`ErrorItem`) emitted by a proc macro with
-//! `ErrorItem::to_compile_error()`, by building `tests/crates/diagnostic` (which fails to compile).
+//! Checks how rustc renders the errors of the Leaker (`ErrorItem`) reported by a proc macro with
+//! `ErrorItem::emit()`, by building `tests/crates/diagnostic` (which fails to compile).
 //! The first items of `tests/crates/diagnostic_serialized` are the same, but the macro writes its
 //! errors as tokens, reads them back and then reports them: rustc renders them in the same way, at
 //! the same places.
@@ -18,6 +18,9 @@
 //!   `type-leak` (`Tag*`), whatever it carries as the format tag.
 //!
 //! The build must report exactly these errors, and no other.
+//!
+//! `tests/crates/diagnostic_pure` is a macro that builds the tokens of `to_compile_error()` and drops
+//! them: it reports nothing, on any toolchain.
 //!
 //! `tests/crates/diagnostic_result` is a Referrer's crate whose macro got the errors of the Leaker's
 //! macro in another crate (the serialized `LeakerResult`), allowed some, and reports the others. By
@@ -176,7 +179,7 @@ note: `RelA` also depends on the type context
   |
 9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
   |                            ^^^^
-note: `RelB < '_ >` also depends on the type context
+note: `RelB<'_>` also depends on the type context
  --> lib.rs:9:35
   |
 9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
@@ -207,11 +210,11 @@ error: use absolute path: 'Clone'
 ",
             // The notes (why) come first, then the help (what to write).
             "\
-error: use absolute path: 'Box < dyn RelA + RelB < '_ > >'
+error: use absolute path: 'Box<dyn RelA + RelB<'_>>'
 
          = note: it cannot be leaked as a whole because of `'_`
          = note: `RelA` also depends on the type context
-         = note: `RelB < '_ >` also depends on the type context
+         = note: `RelB<'_>` also depends on the type context
          = help: use `::std::boxed::Box` instead of `Box`
 
  --> lib.rs:9:20
@@ -243,7 +246,7 @@ fn every_offending_path_is_an_error_of_its_own() {
     let clone_help = "use `::core::clone::Clone` instead of `Clone`";
     let because = "it cannot be leaked as a whole because of `'_`";
     let self_note = "`Self` has no meaning here: it is declared only by a struct, an enum, a union, an impl or a trait, not by a module or generics";
-    let self_help = "write the type instead of `Self`, or enter a scope that declares `Self` around it (`Leaker::enter_type`, `enter_impl` or `enter_trait`)";
+    let self_help = "write the type instead of `Self`";
     let expected_notes_of_multi = [
         error("use absolute path: 'Clone'", "14:18", &[], &[clone_help]),
         error(
@@ -253,16 +256,16 @@ fn every_offending_path_is_an_error_of_its_own() {
             &["use `::core::marker::Send` instead of `Send`"],
         ),
         error(
-            "use absolute path: 'MyType < '_ >'",
+            "use absolute path: 'MyType<'_>'",
             "15:20",
             &[because],
-            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `Allow::allow_path_if()`"],
+            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`)"],
         ),
         error(
-            "use absolute path: 'Other < '_, :: core :: primitive :: u8 >'",
+            "use absolute path: 'Other<'_, ::core::primitive::u8>'",
             "15:35",
             &[because],
-            &["write `Other` with an absolute path (e.g. `::my_crate::Other`), or allow it with `Allow::allow_path_if()`"],
+            &["write `Other` with an absolute path (e.g. `::my_crate::Other`)"],
         ),
         error(
             "use absolute path: 'Sync'",
@@ -287,18 +290,18 @@ fn every_offending_path_is_an_error_of_its_own() {
     let mut expected = vec![
         error("use absolute path: 'Clone'", "2:20", &[], &[clone_help]),
         error(
-            "use absolute path: 'for < 'a > Fn(& 'a u8)'",
+            "use absolute path: 'for<'a> Fn(&'a u8)'",
             "5:18",
             &[],
             &["use `::core::ops::Fn` instead of `Fn`"],
         ),
         error(
-            "use absolute path: 'Box < dyn RelA + RelB < '_ > >'",
+            "use absolute path: 'Box<dyn RelA + RelB<'_>>'",
             "9:20",
             &[
                 because,
                 "`RelA` also depends on the type context",
-                "`RelB < '_ >` also depends on the type context",
+                "`RelB<'_>` also depends on the type context",
             ],
             &["use `::std::boxed::Box` instead of `Box`"],
         ),
@@ -391,6 +394,15 @@ fn serialized_errors_are_reported_at_the_same_places() {
     assert_eq!(errors, direct.len(), "{}", built.stderr);
 }
 
+/// `ErrorItem::to_compile_error()` only builds tokens: a macro that drops them reports nothing,
+/// also on nightly, where `emit()` reports a `Diagnostic` as a side effect.
+#[test]
+fn to_compile_error_alone_reports_nothing() {
+    let built = nested::cargo("diagnostic_pure", &["check"], &[]);
+    assert!(built.success, "{}", built.stderr);
+    assert_eq!(built.stderr.trim(), "", "{}", built.stderr);
+}
+
 /// The first position of each error of the output of rustc: `path:line:column` of its first `-->`.
 fn first_positions(stderr: &str) -> Vec<String> {
     let mut positions = Vec::new();
@@ -430,16 +442,16 @@ fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
     assert!(!built.success, "{}", built.stderr);
     let mut expected = vec![
         error(
-            "use absolute path: 'Held < '_ >'",
+            "use absolute path: 'Held<'_>'",
             "11:1",
             &["it cannot be leaked as a whole because of `'_`"],
-            &["write `Held` with an absolute path (e.g. `::my_crate::Held`), or allow it with `Allow::allow_path_if()`"],
+            &["write `Held` with an absolute path (e.g. `::my_crate::Held`)"],
         ),
         error(
-            "use absolute path: 'core :: fmt :: Debug'",
+            "use absolute path: 'core::fmt::Debug'",
             "11:1",
             &[],
-            &["write `core::fmt::Debug` with an absolute path (e.g. `::core::fmt::Debug`), or allow it with `Allow::allow_path_if()`"],
+            &["write `core::fmt::Debug` with an absolute path (e.g. `::core::fmt::Debug`)"],
         ),
     ];
     let mut got = reported(&built.stderr);

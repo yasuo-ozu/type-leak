@@ -13,6 +13,12 @@ fn referrer(tr: &ItemTrait) -> Referrer {
     }
 }
 
+/// The context of the trait that `referrer()` analyzed: the top-level one, numbered after the
+/// contexts of the entries.
+fn top_level(referrer: &Referrer) -> ContextId {
+    referrer.contexts().last().unwrap()
+}
+
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
@@ -36,7 +42,7 @@ fn complete_calls(
 ) -> Result<(Vec<String>, Vec<Call>)> {
     let mut calls = Vec::new();
     let completed = referrer
-        .complete_args(given, params, |ty, ix, prefix| {
+        .complete_args(top_level(referrer), params, given, |ty, ix, prefix| {
             calls.push((s(&ty), ix, prefix.iter().map(s).collect()));
             parse_quote!(<Self as R<#ix>>::Type)
         })
@@ -279,8 +285,9 @@ fn test_defaults_of_several_calls_are_shared() {
     // The default is copied (the optional entry is left as it is), as in any call.
     let completed = referrer
         .complete_args(
-            &args(parse_quote!(<u8>)),
+            top_tr,
             &tr.generics.params,
+            &args(parse_quote!(<u8>)),
             |_, _, _| unreachable!(),
         )
         .unwrap();
@@ -289,14 +296,14 @@ fn test_defaults_of_several_calls_are_shared() {
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
     // A Referrer which does not trust the names of the crates replaces the default by the entry.
-    let mut strict = result;
-    strict.deny_ambiguous_crate_name();
+    let strict = result.deny_ambiguous_crate_name();
     let strict = strict.into_referrer();
     let mut replaced = Vec::new();
     let completed = strict
         .complete_args(
-            &args(parse_quote!(<u8>)),
+            top_tr,
             &tr.generics.params,
+            &args(parse_quote!(<u8>)),
             |ty, ix, prefix| {
                 replaced.push((s(&ty), ix, prefix.len()));
                 parse_quote!(P)
@@ -420,8 +427,9 @@ fn test_complete_args_nested_leaked_types() {
     let referrer = referrer(&tr);
     let completed = referrer
         .complete_args(
-            &args(parse_quote!(<Rel<u8>>)),
+            top_level(&referrer),
             &tr.generics.params,
+            &args(parse_quote!(<Rel<u8>>)),
             |ty, ix, prefix| {
                 assert_eq!(ix, 0);
                 assert_eq!(s(&ty), "Rel < T >");
@@ -449,9 +457,12 @@ fn test_complete_args_no_substitution_in_projections() {
     );
     let referrer = referrer(&tr);
     let completed = referrer
-        .complete_args(&args(parse_quote!(<u8>)), &tr.generics.params, |_, _, _| {
-            parse_quote!(<T as Proj>::Type)
-        })
+        .complete_args(
+            top_level(&referrer),
+            &tr.generics.params,
+            &args(parse_quote!(<u8>)),
+            |_, _, _| parse_quote!(<T as Proj>::Type),
+        )
         .unwrap();
     assert_eq!(
         s(&completed[1]),

@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use syn::*;
-use template_quote::ToTokens;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 fn entries(referrer: &Referrer) -> Vec<(String, bool)> {
@@ -41,7 +41,7 @@ fn analyze<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     item: &ItemStruct,
     config: Allow<P, E>,
 ) -> LeakerResult {
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(item, true);
     leaker.result()
 }
@@ -89,12 +89,10 @@ fn an_error_rule_accepts_what_the_convenience_method_does() {
     let in_default: Vec<bool> = result.errors().iter().map(|e| e.in_default).collect();
     assert_eq!(in_default.iter().filter(|&&d| d).count(), 1);
     // A rule on the errors drops the one in the default, as `allow_default()` does.
-    let mut by_rule = result.clone();
-    by_rule.allow(|error| error.in_default);
+    let by_rule = result.clone().allow(|error| error.in_default);
     assert_eq!(by_rule.errors().len(), 1);
     assert!(!by_rule.errors()[0].in_default);
-    let mut by_method = result;
-    by_method.allow_default();
+    let by_method = result.allow_default();
     assert_eq!(texts(by_rule.errors()), texts(by_method.errors()));
     // The same in the config.
     let by_config = analyze(&item, Allow::new().allow_default());
@@ -110,16 +108,16 @@ fn path_rules_add_up_on_a_result() {
             a: &'a Rel<'_, Vec<u8>>,
         }
     );
-    let mut result = analyze(&item, Allow::new());
+    let result = analyze(&item, Allow::new());
     assert_eq!(result.errors().len(), 1);
     assert_eq!(paths(&result.errors()[0]), ["Rel", "Vec", "u8"]);
     // The rules take the paths off one by one, as the rule of one call that accepts them all.
-    result.allow_prelude();
+    let result = result.allow_prelude();
     assert_eq!(paths(&result.errors()[0]), ["Rel", "u8"]);
-    result.allow_primitive();
+    let result = result.allow_primitive();
     assert_eq!(paths(&result.errors()[0]), ["Rel"]);
     // The error goes with the last.
-    result.allow_path_if(starts_with(parse_quote!(Rel)));
+    let result = result.allow_path_if(starts_with(parse_quote!(Rel)));
     assert!(result.errors().is_empty());
 }
 
@@ -136,8 +134,9 @@ fn the_rules_may_borrow_what_is_around() {
     let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
     assert_eq!(causes.len(), 3);
     // A rule of a result borrows a list of causes that is not 'static.
-    let mut left = result.clone();
-    left.allow(|error| causes[..2].contains(&error.cause));
+    let left = result
+        .clone()
+        .allow(|error| causes[..2].contains(&error.cause));
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].cause, causes[2]);
     // So does a rule of a config, which the Leaker keeps while it analyzes.
@@ -167,12 +166,11 @@ fn a_rule_that_accepts_everything_leaves_no_error_and_no_nested_error() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.errors().iter().any(|error| !error.nested.is_empty()));
-    let mut all = result.clone();
-    all.allow(|_| true);
+    let all = result.clone().allow(|_| true);
     assert!(all.errors().is_empty());
     // Dropping the bound alone brings the nested error up.
-    let mut brought_up = result;
-    brought_up.allow(|error| error.cause == Cause::Trait(parse_quote!(Into<Self::A0>)));
+    let brought_up =
+        result.allow(|error| error.cause == Cause::Trait(parse_quote!(Into<Self::A0>)));
     assert_eq!(brought_up.errors().len(), 1);
 }
 
@@ -271,43 +269,40 @@ fn paths_of(result: &LeakerResult) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn a_rule_that_panics_on_a_result_leaves_the_errors_as_they_were() {
+fn a_rule_that_panics_on_a_result_panics_the_call_and_loses_that_result() {
     let result = three_errors();
     let before = texts(result.errors());
 
     // A rule on errors, which accepts the first and panics on the second.
-    let mut by_error = result.clone();
     let calls = Cell::new(0);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        by_error.allow(|_| {
+        result.clone().allow(|_| {
             calls.set(calls.get() + 1);
             if calls.get() == 2 {
                 panic!("the rule on errors");
             }
             true
-        });
+        })
     }));
     assert!(outcome.is_err());
     assert_eq!(calls.get(), 2);
-    assert_eq!(texts(by_error.errors()), before);
-    // The result is still usable.
-    by_error.allow(|_| true);
-    assert!(by_error.errors().is_empty());
+    // The result that the call took is gone with the panic; the one it was cloned from is as it was.
+    assert_eq!(texts(result.errors()), before);
+    assert!(result.clone().allow(|_| true).errors().is_empty());
 
     // A rule on paths, which accepts `Rel` and panics on `MyType`.
-    let mut by_path = result;
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        by_path.allow_path_if(|path| {
+        result.clone().allow_path_if(|path| {
             if path.is_ident("MyType") {
                 panic!("the rule on paths");
             }
             path.is_ident("Rel")
-        });
+        })
     }));
     assert!(outcome.is_err());
-    assert_eq!(texts(by_path.errors()), before);
-    assert!(by_path.clone().finish().is_err());
-    by_path.allow_path_if(|path| path.is_ident("MyType") || path.is_ident("Other"));
+    assert_eq!(texts(result.errors()), before);
+    assert!(result.clone().finish().is_err());
+    let by_path = result.allow_path_if(|path| path.is_ident("MyType") || path.is_ident("Other"));
     assert_eq!(paths_of(&by_path), [["Rel"]]);
 }
 
@@ -337,8 +332,14 @@ fn all_paths(errors: &[ErrorItem], found: &mut Vec<String>) {
 fn the_path_rule_is_not_asked_about_self_or_a_generic() {
     for (allow_self, check_values) in [(true, false), (false, false), (true, true), (false, true)] {
         let seen = Rc::new(Seen::default());
-        let mut leaker =
-            Leaker::from_config(Allow::new().allow_path_if(seen.rule()), check_values, false);
+        let mut leaker = Leaker::from_config(
+            Allow::new().allow_path_if(seen.rule()),
+            if check_values {
+                Options::new().check_values()
+            } else {
+                Options::new()
+            },
+        );
         leaker.intern_trait(&own_names(), allow_self);
         let result = leaker.result();
         let what = format!("allow_self {}, check_values {}", allow_self, check_values);
@@ -366,7 +367,7 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
     // With `allow_self = false` a type that names `Self` cannot be an entry.
     fn by<P: Fn(&Path) -> bool>(source: &str, allow: Allow<P>) -> LeakerResult {
         let item: ItemStruct = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(allow, false, false);
+        let mut leaker = Leaker::from_config(allow, Options::new());
         leaker.intern_struct(&item, false);
         leaker.result()
     }
@@ -389,8 +390,7 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
             Allow::new().allow_path_if(|path| path.is_ident("Self")),
         );
         assert_eq!(texts(by_rule.errors()), texts(plain.errors()), "{}", source);
-        let mut on_result = plain.clone();
-        on_result.allow_path_if(|path| path.is_ident("Self"));
+        let on_result = plain.clone().allow_path_if(|path| path.is_ident("Self"));
         assert_eq!(
             texts(on_result.errors()),
             texts(plain.errors()),
@@ -407,14 +407,14 @@ fn the_filter_does_not_ask_the_rule_about_self() {
     let mut error = base.errors()[0].clone();
     error.paths = vec![parse_quote!(Self::A)];
     let mut tokens = base.into_referrer().to_token_stream();
-    tokens.extend(error.to_token_stream());
-    let mut result: LeakerResult = parse2(tokens).unwrap();
+    tokens.extend(quote!(@ [#error]));
+    let result: LeakerResult = parse2(tokens).unwrap();
     assert_eq!(paths_of(&result), [["Self :: A"]]);
     let seen = Rc::new(Seen::default());
-    result.allow_path_if(seen.rule());
+    let result = result.allow_path_if(seen.rule());
     assert!(seen.paths.borrow().is_empty());
     // A rule that accepts everything does not accept it either.
-    result.allow_path_if(|_| true);
+    let result = result.allow_path_if(|_| true);
     assert_eq!(paths_of(&result), [["Self :: A"]]);
 }
 
@@ -466,9 +466,8 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
     let result = analyze_trait(&item, Allow::new().allow_path_if(seen.rule()), true);
     assert!(seen.contains("m :: Bound") && seen.contains("helper :: f"));
     assert!(!seen.with_arguments.get(), "{:?}", seen.paths);
-    let mut result = result;
     seen.paths.borrow_mut().clear();
-    result.allow_path_if(seen.rule());
+    let _ = result.allow_path_if(seen.rule());
     assert!(!seen.paths.borrow().is_empty());
     assert!(!seen.with_arguments.get(), "{:?}", seen.paths);
 }
@@ -503,7 +502,7 @@ fn boom(path: &Path) -> bool {
 
 #[test]
 fn a_rule_that_panics_in_a_caught_visit_poisons_the_call() {
-    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), false, false);
+    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), Options::new());
     let generics: Generics = parse_quote!(<T>);
     let where_clause: WhereClause = parse_quote!(where T: m::Tr<Rel2>);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -532,7 +531,7 @@ fn a_rule_that_panics_in_a_caught_visit_poisons_the_call() {
 
 #[test]
 fn a_rule_that_panics_in_a_caught_inner_scope_poisons_the_outer_call() {
-    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), false, false);
+    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), Options::new());
     let generics: Generics = parse_quote!(<T>);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         leaker.enter_generics(&generics, |view| {
@@ -555,7 +554,7 @@ fn a_rule_that_panics_in_a_caught_inner_scope_poisons_the_outer_call() {
 
 #[test]
 fn a_rule_that_panics_is_a_panic_of_the_closure() {
-    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), false, false);
+    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), Options::new());
     let item: ItemStruct = parse_quote!(
         struct S {
             a: Rel,
@@ -613,7 +612,7 @@ fn analyze_rule(
 
 /// `result` after the wrapper of `LeakerResult` named `rule`, or after `allow_path_if()` of the
 /// function of `rule`.
-fn on_result(rule: &str, function: bool, mut result: LeakerResult) -> LeakerResult {
+fn on_result(rule: &str, function: bool, result: LeakerResult) -> LeakerResult {
     match (rule, function) {
         ("primitive", false) => result.allow_primitive(),
         ("primitive", true) => result.allow_path_if(is_primitive_path),
@@ -624,8 +623,7 @@ fn on_result(rule: &str, function: bool, mut result: LeakerResult) -> LeakerResu
         ("crate", false) => result.allow_crate(),
         ("crate", true) => result.allow_path_if(is_crate_path),
         _ => unreachable!(),
-    };
-    result
+    }
 }
 
 /// The Referrer and the errors of `result`, as one text.
@@ -803,7 +801,7 @@ fn a_run_time_choice_goes_into_one_closure() {
         assert_eq!(chosen.errors().is_empty(), prelude, "{}", what);
     }
     // The result takes the same closure.
-    let mut result = analyze_trait(&item, Allow::new(), false);
-    result.allow_path_if(|path| is_prelude_path(path) || is_primitive_path(path));
+    let result = analyze_trait(&item, Allow::new(), false)
+        .allow_path_if(|path| is_prelude_path(path) || is_primitive_path(path));
     assert!(result.errors().is_empty());
 }

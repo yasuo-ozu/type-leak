@@ -349,7 +349,6 @@ fn the_referrer_finds_the_entries_with_the_lifetimes_declared_where_the_copy_is(
         // a generic of the trait, which the signature does not declare).
         let mut copy = tr.clone();
         referrer
-            .clone()
             .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
             .visit_item_trait_mut(&mut copy);
         let text = s(&copy);
@@ -358,7 +357,6 @@ fn the_referrer_finds_the_entries_with_the_lifetimes_declared_where_the_copy_is(
         // Taking the generics of the trait as those of the context agrees.
         let mut copy = tr.clone();
         referrer
-            .clone()
             .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
             .with_outermost_generics_as_leakers()
             .visit_item_trait_mut(&mut copy);
@@ -697,11 +695,9 @@ fn found(tr: &ItemTrait, referrer: &Referrer, top_level: ContextId, how: &str) -
     let visitor = |ix| -> Type { parse_quote!(P<#ix>) };
     match how {
         "declared" => referrer
-            .clone()
             .visitor(top_level, |_, ix| visitor(ix))
             .visit_item_trait_mut(&mut copy),
         "leakers" => referrer
-            .clone()
             .visitor(top_level, |_, ix| visitor(ix))
             .with_outermost_generics_as_leakers()
             .visit_item_trait_mut(&mut copy),

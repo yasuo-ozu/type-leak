@@ -50,9 +50,9 @@ fn the_span_of_a_relative_path_is_the_path() {
     let items = result.errors();
     assert_eq!(items.len(), 2, "{}", messages(items));
     // The error is at the whole type, in the order of the source.
-    assert_eq!(items[0].message, "use absolute path: 'MyType < '_ >'");
+    assert_eq!(items[0].message, "use absolute path: 'MyType<'_>'");
     assert_span_at(items[0].span(), source, "MyType<'_>", 0);
-    assert_eq!(items[1].message, "use absolute path: 'Vec < & '_ u8 >'");
+    assert_eq!(items[1].message, "use absolute path: 'Vec<&'_ u8>'");
     assert_span_at(items[1].span(), source, "Vec<&'_ u8>", 0);
     // The first one: the note is the cause, at the lifetime that stops the type from being leaked
     // as a whole, and the help is at the name of the path, not at the whole type.
@@ -160,13 +160,13 @@ fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let source = "trait Tr<T: Fn(Rel)> {\n    fn f(&self, a: Wrap<T>)\n    where\n        Wrap<T>: Sized;\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Allow::new().allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(
         messages(items),
-        "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a leaked \
+        "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked \
          type"
     );
     assert_eq!(items[0].reason, Reason::UnprovableBound);
@@ -368,7 +368,7 @@ fn assert_in_source(tokens: proc_macro2::TokenStream, source: &str) {
 fn macro_error(source: &str) -> ErrorItem {
     let item: ItemStruct = parse_str(source).unwrap();
     let config = Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(&item, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1, "{}", messages(result.errors()));
@@ -448,7 +448,7 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     let source = "trait Tr {\n    fn f(&self) -> u8 {\n        two!() + 1\n    }\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(config, true, false);
+    let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let items = result.errors();

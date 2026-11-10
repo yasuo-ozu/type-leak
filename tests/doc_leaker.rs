@@ -182,7 +182,7 @@ fn allow_a_cause_copies_that_part_as_written() {
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
 
     // `f` is copied as written either way, and only `g` leaks `dyn RelTr`.
-    result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
+    result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
     assert_eq!(result.finish().unwrap().required().count(), 1);
 }
 
@@ -191,7 +191,7 @@ fn allow_a_cause_copies_that_part_as_written() {
 fn deny_ambiguous_crate_name_replaces_optional_entries() {
     let mut leaker = Leaker::new();
     let context = leaker.intern_struct(&parse_quote! { struct S { a: ::foo::X } }, true);
-    let mut result = leaker.result();
+    let result = leaker.result();
     let ty: Type = parse_quote!(::foo::X);
     let replaced: Type = parse_quote!(Replaced);
     let referrer = result.clone().finish().unwrap();
@@ -199,7 +199,7 @@ fn deny_ambiguous_crate_name_replaces_optional_entries() {
         referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
         ty
     );
-    let referrer = result.deny_ambiguous_crate_name().clone().finish().unwrap();
+    let referrer = result.deny_ambiguous_crate_name().finish().unwrap();
     assert_eq!(
         referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
         replaced
@@ -215,7 +215,7 @@ fn leaker_result_with_its_errors_is_read_back_from_tokens() {
     leaker.intern_trait(&item, true);
     let tokens = leaker.result().to_token_stream();
 
-    let mut result: LeakerResult = parse2(tokens).unwrap();
+    let result: LeakerResult = parse2(tokens).unwrap();
     assert_eq!(result.errors().len(), 1);
     assert!(result.allow_std_crates().errors().is_empty());
 }
@@ -229,13 +229,13 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     };
     // Without the option the value is not read: the copy breaks without an error.
     let config = Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     assert!(leaker.result().finish().unwrap().is_empty());
 
     // With it the type is an entry, which the visitor replaces in the copy of the value.
     let config = || Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     let context = leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.required().count(), 1);
@@ -252,11 +252,11 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
 
     // A path that is not a type cannot be replaced.
     let item: ItemTrait = parse_quote! { trait Tr { const N: usize = inner::N; } };
-    let mut leaker = Leaker::from_config(config(), true, false);
+    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let error = &result.errors()[0];
-    assert_eq!(error.message, "use absolute path: 'inner :: N'");
+    assert_eq!(error.message, "use absolute path: 'inner::N'");
     assert_eq!(
         error.notes.first().map(|(_, note)| note.as_str()),
         Some("it is in the default value of `N`, which the copy writes as it is")
@@ -277,7 +277,7 @@ fn nested_self_entries_accepts_self_in_a_nested_type_with_a_self_bound() {
     nested(&mut leaker);
     assert_eq!(leaker.result().errors().len(), 1);
 
-    let mut leaker = Leaker::from_config(Allow::new(), false, true);
+    let mut leaker = Leaker::from_config(Allow::new(), Options::new().nested_self_entries());
     nested(&mut leaker);
     let referrer = leaker.result().finish().unwrap();
     // The entry is for any type that the bound holds for, with `Self` as its implementor.
@@ -285,13 +285,15 @@ fn nested_self_entries_accepts_self_in_a_nested_type_with_a_self_bound() {
         referrer.context_self(referrer.context(0)),
         Some(SelfRequirement::Any)
     ));
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     let param: Ident = parse_quote!(__S);
     let r = referrer
-        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .repeater_impl(0, ImplSelf::Param(&param), slots.const_fn())
         .unwrap();
-    let (generics, args, ty) = (&r.generics, &r.args, &r.ty);
+    let (generics, ty) = (&r.generics, &r.ty);
+    let repeater = slots.trait_path(&r.args, 7, 0);
     let imp: ItemImpl = parse_quote! {
-        impl #generics Repeater<#args, 7u64, 0usize> for __S { type Type = #ty; }
+        impl #generics #repeater for __S { type Type = #ty; }
     };
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), 7u64, 0usize> for __S {
@@ -326,7 +328,7 @@ fn allow_prelude_leaves_the_names_of_the_prelude_as_written() {
     assert!(leaker.result().finish().is_err());
 
     let config = Allow::new().allow_prelude();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     // `Clone` and `Vec` are left as written. The only entry is `Vec<Rel>`: a bare `Rel` may be
     // a const, so the type that holds it is leaked whole.
@@ -343,7 +345,7 @@ fn allow_crate_leaves_crate_paths_as_written() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     // ...and left as written if the copy is in the same crate.
     let config = Allow::new().allow_crate();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(&item, true);
     assert!(leaker.result().finish().unwrap().is_empty());
 }

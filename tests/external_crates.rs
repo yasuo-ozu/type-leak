@@ -18,7 +18,7 @@ fn tag() -> String {
 
 fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
     let config = Allow::new().allow_primitive();
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 /// A Leaker which allows the external crates `allowed` (`::name`).
@@ -33,7 +33,7 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Fn(&Path) -> bool> {
     let config = Allow::new()
         .allow_primitive()
         .allow_path_if(move |path| allowed.iter().any(|a| starts_with(a.clone())(path)));
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 /// Prints tokens without whitespace, to compare them with the source.
@@ -265,7 +265,7 @@ fn allowed_absolute_path_is_never_a_node() {
     );
     // An allowed relative path allows the relative paths only: an absolute one is a node.
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(my)));
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     let item: ItemTrait = parse_quote! {
         trait T {
             fn f(&self, a: my::X, b: ::my::Y);
@@ -278,7 +278,7 @@ fn allowed_absolute_path_is_never_a_node() {
     );
     // The more specific path may be allowed alone.
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(::foo::inner)));
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     let item: ItemTrait = parse_quote! {
         trait T {
             fn f(&self, a: ::foo::inner::X, b: ::foo::Y);
@@ -293,7 +293,7 @@ fn allowed_absolute_path_is_never_a_node() {
     let ty: Type = parse_quote!(::foo::W<(Rel,)>);
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(::foo)));
     let result = check_in(
-        &mut Leaker::from_config(config, false, false),
+        &mut Leaker::from_config(config, Options::new()),
         &ty,
         &Generics::default(),
     );
@@ -450,7 +450,7 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(err.len(), 1);
-    assert_eq!(err[0].message, "use absolute path: 'Rel < '_ >'");
+    assert_eq!(err[0].message, "use absolute path: 'Rel<'_>'");
 }
 
 /// Entries of the same item with all the crates allowed (a Leaker with no external crates), as
@@ -595,7 +595,7 @@ fn referrer_leaves_optional_entries_by_default() {
 #[test]
 fn referrer_replaces_optional_entries_without_ambiguous_crate_names() {
     let (mut result, context) = result_with_foo();
-    result.deny_ambiguous_crate_name();
+    result = result.deny_ambiguous_crate_name();
     let referrer = result.finish().unwrap();
     let ix_foo = referrer
         .iter()
@@ -629,8 +629,7 @@ fn referrer_replaces_optional_entries_without_ambiguous_crate_names() {
         format!(":: foo :: W < (P < {}usize > ,) >", ix_rel)
     );
     // And replaced as a whole otherwise.
-    let mut result = result;
-    result.deny_ambiguous_crate_name();
+    let result = result.deny_ambiguous_crate_name();
     let referrer = result.finish().unwrap();
     assert_eq!(
         expand(&referrer, context, parse_quote!(::foo::W<(Rel,)>)),
@@ -661,8 +660,7 @@ fn referrer_visitor_respects_the_flag() {
     let s = quote!(#item).to_string();
     assert!(s.contains(":: foo :: X"), "{}", s);
     assert!(s.contains("P <"), "{}", s);
-    let mut strict = result;
-    strict.deny_ambiguous_crate_name();
+    let strict = result.deny_ambiguous_crate_name();
     strict
         .finish()
         .unwrap()
@@ -688,7 +686,7 @@ fn the_flag_of_the_result_reaches_the_referrer_of_finish_and_into_referrer() {
     }
     let mut strict = result;
     // It is chainable like the `allow*()` methods.
-    strict.deny_ambiguous_crate_name().allow_primitive();
+    strict = strict.deny_ambiguous_crate_name().allow_primitive();
     for referrer in [strict.clone().finish().unwrap(), strict.into_referrer()] {
         let ix = referrer
             .iter()
@@ -726,9 +724,10 @@ fn a_serialized_referrer_parses_as_a_result_without_errors_and_takes_the_flag() 
         ),
         ":: foo :: X"
     );
-    parsed.deny_ambiguous_crate_name();
+    parsed = parsed.deny_ambiguous_crate_name();
     let strict = parsed.finish().unwrap();
-    assert_ne!(strict, referrer);
+    // `==` ignores the strictness, but the Referrers behave differently.
+    assert_eq!(strict, referrer);
     let ix = strict
         .iter()
         .position(|t| squash(quote!(#t)) == "::foo::X")
@@ -746,11 +745,51 @@ fn a_serialized_referrer_parses_as_a_result_without_errors_and_takes_the_flag() 
     assert!(read.errors().is_empty());
 }
 
+/// The strictness is not serialized, so `==` ignores it: a strict Referrer equals its parsed copy
+/// (which is lenient), and stays strict.
+#[test]
+fn a_strict_referrer_equals_its_parsed_copy_and_stays_strict() {
+    let (result, context) = result_with_foo();
+    let strict = result.clone().deny_ambiguous_crate_name();
+    for strict in [strict.clone().finish().unwrap(), strict.into_referrer()] {
+        let parsed: Referrer = parse2(quote!(#strict)).unwrap();
+        assert_eq!(strict, parsed);
+        assert_eq!(parsed, strict);
+        assert_eq!(strict, strict.clone());
+        // Through a result too.
+        let again: LeakerResult = parse2(quote!(#strict)).unwrap();
+        assert_eq!(again.into_referrer(), strict);
+        // Equal, but only the original replaces the optional entry.
+        let ix = strict
+            .iter()
+            .position(|t| squash(quote!(#t)) == "::foo::X")
+            .unwrap();
+        let replaced = format!("P < {}usize >", ix);
+        assert_eq!(expand(&strict, context, parse_quote!(::foo::X)), replaced);
+        assert_eq!(
+            expand(&parsed, context, parse_quote!(::foo::X)),
+            ":: foo :: X"
+        );
+        // Comparing changed nothing, and the original is still not the default one.
+        assert_eq!(expand(&strict, context, parse_quote!(::foo::X)), replaced);
+    }
+    // Anything that the serialization keeps is still compared.
+    let mut leaker = leaker();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait T {
+                fn f(&self, a: ::foo::Y) -> Rel;
+            }
+        ),
+        true,
+    );
+    assert_ne!(result.finish().unwrap(), leaker.result().finish().unwrap());
+}
+
 #[test]
 fn the_flag_of_the_result_is_not_serialized() {
     let (result, context) = result_with_foo();
-    let mut strict = result.clone();
-    strict.deny_ambiguous_crate_name();
+    let strict = result.clone().deny_ambiguous_crate_name();
     let tokens = quote!(#strict);
     assert_eq!(tokens.to_string(), quote!(#result).to_string());
     let parsed: LeakerResult = parse2(tokens).unwrap();
@@ -788,10 +827,9 @@ fn referrer_serialization_round_trip() {
     assert_eq!(parsed, referrer);
     assert_eq!(entries(&parsed), before);
     // The flag is the choice of the Referrer's side, so it is not serialized.
-    let mut strict = result;
-    strict.deny_ambiguous_crate_name();
+    let strict = result.deny_ambiguous_crate_name();
     let strict = strict.finish().unwrap();
-    assert_ne!(strict, referrer);
+    assert_eq!(strict, referrer);
     assert_eq!(quote!(#strict).to_string(), s);
     let parsed: Referrer = parse2(quote!(#strict)).unwrap();
     assert_eq!(parsed, referrer);
@@ -800,9 +838,8 @@ fn referrer_serialization_round_trip() {
         ":: foo :: X",
         "a parsed Referrer has the default"
     );
-    let mut reset: LeakerResult = parse2(quote!(#strict)).unwrap();
-    reset.deny_ambiguous_crate_name();
-    let reset = reset.finish().unwrap();
+    let reset: LeakerResult = parse2(quote!(#strict)).unwrap();
+    let reset = reset.deny_ambiguous_crate_name().finish().unwrap();
     assert_eq!(reset, strict);
     assert_ne!(
         expand(&reset, context, parse_quote!(::foo::X)),

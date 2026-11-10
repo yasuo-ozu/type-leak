@@ -13,9 +13,10 @@ mod forward;
 ///
 /// The `visit_*` methods analyze one kind of syntax each, and [`View::check()`] looks at a type
 /// without recording anything. The `enter_*` methods open a nested scope: its generics are local,
-/// and the generics around stay in scope. `Self` is what the scope declares, so naming it in
-/// `enter_generics()` or `enter_mod()` is an error. A nested scope returns the id and the result,
-/// but no errors: the outermost call records them ([`Leaker::result()`](crate::Leaker::result)).
+/// and the generics around stay in scope. `Self` is what the scope declares: `enter_generics()`
+/// keeps the one around, so naming it is an error only where none is (at the top, or inside
+/// `enter_mod()`). A nested scope returns the id and the result, but no errors: the outermost call
+/// records them ([`Leaker::result()`](crate::Leaker::result)).
 ///
 /// `View` also implements [`Visit`](syn::visit::Visit): `syn::visit::visit_item_struct(view,
 /// &item)` does what [`Leaker::intern_struct()`](crate::Leaker::intern_struct) does. The walk

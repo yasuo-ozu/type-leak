@@ -59,7 +59,7 @@ fn expect_errors<R>(leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> V
 
 /// Runs a Leaker on `item_trait`, returning the leaked types or the error message.
 fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
-    let mut leaker = Leaker::from_config(leaker_config(), false, false);
+    let mut leaker = Leaker::from_config(leaker_config(), Options::new());
     leaker.intern_trait(item_trait, true);
     leaker.reduce_roots();
     let referrer = leaker
@@ -250,7 +250,7 @@ fn help_suggests_absolute_prelude_path() {
     assert_eq!(
         leak_error_default(&item),
         error(
-            "use absolute path: 'Iterator < Item = u8 >'",
+            "use absolute path: 'Iterator<Item = u8>'",
             Some("use `::core::iter::Iterator` instead of `Iterator`")
         )
     );
@@ -291,7 +291,7 @@ fn help_suggests_absolute_prelude_path() {
     assert_eq!(
         leak_error_default(&item),
         error(
-            "use absolute path: 'TryFrom < u8 >'",
+            "use absolute path: 'TryFrom<u8>'",
             Some("use `::core::convert::TryFrom` instead of `TryFrom`")
         )
     );
@@ -307,7 +307,7 @@ fn help_suggests_absolute_primitive_path() {
     assert_eq!(
         leak_error_default(&item),
         error(
-            "use absolute path: 'usize :: MAX'",
+            "use absolute path: 'usize::MAX'",
             Some("use `::core::primitive::usize` instead of `usize`")
         )
     );
@@ -324,10 +324,7 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
         leak_error_default(&item),
         error(
             "use absolute path: 'MyBound'",
-            Some(
-                "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-                 with `Allow::allow_path_if()`"
-            )
+            Some("write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`)")
         )
     );
 
@@ -339,11 +336,8 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
     assert_eq!(
         leak_error_default(&item),
         error(
-            "use absolute path: 'my_mod :: Clone'",
-            Some(
-                "write `my_mod::Clone` with an absolute path (e.g. `::my_crate::my_mod::Clone`), \
-                 or allow it with `Allow::allow_path_if()`"
-            )
+            "use absolute path: 'my_mod::Clone'",
+            Some("write `my_mod::Clone` with an absolute path (e.g. `::my_crate::my_mod::Clone`)")
         )
     );
 
@@ -363,10 +357,8 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
     assert_eq!(
         helps,
         [
-            "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `Allow::allow_path_if()`",
-            "write `super::Other` with an absolute path (e.g. `::my_crate::Other`), or allow it \
-             with `Allow::allow_path_if()`"
+            "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`)",
+            "write `super::Other` with an absolute path (e.g. `::my_crate::Other`)"
         ]
     );
 }
@@ -396,7 +388,7 @@ fn help_in_syn_error() {
     assert_eq!(
         err.to_string(),
         "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. \
-         `::my_crate::MyBound`), or allow it with `Allow::allow_path_if()`\n"
+         `::my_crate::MyBound`)\n"
     );
 }
 
@@ -433,7 +425,7 @@ fn help_for_trait_bounds() {
     assert_eq!(
         leak_error_default(&item),
         error(
-            "use absolute path: 'for < 'a > Fn (& 'a u8)'",
+            "use absolute path: 'for<'a> Fn (&'a u8)'",
             Some("use `::core::ops::Fn` instead of `Fn`")
         )
     );
@@ -486,7 +478,7 @@ fn all_relative_paths_are_reported() {
     );
     assert_eq!(
         messages(&err),
-        "use absolute path: 'Clone'\nuse absolute path: 'MyBound'\nuse absolute path: 'MyType < '_ >'"
+        "use absolute path: 'Clone'\nuse absolute path: 'MyBound'\nuse absolute path: 'MyType<'_>'"
     );
     // The first error and its help.
     assert_eq!(
@@ -499,8 +491,8 @@ fn all_relative_paths_are_reported() {
         syn_err.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
         vec![
             "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n",
-            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it with `Allow::allow_path_if()`\n",
-            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `Allow::allow_path_if()`\n",
+            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`)\n",
+            "use absolute path: 'MyType<'_>'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
         ]
     );
 }
@@ -527,10 +519,10 @@ fn notes_explain_conflicts() {
     );
     assert_eq!(
         to_syn_error(&err).to_string(),
-        "use absolute path: 'Box < dyn RelA + RelB < '_ > >'\n\n\
+        "use absolute path: 'Box<dyn RelA + RelB<'_>>'\n\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
          \x20 = note: `RelA` also depends on the type context\n\
-         \x20 = note: `RelB < '_ >` also depends on the type context\n\
+         \x20 = note: `RelB<'_>` also depends on the type context\n\
          \x20 = help: use `::std::boxed::Box` instead of `Box`\n"
     );
 }
@@ -549,7 +541,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
     assert_eq!(
         messages(&err),
-        "`Wrap < 'b >` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n\
+        "`Wrap<'b>` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n\
          `RelTrait` leaves the lifetime `'c` of the method unconstrained in the copy (E0195)"
     );
     assert!(err
@@ -581,7 +573,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, false));
     assert_eq!(
         messages(&err),
-        "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
+        "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked"
     );
     assert_eq!(err[0].reason, Reason::DeniedSelfInBounds);
     assert_eq!(
@@ -597,7 +589,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     })
     .unwrap();
     let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
-    assert_eq!(messages(&err), "use absolute path: 'MyType < '_ >'");
+    assert_eq!(messages(&err), "use absolute path: 'MyType<'_>'");
     assert_eq!(err[0].reason, Reason::RelativePath);
 }
 
@@ -621,10 +613,7 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
     let err = leak(parse_quote!(<Self as super::Tr<u8>>::X));
     let items = &err;
     assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].message,
-        "use absolute path: 'super :: Tr < u8 > :: X'"
-    );
+    assert_eq!(items[0].message, "use absolute path: 'super::Tr<u8>::X'");
     assert_eq!(
         items[0]
             .notes
@@ -646,7 +635,7 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
             .collect::<Vec<_>>(),
         [
             "it cannot be leaked as a whole because of `Self`",
-            "`Tr < u8 > :: X` also depends on the type context"
+            "`Tr<u8>::X` also depends on the type context"
         ]
     );
 }
@@ -660,7 +649,7 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
     let item: ItemTrait = parse_quote! {
         pub trait Tr { fn f(&self, x: [u8; { let c = |a: u8| a; 3 }]); }
     };
-    let mut leaker = Leaker::from_config(leaker_config(), false, false);
+    let mut leaker = Leaker::from_config(leaker_config(), Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let err = result.errors();
@@ -679,7 +668,7 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
     let item: ItemTrait = parse_quote! {
         pub trait Tr { fn f(&self, x: [u8; { let c = 3; c }]); }
     };
-    let mut leaker = Leaker::from_config(leaker_config(), false, false);
+    let mut leaker = Leaker::from_config(leaker_config(), Options::new());
     leaker.intern_trait(&item, true);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }

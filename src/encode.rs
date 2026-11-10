@@ -1,6 +1,6 @@
 //! Encoding generic parameters and arguments into types.
 
-use crate::util::{parenthesize_pointee, unwrap_type_group};
+use crate::util::{parenthesize_pointee, unwrap_type_group, ReplaceSelf};
 use proc_macro2::Span;
 use std::collections::HashMap;
 use syn::punctuated::Punctuated;
@@ -117,15 +117,10 @@ pub(crate) fn complete_generics_args<'a>(
             }
             GenericParam::Const(cp) => {
                 let value: Expr = match other_args.next() {
-                    Some(GenericArgument::Const(expr)) => expr.clone(),
-                    Some(GenericArgument::Type(Type::Path(TypePath { qself: None, path })))
-                        if path.get_ident().is_some() =>
-                    {
-                        parse_quote!(#path)
-                    }
-                    Some(arg) => {
-                        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
-                    }
+                    Some(arg) => match const_argument(arg) {
+                        Some(value) => value,
+                        None => return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone()))),
+                    },
                     None => match &cp.default {
                         Some(default) => substitute.fold_expr(default.clone()),
                         None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
@@ -140,6 +135,44 @@ pub(crate) fn complete_generics_args<'a>(
         return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
     }
     Ok(completed)
+}
+
+/// The value that `arg` gives to a const parameter: a const argument, or a bare identifier, which
+/// is parsed as a type.
+fn const_argument(arg: &GenericArgument) -> Option<Expr> {
+    match arg {
+        GenericArgument::Const(expr) => Some(expr.clone()),
+        GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
+            if path.get_ident().is_some() =>
+        {
+            Some(parse_quote!(#path))
+        }
+        _ => None,
+    }
+}
+
+/// Checks that `args` are arguments for the first of `params`, by position: not more than there
+/// are parameters, each of the kind of its parameter. A parameter with no argument is not an
+/// error here: the arguments may be those before a default.
+pub(crate) fn check_root_args(
+    params: &Punctuated<GenericParam, Token![,]>,
+    args: &[GenericArgument],
+) -> std::result::Result<(), EncodeError> {
+    for (param, arg) in params.iter().zip(args) {
+        let fits = match (param, arg) {
+            (GenericParam::Lifetime(_), GenericArgument::Lifetime(_))
+            | (GenericParam::Type(_), GenericArgument::Type(_)) => true,
+            (GenericParam::Const(_), arg) => const_argument(arg).is_some(),
+            _ => false,
+        };
+        if !fits {
+            return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
+        }
+    }
+    match args.get(params.len()) {
+        Some(arg) => Err(EncodeError::UnexpectedArgument(Box::new(arg.clone()))),
+        None => Ok(()),
+    }
 }
 
 /// Primitive types which can be the type of const parameters on stable Rust.
@@ -555,39 +588,176 @@ pub(crate) struct SubstituteParams {
     lifetimes: HashMap<Lifetime, Lifetime>,
 }
 
+impl SubstituteParams {
+    /// The substitution of `params` by `args`, which pair up by position. An argument of another
+    /// kind than its parameter, and a parameter with no argument, are left out.
+    pub(crate) fn of(
+        params: &Punctuated<GenericParam, Token![,]>,
+        args: &[GenericArgument],
+    ) -> Self {
+        let mut substitute = Self::default();
+        for (param, arg) in params.iter().zip(args) {
+            match (param, arg) {
+                (
+                    GenericParam::Lifetime(LifetimeParam { lifetime, .. }),
+                    GenericArgument::Lifetime(arg),
+                ) => {
+                    substitute.lifetimes.insert(lifetime.clone(), arg.clone());
+                }
+                (GenericParam::Type(TypeParam { ident, .. }), GenericArgument::Type(ty)) => {
+                    substitute.types.insert(ident.clone(), ty.clone());
+                }
+                (GenericParam::Const(ConstParam { ident, .. }), arg) => {
+                    if let Some(value) = const_argument(arg) {
+                        // `fold_expr()` writes the braces of a value that needs them.
+                        let value = unwrap_block(&value).clone();
+                        substitute.consts.insert(ident.clone(), value);
+                    }
+                }
+                _ => (),
+            }
+        }
+        substitute
+    }
+
+    /// The argument that `ty` is the parameter of.
+    fn type_argument(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Path(TypePath { qself: None, path }) => {
+                self.types.get(path.get_ident()?).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The value that `expr` is the const parameter of, in braces.
+    fn const_value(&self, expr: &Expr) -> Option<Expr> {
+        match expr {
+            Expr::Path(ExprPath {
+                qself: None, path, ..
+            }) => {
+                let value = self.consts.get(path.get_ident()?)?;
+                Some(parse_quote!({ #value }))
+            }
+            _ => None,
+        }
+    }
+
+    /// The argument for a bare const parameter, which is parsed as a type argument (`N` in
+    /// `Foo<N>`).
+    fn const_argument_of(&self, arg: &GenericArgument) -> Option<GenericArgument> {
+        match arg {
+            GenericArgument::Type(Type::Path(TypePath { qself: None, path })) => {
+                let value = self.consts.get(path.get_ident()?)?;
+                Some(GenericArgument::Const(normalize_const_arg(value)))
+            }
+            _ => None,
+        }
+    }
+
+    fn lifetime(&self, lifetime: Lifetime) -> Lifetime {
+        self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
+    }
+}
+
 impl syn::fold::Fold for SubstituteParams {
     fn fold_type(&mut self, ty: Type) -> Type {
-        if let Type::Path(TypePath { qself: None, path }) = &ty {
-            if let Some(ident) = path.get_ident() {
-                if let Some(arg) = self.types.get(ident) {
-                    return arg.clone();
-                }
-            }
+        match self.type_argument(&ty) {
+            Some(arg) => arg,
+            None => syn::fold::fold_type(self, ty),
         }
-        syn::fold::fold_type(self, ty)
     }
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        if let Expr::Path(ExprPath {
-            qself: None, path, ..
-        }) = &expr
-        {
-            if let Some(arg) = path.get_ident().and_then(|ident| self.consts.get(ident)) {
-                return parse_quote!({ #arg });
-            }
+        match self.const_value(&expr) {
+            Some(value) => value,
+            None => syn::fold::fold_expr(self, expr),
         }
-        syn::fold::fold_expr(self, expr)
     }
     fn fold_generic_argument(&mut self, arg: GenericArgument) -> GenericArgument {
-        // A bare const parameter is parsed as a type argument, e.g. `N` in `Foo<N>`.
-        if let GenericArgument::Type(Type::Path(TypePath { qself: None, path })) = &arg {
-            if let Some(value) = path.get_ident().and_then(|ident| self.consts.get(ident)) {
-                return GenericArgument::Const(normalize_const_arg(value));
-            }
+        match self.const_argument_of(&arg) {
+            Some(arg) => arg,
+            None => syn::fold::fold_generic_argument(self, arg),
         }
-        syn::fold::fold_generic_argument(self, arg)
     }
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
-        self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
+        self.lifetime(lifetime)
+    }
+}
+
+/// Writes a type at a use site: the substitution of `params`, and `Self` replaced by `self_ty`, in
+/// one pass, so that what replaces a name is not substituted again.
+pub(crate) struct SubstituteSite<'a> {
+    pub(crate) params: SubstituteParams,
+    pub(crate) self_ty: Option<&'a Type>,
+}
+
+impl SubstituteSite<'_> {
+    /// `T::A` for a type parameter `T` that has an argument is `<arg>::A`.
+    fn projection_of_parameter(&mut self, ty: &Type) -> Option<Type> {
+        let path = match ty {
+            Type::Path(TypePath { qself: None, path }) => path,
+            _ => return None,
+        };
+        let first = path.segments.first()?;
+        if path.leading_colon.is_some() || path.segments.len() < 2 || !first.arguments.is_none() {
+            return None;
+        }
+        let arg = self.params.types.get(&first.ident)?.clone();
+        let rest = Path {
+            leading_colon: Some(Default::default()),
+            segments: path.segments.iter().skip(1).cloned().collect(),
+        };
+        Some(Type::Path(TypePath {
+            qself: Some(QSelf {
+                lt_token: Default::default(),
+                ty: Box::new(arg),
+                position: 0,
+                as_token: None,
+                gt_token: Default::default(),
+            }),
+            path: syn::fold::Fold::fold_path(self, rest),
+        }))
+    }
+}
+
+impl syn::fold::Fold for SubstituteSite<'_> {
+    fn fold_type(&mut self, ty: Type) -> Type {
+        if let Some(arg) = self.params.type_argument(&ty) {
+            return arg;
+        }
+        if let Some(projection) = self.projection_of_parameter(&ty) {
+            return projection;
+        }
+        match self.self_ty {
+            Some(self_ty) => ReplaceSelf { self_ty }.fold_type_with(self, ty),
+            // An argument may be a trait object with several bounds, which needs parentheses
+            // behind a reference or a pointer.
+            None => parenthesize_pointee(syn::fold::fold_type(self, ty)),
+        }
+    }
+    fn fold_expr(&mut self, expr: Expr) -> Expr {
+        if let Some(value) = self.params.const_value(&expr) {
+            return value;
+        }
+        match self.self_ty {
+            Some(self_ty) => ReplaceSelf { self_ty }.fold_expr_with(self, expr),
+            None => syn::fold::fold_expr(self, expr),
+        }
+    }
+    fn fold_generic_argument(&mut self, arg: GenericArgument) -> GenericArgument {
+        match self.params.const_argument_of(&arg) {
+            Some(arg) => arg,
+            None => syn::fold::fold_generic_argument(self, arg),
+        }
+    }
+    fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
+        self.params.lifetime(lifetime)
+    }
+    fn fold_macro(&mut self, mac: Macro) -> Macro {
+        match self.self_ty {
+            Some(self_ty) => ReplaceSelf { self_ty }.fold_macro(mac),
+            None => mac,
+        }
     }
 }
 

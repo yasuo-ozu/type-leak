@@ -120,7 +120,7 @@ impl ToTokens for Nested {
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let nested: Nested = parse2(input)?;
     let config = Allow::new().allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     let (context, ()) =
         leaker.enter_trait(&nested.trait_ident, &nested.trait_generics, true, |view| {
             view.enter_impl(&nested.impl_generics, &nested.self_ty, None, true, |view| {
@@ -129,25 +129,27 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
                 }
             });
         });
-    let mut result = leaker.result();
+    let result = leaker.result();
     // Every error is accepted: the part that conflicts is copied as written.
     let errors: Vec<ErrorItem> = result.errors().to_vec();
-    crate::allow_every_cause(&mut result);
+    let result = crate::allow_every_cause(result);
     if let Some(error) = result.errors().first() {
         return Err(Error::new(Span::call_site(), &error.message));
     }
     let referrer = result.into_referrer();
     let id = nested.id;
     let self_param = ident("__S");
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let mut impls = TokenStream::new();
     for ix in 0..referrer.iter().count() {
         let r = referrer
             .repeater_impl(ix, ImplSelf::Param(&self_param), array_const)
             .map_err(Error::from)?;
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+        let (self_ty, ty) = (&r.self_ty, &r.ty);
+        let trait_path = slots.trait_path(&r.args, id, ix);
         impls.extend(quote! {
-            impl #impl_generics crate::Repeater<#args, #id, #ix> for #self_ty #where_clause {
+            impl #impl_generics #trait_path for #self_ty #where_clause {
                 type Type = #ty;
             }
         });
@@ -254,7 +256,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         strict,
     } = parse2(input)?;
     if strict {
-        result.deny_ambiguous_crate_name();
+        result = result.deny_ambiguous_crate_name();
     }
     let referrer = result.into_referrer();
     let id = nested.id;
@@ -263,7 +265,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         .first()
         .map(|seg| seg.ident.clone())
         .ok_or_else(|| Error::new(Span::call_site(), "expected a path"))?;
-    let repeater: Path = parse_quote!(::#krate::Repeater);
+    let slots = RepeaterSlots::new(parse_quote!(::#krate::Repeater));
 
     // The copy nests the impl in the body of a method of the trait, as the Leaker nested the scopes.
     let (trait_generics, impl_generics, self_ty) = (
@@ -284,11 +286,10 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     };
     let error = std::cell::RefCell::new(None);
     referrer
-        .clone()
         .visitor(context, |_, ix| {
             let args = referrer.entry_args(ix, &UseSite::identity(), array_const);
             match args {
-                Ok(args) => parse_quote!(<() as #repeater<#args, #id, #ix>>::Type),
+                Ok(args) => slots.projection(&parse_quote!(()), &args, id, ix),
                 Err(e) => {
                     *error.borrow_mut() = Some(e);
                     parse_quote!(())

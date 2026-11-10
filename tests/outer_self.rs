@@ -195,7 +195,7 @@ fn the_self_of_a_trait_has_no_name() {
     assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
-            "the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no name \
+            "the bound of `T` mentions the `Self` of the trait `Tr<T>`, which has no name \
              here: `Self` is something else in the item around"
         )
     );
@@ -206,7 +206,7 @@ fn the_self_of_a_trait_has_no_name() {
     assert_eq!(result.into_referrer().iter().count(), 0);
     // So is it for the items of the scope, and for a where predicate.
     let bound_headline = "the bound of `T` mentions a `Self` which has no name here";
-    let predicate_headline = "the where predicate `T : :: p :: Tr < Self >` mentions a `Self` \
+    let predicate_headline = "the where predicate `T : ::p::Tr<Self>` mentions a `Self` \
                               which has no name here";
     for (generics, item, headline) in [
         (
@@ -240,11 +240,7 @@ fn the_self_of_a_trait_has_no_name() {
         let err = result.errors();
         assert_eq!(messages(err), headline, "{}", s(&item));
         let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
-        assert!(
-            note.contains("the `Self` of the trait `Tr < T >`"),
-            "{}",
-            note
-        );
+        assert!(note.contains("the `Self` of the trait `Tr<T>`"), "{}", note);
     }
 }
 
@@ -294,13 +290,13 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
     assert_eq!(
         messages(err),
         "the bound of `T` mentions a `Self` which has no name here\n\
-         use absolute path: 'Other < '_ >'"
+         use absolute path: 'Other<'_>'"
     );
     // The first error comes first, with the note which tells why, and the cause.
     assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
-            "the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no name \
+            "the bound of `T` mentions the `Self` of the trait `Tr<T>`, which has no name \
              here: `Self` is something else in the item around"
         )
     );
@@ -308,7 +304,7 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
     assert!(
         message.starts_with(
             "the bound of `T` mentions a `Self` which has no name here\n\n  \
-             = note: the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no \
+             = note: the bound of `T` mentions the `Self` of the trait `Tr<T>`, which has no \
              name here: `Self` is something else in the item around\n  \
              = note: it cannot be leaked as a whole because of `Self`\n"
         ),
@@ -317,7 +313,7 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
     );
     // Nothing of it is a note of the error about the path.
     assert!(
-        !message.contains("use absolute path: 'Rel < T >'"),
+        !message.contains("use absolute path: 'Rel<T>'"),
         "{}",
         message
     );
@@ -338,12 +334,12 @@ fn an_associated_item_of_self_has_no_name() {
     let err = result.errors();
     assert_eq!(
         messages(err),
-        "the bound of `T` mentions `Self :: X`, which has no name here"
+        "the bound of `T` mentions `Self::X`, which has no name here"
     );
     assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
-            "the bound of `T` mentions `Self :: X`, an associated item of the `Self` of `S < T >`, \
+            "the bound of `T` mentions `Self::X`, an associated item of the `Self` of `S<T>`, \
              which has no name here: `Self` is something else in the item around"
         )
     );
@@ -685,7 +681,7 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
             .first()
             .map(|(_, n)| n.as_str())
             .unwrap()
-            .contains("the `Self` of the trait `Tr < T >`"),
+            .contains("the `Self` of the trait `Tr<T>`"),
         "{:?}",
         err[0].notes.first().map(|(_, n)| n.as_str())
     );
@@ -739,7 +735,6 @@ fn the_referrer_finds_the_entry_of_a_nested_scope() {
     );
     let mut rewritten = copy.clone();
     referrer
-        .clone()
         .visitor(outer, replace)
         .visit_item_impl_mut(&mut rewritten);
     assert_eq!(s(&rewritten), s(&expected));

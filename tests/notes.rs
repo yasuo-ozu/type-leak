@@ -32,7 +32,7 @@ fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
         .allow_primitive()
         .allow_prelude()
         .allow_path_if(starts_with(parse_quote!(::p)));
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 /// What an error says.
@@ -123,7 +123,7 @@ fn an_associated_item_of_self_in_an_impl_of_a_trait_names_the_trait() {
             "Rel < Self :: A >",
             &[
                 &why("Self::A", "the trait of this impl (`::p::Tr`)"),
-                "it cannot be leaked as a whole because of `Self :: A`",
+                "it cannot be leaked as a whole because of `Self::A`",
             ],
             "replace `Self::A` with `<Self as ::p::Tr>::A`",
         )]
@@ -178,7 +178,7 @@ fn a_relative_trait_of_the_impl_is_written_as_an_absolute_path() {
             "Wrap < Self :: A >",
             &[
                 &why("Self::A", "the trait of this impl (`Tr`)"),
-                "it cannot be leaked as a whole because of `Self :: A`",
+                "it cannot be leaked as a whole because of `Self::A`",
             ],
             "replace `Self::A` with `<Self as ::my_crate::Tr>::A`, with `Tr` written as an \
              absolute path",
@@ -237,7 +237,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
                    cannot tell which trait `A` comes from";
     let notes = [
         why("Self::A", "a trait that this type implements"),
-        "it cannot be leaked as a whole because of `Self :: A`".to_string(),
+        "it cannot be leaked as a whole because of `Self::A`".to_string(),
     ];
     let notes: Vec<&str> = notes.iter().map(|note| note.as_str()).collect();
     let help =
@@ -311,7 +311,7 @@ fn an_associated_item_of_self_in_a_bound_names_the_generics() {
             "Rel < T >",
             &[
                 &why("Self::A", "the trait of this impl (`::p::Tr`)"),
-                "it cannot be leaked as a whole because of `Self :: A`",
+                "it cannot be leaked as a whole because of `Self::A`",
             ],
             "replace `Self::A` with `<Self as ::p::Tr>::A`",
         )
@@ -352,11 +352,11 @@ fn self_assoc_in_a_predicate_has_a_note_on_the_impl_of_the_trait() {
     assert_eq!(
         shown(&error(&item)),
         [Shown::new(
-            "`Self :: A` is in a bound or where predicate, and a bound of its generics names a \
+            "`Self::A` is in a bound or where predicate, and a bound of its generics names a \
              leaked type",
             "Self :: A",
             &[
-                "the copy for a concrete implementor resolves `Self :: A` by the impl of the \
+                "the copy for a concrete implementor resolves `Self::A` by the impl of the \
                trait, which needs the bound `T : Fn (Rel)` of the impl, where the copy writes \
                the leaked type as a path through the Repeater, and rustc cannot normalize the \
                one in a bound or where predicate while it checks the bounds (E0277, E0275)"
@@ -399,7 +399,7 @@ fn self_in_a_predicate_has_a_note_on_the_self_type_of_the_impl() {
 /// with the advice to write the bound without it.
 #[test]
 fn the_self_type_of_an_impl_is_named_in_the_note() {
-    let rest = "The copy writes `S < T >` as a path through the Repeater, whose impl is for \
+    let rest = "The copy writes `S<T>` as a path through the Repeater, whose impl is for \
                 `Self`, so the Referrer has no type to write for `Self`: it is the one being \
                 replaced";
     let item: ItemImpl = parse_quote!(
@@ -408,7 +408,7 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
     let err = error(&item);
     assert_eq!(
         messages(&err),
-        "`S < T >` is in the self type of the impl, and a bound of its generics names `Self`\n\
+        "`S<T>` is in the self type of the impl, and a bound of its generics names `Self`\n\
          `Self` is in a bound or where predicate, and a bound of its generics names `Self`, \
          which is a leaked type"
     );
@@ -416,11 +416,11 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
         shown(&err),
         [
             Shown::new(
-                "`S < T >` is in the self type of the impl, and a bound of its generics names \
+                "`S<T>` is in the self type of the impl, and a bound of its generics names \
                  `Self`",
                 "S < T >",
                 &[
-                    &format!("`Self` is `S < T >`, the self type of the impl. {}", rest),
+                    &format!("`Self` is `S<T>`, the self type of the impl. {}", rest),
                     "it cannot be leaked as a whole because of `Self`",
                 ],
                 "write `S<T>` with an absolute path, or the bound of its generics without `Self`",
@@ -431,8 +431,8 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
                 "Self",
                 &[
                     "`Self` is the self type of the impl, which the copy writes with its leaked \
-                   types as paths through the Repeater, and the bound `T : AsRef < Option < \
-                   Self > >` of their generics names `Self`, which the copy writes as the self \
+                   types as paths through the Repeater, and the bound `T : AsRef<Option<\
+                   Self>>` of their generics names `Self`, which the copy writes as the self \
                    type of the impl, a path through the Repeater that rustc has not \
                    normalized yet in the environment, where it must prove the bound (E0277, \
                    E0271)"
@@ -452,12 +452,12 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
     assert_eq!(
         shown[0],
         Shown::new(
-            "`Rel < T >` is in the self type of the impl, and a bound of its generics names \
+            "`Rel<T>` is in the self type of the impl, and a bound of its generics names \
              `Self`",
             "Rel < T >",
             &[
-                "`Self` is the self type `:: p :: W < Rel < T > , U >` of the impl, which \
-                 contains `Rel < T >`. The copy writes `Rel < T >` as a path through the \
+                "`Self` is the self type `::p::W<Rel<T>, U>` of the impl, which \
+                 contains `Rel<T>`. The copy writes `Rel<T>` as a path through the \
                  Repeater, whose impl is for `Self`, so the Referrer has no type to write for \
                  `Self`: it is the one being replaced",
                 "it cannot be leaked as a whole because of `Self`",
@@ -469,7 +469,7 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
         shown[1].notes,
         [
             "`Self` is the self type of the impl, which the copy writes with its leaked types as \
-          paths through the Repeater, and the bound `T : AsRef < Self >` of their generics names \
+          paths through the Repeater, and the bound `T : AsRef<Self>` of their generics names \
           `Self`, which the copy writes as the self type of the impl, a path through the \
           Repeater that rustc has not normalized yet in the environment, where it must prove the \
           bound (E0277, E0271)"
@@ -499,17 +499,17 @@ fn the_note_of_a_hidden_lifetime_says_where_the_holder_is_not_leaked() {
     assert_eq!(
         shown(err),
         [Shown::new(
-            "use absolute path: 'Rel < T >'",
+            "use absolute path: 'Rel<T>'",
             "Rel < T >",
             &[
-                "the output `& u8` has an elided lifetime, which elision takes from the only \
+                "the output `&u8` has an elided lifetime, which elision takes from the only \
                  lifetime of the inputs, which a path hides (the Leaker does not see it), but a \
                  leaked type in the inputs has `'a` among its generics, and the copy names it \
                  in the arguments of its projection, so the inputs have more than one lifetime \
                  (E0106), so a type using them cannot be leaked alone, and the type holding the \
                  signature would be leaked as a whole instead",
-                "it cannot be leaked as a whole because of `impl Fn (:: p :: WRef < u8 > , Rel < \
-                 T >) -> & u8`",
+                "it cannot be leaked as a whole because of `impl Fn (::p::WRef<u8>, Rel<\
+                 T>) -> &u8`",
             ],
             "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output, \
              or write `Rel<T>` with an absolute path",

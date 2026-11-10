@@ -20,14 +20,16 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
     leaker.intern_mod(&item);
     let referrer = leaker.result().finish().unwrap();
 
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let param: Ident = parse_quote!(__S);
     let r = referrer
-        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .repeater_impl(0, ImplSelf::Param(&param), slots.const_fn())
         .unwrap();
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-    let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    let (self_ty, ty) = (&r.self_ty, &r.ty);
+    let repeater = slots.trait_path(&r.args, 7, 0);
     let imp: ItemImpl = parse_quote! {
-        impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+        impl #impl_generics #repeater for #self_ty #where_clause {
             type Type = #ty;
         }
     };
@@ -251,9 +253,7 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     // The impl encodes the parameters themselves...
     let param: Ident = parse_quote!(__S);
     let r = referrer
-        .repeater_impl(0, ImplSelf::Param(&param), |value, param| {
-            slots.encode_const(value, &param.ty)
-        })
+        .repeater_impl(0, ImplSelf::Param(&param), slots.const_fn())
         .unwrap();
     assert_eq!(
         r.args,
@@ -269,7 +269,7 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
         .entry_args(
             0,
             &UseSite::substituting(&tr.generics.params, &trait_args),
-            |value, param| slots.encode_const(value, &param.ty),
+            slots.const_fn(),
         )
         .unwrap();
     assert_eq!(
@@ -422,16 +422,17 @@ fn repeater_impl_for_each_entry_of_a_trait() {
     let referrer = leaker.result().finish().unwrap();
 
     let self_param: Ident = parse_quote!(__S);
-    let repeater: Path = parse_quote!(crate::Repeater);
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let impls: Vec<ItemImpl> = (0..referrer.iter().count())
         .map(|ix| {
             let r = referrer
-                .repeater_impl(ix, ImplSelf::Param(&self_param), array_const)
+                .repeater_impl(ix, ImplSelf::Param(&self_param), slots.const_fn())
                 .unwrap();
             let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-            let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+            let (self_ty, ty) = (&r.self_ty, &r.ty);
+            let repeater = slots.trait_path(&r.args, 7, ix);
             parse_quote! {
-                impl #impl_generics #repeater<#args, 7u64, #ix> for #self_ty #where_clause {
+                impl #impl_generics #repeater for #self_ty #where_clause {
                     type Type = #ty;
                 }
             }

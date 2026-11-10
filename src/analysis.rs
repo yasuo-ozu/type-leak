@@ -62,10 +62,11 @@ pub struct CheckResult {
     /// Causes that cannot be leaked (an elided lifetime, `impl Trait`), in order of appearance,
     /// then the mentions of `Self` that have no meaning.
     pub impossible: Vec<Cause>,
-    /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
-    /// must be leaked whole; `false` if `must` is empty or only its parts are causes
-    /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
-    /// holding it ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).
+    /// `true` if the type is leaked whole, so a conflict cannot be solved by leaking its parts
+    /// (`MyType<'_>`; `::ext::W<Rel>` has `must` `[Rel]` and no conflict); `false` if `must` is
+    /// empty or only the parts are leaked (`::path::Wrap<MyType, '_>`). A bare identifier argument
+    /// counts as a cause of the type holding it ([Bare identifiers and
+    /// consts](crate::Leaker#bare-identifiers-and-consts)).
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`), which the Referrer may not share. `must` holds only its
@@ -74,7 +75,7 @@ pub struct CheckResult {
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no meaning).
     /// Reported first.
     pub note: Option<String>,
-    /// What to write instead, as tokens. If it is `None`, the [`ErrorItem`] suggests the absolute
+    /// What to write instead, as text. If it is `None`, the [`ErrorItem`] suggests the absolute
     /// path of the first of `must` ([`ErrorItem::help`](crate::ErrorItem::help)).
     pub help: Option<String>,
     /// The message of the [`ErrorItem`] if the fault is not that the path of the type is relative.

@@ -150,6 +150,43 @@ fn has_self_tells_whether_an_entry_names_self() {
     assert!(!leaker.result().finish().unwrap().has_self());
 }
 
+/// `has_self()` is true if some entry `needs_self()`, also if its context has `Self` only in
+/// `Self: 'a`, which is not a leaked type nor a generic of the context.
+#[test]
+fn has_self_is_true_if_some_entry_needs_self() {
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr<'a>
+            where
+                Self: 'a,
+            {
+                fn f(&'a self) -> &'a Rel;
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
+    assert!(referrer.needs_self(0));
+    assert!(referrer.has_self());
+    let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
+    assert!(parsed.has_self());
+
+    // No entry needs `Self`.
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr<T> {
+                fn f(&self, t: Rel<T>) -> Rel2;
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
+    assert!((0..referrer.iter().count()).all(|ix| !referrer.needs_self(ix)));
+    assert!(!referrer.has_self());
+}
+
 /// `complete_args()` adds the omitted defaulted argument, written by `type_fn`.
 #[test]
 fn complete_args_fills_the_defaulted_parameter() {
@@ -159,14 +196,15 @@ fn complete_args_fills_the_defaulted_parameter() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     // For `impl Tr<u8> for ..`, omitting `U`.
     let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
     let completed = referrer
         .complete_args(
-            &args.args,
+            top_level,
             &tr.generics.params,
+            &args.args,
             |_, ix, _| parse_quote!(Leaked<#ix>),
         )
         .unwrap();
@@ -220,7 +258,6 @@ fn outermost_generics_as_leakers_replaces_despite_other_bounds() {
     );
     let mut copy = item.clone();
     referrer
-        .clone()
         .visitor(context, replace)
         .visit_item_impl_mut(&mut copy);
     assert_eq!(copy, item); // `T: Clone` is not the generic of the trait: nothing is replaced.
@@ -289,7 +326,6 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .clone()
         .visitor(module, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
         .with_nested_self(|nested, _leaked, ix| {
             let ident = nested.ident.as_ref().unwrap();
@@ -322,13 +358,15 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
     ));
 
     // The Leaker's crate: the impl is for any type `__S` that `T: AsRef<__S>` holds for.
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     let param: Ident = parse_quote!(__S);
     let r = referrer
-        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .repeater_impl(0, ImplSelf::Param(&param), slots.const_fn())
         .unwrap();
-    let (generics, args, ty) = (&r.generics, &r.args, &r.ty);
+    let (generics, ty) = (&r.generics, &r.ty);
+    let repeater = slots.trait_path(&r.args, 7, 0);
     let imp: ItemImpl = parse_quote! {
-        impl #generics Repeater<#args, 7u64, 0usize> for __S { type Type = #ty; }
+        impl #generics #repeater for __S { type Type = #ty; }
     };
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S: ?::core::marker::Sized>
@@ -346,19 +384,16 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .clone()
         .visitor(
             module,
             |_, ix| parse_quote!(<() as Repeater<(), 7u64, #ix>>::Type),
         )
         .with_nested_self(|_nested, _leaked, ix| {
             let args = referrer
-                .entry_args(ix, &UseSite::identity(), array_const)
+                .entry_args(ix, &UseSite::identity(), slots.const_fn())
                 .unwrap();
             match referrer.context_self(referrer.context(ix)) {
-                Some(SelfRequirement::Any) => {
-                    parse_quote!(<Self as Repeater<#args, 7u64, #ix>>::Type)
-                }
+                Some(SelfRequirement::Any) => slots.projection(&parse_quote!(Self), &args, 7, ix),
                 _ => unimplemented!("the Leaker's type, from `nested`"),
             }
         })
@@ -385,8 +420,7 @@ fn nested_self_keeps_an_absolute_self_type_as_written_for_a_strict_referrer() {
     let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
-    let mut result = leaker.result();
-    result.deny_ambiguous_crate_name(); // strict
+    let result = leaker.result().deny_ambiguous_crate_name(); // strict
     let referrer = result.finish().unwrap();
     assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
 
@@ -396,7 +430,6 @@ fn nested_self_keeps_an_absolute_self_type_as_written_for_a_strict_referrer() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .clone()
         .visitor(module, |_leaked, ix| parse_quote!(Entry<#ix>))
         .with_nested_self(|_nested, _leaked, ix| parse_quote!(LeakersType<#ix>))
         .visit_file_mut(&mut file);

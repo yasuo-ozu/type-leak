@@ -23,7 +23,8 @@
 //! - The Repeater is a trait of crate A (`repo::Repeater`, at its root). It cannot be in the
 //!   proc-macro crate (which exports only macros), and it cannot be in a third crate: crate A
 //!   implements it for any `Self` (`impl<S: ?Sized> Repeater<..> for S`), which the orphan rule
-//!   allows only for a local trait.
+//!   allows only for a local trait. The macros write the Repeater with its arguments through
+//!   `RepeaterSlots::trait_path()` and `projection()`, not by hand.
 //! - Crate B cannot be given the Referrer by crate A directly, because crate A does not know the
 //!   input of B's macro. So crate A defines a `macro_rules!` which B calls; it adds what only A
 //!   knows (`$crate::Repeater`, the id, the Referrer, the top-level `ContextId`, the trait) to the
@@ -50,7 +51,8 @@ use syn::{
     ItemTrait, Path, PathArguments, Token, TraitItem, Type,
 };
 use type_leak::{
-    array_const, ContextId, EncodeError, ErrorItem, ImplSelf, Leaker, Referrer, UseSite,
+    array_const, ContextId, EncodeError, ErrorItem, ImplSelf, Leaker, Referrer, RepeaterSlots,
+    UseSite,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -74,6 +76,7 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
     //    the entries mean what they mean in the trait.
     let id = id_of(&item_trait);
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let self_param: syn::Ident = parse_quote!(__S);
     let mut impls: Vec<ItemImpl> = vec![];
     for ix in 0..referrer.iter().count() {
@@ -86,9 +89,10 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+        let (self_ty, ty) = (&r.self_ty, &r.ty);
+        let repeater = slots.trait_path(&r.args, id, ix);
         impls.push(parse_quote! {
-            impl #impl_generics crate::Repeater<#args, #id, #ix> for #self_ty #where_clause {
+            impl #impl_generics #repeater for #self_ty #where_clause {
                 type Type = #ty;
             }
         });
@@ -223,6 +227,7 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
         trait_path,
         wrapper,
     } = finish;
+    let slots = RepeaterSlots::new(repeater);
     let name = &wrapper.ident;
     let inner = match wrapper.fields.iter().next() {
         Some(field) if wrapper.fields.len() == 1 => &field.ty,
@@ -237,8 +242,8 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
 
     // Where the copy is: `impl<K> Repo<K> for W` declares the generics of the trait itself
     // (`UseSite::identity()`). `impl Repo<u8> for W` gives them arguments, which the paths through
-    // the Repeater must carry (`UseSite::substituting(..)`), and which we write in the types that
-    // are not leaked (`t: K`) ourselves.
+    // the Repeater must carry (`UseSite::substituting(..)`), and which `UseSite::substitute()`
+    // writes in the types that are not leaked (`t: K`).
     let explicit: Option<Vec<GenericArgument>> =
         match &trait_path.segments.last().unwrap().arguments {
             PathArguments::AngleBracketed(args) => Some(args.args.iter().cloned().collect()),
@@ -247,9 +252,10 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     let (impl_generics, trait_path, site) = match &explicit {
         Some(args) => {
             // Arguments the copy omits take the defaults of the trait.
-            let args = enc(referrer.complete_args(args, &generics.params, |_, _, _| {
+            let completed = referrer.complete_args(top_level, &generics.params, args, |_, _, _| {
                 unreachable!("the traits of this example have no default that names a leaked type")
-            }))?;
+            });
+            let args = enc(completed)?;
             (
                 quote!(),
                 trait_path,
@@ -279,21 +285,17 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                 let mut sig = method.sig.clone();
                 // 3. Replace each leaked type with its path through the Repeater. The visitor
                 //    needs the whole signature, and the `ContextId` of the trait.
-                let mut visitor = referrer.clone().visitor(top_level, |_leaked, ix| {
+                let mut visitor = referrer.visitor(top_level, |_leaked, ix| {
                     // The arguments of the Repeater, as written at this site. The paths come out
                     // as the impls of crate A have them, because both use `Referrer`.
                     let args = referrer
                         .entry_args(ix, &site, array_const)
                         .expect("the arguments can be encoded");
-                    parse_quote!(<Self as #repeater<#args, #id, #ix>>::Type)
+                    slots.projection(&parse_quote!(Self), &args, id, ix)
                 });
                 visitor.visit_signature_mut(&mut sig);
-                if let Some(args) = &explicit {
-                    Substitute {
-                        params: generics.params.iter().collect(),
-                        args,
-                    }
-                    .visit_signature_mut(&mut sig);
+                if explicit.is_some() {
+                    Written(&site).visit_signature_mut(&mut sig);
                 }
                 let receiver = match sig.receiver() {
                     Some(r) if r.reference.is_some() && r.mutability.is_some() => {
@@ -349,25 +351,12 @@ fn own_name(param: &GenericParam) -> GenericArgument {
     }
 }
 
-/// Replaces the type parameters of the trait with the arguments of `impl Trait<Args> for ..`, in
-/// the types that are not leaked. (The visitor of `type-leak` replaces only leaked types.)
-struct Substitute<'a> {
-    params: Vec<&'a GenericParam>,
-    args: &'a [GenericArgument],
-}
+/// Writes the types that are not leaked as they are at the site: `K` is `u8` in `impl Repo<u8> for
+/// ..`. (The visitor of `type-leak` replaces only leaked types.)
+struct Written<'a>(&'a UseSite);
 
-impl VisitMut for Substitute<'_> {
+impl VisitMut for Written<'_> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        if let Type::Path(path) = ty {
-            for (param, arg) in self.params.iter().zip(self.args) {
-                if let (GenericParam::Type(param), GenericArgument::Type(arg)) = (param, arg) {
-                    if path.qself.is_none() && path.path.is_ident(&param.ident) {
-                        *ty = arg.clone();
-                        return;
-                    }
-                }
-            }
-        }
-        syn::visit_mut::visit_type_mut(self, ty);
+        *ty = self.0.substitute(ty);
     }
 }

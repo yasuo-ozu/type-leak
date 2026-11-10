@@ -32,7 +32,7 @@ pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{array_const, EncodeError};
 pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};
 pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};
-pub use crate::leaker::{Leaker, LeakerResult};
+pub use crate::leaker::{Leaker, LeakerResult, Options};
 pub use crate::referrer::{NestedSelf, Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, RepeaterSlots};
 pub use crate::view::View;

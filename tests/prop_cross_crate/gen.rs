@@ -581,7 +581,7 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
 /// `value_path`: a body, a constant or a default has a relative path of a value (`crate::base::bf()`,
-/// `RLEN`), which the `check_values` argument of `Leaker::from_config()` rejects (`values`).
+/// `RLEN`), which `Options::check_values()` rejects (`values`).
 pub const TAG_VALUE_PATH: &str = "value_path";
 /// `relative_std`: a path of `std`, `core` or `alloc` is written without the leading `::` in the item.
 /// The Leaker leaks it unless it allows them (the rule `std` of `allow_stages` does not), so in a

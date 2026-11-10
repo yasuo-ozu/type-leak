@@ -50,7 +50,7 @@ fn analyzed(item: &ItemImpl) -> LeakerResult {
 /// `result` with these causes allowed.
 fn allowing(mut result: LeakerResult, causes: &[Cause]) -> LeakerResult {
     for cause in causes {
-        result.allow(|e| e.cause == cause.clone());
+        result = result.allow(|e| e.cause == cause.clone());
     }
     result
 }
@@ -112,8 +112,8 @@ fn the_item_has_one_error() {
 
 #[test]
 fn allowing_the_cause_of_the_error_accepts_the_item() {
-    let mut result = analyzed(&f_and_g());
-    assert!(result.allow(|e| e.cause == rel_tr()).errors().is_empty());
+    let result = analyzed(&f_and_g()).allow(|e| e.cause == rel_tr());
+    assert!(result.errors().is_empty());
     assert!(result.finish().is_ok());
     // The cause of the error itself is the same.
     let cause = errors_of_f_and_g().remove(0).cause;
@@ -161,7 +161,7 @@ fn a_cause_written_by_hand_matches_one_that_the_analysis_made() {
 fn allowing_a_cause_leaves_the_referrer_as_it_is() {
     let mut result = analyzed(&f_and_g());
     let referrer = result.clone().into_referrer();
-    result.allow(|e| e.cause == rel_tr());
+    result = result.allow(|e| e.cause == rel_tr());
     assert!(result.errors().is_empty());
     assert_eq!(result.into_referrer(), referrer);
 }
@@ -180,7 +180,7 @@ fn the_entries_are_those_of_the_item_without_the_conflict() {
 fn allowed_paths_would_change_more() {
     // The trait made context-free everywhere: `g` loses its required entry too.
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(RelTr)));
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_impl(&f_and_g(), true);
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.iter().all(|ty| *ty != parse_quote!(dyn RelTr)));
@@ -309,7 +309,7 @@ fn conflict_in_an_inner_scope() -> (LeakerResult, ContextId) {
 fn an_error_in_an_inner_scope_is_dropped_by_allowing_its_cause() {
     let (mut result, _) = conflict_in_an_inner_scope();
     assert_eq!(result.errors().len(), 1);
-    result.allow(|e| e.cause == rel_tr());
+    result = result.allow(|e| e.cause == rel_tr());
     // The scope stays, with the entries that it also holds.
     let referrer = result.finish().unwrap();
     let required: Vec<&Type> = referrer.required().map(|(_, ty)| ty).collect();
@@ -362,7 +362,7 @@ fn the_errors_of_the_inner_and_the_outer_scope_are_one_list_in_order() {
     let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
     assert_eq!(causes, [rel_tr(), Cause::Trait(parse_quote!(Other))]);
     // Allowing the first leaves the second.
-    result.allow(|e| e.cause == rel_tr());
+    result = result.allow(|e| e.cause == rel_tr());
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(Other)));
     // The scope keeps `Rel<T>` as well, and the conflicts it recovered from.
@@ -643,17 +643,17 @@ fn a_value_with_a_self_without_meaning_is_copied_whole() {
             let b: Rel2 = ::core::default::Default::default();
         }
     );
-    let mut leaker = Leaker::from_config(Allow::new(), true, false);
+    let mut leaker = Leaker::from_config(Allow::new(), Options::new().check_values());
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Fn(item.clone()))
     });
-    let mut result = leaker.result();
+    let result = leaker.result();
     assert!(!result.errors().is_empty());
     assert!(result
         .errors()
         .iter()
         .all(|error| error.reason == Reason::SelfWithoutMeaning));
-    allow_every_cause(&mut result);
+    let (result, _) = allow_every_cause(result);
     assert_eq!(
         listed(&result.finish().unwrap()),
         [("Rel2".to_string(), true)]
@@ -694,7 +694,7 @@ fn unreadable_syntax_in_a_body_is_accepted_with_check_values() {
         }
     );
     let analyze = || {
-        let mut leaker = Leaker::from_config(Allow::new(), true, false);
+        let mut leaker = Leaker::from_config(Allow::new(), Options::new().check_values());
         leaker.intern_trait(&item, true);
         leaker.result()
     };
@@ -838,7 +838,7 @@ fn accepting_self_in_a_predicate_leaves_the_bound_of_its_context_leaked() {
                 X: Into<Self::A0>;
         }
     );
-    let mut leaker = Leaker::from_config(std_config(), false, false);
+    let mut leaker = Leaker::from_config(std_config(), Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert_eq!(
@@ -865,7 +865,7 @@ fn accepting_a_predicate_in_an_impl_leaves_the_bound_of_its_context_leaked() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(std_config(), false, false);
+    let mut leaker = Leaker::from_config(std_config(), Options::new());
     leaker.intern_impl(&on_self, false);
     let result = leaker.result();
     assert_eq!(
@@ -885,7 +885,7 @@ fn accepting_a_predicate_in_an_impl_leaves_the_bound_of_its_context_leaked() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(std_config(), false, false);
+    let mut leaker = Leaker::from_config(std_config(), Options::new());
     leaker.intern_impl(&on_other, false);
     let result = leaker.result();
     assert_eq!(
@@ -918,7 +918,7 @@ fn a_cause_is_equal_whatever_the_spacing_of_its_punctuation() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(Allow::new(), true, false);
+    let mut leaker = Leaker::from_config(Allow::new(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let mut result = leaker.result();
     assert_eq!(result.errors().len(), 1);
@@ -931,7 +931,7 @@ fn a_cause_is_equal_whatever_the_spacing_of_its_punctuation() {
     assert_eq!(made, lexed);
     assert_eq!(hash_of(&made), hash_of(&lexed));
     // The one that was lexed accepts the conflict.
-    result.allow(|e| e.cause == lexed);
+    result = result.allow(|e| e.cause == lexed);
     assert!(result.finish().is_ok());
 }
 
@@ -1061,7 +1061,7 @@ fn allow_std_crates_drops_the_causes_that_start_with_std_core_or_alloc() {
     let mut result = result_of_paths();
     let referrer = result.clone().into_referrer();
     // `Clone` and `Vec<..>` are prelude names, not paths of a crate.
-    result.allow_std_crates();
+    result = result.allow_std_crates();
     assert_eq!(
         causes(&result),
         ["Clone", "Vec < Rel < '_ > >", "Rel < '_ >", "MyType < '_ >"]
@@ -1073,12 +1073,12 @@ fn allow_std_crates_drops_the_causes_that_start_with_std_core_or_alloc() {
 fn allow_std_crates_chains_with_allow() {
     let mut result = result_of_paths();
     let referrer = result.clone().into_referrer();
-    result.allow_std_crates();
+    result = result.allow_std_crates();
     assert_eq!(
         causes(&result),
         ["Clone", "Vec < Rel < '_ > >", "Rel < '_ >", "MyType < '_ >"]
     );
-    result
+    result = result
         .allow(|e| e.cause == Cause::Trait(parse_quote!(Clone)))
         .allow(|e| e.cause == Cause::Type(parse_quote!(Vec<Rel<'_>>)))
         .allow(|e| e.cause == Cause::Type(parse_quote!(Rel<'_>)))
@@ -1101,7 +1101,7 @@ fn allow_std_crates_needs_every_relative_path_of_the_cause() {
         config: Allow<P, E>,
         item: &ItemTrait,
     ) -> LeakerResult {
-        let mut leaker = Leaker::from_config(config, false, false);
+        let mut leaker = Leaker::from_config(config, Options::new());
         leaker.intern_trait(item, true);
         leaker.result()
     }
@@ -1125,7 +1125,7 @@ fn allow_std_crates_needs_every_relative_path_of_the_cause() {
             vec!["std :: fmt :: Formatter"]
         ]
     );
-    result.allow_std_crates();
+    result = result.allow_std_crates();
     assert_eq!(causes(&result), ["std :: vec :: Vec < Rel < '_ > >"]);
     // The config reports the part that is not allowed.
     let config = Allow::new().allow_std_crates();
@@ -1147,7 +1147,7 @@ fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
     // `u8` in the arguments of the value is a path of it, which a rule has to allow too (F50).
     let analyze = || {
         let config = Allow::new().allow_primitive();
-        let mut leaker = Leaker::from_config(config, true, false);
+        let mut leaker = Leaker::from_config(config, Options::new().check_values());
         leaker.intern_trait(&item, true);
         leaker.result()
     };
@@ -1155,21 +1155,18 @@ fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
     let has = |kind: fn(&Cause) -> bool| result.errors().iter().any(|e| kind(&e.cause));
     assert!(has(|cause| matches!(cause, Cause::Macro(_))));
     assert!(has(|cause| matches!(cause, Cause::Expr(_))));
-    let mut left = analyze();
-    left.allow_std_crates();
+    let left = analyze().allow_std_crates();
     // Only `inner::make` is left: the macro and the value of `core` are dropped.
     assert_eq!(causes(&left), ["inner :: make"]);
     // `allow(cause)` drops each of them, whatever its kind.
-    let mut left = analyze();
-    allow_every_cause(&mut left);
+    let (left, _) = allow_every_cause(analyze());
     assert!(left.errors().is_empty());
 }
 
 /// A cause with no path is never dropped: `Self`, an unreadable syntax, a closure.
 #[test]
 fn a_cause_without_a_path_is_never_dropped() {
-    let mut result = without_self(&[parse_quote!(Rel<Self>)]);
-    result.allow_std_crates();
+    let result = without_self(&[parse_quote!(Rel<Self>)]).allow_std_crates();
     assert_eq!(result.errors().len(), 1);
 
     let item: ItemTrait = parse_quote!(
@@ -1181,11 +1178,11 @@ fn a_cause_without_a_path_is_never_dropped() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(Allow::new(), true, false);
+    let mut leaker = Leaker::from_config(Allow::new(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let mut result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    result.allow_std_crates();
+    result = result.allow_std_crates();
     assert_eq!(result.errors().len(), 1);
 }
 
@@ -1196,10 +1193,10 @@ fn finish_is_ok_only_if_no_error_remains() {
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].cause, rel_tr());
     // Allowing something else leaves the error, allowing the cause leaves the Referrer.
-    result.allow(|e| e.cause == Cause::Trait(parse_quote!(Other)));
+    result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(Other)));
     assert!(result.clone().finish().is_err());
     let recovered = result.clone().into_referrer();
-    result.allow(|e| e.cause == rel_tr());
+    result = result.allow(|e| e.cause == rel_tr());
     assert_eq!(result.finish().unwrap(), recovered);
     // No error at all.
     assert!(analyzed(&g_only()).finish().is_ok());
@@ -1286,13 +1283,13 @@ fn nested_scopes_record_each_error_once_in_the_order_found() {
     // The parts: the outer one, and those of the inner scopes.
     assert_eq!(parts_of(&referrer).len(), 4);
     // Allowing leaves the rest, and the Referrer as it is.
-    result
+    result = result
         .allow(|e| e.cause == rel_tr())
         .allow(|e| e.cause == other);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].cause, unknown);
     assert_eq!(result.clone().into_referrer(), referrer);
-    result.allow(|e| e.cause == unknown);
+    result = result.allow(|e| e.cause == unknown);
     assert_eq!(result.finish().unwrap(), referrer);
 }
 
@@ -1351,7 +1348,7 @@ fn leak_trait<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     config: Allow<P, E>,
     item: &ItemTrait,
 ) -> (LeakerResult, ContextId) {
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_trait(item, true);
     (leaker.result(), context)
 }
@@ -1369,7 +1366,6 @@ fn referrer_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
 fn rewritten(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> ItemTrait {
     let mut copy = item.clone();
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(Entry<#ix>))
         .visit_item_trait_mut(&mut copy);
     copy
@@ -1441,7 +1437,7 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
     );
     assert!(parts_of(&leaker.result().finish().unwrap()).is_empty());
     assert!(parts_of(
-        &Leaker::from_config(Allow::new(), false, false)
+        &Leaker::from_config(Allow::new(), Options::new())
             .result()
             .into_referrer()
     )
@@ -1462,8 +1458,7 @@ fn the_visitor_leaves_a_part_as_written_and_replaces_the_entry_with_the_same_tok
     );
     assert_eq!(rewritten(&referrer, context, &item), expected);
     // A strict Referrer replaces the optional entry as a whole.
-    let mut strict = result;
-    strict.deny_ambiguous_crate_name();
+    let strict = result.deny_ambiguous_crate_name();
     let strict = strict.into_referrer();
     let expected: ItemTrait = parse_quote!(
         trait Fg {
@@ -1494,7 +1489,6 @@ fn an_item_beside_the_conflict_in_the_same_context_is_still_replaced() {
     assert_eq!(parts_of(&referrer).len(), 1);
     let mut copy = st.clone();
     referrer
-        .clone()
         .visitor(in_struct, |_, ix| parse_quote!(Entry<#ix>))
         .visit_item_struct_mut(&mut copy);
     let expected: ItemStruct = parse_quote!(
@@ -1668,7 +1662,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
     // Only `dyn RelTr` is the cause of the error: it is copied as written, in the path that owns
     // the elided lifetime. `Rel` beside it is an entry, and replaced.
     let list = |ty: Type| -> (Entries, Type) {
-        let mut leaker = Leaker::from_config(std_config(), false, false);
+        let mut leaker = Leaker::from_config(std_config(), Options::new());
         let (context, ()) =
             leaker.enter_generics(&Generics::default(), |view| view.visit_type(&ty));
         let referrer = leaker.result().into_referrer();
@@ -1809,9 +1803,7 @@ fn a_part_of_a_module_is_left_as_written_in_that_module_only() {
     assert_eq!(parts.len(), 2);
     assert_ne!(parts[0], parts[1]);
     let mut items = item.content.unwrap().1;
-    let mut visitor = referrer
-        .clone()
-        .visitor(context, |_, ix| parse_quote!(Entry<#ix>));
+    let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(Entry<#ix>));
     for item in &mut items {
         visitor.visit_item_mut(item);
     }
@@ -1847,7 +1839,7 @@ fn a_path_of_a_value_that_conflicts_is_a_part_with_the_types_in_it() {
         }
     );
     let leak = || {
-        let mut leaker = Leaker::from_config(std_config(), true, false);
+        let mut leaker = Leaker::from_config(std_config(), Options::new().check_values());
         let context = leaker.intern_trait(&item, true);
         (leaker.result(), context)
     };

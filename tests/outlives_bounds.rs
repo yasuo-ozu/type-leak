@@ -524,12 +524,11 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
         };
         let replace = |_: Type, ix: usize| -> Type { parse_quote!(P<#ix>) };
         // The copy declares the generics of the trait as they are: it is the scope itself.
-        let copy = rewrite(&mut referrer.clone().visitor(context, replace));
+        let copy = rewrite(&mut referrer.visitor(context, replace));
         assert!(!copy.contains("Rel"), "{}", copy);
         // The generics of the trait are those of the context, whatever the copy declares.
         let copy = rewrite(
             &mut referrer
-                .clone()
                 .visitor(context, replace)
                 .with_outermost_generics_as_leakers(),
         );
@@ -543,9 +542,7 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     let referrer = leaker.result().finish().unwrap();
     let mut sig: Signature = parse_quote!(fn f<'a, T: ::core::clone::Clone>(x: Rel<'a, T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
-        &mut referrer
-            .clone()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut sig,
     );
     assert!(s(&sig).contains("Rel"), "{}", s(&sig));
@@ -564,9 +561,7 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     let referrer = leaker.result().finish().unwrap();
     let mut sig: Signature = parse_quote!(fn f<'a, T>(x: &'a Rel<T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
-        &mut referrer
-            .clone()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut sig,
     );
     assert!(!s(&sig).contains("Rel"), "{}", s(&sig));

@@ -46,7 +46,7 @@
 //! `LeakerResult` (the Referrer, then the errors, as tokens). The Referrer's invocation says what
 //! it allows (`allow(std_crates, trait Path, type Ty)`: `LeakerResult::allow_std_crates()`,
 //! `allow(cause)`), [`apply()`] reports every error that remains with
-//! `ErrorItem::to_compile_error()`, and copies the item with the recovered Referrer either way.
+//! `ErrorItem::emit()`, and copies the item with the recovered Referrer either way.
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream};
 use std::collections::HashSet;
@@ -101,7 +101,7 @@ pub(crate) struct Args {
     /// `unimplemented!()` and a value of the type of the constant.
     bodies: bool,
     /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
-    /// that does (the `nested_self_entries` argument of `Leaker::from_config()`).
+    /// that does ([`Options::nested_self_entries()`]).
     nested_self_entries: bool,
     /// `marker = "::path::Marker"`: the impls of the entries where `Referrer::needs_self()` is false
     /// are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner, where
@@ -318,7 +318,7 @@ impl Rule {
         ident(&format!("__tl_stages_{}_{}", self.name(), id))
     }
 
-    fn on_result(self, result: &mut LeakerResult) {
+    fn on_result(self, result: LeakerResult) -> LeakerResult {
         match self {
             Rule::Prelude => result.allow_prelude(),
             Rule::Crate => result.allow_crate(),
@@ -329,7 +329,7 @@ impl Rule {
             Rule::StdCrates => result.allow_std_crates(),
             Rule::Values => result.allow_values(),
             Rule::Default => result.allow_default(),
-        };
+        }
     }
 }
 
@@ -419,7 +419,14 @@ fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     args: &Args,
     config: Allow<P, E>,
 ) -> (LeakerResult, ContextId, TokenStream) {
-    let mut leaker = Leaker::from_config(config, args.values, args.nested_self_entries);
+    let mut options = Options::new();
+    if args.values {
+        options = options.check_values();
+    }
+    if args.nested_self_entries {
+        options = options.nested_self_entries();
+    }
+    let mut leaker = Leaker::from_config(config, options);
     let allow_self = args.allow_self;
     let context = match (args.scope.as_str(), item) {
         ("mod", Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_)) => {
@@ -553,9 +560,7 @@ fn repeater_impls(
             },
         };
         let r = referrer
-            .repeater_impl(ix, target, |value, param| {
-                slots.encode_const(value, &param.ty)
-            })
+            .repeater_impl(ix, target, slots.const_fn())
             .map_err(Error::from)?;
         check_impl_pieces(referrer, ix, id, &r, &self_param, marker)?;
         if !strict && !referrer.must(ix) {
@@ -568,11 +573,12 @@ fn repeater_impls(
             .map(|p| p.to_vec())
             .unwrap_or_default();
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+        let (self_ty, ty) = (&r.self_ty, &r.ty);
+        let trait_path = slots.trait_path(&r.args, id, ix);
         impls.push((
             module,
             quote! {
-                impl #impl_generics #repeater<#args, #id, #ix> for #self_ty #where_clause {
+                impl #impl_generics #trait_path for #self_ty #where_clause {
                     type Type = #ty;
                 }
             },
@@ -1754,12 +1760,9 @@ impl Projector<'_> {
             UseSite::substituting(&self.root_params, &self.root_args).with_self(self_ty.clone());
         let encoded = self
             .referrer
-            .entry_args(ix, &site, |value, param| {
-                slots.encode_const(value, &param.ty)
-            })
+            .entry_args(ix, &site, slots.const_fn())
             .map_err(Error::from)?;
-        let (repeater, id) = (&self.repeater, self.id);
-        Ok(parse_quote!(<#self_ty as #repeater<#encoded, #id, #ix>>::Type))
+        Ok(slots.projection(&self_ty, &encoded, self.id, ix))
     }
 }
 
@@ -1854,7 +1857,7 @@ fn rewrite(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        let visitor = referrer.clone().visitor(context, |_, ix| {
+        let visitor = referrer.visitor(context, |_, ix| {
             projector.project(ix).unwrap_or_else(|e| {
                 *error.borrow_mut() = Some(e);
                 parse_quote!(())
@@ -1981,7 +1984,6 @@ fn rewrite_defaults(
         items: vec![Item::Trait(shell)],
     };
     referrer
-        .clone()
         .visitor(context, |_, ix| {
             placeholder.project(ix).unwrap_or_else(|e| {
                 *error.borrow_mut() = Some(e);
@@ -2411,8 +2413,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     if !errors.is_empty() {
         // With `accept`, the cause of every error is allowed, which must drop every error: the
         // Referrer is the recovered one either way.
-        let mut allowed = result.clone();
-        crate::allow_every_cause(&mut allowed);
+        let allowed = crate::allow_every_cause(result.clone());
         let remaining = allowed.errors().to_vec();
         if mode != Mode::Result && (!accept || !remaining.is_empty()) {
             // The item is not leaked: the Leaker's crate still has it.
@@ -2592,7 +2593,7 @@ fn count_copy(
     let dummy: Path = parse_quote!(::__dummy);
     let mut counted = result.clone();
     if args.strict == Some(true) {
-        counted.deny_ambiguous_crate_name();
+        counted = counted.deny_ambiguous_crate_name();
     }
     let counted = counted.into_referrer();
     let report = match rewrite(&counted, context, original, args, &dummy, false) {
@@ -2683,8 +2684,7 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
     let (before, before_context, before_assertions) =
         analyze_with(original, &plain_args, Some(rule));
     let plain_errors = plain.errors().to_vec();
-    let mut after = plain.clone();
-    rule.on_result(&mut after);
+    let after = rule.on_result(plain.clone());
     let text = |errors: &[ErrorItem]| -> Vec<String> {
         errors
             .iter()
@@ -2796,14 +2796,14 @@ fn stage_copy(
             quote!(#report #noop)
         },
     };
-    let (mut result, context, assertions) = match analysis {
+    let (result, context, assertions) = match analysis {
         Some(analysis) => analysis,
         None => return nothing(format!("{}|{}|skip|", id, kind), String::new()),
     };
     // The errors that the rule does not drop are allowed by their causes, and so are those that
     // come up from inside them.
     let errors: Vec<ErrorItem> = result.errors().to_vec();
-    crate::allow_every_cause(&mut result);
+    let result = crate::allow_every_cause(result);
     let remaining = result.errors().to_vec();
     if !remaining.is_empty() {
         let reason = crate::messages(&remaining).replace(['\n', '|'], " ");
@@ -3024,12 +3024,12 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         return Ok(TokenStream::new());
     }
     for allowed in allow {
-        match allowed {
+        result = match allowed {
             AllowArg::StdCrates => result.allow_std_crates(),
             AllowArg::Cause(cause) => result.allow(|e| e.cause == cause),
         };
     }
-    let errors = crate::report(result.errors());
+    let errors = result.errors().to_vec();
     // `strict` makes the Referrer replace the optional entries as well.
     if args.strict.is_some_and(|said| said != strict) {
         return Err(Error::new(
@@ -3038,7 +3038,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         ));
     }
     if strict {
-        result.deny_ambiguous_crate_name();
+        result = result.deny_ambiguous_crate_name();
     }
     let referrer = result.into_referrer();
     let rewritten = rewrite(&referrer, context, &item, &args, &path, dyn_host)?;
@@ -3089,6 +3089,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         }
         other => quote!(#other),
     };
+    // Reported last: nothing is emitted (nightly) if the macro fails above.
+    let errors = crate::report(&errors);
     Ok(quote! {
         #errors
         #body

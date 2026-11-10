@@ -61,7 +61,11 @@ fn analyze_with<P: Fn(&Path) -> bool>(
 
 fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     let config = Allow::new().allow_primitive();
-    analyze_with(Leaker::from_config(config, false, false), item, allow_self)
+    analyze_with(
+        Leaker::from_config(config, Options::new()),
+        item,
+        allow_self,
+    )
 }
 
 /// The required entries, as text.
@@ -121,12 +125,28 @@ fn absolute(name: &str) -> String {
     )
 }
 
-const ALLOW: &str = "allow it with `Allow::allow_path_if()`";
-const ALLOW_SELF: &str = "analyze the item with `allow_self = true`";
-
 /// The note that says what the holder cannot be leaked because of.
 fn because_of(cause: &str) -> String {
-    format!("it cannot be leaked as a whole because of `{}`", cause)
+    format!(
+        "it cannot be leaked as a whole because of `{}`",
+        plain(cause)
+    )
+}
+
+/// Tokens as a message writes them: `Wrap < T >` is `Wrap<T>`, and `Self :: A` is `Self::A`.
+fn plain(text: &str) -> String {
+    [
+        (" :: ", "::"),
+        (":: ", "::"),
+        (" ::", "::"),
+        (" <", "<"),
+        ("< ", "<"),
+        (" >", ">"),
+        ("& ", "&"),
+        (" ,", ","),
+    ]
+    .iter()
+    .fold(text.to_string(), |text, (from, to)| text.replace(from, to))
 }
 
 /// The error for `name` with the notes and the help.
@@ -141,11 +161,7 @@ fn error(name: &str, notes: &[&str], help: &str) -> Shown {
 
 /// The error where `Self` is denied and the holder names it as `cause`.
 fn self_denied(name: &str, cause: &str) -> Shown {
-    error(
-        name,
-        &[&because_of(cause)],
-        &format!("{}, {}, or {}", absolute(name), ALLOW, ALLOW_SELF),
-    )
+    error(name, &[&because_of(cause)], &absolute(name))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -176,8 +192,7 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
          \n\
          \x20 = note: it cannot be leaked as a whole because of `Self`\n\
          \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
-         `{ ::my_crate::ILEN }` for a const), allow it with `Allow::allow_path_if()`, or \
-         analyze the item with `allow_self = true`\n"
+         `{ ::my_crate::ILEN }` for a const)\n"
     );
     // With `Self` allowed the path is the entry: it holds `ILEN` for a type and for a const.
     let referrer = analyze(&item, true).unwrap();
@@ -206,7 +221,7 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
     }
     // Allowed by the config: left as written, so it is no cause either.
     let config = Allow::new().allow_path_if(starts_with(parse_quote!(ILEN)));
-    let referrer = analyze_with(Leaker::from_config(config, false, false), &item, false).unwrap();
+    let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, false).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -358,20 +373,20 @@ fn an_associated_type_of_a_self_that_is_a_type_is_an_error() {
             shown(&err),
             [error(
                 "ILEN",
-                &[note, &because_of("Self :: A")],
+                &[note, &because_of("Self::A")],
                 &format!("{}, or {}", absolute("ILEN"), replace)
             )],
             "{}",
             quote!(#item)
         );
-        // `Self` is denied as well: the advice says so.
+        // `Self` is denied as well: the advice is the same.
         let err = analyze(&item, false).err().unwrap();
         assert_eq!(
             shown(&err),
             [error(
                 "ILEN",
-                &[note, &because_of("Self :: A")],
-                &format!("{}, {}, or {}", absolute("ILEN"), replace, ALLOW_SELF)
+                &[note, &because_of("Self::A")],
+                &format!("{}, or {}", absolute("ILEN"), replace)
             )],
             "{}",
             quote!(#item)
@@ -431,8 +446,7 @@ fn hard_causes_are_errors() {
                 &because_of("Self")
             ],
             &format!(
-                "{}, write the bound of the generics of `::l::W<T, ILEN>` without `Self`, or \
-                 analyze the item with `allow_self = true`",
+                "{}, or write the bound of the generics of `::l::W<T, ILEN>` without `Self`",
                 absolute("ILEN")
             )
         )]
@@ -492,8 +506,8 @@ fn hard_causes_are_errors() {
         shown(&err),
         [error(
             "ILEN",
-            &[&because_of(":: l :: m ! ()")],
-            &format!("{}, or {}", absolute("ILEN"), ALLOW)
+            &[&because_of("::l::m!()")],
+            &absolute("ILEN")
         )]
     );
     let item = item!(
@@ -504,11 +518,7 @@ fn hard_causes_are_errors() {
     let err = analyze(&item, true).err().unwrap();
     assert_eq!(
         shown(&err),
-        [error(
-            "ILEN",
-            &[&because_of(":: l :: V")],
-            &format!("{}, or {}", absolute("ILEN"), ALLOW)
-        )]
+        [error("ILEN", &[&because_of("::l::V")], &absolute("ILEN"))]
     );
 }
 
@@ -922,7 +932,7 @@ fn module_config() -> Allow<impl Fn(&Path) -> bool> {
 
 fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     analyze_with(
-        Leaker::from_config(module_config(), false, false),
+        Leaker::from_config(module_config(), Options::new()),
         item,
         true,
     )
@@ -947,10 +957,9 @@ fn beside_module_item(name: &str, module_item: &str) -> Shown {
             module_item
         )],
         &format!(
-            "{0}, import `{1}` with an absolute `use` (`use ::my_crate::{1};`), or {2}",
+            "{0}, or import `{1}` with an absolute `use` (`use ::my_crate::{1};`)",
             absolute(name),
-            name,
-            ALLOW
+            name
         ),
     )
 }
@@ -983,8 +992,8 @@ fn a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type()
          \x20 = note: the type names `super::RC`, which the module declares and the copy \
          declares again, so it is not leaked as a whole\n\
          \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
-         `{ ::my_crate::ILEN }` for a const), import `ILEN` with an absolute `use` \
-         (`use ::my_crate::ILEN;`), or allow it with `Allow::allow_path_if()`\n"
+         `{ ::my_crate::ILEN }` for a const), or import `ILEN` with an absolute `use` \
+         (`use ::my_crate::ILEN;`)\n"
     );
 }
 
@@ -1033,7 +1042,7 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
     // Allowed by the config: left as written, so it is no cause either.
     let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
     let config = module_config().allow_path_if(starts_with(parse_quote!(ILEN)));
-    let referrer = analyze_with(Leaker::from_config(config, false, false), &item, true).unwrap();
+    let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, true).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -1236,7 +1245,7 @@ fn a_name_that_enter_mod_declares_beside_the_identifier_is_an_error_too() {
             .iter()
             .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
             .collect();
-        let mut leaker = Leaker::from_config(module_config(), false, false);
+        let mut leaker = Leaker::from_config(module_config(), Options::new());
         leaker.enter_mod("m", declared, |view| view.visit_item(&item));
         leaker.result().finish()
     };

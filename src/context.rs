@@ -179,7 +179,7 @@ pub enum SelfRequirement {
     /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound for its
     /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self` as the implementor
     /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)). With
-    /// [`nested_self_entries`](crate::Leaker::from_config) the type
+    /// [`nested_self_entries()`](crate::Options::nested_self_entries) the type
     /// may name `Self` too (`Rel2<Self, T>`).
     ///
     /// The impl is for a parameter (`__S`) that replaces `Self` in the bounds and has no bound of
@@ -728,7 +728,7 @@ impl Context {
 
     /// Like [`Context::of()`], for an entry of a struct, an enum or a union nested in the analyzed
     /// syntax (`nested_type`) that is for any type although its type names `Self`
-    /// ([`nested_self_entries`](crate::Leaker::from_config)): `Self`
+    /// ([`nested_self_entries()`](crate::Options::nested_self_entries)): `Self`
     /// in the type and in the bounds is the implementor of the impl, and the impl does not need the
     /// generics that `Self` has as arguments. Not so with `nested_type` unset, or a `Self` that is
     /// not a type. It is `of()` for a type that does not name `Self`.
@@ -1547,7 +1547,7 @@ impl WrittenForSelf for WherePredicate {
         self_in_predicate(self)
     }
     fn what(&self) -> String {
-        format!("the where predicate `{}`", quote!(#self))
+        format!("the where predicate `{}`", tidy(&quote!(#self)))
     }
     fn rewrite(self, folder: &mut ReplaceSelf<'_>) -> Self {
         folder.fold_where_predicate(self)
@@ -1581,7 +1581,7 @@ fn for_self_of<T: WrittenForSelf>(
                 "{} mentions the `Self` of the trait `{}`, which has no name here: `Self` is \
                  something else in the item around",
                 node.what(),
-                quote!(#path)
+                tidy(&quote!(#path))
             ),
             help: format!("write {} without `Self`", node.what()),
         }),
@@ -1590,14 +1590,14 @@ fn for_self_of<T: WrittenForSelf>(
                 headline: format!(
                     "{} mentions `{}`, which has no name here",
                     node.what(),
-                    cause.shown()
+                    tidy(&cause.shown())
                 ),
                 note: format!(
                     "{} mentions `{}`, an associated item of the `Self` of `{}`, which has no \
                      name here: `Self` is something else in the item around",
                     node.what(),
-                    cause.shown(),
-                    quote!(#ty)
+                    tidy(&cause.shown()),
+                    tidy(&quote!(#ty))
                 ),
                 help: format!("write {} without `{}`", node.what(), tidy(&cause.shown())),
                 cause: Box::new(cause),

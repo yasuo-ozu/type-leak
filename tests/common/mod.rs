@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    path_starts_with, Allow, Cause, CheckResult, ContextId, ErrorItem, Leaker, LeakerResult, View,
+    path_starts_with, Allow, Cause, CheckResult, ContextId, ErrorItem, Leaker, LeakerResult,
+    Options, View,
 };
 
 /// Converts the required types of a `Referrer` (see `Referrer::must()`) to a `BTreeSet<String>`
@@ -88,7 +89,14 @@ pub fn analyze_trait<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     config: Allow<P, E>,
     check_values: bool,
 ) -> LeakerResult {
-    let mut leaker = Leaker::from_config(config, check_values, false);
+    let mut leaker = Leaker::from_config(
+        config,
+        if check_values {
+            Options::new().check_values()
+        } else {
+            Options::new()
+        },
+    );
     leaker.intern_trait(item, true);
     leaker.result()
 }
@@ -97,16 +105,16 @@ pub fn analyze_trait<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
 /// Dropping an error puts its nested errors in its place ([`type_leak::ErrorItem::nested`]), whose
 /// causes are not those of the errors that were there, so one round may not be enough.
 #[allow(dead_code)]
-pub fn allow_every_cause(result: &mut LeakerResult) -> usize {
+pub fn allow_every_cause(mut result: LeakerResult) -> (LeakerResult, usize) {
     let mut rounds = 0;
     while !result.errors().is_empty() {
         let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
         for cause in causes {
-            result.allow(|e| e.cause == cause);
+            result = result.allow(|e| e.cause == cause);
         }
         rounds += 1;
     }
-    rounds
+    (result, rounds)
 }
 
 /// One of the `allow*()` operations that `Allow` and `LeakerResult` share, so that a test can
@@ -181,7 +189,7 @@ impl Rule {
     }
 
     /// Gives the rule to the result: it is applied after the analysis.
-    pub fn on_result(&self, result: &mut LeakerResult) {
+    pub fn on_result(&self, result: LeakerResult) -> LeakerResult {
         match self {
             Rule::Cause(cause) => result.allow(|e| e.cause == *cause),
             Rule::Path(path) => result.allow_path_if(starts_with(path.clone())),
@@ -191,6 +199,6 @@ impl Rule {
             Rule::Crate => result.allow_crate(),
             Rule::Values => result.allow_values(),
             Rule::Default => result.allow_default(),
-        };
+        }
     }
 }

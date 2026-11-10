@@ -25,7 +25,7 @@ use common::{check_in, starts_with};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, Cause, ContextId, ErrorItem, Leaker, Referrer};
+use type_leak::{to_syn_error, Allow, Cause, ContextId, ErrorItem, Leaker, Options, Referrer};
 
 /// A Leaker which allows `::p`, standing for an external crate which the Referrer's crate is known
 /// to have as the Leaker's: its types may be an anchor. The types of the other external crates may
@@ -40,7 +40,7 @@ fn leaker_with(allowed: &[Path]) -> Leaker<impl Fn(&Path) -> bool> {
         .allow_primitive()
         .allow_prelude()
         .allow_path_if(move |path| allowed.iter().any(|a| starts_with(a.clone())(path)));
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {
@@ -208,7 +208,7 @@ fn a_bound_whose_output_mentions_the_lifetime_is_an_error() {
     ] {
         let item: ItemTrait = item;
         let (message, note) = error(item.clone());
-        assert_eq!(message, "use absolute path: 'Rel < 'x >'", "{}", s(&item));
+        assert_eq!(message, "use absolute path: 'Rel<'x>'", "{}", s(&item));
         assert_eq!(note.as_deref(), Some(NOTE), "{}", s(&item));
     }
 
@@ -221,7 +221,7 @@ fn a_bound_whose_output_mentions_the_lifetime_is_an_error() {
     assert_eq!(
         to_syn_error(&err).to_string(),
         format!(
-            "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
+            "use absolute path: 'Rel<'x>'\n\n  = note: {}\n  = note: it cannot be leaked as a \
              whole because of `'x`\n  = help: {}\n",
             NOTE, HELP
         )
@@ -396,7 +396,7 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
             trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8); }
         }),
         (
-            "use absolute path: 'Rel < 'x >'".to_string(),
+            "use absolute path: 'Rel<'x>'".to_string(),
             Some(NOTE_OWNED.to_string())
         )
     );
@@ -408,8 +408,8 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
     assert_eq!(
         to_syn_error(&err).to_string(),
         format!(
-            "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
-             whole because of `dyn :: core :: fmt :: Debug`\n  = note: the lifetime of the trait \
+            "use absolute path: 'Rel<'x>'\n\n  = note: {}\n  = note: it cannot be leaked as a \
+             whole because of `dyn ::core::fmt::Debug`\n  = note: the lifetime of the trait \
              object defaults to that of the enclosing reference or path\n  = help: {}\n",
             NOTE_OWNED, HELP
         )
@@ -420,7 +420,7 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
             trait Tr { fn f(&self, f: impl for<'x> Fn(Rel<'x>) -> &'x u8); }
         }),
         (
-            "use absolute path: 'Rel < 'x >'".to_string(),
+            "use absolute path: 'Rel<'x>'".to_string(),
             Some(NOTE_OWNED.to_string())
         )
     );
@@ -452,7 +452,7 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
             }
         })
         .0,
-        "use absolute path: 'Rel < 'x , 'y >'"
+        "use absolute path: 'Rel<'x, 'y>'"
     );
     // With an elided lifetime of its own, the outer function pointer is leaked as a whole.
     assert_eq!(
@@ -710,12 +710,7 @@ fn an_occurrence_which_does_not_constrain_the_lifetime_is_not_an_anchor() {
             }
         };
         let (message, note) = error(item.clone());
-        assert_eq!(
-            message,
-            "use absolute path: 'Parser < 'x >'",
-            "{}",
-            s(&item)
-        );
+        assert_eq!(message, "use absolute path: 'Parser<'x>'", "{}", s(&item));
         assert_eq!(note.as_deref(), Some(NOTE), "{}", s(&item));
     }
     // Only an occurrence in the output.
@@ -757,7 +752,7 @@ fn an_occurrence_in_a_type_leaked_as_a_whole_is_not_an_anchor() {
             trait Tr { fn f<F: for<'x> Fn(Rel2<&'x str>) -> &'x str>(&self, f: F); }
         }),
         (
-            "use absolute path: 'Rel2 < & 'x str >'".to_string(),
+            "use absolute path: 'Rel2<&'x str>'".to_string(),
             Some(NOTE.to_string())
         )
     );
@@ -1240,7 +1235,7 @@ fn external_crate_types_do_not_anchor_the_lifetime() {
         }
     };
     let (message, note) = error_by(leaker_allowing_nothing(), item.clone());
-    assert_eq!(message, "use absolute path: 'Parser < 'x >'");
+    assert_eq!(message, "use absolute path: 'Parser<'x>'");
     assert_eq!(note.as_deref(), Some(NOTE));
     // The same in a predicate, a trait object in a type and a function pointer in a bound.
     for item in [
@@ -1575,8 +1570,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // The Referrer which replaces them: the type is replaced (with its entry), and `&'x u8`
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
-    let mut strict = result;
-    strict.deny_ambiguous_crate_name();
+    let strict = result.deny_ambiguous_crate_name();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
         &mut strict
             .finish()
@@ -1603,7 +1597,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
         let mut copy = item.clone();
         let mut result = result.clone();
         if !allow {
-            result.deny_ambiguous_crate_name();
+            result = result.deny_ambiguous_crate_name();
         }
         syn::visit_mut::VisitMut::visit_item_trait_mut(
             &mut result

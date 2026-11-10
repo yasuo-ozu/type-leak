@@ -5,7 +5,7 @@ mod common;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, ErrorItem, Leaker};
+use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options};
 
 #[test]
 fn test_leaker() {
@@ -182,16 +182,16 @@ fn test_config_allows_the_documented_names() {
         // Each list allows its names, and not the other list's.
         let (own, other) = if primitives.contains(name) {
             let own =
-                entries_of_a_field(Leaker::from_config(only_primitives(), false, false), name);
+                entries_of_a_field(Leaker::from_config(only_primitives(), Options::new()), name);
             (
                 own,
-                entries_of_a_field(Leaker::from_config(only_prelude(), false, false), name),
+                entries_of_a_field(Leaker::from_config(only_prelude(), Options::new()), name),
             )
         } else {
-            let own = entries_of_a_field(Leaker::from_config(only_prelude(), false, false), name);
+            let own = entries_of_a_field(Leaker::from_config(only_prelude(), Options::new()), name);
             (
                 own,
-                entries_of_a_field(Leaker::from_config(only_primitives(), false, false), name),
+                entries_of_a_field(Leaker::from_config(only_primitives(), Options::new()), name),
             )
         };
         assert_eq!(own, 0, "{}", name);
@@ -205,7 +205,7 @@ fn test_config_allows_the_documented_names() {
         config: Allow<P, E>,
         item: &ItemStruct,
     ) -> usize {
-        let mut leaker = Leaker::from_config(config, false, false);
+        let mut leaker = Leaker::from_config(config, Options::new());
         leaker.intern_struct(item, true);
         leaker.result().finish().unwrap().iter().count()
     }
@@ -217,10 +217,10 @@ fn test_config_allows_the_documented_names() {
         struct S(crate::A, u8, Vec<crate::B>);
     );
     let all = Allow::new().allow_primitive().allow_prelude().allow_crate();
-    let mut leaker = Leaker::from_config(all, false, false);
+    let mut leaker = Leaker::from_config(all, Options::new());
     leaker.intern_struct(&item, true);
     assert!(leaker.result().finish().unwrap().is_empty());
-    let mut leaker = Leaker::from_config(only_prelude(), false, false);
+    let mut leaker = Leaker::from_config(only_prelude(), Options::new());
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
@@ -244,7 +244,7 @@ fn test_intern() {
     };
     let item: ItemTrait = parse_quote!(#tokens);
     let config = Allow::new().allow_crate();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
 
     leaker.intern_trait(&item, true);
     leaker.reduce_roots();
@@ -264,7 +264,7 @@ fn messages(errors: &[ErrorItem]) -> String {
 
 fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
     let config = type_leak::Allow::new().allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(item, true);
     let referrer = leaker
         .result()
@@ -275,7 +275,7 @@ fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
 
 fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
     let config = type_leak::Allow::new().allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(item, true);
     let referrer = leaker
         .result()
@@ -450,7 +450,7 @@ fn test_uninternable_types_are_decomposed() {
     };
     assert_eq!(
         leak_trait(&item).unwrap_err().to_string(),
-        "use absolute path: 'MyType < '_ >'"
+        "use absolute path: 'MyType<'_>'"
     );
 }
 
@@ -505,7 +505,7 @@ fn test_assertions_for_assumed_primitives() {
         }
     };
     let config = type_leak::Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     let assertions = leaker.assertions().to_string();
     assert!(leaker.result().errors().is_empty());
@@ -635,7 +635,7 @@ fn test_receivers() {
             ),
             false
         ),
-        Err("use absolute path: 'Rel < Self >'".to_string())
+        Err("use absolute path: 'Rel<Self>'".to_string())
     );
     // `Rel` may be a const, and the path cannot be leaked as a whole because of `Self`: it is not
     // leaked as a type (see `tests/bare_const.rs`).
@@ -714,7 +714,7 @@ fn test_qualified_paths_are_decomposed() {
     };
     assert_eq!(
         leak_trait(&item).unwrap_err().to_string(),
-        "use absolute path: 'RelTrait < '_ > :: Ty'"
+        "use absolute path: 'RelTrait<'_>::Ty'"
     );
 }
 
@@ -757,11 +757,7 @@ fn test_self_ty_cannot_be_interned() {
     )
     .unwrap_err()
     .to_string();
-    assert!(
-        err.starts_with("use absolute path: 'Rel < Self >'"),
-        "{}",
-        err
-    );
+    assert!(err.starts_with("use absolute path: 'Rel<Self>'"), "{}", err);
     assert!(
         err.contains("it cannot be leaked as a whole because of `Self`"),
         "{}",

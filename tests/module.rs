@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, Visitor};
+use type_leak::{ContextId, Leaker, Options, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -15,7 +15,7 @@ fn tag() -> String {
 /// Visits the items of the module copy `item` one by one with `visitor`, whose context is the
 /// module the copy is of. A visited `mod` item is a module nested in the context, so the items
 /// are what a copy of a whole module is rewritten with.
-fn visit_items<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<F>, item: &mut ItemMod) {
+fn visit_items<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<'_, F>, item: &mut ItemMod) {
     for item in &mut item.content.as_mut().unwrap().1 {
         visitor.visit_item_mut(item);
     }
@@ -65,7 +65,7 @@ fn intern_mod_referrer_rewrites_a_copy() {
     let referrer = leaker.result().finish().unwrap();
     let mut item = module();
     visit_items(
-        referrer.clone().visitor(context, |ty, ix| {
+        referrer.visitor(context, |ty, ix| {
             let ty = quote!(#ty).to_string();
             let name = ty.replace(' ', "");
             let _ = ix;
@@ -131,7 +131,7 @@ fn intern_mod_errors_and_bodies() {
 /// standard prelude, and returns the module context too.
 fn referrer_with_prelude(m: &ItemMod) -> (type_leak::Referrer, ContextId) {
     let config = type_leak::Allow::new().allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_mod(m);
     (leaker.result().finish().unwrap(), context)
 }
@@ -397,9 +397,7 @@ fn referrer_visits_a_copy_in_a_module() {
     let referrer = leaker.result().finish().unwrap();
     let inner = referrer.context_module(referrer.context(1)).unwrap();
     let copy = |module: ContextId| {
-        let mut visitor = referrer
-            .clone()
-            .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
+        let mut visitor = referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
         let mut item: ItemStruct = parse_quote!(
             pub struct C {
                 y: Rel,
@@ -434,7 +432,6 @@ fn referrer_visits_a_copy_in_a_module() {
         );
         let rewrite = |_: Type, _| -> Type { parse_quote!(P) };
         referrer
-            .clone()
             .visitor(module, rewrite)
             .visit_item_struct_mut(&mut item);
         quote!(#item).to_string()
@@ -487,7 +484,7 @@ fn referrer_tracks_the_modules_it_enters() {
     );
     // A copy of the items of `m`: `inner` is a module in it, found by its name.
     let mut item = m.clone();
-    visit_items(referrer.clone().visitor(root, rewrite), &mut item);
+    visit_items(referrer.visitor(root, rewrite), &mut item);
     let expected: ItemMod = parse_quote!(
         mod m {
             pub mod inner {
@@ -503,33 +500,25 @@ fn referrer_tracks_the_modules_it_enters() {
     // match, when a root `mod` item was the module.)
     let mut item = unchanged.clone();
     referrer
-        .clone()
         .visitor(root, rewrite)
         .visit_item_mod_mut(&mut item);
     assert_eq!(quote!(#item).to_string(), quote!(#rewritten).to_string());
     // The same through `visit_item_mut()`, and as an item of a file.
     let mut item = Item::Mod(unchanged.clone());
-    referrer
-        .clone()
-        .visitor(root, rewrite)
-        .visit_item_mut(&mut item);
+    referrer.visitor(root, rewrite).visit_item_mut(&mut item);
     assert_eq!(quote!(#item).to_string(), quote!(#rewritten).to_string());
     let mut file = File {
         shebang: None,
         attrs: Vec::new(),
         items: vec![Item::Mod(unchanged.clone())],
     };
-    referrer
-        .clone()
-        .visitor(root, rewrite)
-        .visit_file_mut(&mut file);
+    referrer.visitor(root, rewrite).visit_file_mut(&mut file);
     assert_eq!(quote!(#file).to_string(), quote!(#rewritten).to_string());
     // With the context of the module `m::inner`, `m::inner` has no module of its own, so a `mod
     // inner` is the module itself: the same as its items.
     let inner = referrer.context_module(referrer.context(0)).unwrap();
     let mut item = unchanged.clone();
     referrer
-        .clone()
         .visitor(inner, rewrite)
         .visit_item_mod_mut(&mut item);
     assert_eq!(quote!(#item).to_string(), quote!(#rewritten).to_string());
@@ -604,7 +593,7 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
     let (other, ()) = leaker.enter_mod("other", [], |_| ());
     let referrer = leaker.result().finish().unwrap();
     let copy = |module: ContextId| {
-        let mut visitor = referrer.clone().visitor(module, |_, _| parse_quote!(P));
+        let mut visitor = referrer.visitor(module, |_, _| parse_quote!(P));
         let mut item: ItemStruct = parse_quote!(
             pub struct C {
                 y: Rel,
@@ -772,7 +761,6 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
-            .clone()
             .visitor(module, |_, _| parse_quote!(P))
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
@@ -813,7 +801,6 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
-            .clone()
             .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
@@ -884,9 +871,7 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         visit_items(
-            referrer
-                .clone()
-                .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap()),
+            referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap()),
             &mut item,
         );
         quote!(#item).to_string()
@@ -909,7 +894,6 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
     let whole = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
-            .clone()
             .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
@@ -952,9 +936,7 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it_unless_it_is_the_mod
     )
     .to_string();
     let visitor = |module: ContextId| {
-        referrer
-            .clone()
-            .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
+        referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
     };
     // The items of `m` are in the module analyzed, and `inner` is found by its name.
     let by_items = |module: ContextId| {
@@ -1027,7 +1009,6 @@ fn shown(item: Item) -> String {
 /// Rewrites `item`, a copy in the scope `context`, replacing the `ix`-th entry with `P<ix>`.
 fn rewrite_in(referrer: &type_leak::Referrer, context: ContextId, mut item: Item) -> String {
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_mut(&mut item);
     quote!(#item).to_string()
@@ -1202,7 +1183,6 @@ fn the_items_of_a_module_are_nested_items() {
         pub struct S<T>(Wrap<T>);
     );
     referrer
-        .clone()
         .visitor(module, |_, ix| parse_quote!(P<#ix>))
         .with_outermost_generics_as_leakers()
         .visit_item_mut(&mut item);
@@ -1228,7 +1208,6 @@ fn the_items_of_a_module_are_nested_items() {
         }
     );
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .with_outermost_generics_as_leakers()
         .visit_item_mut(&mut item);

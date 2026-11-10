@@ -56,7 +56,7 @@ fn the_example_reports_what_cannot_be_exported() {
         stderr
     );
     assert!(
-        stderr.contains("error: use absolute path: 'Record < '_ >'"),
+        stderr.contains("error: use absolute path: 'Record<'_>'"),
         "{}",
         stderr
     );

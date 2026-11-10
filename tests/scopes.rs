@@ -8,8 +8,8 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Reason, Referrer, SelfRequirement,
-    View,
+    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Options, Reason, Referrer,
+    SelfRequirement, View,
 };
 
 fn s(x: &impl ToTokens) -> String {
@@ -494,7 +494,7 @@ fn allow_self_decides_whether_self_may_be_interned() {
         assert_eq!(result.errors().is_empty(), allow_self);
         if !allow_self {
             let err = result.errors();
-            assert!(messages(err).starts_with("use absolute path: 'Rel < Self >'"));
+            assert!(messages(err).starts_with("use absolute path: 'Rel<Self>'"));
             assert_eq!(
                 err[0].notes.first().map(|(_, n)| n.as_str()),
                 Some("it cannot be leaked as a whole because of `Self`")
@@ -561,7 +561,7 @@ fn headlines(result: &LeakerResult) -> Vec<String> {
 fn allow_self_applies_to_the_whole_items() {
     // With `allow_self == false`, `Self` is not leaked: the type that names it is an error, with
     // the path to write instead (`use absolute path`), and not another error.
-    let denied = ["use absolute path: 'Rel < Self >'"];
+    let denied = ["use absolute path: 'Rel<Self>'"];
     let item: ItemImpl = parse_quote! {
         impl<T> ::p::Tr for ::p::W<T> {
             fn f(&self) -> Rel<Self> { loop {} }
@@ -633,7 +633,7 @@ fn allow_self_applies_to_the_whole_items() {
         headlines(&recorded(|l| {
             l.intern_struct(&item, false);
         })),
-        ["use absolute path: 'Self :: K'"]
+        ["use absolute path: 'Self::K'"]
     );
 }
 
@@ -768,7 +768,7 @@ fn the_defaults_of_a_nested_scope_are_analyzed_with_the_parameters_before() {
     });
     assert_eq!(
         messages(leaker.result().errors()),
-        "use absolute path: 'Bad < '_ , A >'"
+        "use absolute path: 'Bad<'_, A>'"
     );
 }
 
@@ -828,7 +828,7 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
     assert!(message.contains("Bad2"), "{}", message);
     // Accepting the causes afterwards drops the errors, and does not change the Referrer.
     let mut accepted = failed.result.clone();
-    accepted
+    accepted = accepted
         .allow(|e| e.cause == Cause::Type(parse_quote!(Bad1<'_>)))
         .allow(|e| e.cause == Cause::Type(parse_quote!(Bad2<'_, U>)));
     assert!(accepted.errors().is_empty());
@@ -880,7 +880,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
     });
     let result = leaker.result();
     assert_eq!(messages(result.errors()).lines().count(), 1);
-    assert_eq!(messages(result.errors()), "use absolute path: 'Bad < '_ >'");
+    assert_eq!(messages(result.errors()), "use absolute path: 'Bad<'_>'");
     assert_eq!(result.into_referrer().iter().count(), 1);
 
     // With nothing else in the outer scope, it has the error all the same.
@@ -891,7 +891,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
         });
     });
     let result = leaker.result();
-    assert_eq!(messages(result.errors()), "use absolute path: 'Bad < '_ >'");
+    assert_eq!(messages(result.errors()), "use absolute path: 'Bad<'_>'");
     assert!(result.into_referrer().is_empty());
 
     // The errors come in the order in which they were found, those of the inner scopes among the
@@ -947,7 +947,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
 /// A Leaker that allows the primitive types and the names of the standard prelude.
 fn leaker_with_std() -> Leaker<impl Fn(&Path) -> bool> {
     let config = Allow::new().allow_primitive().allow_prelude();
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 /// `Leaker::enter_generics()` docs: a scope keeps what it recorded when it has errors. The
@@ -1068,8 +1068,7 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
     assert_eq!(result.errors().len(), 2);
     assert!(result.errors().iter().all(|error| error.cause == cause));
     let tokens = result.clone().into_referrer().to_token_stream().to_string();
-    let mut accepted = result.clone();
-    accepted.allow(|e| e.cause == cause);
+    let accepted = result.clone().allow(|e| e.cause == cause);
     assert!(accepted.errors().is_empty());
     assert_eq!(
         accepted.finish().unwrap().to_token_stream().to_string(),
@@ -1262,9 +1261,7 @@ fn the_visitor_enters_the_module_by_its_id() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let copy = |module: ContextId| {
-        let mut visitor = referrer
-            .clone()
-            .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
+        let mut visitor = referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
         let mut item: ItemStruct = parse_quote!(
             struct C {
                 y: Rel,
@@ -1299,7 +1296,7 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
     });
     let referrer = leaker.result().finish().unwrap();
     let copy = |item: &ItemMod, module: ContextId| {
-        let mut visitor = referrer.clone().visitor(module, |_, _| parse_quote!(P));
+        let mut visitor = referrer.visitor(module, |_, _| parse_quote!(P));
         let mut item = item.clone();
         visitor.visit_item_mod_mut(&mut item);
         s(&item)
@@ -1386,7 +1383,6 @@ fn modules_are_serialized() {
         }
     );
     parsed
-        .clone()
         .visitor(root, |_, _| parse_quote!(P))
         .visit_item_mod_mut(&mut item);
     assert_eq!(
@@ -1514,8 +1510,7 @@ fn the_format_of_the_previous_version_is_rejected() {
     // the default of a parameter of a struct, an enum or a union nested in the visited syntax when a
     // bound of an earlier parameter names `Self` (`U = Wrap<T>` with `T: AsRef<Self>`): the
     // Leaker rejected it, and now the entry is analyzed without the bounds that name `Self`. It
-    // finds an entry for any type that names the `Self` too (the `nested_self_entries` argument of
-    // `Leaker::from_config()`).
+    // finds an entry for any type that names the `Self` too (`Options::nested_self_entries()`).
     let old: proc_macro2::TokenStream = "\"type-leak-format-13\" 2 < T > ; () < T > ; (Rel)"
         .parse()
         .unwrap();
@@ -1791,7 +1786,7 @@ fn a_panic_caught_in_a_nested_scope_restores_what_the_scope_declares() {
         // `allow_self` of the outer scope is the one in effect, and `Self` is `O`.
         view.visit_type(&parse_quote!(Rel2<Self>));
     });
-    assert!(messages(leaker.result().errors()).starts_with("use absolute path: 'Rel2 < Self >'"));
+    assert!(messages(leaker.result().errors()).starts_with("use absolute path: 'Rel2<Self>'"));
     let mut leaker = Leaker::new();
     leaker.enter_type(&ident("O"), &Generics::default(), true, |view| {
         caught(|| {
@@ -2416,7 +2411,7 @@ fn allow_self_applies_to_traits() {
     leaker.intern_trait(&item, false);
     let result = leaker.result();
     let err = result.errors();
-    assert!(messages(err).starts_with("use absolute path: 'Rel < Self >'"));
+    assert!(messages(err).starts_with("use absolute path: 'Rel<Self>'"));
     assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("it cannot be leaked as a whole because of `Self`")
@@ -2783,7 +2778,7 @@ fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
         // The error is about the path of the trait, at the root.
         assert_eq!(
             messages(err),
-            format!("use absolute path: '{}'", s(&path)),
+            format!("use absolute path: '{}'", s(&path).replace(' ', "")),
             "{}",
             s(&path)
         );
@@ -2803,7 +2798,7 @@ fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
     });
     let result = leaker.result();
     let err = result.errors();
-    assert!(messages(err).starts_with("use absolute path: 'Self :: X'"));
+    assert!(messages(err).starts_with("use absolute path: 'Self::X'"));
 }
 
 #[test]
@@ -2833,8 +2828,8 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     let err = result.errors();
     assert_eq!(
         messages(err),
-        "use absolute path: 'm :: Tr < Rel >'\nuse absolute path: 'Rel3'\n\
-         use absolute path: 'Rel4 < '_ >'"
+        "use absolute path: 'm::Tr<Rel>'\nuse absolute path: 'Rel3'\n\
+         use absolute path: 'Rel4<'_>'"
     );
     let item: ItemImpl = parse_quote!(impl ::p::Tr<Rel> for () {});
     let mut leaker = Leaker::new();
@@ -2853,7 +2848,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     );
     let result = leaker.result();
     let err = result.errors();
-    assert_eq!(messages(err), "use absolute path: 'Tr < Rel >'");
+    assert_eq!(messages(err), "use absolute path: 'Tr<Rel>'");
     // Without a trait (an inherent impl), the caller visits the bound to check the path.
     let mut leaker = Leaker::new();
     leaker.enter_impl(&item.generics, &item.self_ty, None, true, |view| {
@@ -2861,7 +2856,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     });
     let result = leaker.result();
     let err = result.errors();
-    assert_eq!(messages(err), "use absolute path: 'Tr < Rel >'");
+    assert_eq!(messages(err), "use absolute path: 'Tr<Rel>'");
     // The same path visited as `Visit::visit_path()` is not checked.
     let mut leaker = Leaker::new();
     leaker.enter_impl(&item.generics, &item.self_ty, None, true, |view| {

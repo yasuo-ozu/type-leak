@@ -162,7 +162,7 @@ impl ScopeInput {
         &self,
         config: Allow<P, E>,
     ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
-        let mut leaker = Leaker::from_config(config, false, false);
+        let mut leaker = Leaker::from_config(config, Options::new());
         let visit = |view: &mut View<'_, P>| {
             for arguments in self.fragments() {
                 view.visit_path_arguments(arguments);
@@ -243,14 +243,12 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
         };
         crate::check_plain(&referrer, ix, &slots)?;
         let r = referrer
-            .repeater_impl(ix, target, |value, param| {
-                slots.encode_const(value, &param.ty)
-            })
+            .repeater_impl(ix, target, slots.const_fn())
             .map_err(Error::from)?;
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
-        let head =
-            quote!(impl #impl_generics #repeater<#args, #id, #ix> for #self_ty #where_clause);
+        let (self_ty, ty) = (&r.self_ty, &r.ty);
+        let trait_path = slots.trait_path(&r.args, *id, ix);
+        let head = quote!(impl #impl_generics #trait_path for #self_ty #where_clause);
         heads.push(head.to_string());
         impls.extend(quote! {
             #head {
@@ -419,7 +417,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         strict,
     } = parse2(input)?;
     if strict {
-        result.deny_ambiguous_crate_name();
+        result = result.deny_ambiguous_crate_name();
     }
     let referrer = result.into_referrer();
     let krate = path
@@ -462,10 +460,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
                 marker_ty.clone()
             };
             let site = UseSite::identity().with_self(owner.clone());
-            let args = referrer.entry_args(ix, &site, |value, param| {
-                slots.encode_const(value, &param.ty)
-            })?;
-            Ok(parse_quote!(<#owner as #repeater<#args, #id, #ix>>::Type))
+            let args = referrer.entry_args(ix, &site, slots.const_fn())?;
+            Ok(slots.projection(&owner, &args, id, ix))
         })();
         result.unwrap_or_else(|e| {
             *error.borrow_mut() = Some(e);
@@ -475,11 +471,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
 
     // The self type first, as `Self` of an entry is written with it.
     referrer
-        .clone()
         .visitor(context, |_, ix| project(None, ix))
         .visit_type_mut(&mut self_ty);
     let mut visitor = referrer
-        .clone()
         .visitor(context, |_, ix| project(Some(&self_ty), ix));
     let mut types = types;
     for ty in &mut types {

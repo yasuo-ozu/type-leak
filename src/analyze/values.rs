@@ -1,4 +1,4 @@
-//! The check of the values of an item, for [`check_values`](crate::Leaker::from_config): the
+//! The check of the values of an item, for [`check_values()`](crate::Options::check_values): the
 //! default of an associated const, the value of a const or a static, and the body of a function.
 //! An enum discriminant and the default of a const parameter are read the same way, whether
 //! values are read or not.
@@ -43,7 +43,7 @@ use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
-use template_quote::{quote, ToTokens};
+use template_quote::quote;
 
 impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
@@ -275,7 +275,7 @@ impl<'a, P: Fn(&Path) -> bool> ValueWalk<'a, P> {
         // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
         // type is shown by its path alone.
         let headline = match &cause {
-            Cause::Macro(_) => Some(format!("use absolute path: '{}'", cause.to_token_stream())),
+            Cause::Macro(_) => Some(format!("use absolute path: '{}!'", tidy(&cause.shown()))),
             _ => None,
         };
         let mut note = format!("it is in {}, which the copy writes as it is", self.what);
@@ -1108,8 +1108,7 @@ fn macro_help(path: &Path) -> String {
         }
     }
     format!(
-        "write `{0}!` with an absolute path (e.g. `::my_crate::{0}!`), or allow it with \
-         `Allow::allow_path_if()`",
+        "write `{0}!` with an absolute path (e.g. `::my_crate::{0}!`)",
         name
     )
 }

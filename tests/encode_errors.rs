@@ -20,11 +20,16 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
     let empty = Leaker::new().result().into_referrer();
-    let completed =
-        match empty.complete_args(&args.args, &generics.params, |_, _, _| unreachable!()) {
-            Ok(completed) => completed,
-            Err(error) => return error,
-        };
+    let context = empty.contexts().next().unwrap();
+    let completed = match empty.complete_args(
+        context,
+        &generics.params,
+        &args.args,
+        |_, _, _| unreachable!(),
+    ) {
+        Ok(completed) => completed,
+        Err(error) => return error,
+    };
     let used = generics.params.iter().map(|param| match param {
         GenericParam::Lifetime(param) => param.lifetime.to_token_stream(),
         GenericParam::Type(param) => param.ident.to_token_stream(),
@@ -38,7 +43,7 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
         .entry_args(
             0,
             &UseSite::substituting(&generics.params, &completed),
-            |value, param| slots().encode_const(value, &param.ty),
+            slots().const_fn(),
         )
         .unwrap_err()
 }

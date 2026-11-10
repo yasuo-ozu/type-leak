@@ -74,7 +74,7 @@ const PRELUDE_LATER: [(&str, &str); 9] = [
 ];
 
 /// Whether the config allows the primitive types and the prelude.
-type Options = (bool, bool);
+type Rules = (bool, bool);
 
 /// Where the name is written, and the headline of the error where that is one.
 struct Form {
@@ -97,7 +97,7 @@ fn forms(name: &str) -> Vec<Form> {
         Form {
             label: "const expression",
             source: format!("trait Tr: ::p::Sup<{{ {}::X }}> {{}}", name),
-            headline: Some(format!("use absolute path: '{} :: X'", name)),
+            headline: Some(format!("use absolute path: '{}::X'", name)),
             entry: None,
         },
         Form {
@@ -110,7 +110,7 @@ fn forms(name: &str) -> Vec<Form> {
 }
 
 /// The entries of the Referrer, or the headline of the error, with the options of `options`.
-fn analyze(options: Options, source: &str) -> std::result::Result<Vec<String>, String> {
+fn analyze(options: Rules, source: &str) -> std::result::Result<Vec<String>, String> {
     let (primitive, prelude) = options;
     let config = Allow::new().allow_path_if(move |path| {
         (primitive && is_primitive_path(path)) || (prelude && is_prelude_path(path))
@@ -123,7 +123,7 @@ fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     source: &str,
 ) -> std::result::Result<Vec<String>, String> {
     let item: ItemTrait = parse_str(source).unwrap();
-    let mut leaker = Leaker::from_config(config, false, false);
+    let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().map_err(|err| {
         err.iter()
@@ -135,7 +135,7 @@ fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
 }
 
 /// `names` are allowed by the config `allowing`, and not by the other config, nor by none.
-fn check(names: &[&str], allowing: Options, others: &[Options]) {
+fn check(names: &[&str], allowing: Rules, others: &[Rules]) {
     for name in names {
         for form in forms(name) {
             let context = format!("{} in {}: {}", name, form.label, form.source);

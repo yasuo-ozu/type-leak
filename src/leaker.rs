@@ -15,6 +15,7 @@ use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
 use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -65,7 +66,7 @@ use template_quote::{quote, ToTokens};
 /// - An absolute path of another crate is copied as written, which assumes that both crates
 ///   resolve it alike ([`LeakerResult::deny_ambiguous_crate_name()`]).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
-/// - Values and bodies are not analyzed unless `check_values` is on ([`Leaker::from_config()`]).
+/// - Values and bodies are not analyzed unless [`Options::check_values()`] is on.
 ///
 /// ## Outlives bounds
 ///
@@ -122,6 +123,65 @@ pub struct Leaker<P = fn(&Path) -> bool, E = fn(&ErrorItem) -> bool> {
     state: State,
 }
 
+/// What a [`Leaker`] reads and accepts beyond its [`Allow`] rules. Pass it to
+/// [`Leaker::from_config()`]; everything is off by default.
+///
+/// ```
+/// # use type_leak::*;
+/// let leaker = Leaker::from_config(Allow::new().allow_prelude(), Options::new().check_values());
+/// # let _ = leaker;
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    check_values: bool,
+    nested_self_entries: bool,
+}
+
+impl Options {
+    /// Creates the options with everything off, as [`Leaker::new()`] has them.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Makes the Leaker read the values of an item too: the values of consts and statics, the
+    /// defaults and values of associated consts, and the bodies of functions and methods (enum
+    /// discriminants, the defaults of const parameters and array lengths are read either way, the
+    /// first two as a value is, but their errors are no [`ErrorItem::in_value`]).
+    ///
+    /// Without it a relative path in a value breaks the copy and the Leaker does not tell. The
+    /// types in a type position of a value (a cast, a `let`, a closure parameter or output, the
+    /// generic arguments of a path or method call, the self type of a qualified path) are leaked
+    /// like any type of the item. Another relative path (a function, a constant, a struct literal,
+    /// a variant, the trait of a qualified path) is rejected unless it is absolute or starts with
+    /// `$crate`, is allowed ([`Allow::allow_path_if()`]), or starts with a generic or `Self` in
+    /// scope or a name that the value declares. A macro whose arguments are not expressions
+    /// (`cfg!`, `stringify!` and `matches!` excepted), a `macro_rules!`, a glob import and syntax
+    /// that `syn` does not parse are rejected.
+    pub fn check_values(mut self) -> Self {
+        self.check_values = true;
+        self
+    }
+
+    /// Accepts a type that names the `Self` of a struct, an enum or a union nested in the analyzed
+    /// syntax ([`View::visit_item()`], the items of [`intern_mod()`](Leaker::intern_mod)) when a
+    /// bound of the generics it uses names that `Self` too: `Rel2<Self, T>` in `struct S<T:
+    /// AsRef<Self>>`.
+    ///
+    /// Without it such an entry is an error ([`Reason::NestedSelfInBounds`]). With it the entry is
+    /// for any type that the bound holds for ([`SelfRequirement::Any`]), and the copy passes its
+    /// own type as the implementor. A default of a parameter is not changed (E0735), and a bound
+    /// that names a leaked type that names `Self` is still an error. You promise two things: the
+    /// declaration of the leaked type has no trait bound on the parameter that receives `Self`
+    /// (`struct Rel2<A: Clone, B>`), else the impl fails in the Leaker's crate (E0277), so write
+    /// the type with an absolute path or give the item its own `intern_*` call; and rustc before
+    /// 1.70 fails with E0275 if the copy's field is the last field of a struct, so put it first or
+    /// add `where Self: Sized` to the item.
+    pub fn nested_self_entries(mut self) -> Self {
+        self.nested_self_entries = true;
+        self
+    }
+}
+
 /// What a [`Leaker`] found, apart from the rules that make its type.
 #[derive(Default)]
 struct State {
@@ -138,11 +198,7 @@ struct State {
     /// keeps without an entry too.
     top_levels: BTreeSet<ContextId>,
     assumed_primitives: Vec<Ident>,
-    /// Whether the values of an item are read (`check_values` of [`Leaker::from_config()`]).
-    check_values: bool,
-    /// Whether an entry that names the `Self` of a nested struct, enum or union together with a
-    /// bound that does is accepted (`nested_self_entries` of [`Leaker::from_config()`]).
-    nested_self_entries: bool,
+    options: Options,
     /// The parts copied as written.
     parts: Vec<PartItem>,
     /// The errors of the outermost calls, in the order found.
@@ -152,7 +208,7 @@ struct State {
 impl Leaker {
     /// Creates a [`Leaker`] that allows nothing, so every relative path is leaked.
     pub fn new() -> Self {
-        Self::from_config(Allow::new(), false, false)
+        Self::from_config(Allow::new(), Options::new())
     }
 }
 
@@ -163,41 +219,15 @@ impl Default for Leaker {
 }
 
 impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
-    /// Creates a [`Leaker`] with the rules of `allow`.
+    /// Creates a [`Leaker`] with the rules of `allow` and the `options` of the analysis.
     ///
-    /// `check_values` makes it read the values of an item too: the values of consts and statics,
-    /// the defaults and values of associated consts, and the bodies of functions and methods (enum
-    /// discriminants, the defaults of const parameters and array lengths are read either way, the
-    /// first two as a value is, but their errors are no [`ErrorItem::in_value`]). Without it a
-    /// relative path in a value breaks the copy and the Leaker does not tell. The types in a type
-    /// position of a value (a cast, a `let`, a closure parameter or output, the generic arguments
-    /// of a path or method call, the self type of a qualified path) are leaked like any type of
-    /// the item. Another relative path (a function, a constant, a struct literal, a variant, the
-    /// trait of a qualified path) is rejected unless it is absolute or starts with `$crate`, is
-    /// allowed ([`Allow::allow_path_if()`]), or starts with a generic or `Self` in scope or a name
-    /// that the value declares. A macro whose arguments are not expressions (`cfg!`, `stringify!`
-    /// and `matches!` excepted), a `macro_rules!`, a glob import and syntax that `syn` does not
-    /// parse are rejected.
-    ///
-    /// `nested_self_entries` accepts a type that names the `Self` of a struct, an enum or a union
-    /// nested in the analyzed syntax ([`View::visit_item()`], the items of
-    /// [`intern_mod()`](Leaker::intern_mod)) when a bound of the generics it uses names that `Self`
-    /// too: `Rel2<Self, T>` in `struct S<T: AsRef<Self>>`. Without it such an entry is an error
-    /// ([`Reason::NestedSelfInBounds`]). With it the entry is for any type that the bound holds for
-    /// ([`SelfRequirement::Any`]), and the copy passes its own type as the implementor. A default
-    /// of a parameter is not changed (E0735), and a bound that names a leaked type that names
-    /// `Self` is still an error. You promise two things: the declaration of the leaked type has no
-    /// trait bound on the parameter that receives `Self` (`struct Rel2<A: Clone, B>`), else the
-    /// impl fails in the Leaker's crate (E0277), so write the type with an absolute path or give
-    /// the item its own `intern_*` call; and rustc before 1.70 fails with E0275 if the copy's field
-    /// is the last field of a struct, so put it first or add `where Self: Sized` to the item.
-    pub fn from_config(allow: Allow<P, E>, check_values: bool, nested_self_entries: bool) -> Self {
+    /// See [`Options::check_values()`] and [`Options::nested_self_entries()`].
+    pub fn from_config(allow: Allow<P, E>, options: Options) -> Self {
         Self {
             paths: Rc::new(allow.paths),
             accepted: allow.errors,
             state: State {
-                check_values,
-                nested_self_entries,
+                options,
                 ..State::default()
             },
         }
@@ -206,6 +236,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     /// Returns a compile-time check that the primitive names copied as written (`u8` in `const N:
     /// u8`, or by [`Allow::allow_primitive()`]) are not shadowed, also those in a part that an error
     /// makes copied as written. Emit it in the Leaker's crate. It is empty if none was copied.
+    #[must_use]
     pub fn assertions(&self) -> TokenStream {
         if self.state.assumed_primitives.is_empty() {
             return TokenStream::new();
@@ -504,24 +535,26 @@ impl State {
 ///
 /// [`allow()`](LeakerResult::allow) and [`allow_path_if()`](LeakerResult::allow_path_if) drop the
 /// errors that a rule accepts, and the other `allow*` methods are rules of the same names as those
-/// of [`Allow`]. They never change the Referrer: you promise that the part compiles as
-/// written. A rule is applied at once, so it may borrow. A path rule here only approximates the
-/// one of the [`Allow`] of the Leaker (more errors may remain, and a copy may fail to build): give
-/// path rules to the Leaker when you can. The [nested errors](ErrorItem::nested) of a dropped error
-/// come up in its place, so allow until [`errors()`](LeakerResult::errors) is empty.
+/// of [`Allow`]. They take and return the result, so they chain. They only drop errors and leave the
+/// entries as they are (you promise that the part compiles as written): to remove entries, give an
+/// [`Allow`] to [`Leaker::from_config()`]. A rule is applied at once and may be an `FnMut`, so it
+/// may borrow or count. A path rule here only approximates the one of the [`Allow`] of the Leaker
+/// (more errors may remain, and a copy may fail to build): give path rules to the Leaker when you
+/// can. The [nested errors](ErrorItem::nested) of a dropped error come up in its place, so allow
+/// until [`errors()`](LeakerResult::errors) is empty.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
 /// let item: ItemStruct = parse_quote!(struct S { a: Rel, b: ::p::W<'_, dyn RelTr> });
 /// let mut leaker = Leaker::new();
 /// leaker.intern_struct(&item, true);
-/// let mut result = leaker.result();
+/// let result = leaker.result();
 /// assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
 /// // `Rel` is an entry as usual, and `dyn RelTr` is copied as written.
 /// let referrer = result.clone().into_referrer();
 /// assert_eq!(referrer.iter().count(), 1);
 /// // Allowing the error leaves the Referrer as it is, and `finish()` returns it.
-/// result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
+/// let result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
 /// assert_eq!(result.finish().unwrap(), referrer);
 /// ```
 #[derive(Clone, Debug)]
@@ -531,15 +564,12 @@ pub struct LeakerResult {
 }
 
 impl LeakerResult {
-    /// Applies `allow` to the errors. It filters a copy, so that a rule that panics (and a caller
-    /// that catches it) leaves the errors as they were.
+    /// Applies `allow` to the errors, in place: a rule that panics loses the result.
     fn apply<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-        &mut self,
+        mut self,
         allow: Allow<P, E>,
-    ) -> &mut Self {
-        let mut errors = self.errors.clone();
-        allow.filter(&mut errors);
-        self.errors = errors;
+    ) -> Self {
+        allow.filter(&mut self.errors);
         self
     }
 
@@ -550,8 +580,9 @@ impl LeakerResult {
     /// and the array is copied whole. Allowing a [`Reason::UnprovableBound`] does not make the copy
     /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
     /// ignored).
-    pub fn allow(&mut self, rule: impl Fn(&ErrorItem) -> bool) -> &mut Self {
-        self.apply(Allow::new().allow(rule))
+    pub fn allow(self, rule: impl FnMut(&ErrorItem) -> bool) -> Self {
+        let rule = RefCell::new(rule);
+        self.apply(Allow::new().allow(|error| (*rule.borrow_mut())(error)))
     }
 
     /// Drops the errors whose relative paths `rule` accepts all, and the accepted paths of the
@@ -559,37 +590,38 @@ impl LeakerResult {
     ///
     /// The rule sees [`ErrorItem::paths`] (no generic arguments), never one that starts with
     /// `Self`, and also the nested errors that come up.
-    pub fn allow_path_if(&mut self, rule: impl Fn(&Path) -> bool) -> &mut Self {
-        self.apply(Allow::new().allow_path_if(rule))
+    pub fn allow_path_if(self, rule: impl FnMut(&Path) -> bool) -> Self {
+        let rule = RefCell::new(rule);
+        self.apply(Allow::new().allow_path_if(|path| (*rule.borrow_mut())(path)))
     }
 
     /// Drops the errors whose relative paths are all primitive type names.
-    pub fn allow_primitive(&mut self) -> &mut Self {
+    pub fn allow_primitive(self) -> Self {
         self.apply(Allow::new().allow_primitive())
     }
 
     /// Drops the errors whose relative paths are all names of the standard prelude (`Clone`).
-    pub fn allow_prelude(&mut self) -> &mut Self {
+    pub fn allow_prelude(self) -> Self {
         self.apply(Allow::new().allow_prelude())
     }
 
     /// Drops the errors whose relative paths all start with `std`, `core` or `alloc`.
-    pub fn allow_std_crates(&mut self) -> &mut Self {
+    pub fn allow_std_crates(self) -> Self {
         self.apply(Allow::new().allow_std_crates())
     }
 
     /// Drops the errors whose relative paths all start with `crate`.
-    pub fn allow_crate(&mut self) -> &mut Self {
+    pub fn allow_crate(self) -> Self {
         self.apply(Allow::new().allow_crate())
     }
 
     /// Drops the errors found in a value (see [`ErrorItem::in_value`]).
-    pub fn allow_values(&mut self) -> &mut Self {
+    pub fn allow_values(self) -> Self {
         self.apply(Allow::new().allow_values())
     }
 
     /// Drops the errors found in a default (see [`ErrorItem::in_default`]).
-    pub fn allow_default(&mut self) -> &mut Self {
+    pub fn allow_default(self) -> Self {
         self.apply(Allow::new().allow_default())
     }
 
@@ -600,8 +632,8 @@ impl LeakerResult {
     /// than the Leaker's. The types inside an optional entry are replaced either way. Not
     /// serialized: the Leaker's side writes the impls of all entries ([`Referrer::iter()`]), and
     /// the macro that receives the result chooses.
-    pub fn deny_ambiguous_crate_name(&mut self) -> &mut Self {
-        self.referrer.allow_ambiguous_crate_name = false;
+    pub fn deny_ambiguous_crate_name(mut self) -> Self {
+        self.referrer.allow_ambiguous_crate_name.0 = false;
         self
     }
 
@@ -615,6 +647,12 @@ impl LeakerResult {
         self.referrer
     }
 
+    /// Returns the Referrer as [`into_referrer()`](LeakerResult::into_referrer) does, and the
+    /// errors that remain, in the order found.
+    pub fn into_parts(self) -> (Referrer, Vec<ErrorItem>) {
+        (self.referrer, self.errors)
+    }
+
     /// Returns the Referrer if no error remains, else the errors that remain.
     pub fn finish(self) -> Result<Referrer, Vec<ErrorItem>> {
         if self.errors.is_empty() {
@@ -625,26 +663,38 @@ impl LeakerResult {
     }
 }
 
-/// Writes the [`Referrer`], then one brace group for each remaining [`ErrorItem`].
+/// Writes the [`Referrer`], then, if errors remain, `@ [ {error} {error} .. ]`: one brace group for
+/// each [`ErrorItem`], in the order found, in one bracket group after an `@`.
 impl ToTokens for LeakerResult {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.referrer.to_tokens(tokens);
-        for error in &self.errors {
-            error.to_tokens(tokens);
+        if !self.errors.is_empty() {
+            tokens.extend(quote! {
+                @ [#(for error in &self.errors) { #error }]
+            });
         }
     }
 }
 
-/// Reads a [`Referrer`], then one [`ErrorItem`] for each brace group that follows. Tokens after the
-/// last error are not consumed. Fails as the [`Referrer`] does (a missing or different format tag),
-/// and on an error that does not parse. A serialized Referrer parses with no errors, unless a brace
-/// group follows it.
+/// Reads a [`Referrer`], then the errors of `@ [ {error} .. ]` if that follows. Anything else
+/// after the Referrer is left to the caller: only an `@` followed by a bracket group is read, so a
+/// brace group after the result is not an error. Fails as the [`Referrer`] does (a missing or
+/// different format tag), and on an `@ [ .. ]` that holds something else than error groups. A
+/// serialized Referrer parses with no errors.
 impl Parse for LeakerResult {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let referrer = input.parse()?;
         let mut errors = Vec::new();
-        while input.peek(token::Brace) {
-            errors.push(input.parse()?);
+        if input.peek(Token![@]) && input.peek2(token::Bracket) {
+            input.parse::<Token![@]>()?;
+            let list;
+            bracketed!(list in input);
+            while !list.is_empty() {
+                if !list.peek(token::Brace) {
+                    return Err(list.error("expected an error `{ .. }` in `@ [ .. ]`"));
+                }
+                errors.push(list.parse()?);
+            }
         }
         Ok(LeakerResult { referrer, errors })
     }
@@ -660,8 +710,8 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Scopes for Leaker<P, E> {
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
         let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(self.paths.clone()), &root)
-            .reading_values(self.state.check_values)
-            .with_nested_self_entries(self.state.nested_self_entries);
+            .reading_values(self.state.options.check_values)
+            .with_nested_self_entries(self.state.options.nested_self_entries);
         let mark = self.state.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, or a

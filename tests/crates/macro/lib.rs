@@ -147,9 +147,7 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
 /// true exactly where that impl fails with `EncodeError::NeedsSelf`.
 pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots) -> Result<()> {
     let marker: Type = parse_quote!(__Marker);
-    let r = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), |value, param| {
-        slots.encode_const(value, &param.ty)
-    });
+    let r = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), slots.const_fn());
     let ty = referrer.iter().nth(ix).unwrap();
     let needs_self = referrer.needs_self(ix);
     if matches!(r, Err(EncodeError::NeedsSelf(_))) != needs_self {
@@ -197,19 +195,20 @@ pub(crate) fn starts_with(prefixes: Vec<Path>) -> impl Fn(&Path) -> bool {
 
 /// Allows the cause of every error that remains, until none does: an error that is dropped puts its
 /// nested errors in its place (`ErrorItem::nested`), which have causes of their own.
-pub(crate) fn allow_every_cause(result: &mut LeakerResult) {
+pub(crate) fn allow_every_cause(mut result: LeakerResult) -> LeakerResult {
     while !result.errors().is_empty() {
         let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
         for cause in causes {
-            result.allow(|e| e.cause == cause);
+            result = result.allow(|e| e.cause == cause);
         }
     }
+    result
 }
 
-/// The errors of the Leaker, reported with `ErrorItem::to_compile_error()` (a `Diagnostic` on
-/// nightly), one by one.
+/// The errors of the Leaker, reported with `ErrorItem::emit()` (a `Diagnostic` on nightly), one by
+/// one.
 pub(crate) fn report(errors: &[ErrorItem]) -> TokenStream {
-    errors.iter().map(ErrorItem::to_compile_error).collect()
+    errors.iter().map(ErrorItem::emit).collect()
 }
 
 /// The messages of the errors of the Leaker, one per line.
@@ -241,7 +240,7 @@ fn report_errors(errors: &[ErrorItem], serialized: bool) -> proc_macro::TokenStr
 }
 
 /// Analyzes a trait without allowing any relative path, reporting the errors with
-/// `ErrorItem::to_compile_error()` (for tests/diagnostic.rs). `#[leak_strict(serialized)]` reports
+/// `ErrorItem::emit()` (for tests/diagnostic.rs). `#[leak_strict(serialized)]` reports
 /// them after the serialization (`report_errors()`).
 #[proc_macro_attribute]
 pub fn leak_strict(
@@ -258,9 +257,31 @@ pub fn leak_strict(
     }
 }
 
+/// Analyzes a trait without allowing any relative path, builds the `to_compile_error()` of every
+/// error twice and drops them, and gives the trait back: nothing is reported, whatever the
+/// toolchain (for tests/diagnostic.rs).
+#[proc_macro_attribute]
+pub fn leak_discard(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let item_trait = parse_macro_input!(item as ItemTrait);
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item_trait, true);
+    match leaker.result().finish() {
+        Ok(_) => panic!("the trait has errors"),
+        Err(errors) => {
+            for error in &errors {
+                drop((error.to_compile_error(), error.to_compile_error()));
+            }
+        }
+    }
+    quote!(#item_trait).into()
+}
+
 /// Like `leak_strict`, but enters only the generics of the trait (`Leaker::enter_generics()`), where
 /// `Self` has no meaning, and visits the types of its methods: a mention of `Self` is an error
-/// with the reason `SelfWithoutMeaning`, reported with `ErrorItem::to_compile_error()` (for
+/// with the reason `SelfWithoutMeaning`, reported with `ErrorItem::emit()` (for
 /// tests/diagnostic.rs). `#[leak_generics(serialized)]` reports them after the serialization.
 #[proc_macro_attribute]
 pub fn leak_generics(
@@ -466,8 +487,7 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Allow::new()
             .allow_primitive()
             .allow_path_if(starts_with(allowed)),
-        false,
-        false,
+        Options::new(),
     );
     match &item {
         Item::Trait(item) => leaker.intern_trait(item, true),
@@ -521,8 +541,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
             .allow_primitive()
             .allow_prelude()
             .allow_path_if(starts_with(args.allow.clone().into_iter().collect())),
-        false,
-        false,
+        Options::new(),
     );
     let context = leaker.intern_trait(&item_trait, true);
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
@@ -552,15 +571,14 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let self_param: Ident = parse_quote!(__S);
     for ix in 0..referrer.iter().count() {
         let r = referrer
-            .repeater_impl(ix, ImplSelf::Param(&self_param), |value, param| {
-                slots.encode_const(value, &param.ty)
-            })
+            .repeater_impl(ix, ImplSelf::Param(&self_param), slots.const_fn())
             .map_err(Error::from)?;
         check_plain(&referrer, ix, &slots)?;
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+        let (self_ty, ty) = (&r.self_ty, &r.ty);
+        let trait_path = slots.trait_path(&r.args, id, ix);
         repeater_impls.extend(quote! {
-            impl #impl_generics #repeater<#args, #id, #ix> for #self_ty #where_clause {
+            impl #impl_generics #trait_path for #self_ty #where_clause {
                 type Type = #ty;
             }
         });
@@ -670,7 +688,7 @@ impl Parse for Input {
         // names of the crates, see `LeakerResult::deny_ambiguous_crate_name()`).
         if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
             input.parse::<Ident>()?;
-            result.deny_ambiguous_crate_name();
+            result = result.deny_ambiguous_crate_name();
         }
         let header = Header {
             item_trait,
@@ -917,6 +935,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         items,
     } = input;
     let slots = RepeaterSlots::new(repeater.clone());
+    let id: u64 = id.base10_parse()?;
     let params = &item_trait.generics.params;
     let trait_params: Vec<GenericArgument> = params
         .iter()
@@ -927,14 +946,12 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     let mut copies = TokenStream::new();
     for mut item in items {
         // `Self` is what the context says: the implementor of the trait.
-        let mut visitor = referrer.clone().visitor(context, |_, ix| {
+        let mut visitor = referrer.visitor(context, |_, ix| {
             let projection = (|| -> Result<Type> {
                 let site =
                     UseSite::substituting(params, &trait_params).with_self(self_in_copy.clone());
-                let encoded = referrer.entry_args(ix, &site, |value, param| {
-                    slots.encode_const(value, &param.ty)
-                })?;
-                Ok(parse_quote!(<#self_in_copy as #repeater<#encoded, #id, #ix>>::Type))
+                let encoded = referrer.entry_args(ix, &site, slots.const_fn())?;
+                Ok(slots.projection(&self_in_copy, &encoded, id, ix))
             })();
             projection.unwrap_or_else(|e| {
                 error = Some(e);
@@ -980,6 +997,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     let params = &item_trait.generics.params;
     let trait_ident = &item_trait.ident;
     let slots = RepeaterSlots::new(repeater.clone());
+    let id: u64 = id.base10_parse()?;
 
     // The projection to the leaked type `ix`: the Repeater is encoded with the arguments of the
     // generics the type uses, which are those of the trait or are in scope with the same names (the
@@ -991,9 +1009,9 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         let encoded = referrer.entry_args(
             ix,
             &UseSite::substituting(root_params, root_args),
-            |value, param| slots.encode_const(value, &param.ty),
+            slots.const_fn(),
         )?;
-        Ok(parse_quote!(<Self as #repeater<#encoded, #id, #ix>>::Type))
+        Ok(slots.projection(&parse_quote!(Self), &encoded, id, ix))
     };
 
     // Complete the arguments: an omitted argument takes the default, which is rewritten in the
@@ -1001,7 +1019,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     // are encoded as in the Leaker.
     let mut encode_error = None;
     let completed = referrer
-        .complete_args(&trait_args.args, params, |_, ix, prefix| {
+        .complete_args(context, params, &trait_args.args, |_, ix, prefix| {
             let before: Punctuated<GenericParam, Token![,]> =
                 params.iter().take(prefix.len()).cloned().collect();
             projection(ix, &before, prefix).unwrap_or_else(|e| {
@@ -1065,7 +1083,6 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         // The context of the trait says what `Self` is (the implementor) and which generics are in
         // scope.
         let mut visitor = referrer
-            .clone()
             .visitor(context, |_, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>));
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
@@ -1222,7 +1239,7 @@ pub fn prop_leak_accept(
 /// is emitted as an accepted item whose macro carries the `LeakerResult` (the Referrer, then the
 /// errors, as tokens). `__prop_apply!` drops the errors that its invocation allows
 /// (`allow(prelude, std_crates, trait Path, type Ty)`), reports the others with
-/// `ErrorItem::to_compile_error()`, and copies the item with the recovered Referrer. See `prop.rs`.
+/// `ErrorItem::emit()`, and copies the item with the recovered Referrer. See `prop.rs`.
 #[proc_macro_attribute]
 pub fn prop_leak_result(
     attr: proc_macro::TokenStream,

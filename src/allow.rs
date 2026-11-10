@@ -27,7 +27,7 @@ use template_quote::ToTokens;
 ///     .allow_primitive()
 ///     .allow_prelude()
 ///     .allow_path_if(|p| p.leading_colon.is_some() && p.segments[0].ident == "serde");
-/// let mut leaker = Leaker::from_config(allow, false, false);
+/// let mut leaker = Leaker::from_config(allow, Options::new());
 /// // `Vec` and `u8` are allowed, so only `MyType` is leaked.
 /// let item: ItemStruct = parse_quote!(struct S { a: Vec<u8>, b: MyType });
 /// leaker.intern_struct(&item, true);
@@ -41,9 +41,10 @@ use template_quote::ToTokens;
 /// # use type_leak::*;
 /// # let primitive = true;
 /// let allow = Allow::new().allow_path_if(move |p| primitive && is_primitive_path(p));
-/// # let _ = Leaker::from_config(allow, false, false);
+/// # let _ = Leaker::from_config(allow, Options::new());
 /// ```
 #[derive(Clone)]
+#[must_use]
 pub struct Allow<P = fn(&Path) -> bool, E = fn(&ErrorItem) -> bool> {
     /// Set by [`Allow::allow_path_if()`] and the like.
     pub(crate) paths: P,
@@ -146,8 +147,8 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Allow<P, E> {
     }
 
     /// Accepts the errors found in a value: a const or static value, the body of a function, a
-    /// trait's default value or body. It has an effect only with the `check_values` argument of
-    /// [`Leaker::from_config()`](crate::Leaker::from_config).
+    /// trait's default value or body. It has an effect only with
+    /// [`Options::check_values()`](crate::Options::check_values).
     pub fn allow_values(self) -> Allow<P, impl Fn(&ErrorItem) -> bool> {
         self.allow(|error| error.in_value)
     }

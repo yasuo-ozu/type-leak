@@ -13,7 +13,7 @@ mod common;
 use common::starts_with;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Allow, ErrorItem, Leaker, Referrer};
+use type_leak::{Allow, ErrorItem, Leaker, Options, Referrer};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -42,7 +42,7 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Fn(&Path) -> bool> {
         .allow_primitive()
         .allow_prelude()
         .allow_path_if(move |path| allowed.iter().any(|a| starts_with(a.clone())(path)));
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 /// Analyzes `item` with the matching `intern_*`.
@@ -186,7 +186,7 @@ fn the_error_names_the_type_and_the_bound() {
     let (headline, note) = rejected(item);
     assert_eq!(
         headline,
-        "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a leaked type"
+        "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked type"
     );
     let note = note.unwrap();
     assert!(
@@ -452,8 +452,8 @@ fn an_entry_that_names_self_in_a_predicate_of_its_trait_is_rejected() {
         let note = note.unwrap();
         // The bound of `T` names the entry (the third), or the predicate of the trait does.
         assert!(
-            note.contains("whose impl is for the implementors of the trait (`Self : Tr < T >`)")
-                || note.contains("the bound `T : :: core :: convert :: AsRef < Rel < Self > >`"),
+            note.contains("whose impl is for the implementors of the trait (`Self : Tr<T>`)")
+                || note.contains("the bound `T : ::core::convert::AsRef<Rel<Self>>`"),
             "{}: {}",
             text,
             note
@@ -500,7 +500,7 @@ fn an_associated_type_of_self_in_a_predicate_is_rejected_if_the_trait_has_a_leak
     assert!(headline.contains(HEADLINE), "{}", headline);
     assert!(note
         .unwrap()
-        .contains("resolves `Self :: A` by the impl of the trait"),);
+        .contains("resolves `Self::A` by the impl of the trait"),);
     // The bound of a method is no bound of the trait.
     leak(parse_quote!(
         pub trait Tr<U: Clone> {
@@ -793,7 +793,7 @@ fn self_and_its_associated_types_in_a_bound_are_unstable() {
     ));
     assert_eq!(
         headline,
-        "`Rel < X >` is in a bound or where predicate, and a bound of its generics names `Self`, which is a leaked type"
+        "`Rel<X>` is in a bound or where predicate, and a bound of its generics names `Self`, which is a leaked type"
     );
     assert!(
         note.contains("the bound `X : Fn (Self) -> u8` of its generics names `Self`"),
@@ -813,7 +813,7 @@ fn self_and_its_associated_types_in_a_bound_are_unstable() {
     let help = help_of(item.clone());
     let (headline, _note) = unstable(item);
     assert!(
-        headline.ends_with("a bound of its generics names `Self :: A0`"),
+        headline.ends_with("a bound of its generics names `Self::A0`"),
         "{}",
         headline
     );
@@ -889,14 +889,14 @@ fn self_a_in_a_predicate_of_an_impl_is_unstable_with_a_leaked_bound_of_the_impl(
         let text = s(&item);
         let (headline, note) = unstable(item);
         assert!(
-            headline.starts_with("`Self :: A1` is in a bound or where predicate")
+            headline.starts_with("`Self::A1` is in a bound or where predicate")
                 && headline.ends_with("names a leaked type"),
             "{}: {}",
             text,
             headline
         );
         assert!(
-            note.contains("resolves `Self :: A1` by the impl of the trait")
+            note.contains("resolves `Self::A1` by the impl of the trait")
                 && note.contains("of the impl"),
             "{}: {}",
             text,
@@ -1047,10 +1047,7 @@ fn an_optional_entry_that_an_unstable_bound_makes_cyclic_is_copied_as_written() 
 /// mutant `b_selfassoc_qself_off`.
 #[test]
 fn a_qualified_associated_type_of_self_in_a_bound_is_unstable() {
-    for (written, shown) in [
-        ("Self::A0", "Self :: A0"),
-        ("<Self as ::p::Tr>::A0", "< Self as :: p :: Tr > :: A0"),
-    ] {
+    for written in ["Self::A0", "<Self as ::p::Tr>::A0"] {
         let item: Item = parse_str(&format!(
             "pub trait Tr {{ type A0; fn m<X>(&self) where X: Fn(&{}) -> u8, Rel<X>: Default; }}",
             written
@@ -1060,9 +1057,9 @@ fn a_qualified_associated_type_of_self_in_a_bound_is_unstable() {
         assert_eq!(
             headline,
             format!(
-                "`Rel < X >` is in a bound or where predicate, and a bound of its generics names \
+                "`Rel<X>` is in a bound or where predicate, and a bound of its generics names \
                  `{}`",
-                shown
+                written
             )
         );
         assert!(
@@ -1271,7 +1268,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         let result = leaker.result();
         let err = result.errors();
         assert!(
-            messages(err).contains("names `T :: Item`"),
+            messages(err).contains("names `T::Item`"),
             "{}: {}",
             name,
             messages(err)
@@ -1296,8 +1293,8 @@ fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
         [
             "write `<Self as ::p::Tr>::A` instead of `Self::A` in a bound of the generics of \
              `Rel<T>`: the copy cannot tell which trait `A` comes from",
-            "`Self :: A` is in a bound or where predicate, and a bound of its generics names \
-             `Self :: A`"
+            "`Self::A` is in a bound or where predicate, and a bound of its generics names \
+             `Self::A`"
         ]
     );
 }

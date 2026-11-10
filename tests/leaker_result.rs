@@ -1,12 +1,13 @@
-//! `LeakerResult` as tokens: the `Referrer`, then one brace group for each remaining error.
+//! `LeakerResult` as tokens: the `Referrer`, then, if errors remain, `@ [ {error} {error} .. ]`.
 //!
 //! A Leaker's macro emits the result and the Referrer's macro reads it and decides what to allow.
 //!
 //! - Without errors: the tokens are the Referrer's own.
 //! - With errors: the errors, the Referrer and the tokens that are written again are the same.
 //! - `allow*` drops the same errors before and after the trip.
-//! - The tokens after the result are not consumed, and a wrong format tag fails as the Referrer's
-//!   `Parse` does.
+//! - The tokens after the result are not consumed (a brace group among them is no error: only an
+//!   `@` and a bracket group are read), a wrong format tag fails as the Referrer's `Parse` does,
+//!   and a malformed `@ [ .. ]` fails with a message of its own.
 //!
 //! The spans of the errors that are read back are checked by `tests/crates/spans`
 //! (`a_serialized_leaker_result_keeps_its_spans`).
@@ -14,7 +15,7 @@
 mod common;
 
 use common::{allow_every_cause, starts_with};
-use proc_macro2::{Literal, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Literal, TokenStream, TokenTree};
 use syn::parse::Parser;
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -112,24 +113,44 @@ fn a_result_without_errors_is_written_and_read_back() {
     assert_eq!(read.finish().unwrap(), referrer);
 }
 
-/// A result with several errors is the tokens of its Referrer, then the tokens of each error in
-/// order. It is read back with the same errors, item by item, and a Referrer equal to the original;
-/// writing it twice, or writing the one that was read, gives the same tokens.
+/// A result with several errors is the tokens of its Referrer, then `@` and one bracket group with
+/// the tokens of each error in order. It is read back with the same errors, item by item, and a
+/// Referrer equal to the original; writing it twice, or writing the one that was read, gives the
+/// same tokens.
 #[test]
 fn a_result_with_errors_is_written_and_read_back() {
     let result = with_errors();
     assert!(result.errors().len() >= 5, "{:?}", describe_all(&result));
     let referrer = result.clone().into_referrer();
 
-    // The form: the Referrer, then one brace group for each error, in the order of `errors()`.
+    // The form: the Referrer, then `@`, then one bracket group with one brace group for each error,
+    // in the order of `errors()`.
     let tokens = result.to_token_stream();
-    let mut expected = referrer.to_token_stream();
+    let mut list = TokenStream::new();
     for error in result.errors() {
         let group = error.to_token_stream();
         assert_eq!(group.clone().into_iter().count(), 1);
-        expected.extend(group);
+        list.extend(group);
     }
+    let mut expected = referrer.to_token_stream();
+    expected.extend(quote!(@ [#list]));
     assert_eq!(text(&tokens), text(&expected));
+    // And nothing else: the tokens of the Referrer, an `@`, and the bracket group of the errors.
+    let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    let n = referrer.to_token_stream().into_iter().count();
+    assert_eq!(trees.len(), n + 2);
+    assert!(matches!(&trees[n], TokenTree::Punct(p) if p.as_char() == '@'));
+    match &trees[n + 1] {
+        TokenTree::Group(group) => {
+            assert_eq!(group.delimiter(), Delimiter::Bracket);
+            let groups: Vec<TokenTree> = group.stream().into_iter().collect();
+            assert_eq!(groups.len(), result.errors().len());
+            assert!(groups.iter().all(
+                |tree| matches!(tree, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)
+            ));
+        }
+        other => panic!("{}", other),
+    }
     // It is deterministic.
     assert_eq!(text(&tokens), text(&result.to_token_stream()));
     assert_eq!(text(&tokens), text(&result.clone()));
@@ -161,14 +182,14 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
 
     for cause in &causes {
         let (mut before, mut after) = (result.clone(), read_back.clone());
-        before.allow(|e| e.cause == cause.clone());
-        after.allow(|e| e.cause == cause.clone());
+        before = before.allow(|e| e.cause == cause.clone());
+        after = after.allow(|e| e.cause == cause.clone());
         assert!(before.errors().len() < result.errors().len());
         assert_eq!(describe_all(&after), describe_all(&before));
     }
     let (mut before, mut after) = (result.clone(), read_back.clone());
-    before.allow_std_crates();
-    after.allow_std_crates();
+    before = before.allow_std_crates();
+    after = after.allow_std_crates();
     // `core::fmt::Debug` is the only cause that starts with the name of a crate of the library.
     let remaining: Vec<String> = before.errors().iter().map(|e| text(&e.cause)).collect();
     assert_eq!(remaining.len(), result.errors().len() - 1);
@@ -180,8 +201,7 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     assert_eq!(describe_all(&rest), describe_all(&before));
     assert_eq!(rest.into_referrer(), referrer);
 
-    let mut all = read_back;
-    allow_every_cause(&mut all);
+    let (all, _) = allow_every_cause(read_back);
     assert!(all.errors().is_empty());
     assert_eq!(all.finish().unwrap(), referrer);
 }
@@ -200,7 +220,7 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
         }
     );
     let config = Allow::new().allow_primitive();
-    let mut leaker = Leaker::from_config(config, true, false);
+    let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.errors().iter().any(|e| e.in_value && e.in_default));
@@ -208,35 +228,19 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
     let read_back = read(result.to_token_stream()).unwrap();
     assert_eq!(describe_all(&read_back), describe_all(&result));
 
-    type Rule = fn(&mut LeakerResult);
+    type Rule = fn(LeakerResult) -> LeakerResult;
     let rules: [(&str, Rule); 7] = [
-        ("path", |r| {
-            r.allow_path_if(starts_with(parse_quote!(my)));
-        }),
-        ("prelude", |r| {
-            r.allow_prelude();
-        }),
-        ("std crates", |r| {
-            r.allow_std_crates();
-        }),
-        ("crate", |r| {
-            r.allow_crate();
-        }),
-        ("primitive", |r| {
-            r.allow_primitive();
-        }),
-        ("values", |r| {
-            r.allow_values();
-        }),
-        ("default", |r| {
-            r.allow_default();
-        }),
+        ("path", |r| r.allow_path_if(starts_with(parse_quote!(my)))),
+        ("prelude", |r| r.allow_prelude()),
+        ("std crates", |r| r.allow_std_crates()),
+        ("crate", |r| r.allow_crate()),
+        ("primitive", |r| r.allow_primitive()),
+        ("values", |r| r.allow_values()),
+        ("default", |r| r.allow_default()),
     ];
     let mut dropped_something = 0;
     for (name, rule) in rules {
-        let (mut before, mut after) = (result.clone(), read_back.clone());
-        rule(&mut before);
-        rule(&mut after);
+        let (before, after) = (rule(result.clone()), rule(read_back.clone()));
         assert_eq!(describe_all(&after), describe_all(&before), "{}", name);
         if before.errors().len() < result.errors().len()
             || describe_all(&before) != describe_all(&result)
@@ -246,10 +250,8 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
         // The rest is written and read again, and a second rule on the other side of that trip
         // gives what both rules give on one side.
         for (second_name, second) in rules {
-            let mut together = before.clone();
-            second(&mut together);
-            let mut trip = read(before.to_token_stream()).unwrap();
-            second(&mut trip);
+            let together = second(before.clone());
+            let trip = second(read(before.to_token_stream()).unwrap());
             assert_eq!(
                 describe_all(&trip),
                 describe_all(&together),
@@ -260,6 +262,68 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
         }
     }
     assert!(dropped_something >= 3);
+}
+
+/// `into_parts()` is `into_referrer()` and `errors()` in one call.
+#[test]
+fn into_parts_returns_the_referrer_and_the_errors_that_remain() {
+    let result = with_errors();
+    assert!(!result.errors().is_empty());
+    let (referrer, errors) = result.clone().into_parts();
+    assert_eq!(referrer, result.clone().into_referrer());
+    assert_eq!(errors.len(), result.errors().len());
+    let described: Vec<String> = errors.iter().map(describe).collect();
+    assert_eq!(described, describe_all(&result));
+    // With every error dropped, the errors are none and the Referrer is the same.
+    let (all, _) = allow_every_cause(result);
+    let (again, none) = all.into_parts();
+    assert!(none.is_empty());
+    assert_eq!(again, referrer);
+}
+
+/// The `allow*()` methods and `deny_ambiguous_crate_name()` take and return the result, so they
+/// chain; a rule is an `FnMut`, applied at once, so it may count.
+#[test]
+fn the_rules_chain_and_a_rule_may_count() {
+    let result = with_errors();
+    let mut asked = 0;
+    let mut seen = Vec::new();
+    let chained = result
+        .clone()
+        .allow(|_| {
+            asked += 1;
+            false
+        })
+        .allow_path_if(|path| {
+            seen.push(text(path));
+            false
+        })
+        .allow_std_crates()
+        .deny_ambiguous_crate_name();
+    // The rule on errors is asked once for each error, and the rule on paths for the paths.
+    assert_eq!(asked, result.errors().len());
+    assert!(seen.iter().any(|path| path == "Rel"), "{:?}", seen);
+    // Chained: the same errors as one call after the other, and a strict Referrer.
+    let one_by_one = result.clone().allow_std_crates();
+    assert_eq!(describe_all(&chained), describe_all(&one_by_one));
+    // Only the strict Referrer replaces the optional entry `::foo::X` (`==` ignores strictness).
+    let expand = |result: LeakerResult| {
+        let referrer = result.into_referrer();
+        let ix = referrer
+            .iter()
+            .position(|ty| text(ty) == ":: foo :: X")
+            .unwrap();
+        let ty = referrer.expand(
+            referrer.context(ix),
+            parse_quote!(::foo::X),
+            |_, ix| parse_quote!(P<#ix>),
+        );
+        (ix, text(&ty))
+    };
+    let (ix, strict) = expand(chained);
+    assert_eq!(strict, format!("P < {}usize >", ix));
+    let one_by_one = expand(one_by_one).1;
+    assert_eq!(one_by_one, ":: foo :: X");
 }
 
 /// The tokens after the result are left for the caller: an ident and a `;` after the errors, and
@@ -325,16 +389,129 @@ fn a_wrong_format_tag_fails_as_the_referrer_does() {
     }
 }
 
-/// A brace group after the Referrer is read as an error: one that is not fails with the message of
-/// `ErrorItem`'s `Parse`.
+/// A result and then a brace group (`#result { item }`): the group is left to the caller, with
+/// errors or without, and the errors are those of the result.
 #[test]
-fn a_group_that_is_not_an_error_is_refused() {
+fn a_brace_group_after_the_result_is_left_to_the_caller() {
+    /// A result, then a brace group with its content, and nothing else.
+    fn result_then_group(input: parse::ParseStream) -> Result<(LeakerResult, String)> {
+        let result: LeakerResult = input.parse()?;
+        let group;
+        braced!(group in input);
+        let content: TokenStream = group.parse()?;
+        assert!(input.is_empty());
+        Ok((result, content.to_string()))
+    }
+    for result in [with_errors(), without_errors()] {
+        let tokens = quote!(#result { struct Copy; });
+        let (read, item) = result_then_group.parse2(tokens).unwrap();
+        assert_eq!(item, "struct Copy ;");
+        assert_eq!(describe_all(&read), describe_all(&result));
+        assert_eq!(read.into_referrer(), result.into_referrer());
+    }
+    // A group that has the shape of an error is left too (it was read as one without the `@`).
+    let error = with_errors().errors()[0].to_token_stream();
     let mut tokens = without_errors().to_token_stream();
-    tokens.extend(quote!({ nothing }));
-    let message = read(tokens).unwrap_err().to_string();
+    tokens.extend(error.clone());
+    let (read, item) = (|input: parse::ParseStream| -> Result<(LeakerResult, TokenStream)> {
+        Ok((input.parse()?, input.parse()?))
+    })
+    .parse2(tokens)
+    .unwrap();
+    assert!(read.errors().is_empty());
+    assert_eq!(item.to_string(), error.to_string());
+}
+
+/// A Referrer parses as a result without errors, alone or with tokens after it.
+#[test]
+fn a_referrer_parses_as_a_result_without_errors() {
+    for result in [with_errors(), without_errors()] {
+        let referrer = result.into_referrer();
+        let tokens = referrer.to_token_stream();
+        let read = read(tokens.clone()).unwrap();
+        assert!(read.errors().is_empty());
+        assert_eq!(text(&read), text(&tokens));
+        assert_eq!(read.into_referrer(), referrer);
+        let (read, rest) = (|input: parse::ParseStream| -> Result<(LeakerResult, TokenStream)> {
+            Ok((input.parse()?, input.parse()?))
+        })
+        .parse2(quote!(#referrer { item }))
+        .unwrap();
+        assert!(read.errors().is_empty());
+        assert_eq!(rest.to_string(), "{ item }");
+    }
+}
+
+/// Only an `@` followed by a bracket group is read as the errors: an `@` with anything else after
+/// it is left to the caller, as are the tokens when there is no `@`.
+#[test]
+fn an_at_without_a_bracket_group_is_left_to_the_caller() {
+    fn then_rest(input: parse::ParseStream) -> Result<(LeakerResult, String)> {
+        let result: LeakerResult = input.parse()?;
+        let rest: TokenStream = input.parse()?;
+        Ok((result, rest.to_string()))
+    }
+    for rest in [
+        quote!(@),
+        quote!(@ x [ y ]),
+        quote!(@ { }),
+        quote!(@ ( )),
+        quote!([]),
+    ] {
+        let mut tokens = with_errors().into_referrer().to_token_stream();
+        tokens.extend(rest.clone());
+        let (read, left) = then_rest.parse2(tokens).unwrap();
+        assert!(read.errors().is_empty(), "{}", rest);
+        assert_eq!(left, rest.to_string());
+    }
+    // An empty list is a list without errors.
+    let mut tokens = without_errors().to_token_stream();
+    tokens.extend(quote!(@ [ ] after));
+    let (read, left) = then_rest.parse2(tokens).unwrap();
+    assert!(read.errors().is_empty());
+    assert_eq!(left, "after");
+}
+
+/// An `@ [ .. ]` that holds a token which is not a brace group fails with a message that says what
+/// is expected; a brace group that is no error fails with the message of `ErrorItem`'s `Parse`.
+#[test]
+fn a_malformed_error_list_is_refused() {
+    let result = with_errors();
+    let referrer = result.clone().into_referrer().to_token_stream();
+    let first = result.errors()[0].to_token_stream();
+    let with = |list: TokenStream| -> TokenStream {
+        let mut tokens = referrer.clone();
+        tokens.extend(quote!(@ [#list]));
+        tokens
+    };
+
+    for list in [
+        quote!(nothing),
+        quote!(#first , #first),
+        quote!(#first ( #first )),
+        quote!(#first [ #first ]),
+        quote!(#first x),
+    ] {
+        let message = read(with(list.clone())).unwrap_err().to_string();
+        assert_eq!(
+            message, "expected an error `{ .. }` in `@ [ .. ]`",
+            "{}",
+            list
+        );
+    }
+
     let expected = parse2::<ErrorItem>(quote!({ nothing }))
         .unwrap_err()
         .to_string();
-    assert_eq!(message, expected);
-    assert!(!message.contains("incompatible type-leak"), "{}", message);
+    for list in [quote!({ nothing }), quote!(#first { nothing })] {
+        let message = read(with(list.clone())).unwrap_err().to_string();
+        assert_eq!(message, expected, "{}", list);
+        assert!(!message.contains("incompatible type-leak"), "{}", message);
+    }
+
+    // The list of the result itself is no such list.
+    assert_eq!(
+        describe_all(&read(result.to_token_stream()).unwrap()),
+        describe_all(&result)
+    );
 }

@@ -126,7 +126,7 @@ fn forms(name: &str) -> Vec<(&'static str, String, String)> {
         (
             "path of a const expression",
             format!("trait Tr: ::p::Sup<{{ {}::X }}> {{}}", name),
-            format!("use absolute path: '{} :: X'", name),
+            format!("use absolute path: '{}::X'", name),
         ),
         // The supertrait.
         (
@@ -138,7 +138,7 @@ fn forms(name: &str) -> Vec<(&'static str, String, String)> {
         (
             "type with an elided lifetime",
             format!("trait Tr {{ fn f(&self, x: {}<&'_ ()>); }}", name),
-            format!("use absolute path: '{} < & '_ () >'", name),
+            format!("use absolute path: '{}<&'_ ()>'", name),
         ),
     ]
 }

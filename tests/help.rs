@@ -26,7 +26,7 @@ fn allowing() -> Leaker<impl Fn(&Path) -> bool> {
         .allow_primitive()
         .allow_prelude()
         .allow_path_if(starts_with(parse_quote!(::p)));
-    Leaker::from_config(config, false, false)
+    Leaker::from_config(config, Options::new())
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
@@ -73,7 +73,7 @@ const ROWS: &[Row] = &[
             errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'usize :: MAX'",
+            "use absolute path: 'usize::MAX'",
             "use `::core::primitive::usize` instead of `usize`",
         )],
     },
@@ -87,8 +87,7 @@ const ROWS: &[Row] = &[
         },
         items: &[(
             "use absolute path: 'MyBound'",
-            "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `Allow::allow_path_if()`",
+            "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`)",
         )],
     },
     Row {
@@ -100,9 +99,8 @@ const ROWS: &[Row] = &[
             errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'crate :: m :: Bound'",
-            "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `Allow::allow_path_if()`",
+            "use absolute path: 'crate::m::Bound'",
+            "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`)",
         )],
     },
     Row {
@@ -116,9 +114,8 @@ const ROWS: &[Row] = &[
             errors(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[(
-            "use absolute path: 'MyType < '_ >'",
-            "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `Allow::allow_path_if()`",
+            "use absolute path: 'MyType<'_>'",
+            "write `MyType` with an absolute path (e.g. `::my_crate::MyType`)",
         )],
     },
     Row {
@@ -131,8 +128,7 @@ const ROWS: &[Row] = &[
         },
         items: &[(
             "use absolute path: 'Idx'",
-            "write `Idx` with an absolute path (e.g. `::my_crate::Idx`), or allow it with \
-             `Allow::allow_path_if()`",
+            "write `Idx` with an absolute path (e.g. `::my_crate::Idx`)",
         )],
     },
     Row {
@@ -147,8 +143,7 @@ const ROWS: &[Row] = &[
         },
         items: &[(
             "use absolute path: 'RelTr'",
-            "write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it with \
-             `Allow::allow_path_if()`, or name the lifetime of the trait object (e.g. \
+            "write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)",
         )],
     },
@@ -163,9 +158,8 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, false))
         },
         items: &[(
-            "use absolute path: 'Rel < Self >'",
-            "write `Rel` with an absolute path (e.g. `::my_crate::Rel`), allow it with \
-             `Allow::allow_path_if()`, or analyze the item with `allow_self = true`",
+            "use absolute path: 'Rel<Self>'",
+            "write `Rel` with an absolute path (e.g. `::my_crate::Rel`)",
         )],
     },
     // ── a bare identifier that may be a const ────────────────────────────────────────────────
@@ -182,8 +176,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), allow it with `Allow::allow_path_if()`, or analyze the item with \
-             `allow_self = true`",
+             const)",
         )],
     },
     Row {
@@ -231,8 +224,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), write the bound of the generics of `::p::W<T, LEN>` without `Self`, or \
-             analyze the item with `allow_self = true`",
+             const), or write the bound of the generics of `::p::W<T, LEN>` without `Self`",
         )],
     },
     Row {
@@ -267,7 +259,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or allow it with `Allow::allow_path_if()`",
+             const)",
         )],
     },
     // ── `Self` ───────────────────────────────────────────────────────────────────────────────
@@ -282,8 +274,7 @@ const ROWS: &[Row] = &[
         },
         items: &[(
             "`Self` has no meaning here",
-            "write the type instead of `Self`, or enter a scope that declares `Self` around it \
-             (`Leaker::enter_type`, `enter_impl` or `enter_trait`)",
+            "write the type instead of `Self`",
         )],
     },
     Row {
@@ -317,8 +308,7 @@ const ROWS: &[Row] = &[
         items: &[
             (
                 "use absolute path: 'Tr'",
-                "write `Tr` with an absolute path (e.g. `::my_crate::Tr`), or allow it with \
-                 `Allow::allow_path_if()`",
+                "write `Tr` with an absolute path (e.g. `::my_crate::Tr`)",
             ),
             (
                 "write `<Self as Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -377,8 +367,8 @@ const ROWS: &[Row] = &[
             ),
             // The bound is an error of its own: rustc cannot prove it while it checks the bounds.
             (
-                "`Self :: A` is in a bound or where predicate, and a bound of its generics names \
-                 `Self :: A`",
+                "`Self::A` is in a bound or where predicate, and a bound of its generics names \
+                 `Self::A`",
                 "write the bound without `Self::A`, or use `Self::A` outside the bounds and \
                  where predicates",
             ),
@@ -430,7 +420,7 @@ const ROWS: &[Row] = &[
             })
         },
         items: &[(
-            "the bound of `T` mentions `Self :: X`, which has no name here",
+            "the bound of `T` mentions `Self::X`, which has no name here",
             "write the bound of `T` without `Self::X`, or write `Rel<T>` with an absolute path, \
              so that it is not leaked",
         )],
@@ -446,9 +436,8 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, false))
         },
         items: &[(
-            "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked",
-            "write the bound of the generics of `Wrap<T>` without `Self`, or analyze the item \
-             with `allow_self = true`",
+            "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked",
+            "write the bound of the generics of `Wrap<T>` without `Self`",
         )],
     },
     Row {
@@ -461,7 +450,7 @@ const ROWS: &[Row] = &[
         },
         items: &[
             (
-                "`S < T >` is in the self type of the impl, and a bound of its generics names \
+                "`S<T>` is in the self type of the impl, and a bound of its generics names \
                  `Self`",
                 "write `S<T>` with an absolute path, or the bound of its generics without `Self`",
             ),
@@ -487,7 +476,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a \
+            "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a \
              leaked type",
             "write the leaked type of the bound with an absolute path, or use `Wrap<T>` outside \
              the bounds and where predicates",
@@ -508,8 +497,8 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "`Rel < X >` is in a bound or where predicate, and a bound of its generics names \
-             `Self :: A0`",
+            "`Rel<X>` is in a bound or where predicate, and a bound of its generics names \
+             `Self::A0`",
             "write the bound without `Self::A0`, or use `Rel<X>` outside the bounds and where \
              predicates",
         )],
@@ -527,7 +516,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "`Rel < Self >` names `Self` in a bound or where predicate of its trait",
+            "`Rel<Self>` names `Self` in a bound or where predicate of its trait",
             "write the predicate of the trait without `Rel<Self>`, or use `Rel<Self>` outside \
              the predicates of the trait (in a method, a field or a signature)",
         )],
@@ -546,7 +535,7 @@ const ROWS: &[Row] = &[
         },
         items: &[
             (
-                "`Wrap < 'b >` leaves the lifetime `'b` of the method unconstrained in the copy \
+                "`Wrap<'b>` leaves the lifetime `'b` of the method unconstrained in the copy \
                  (E0195)",
                 "keep `'b` in another argument of the method (for example `&'b self`), or write \
                  `Wrap<'b>` with an absolute path",
@@ -571,7 +560,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'Rel < 'x >'",
+            "use absolute path: 'Rel<'x>'",
             "keep an input that names `'x` as written (for example `&'x u8`), or write \
              `Rel<'x>` with an absolute path",
         )],
@@ -587,7 +576,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'Rel < T >'",
+            "use absolute path: 'Rel<T>'",
             "name the lifetime of the inputs and of the output, give the method a receiver \
              (`&self`), or write `Rel<T>` with an absolute path",
         )],
@@ -601,7 +590,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'Rel < T >'",
+            "use absolute path: 'Rel<T>'",
             "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
              absolute path",
         )],
@@ -615,7 +604,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'Rel < T >'",
+            "use absolute path: 'Rel<T>'",
             "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output, \
              or write `Rel<T>` with an absolute path",
         )],
@@ -631,7 +620,7 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "use absolute path: 'Rel < T >'",
+            "use absolute path: 'Rel<T>'",
             "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
              absolute path",
         )],
@@ -646,8 +635,7 @@ const ROWS: &[Row] = &[
         },
         items: &[(
             "use absolute path: 'Self'",
-            "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output, \
-             or analyze the item with `allow_self = true`",
+            "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output",
         )],
     },
 ];

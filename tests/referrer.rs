@@ -5,7 +5,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{array_const, ContextId, ImplSelf, Referrer};
+use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer, UseSite};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -426,9 +426,7 @@ fn test_outermost_generics_as_leakers() {
     let referrer = leaker.result().finish().unwrap();
     let rewrite = |item: &Item, outermost_as_leakers: bool| {
         let mut item = item.clone();
-        let mut visitor = referrer
-            .clone()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>));
+        let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
         if outermost_as_leakers {
             visitor = visitor.with_outermost_generics_as_leakers();
         }
@@ -539,7 +537,7 @@ fn test_has_self() {
     assert_eq!(err.len(), 1);
     assert_eq!(
         err[0].message,
-        "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
+        "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked"
     );
     assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
@@ -610,7 +608,6 @@ fn test_repeater_impl_replaces_self() {
         .any(|ty| quote!(#ty).to_string() == "Rel < Self >"));
     let mut sig: Signature = parse_quote!(fn a(&self) -> Rel<Self>);
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut sig);
     let expected: Signature = parse_quote!(fn a(&self) -> P<0usize>);
@@ -627,7 +624,6 @@ fn test_visitor_with_self() {
     // Without `with_self`, `Self` is kept.
     let mut plain = sig.clone();
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut plain);
     let expected: Signature = parse_quote!(fn f(&self, x: P<0usize>, y: ::p::W<Self>) -> Self::Out);
@@ -638,7 +634,6 @@ fn test_visitor_with_self() {
     let mut rewritten = sig.clone();
     let mut received = Vec::new();
     referrer
-        .clone()
         .visitor(context, |ty, ix| {
             received.push((quote!(#ty).to_string(), ix));
             // Not rewritten again, though it mentions `Self`.
@@ -831,7 +826,6 @@ fn test_nested_items_define_their_own_self() {
     // it is not replaced by `with_self`. The rest is as before.
     let mut rewritten = item.clone();
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .with_self(parse_quote!(__S))
         .visit_item_trait_mut(&mut rewritten);
@@ -1044,4 +1038,41 @@ fn malformed_associated_types_in_a_context_are_errors() {
             .unwrap_or_else(|| panic!("accepted: {}", text));
         assert_eq!(err.to_string(), message, "{}", text);
     }
+}
+
+/// A visitor borrows the Referrer: its closure may use the Referrer it was made from, two visitors
+/// may share one Referrer, and the Referrer is there after them, with no clone.
+#[test]
+fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            fn f(&self, t: T) -> Wrap<T>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
+    let (mut with_args, mut plain) = (tr.clone(), tr.clone());
+    let mut first = referrer.visitor(top_level, |_, ix| {
+        let args = referrer
+            .entry_args(ix, &UseSite::identity(), array_const)
+            .unwrap();
+        parse_quote!(<Self as crate::Repeater<#args, 7u64, #ix>>::Type)
+    });
+    let mut second = referrer.visitor(top_level, |_, ix| parse_quote!(P<#ix>));
+    first.visit_item_trait_mut(&mut with_args);
+    second.visit_item_trait_mut(&mut plain);
+    let expected: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            fn f(&self, t: T) -> <Self as crate::Repeater<(T,), 7u64, 0usize>>::Type;
+        }
+    );
+    assert_eq!(with_args, expected);
+    let expected: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            fn f(&self, t: T) -> P<0usize>;
+        }
+    );
+    assert_eq!(plain, expected);
+    assert_eq!(referrer.iter().count(), 1);
 }
