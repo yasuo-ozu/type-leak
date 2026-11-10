@@ -40,7 +40,7 @@ fn entries(referrer: &Referrer) -> Vec<String> {
     (0..referrer.iter().count())
         .filter(|&ix| referrer.must(ix))
         .map(|ix| {
-            let generics = referrer.generics(ix);
+            let generics = referrer.context_generics(referrer.context(ix));
             let where_clause = &generics.where_clause;
             format!(
                 "{} | {} | {}",
@@ -193,7 +193,7 @@ fn the_self_of_a_trait_has_no_name() {
         "the bound of `T` mentions a `Self` which has no name here"
     );
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
             "the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no name \
              here: `Self` is something else in the item around"
@@ -239,7 +239,7 @@ fn the_self_of_a_trait_has_no_name() {
         let result = leaker.result();
         let err = result.errors();
         assert_eq!(messages(err), headline, "{}", s(&item));
-        let note = err[0].note().unwrap();
+        let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
         assert!(
             note.contains("the `Self` of the trait `Tr < T >`"),
             "{}",
@@ -298,7 +298,7 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
     );
     // The first error comes first, with the note which tells why, and the cause.
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
             "the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no name \
              here: `Self` is something else in the item around"
@@ -341,7 +341,7 @@ fn an_associated_item_of_self_has_no_name() {
         "the bound of `T` mentions `Self :: X`, which has no name here"
     );
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
             "the bound of `T` mentions `Self :: X`, an associated item of the `Self` of `S < T >`, \
              which has no name here: `Self` is something else in the item around"
@@ -665,11 +665,13 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
     assert_eq!(messages(err), headline);
     assert!(
         err[0]
-            .note()
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
             .unwrap()
             .contains("the `Self` of the trait `Tr < T >`"),
         "{:?}",
-        err[0].note()
+        err[0].notes.first().map(|(_, n)| n.as_str())
     );
     assert_eq!(result.into_referrer().iter().count(), 0);
     // A scope that declares no `Self` keeps the one of the trait, but a default has none.

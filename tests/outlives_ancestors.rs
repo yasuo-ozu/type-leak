@@ -1,5 +1,5 @@
 //! The lifetimes which the references around a type make it outlive are carried by the type when it
-//! is leaked alone (see `Referrer::generics()`): `Rel2<T>` of `&'a Vec<Rel2<T>>` is leaked with
+//! is leaked alone (see `Referrer::context_generics()`): `Rel2<T>` of `&'a Vec<Rel2<T>>` is leaked with
 //! `<'a, T: 'a>`, as `&'a X` is well-formed only if `X: 'a` (the language rule), which holds for
 //! the original but not through the projection which the copy has instead of `Rel2<T>`.
 //!
@@ -45,7 +45,9 @@ fn referrer_in(item: &ItemTrait) -> (Referrer, ContextId) {
 /// The generics (and the where clause) of each leaked type, by its tokens.
 fn contexts_of(referrer: &Referrer, ty: &str) -> Vec<String> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .filter(|(leaked, _)| s(leaked) == ty)
         .map(|(_, generics)| s(&quote!(#generics #{&generics.where_clause})))
         .collect()
@@ -533,7 +535,9 @@ fn rewrite_as_leakers(referrer: &Referrer, context: ContextId, item: &Item) -> S
 /// The index of the entry of the type `ty` with the generics `generics`.
 fn entry(referrer: &Referrer, ty: &str, generics: &str) -> usize {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .position(|(leaked, g)| s(leaked) == ty && s(&quote!(#g #{&g.where_clause})) == generics)
         .unwrap_or_else(|| panic!("no entry {} {}", ty, generics))
 }

@@ -28,12 +28,7 @@ pub use syn;
 pub use crate::analysis::CheckResult;
 pub use crate::config::LeakerConfig;
 pub use crate::context::{ContextId, SelfRequirement};
-pub use crate::encode::{
-    encode_generics_args_to_ty, encode_generics_args_to_ty_with,
-    encode_generics_args_to_ty_with_self, encode_generics_params_to_ty,
-    encode_generics_params_to_ty_with, encode_generics_params_to_ty_with_self,
-    without_encoded_bounds, EncodeError,
-};
+pub use crate::encode::{array_const, EncodeError};
 pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};
 pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};
 pub use crate::leaker::{Leaker, LeakerResult};

@@ -62,7 +62,8 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
     let found: Vec<usize> = (0..referrer.iter().count())
         .filter(|&ix| {
             text(&referrer.iter().nth(ix).unwrap()) == ty
-                && text(&referrer.generics(ix)).replace(' ', "") == generics.replace(' ', "")
+                && text(&referrer.context_generics(referrer.context(ix))).replace(' ', "")
+                    == generics.replace(' ', "")
                 && referrer.context_module(referrer.context(ix)).is_some() == in_module
         })
         .collect();
@@ -74,7 +75,9 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
         generics,
         in_module,
         referrer
-            .iter_with_generics()
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
             .map(|(ty, generics)| (text(ty), text(&generics)))
             .collect::<Vec<_>>()
     );
@@ -473,7 +476,7 @@ fn every_entry_that_names_a_generic_of_the_name_of_a_declared_item_is_found() {
                     "the visitor misses an entry of {}\n  entries: {:?}",
                     source,
                     referrer
-                        .iter_with_generics()
+                        .iter().enumerate().map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
                         .map(|(ty, generics)| (text(ty), text(&generics)))
                         .collect::<Vec<_>>()
                 );
@@ -647,7 +650,9 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
     match leaker.result().finish() {
         Ok(referrer) => Outcome::Accepted {
             entries: referrer
-                .iter_with_generics()
+                .iter()
+                .enumerate()
+                .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
                 .enumerate()
                 .map(|(ix, (ty, generics))| {
                     (
@@ -667,7 +672,11 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
         },
         Err(error) => Outcome::Rejected {
             headline: unprefixed(&messages(&error)),
-            note: error[0].note().map(unprefixed),
+            note: error[0]
+                .notes
+                .first()
+                .map(|(_, n)| n.as_str())
+                .map(unprefixed),
             help: error[0].help_text().map(unprefixed),
         },
     }

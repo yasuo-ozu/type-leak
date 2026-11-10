@@ -405,8 +405,7 @@ fn hard_causes_are_errors() {
                 "ILEN",
                 &["a default of a parameter cannot depend on `Self`"],
                 &format!(
-                    "{}, or write the default without `Self`: name the type instead of `Self` in \
-                     `::l::W<Self, ILEN>`",
+                    "{}, or name the type instead of `Self` in `::l::W<Self, ILEN>`",
                     absolute("ILEN")
                 )
             )],

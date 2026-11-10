@@ -40,7 +40,9 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 /// Returns the leaked types with the generics (and the where clause) they use.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -92,7 +94,10 @@ fn types_are_shared_by_calls() {
     );
     // They use no generics, whichever the generics of the calls are: the generics of `A` (none)
     // are the context of the types, and those of `B` are another context without an entry.
-    assert_eq!(referrer.generics(0).params.len(), 0);
+    assert_eq!(
+        referrer.context_generics(referrer.context(0)).params.len(),
+        0
+    );
     assert_eq!(referrer.contexts().count(), 2);
     assert_eq!(tops[0], referrer.context(0));
     assert_eq!(referrer.context_generics(tops[1]).params.len(), 1);
@@ -163,12 +168,21 @@ fn equal_lifetime_bounds_give_equal_contexts() {
     let referrer = leak(&["<'a, 'b, 'c: 'a + 'b>", "<'a, 'b, 'c: 'b + 'a>"]);
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(referrer.contexts().count(), 1);
-    assert_eq!(s(referrer.generics(0)), "< 'a , 'b , 'c : 'a + 'b >");
+    assert_eq!(
+        s(referrer.context_generics(referrer.context(0))),
+        "< 'a , 'b , 'c : 'a + 'b >"
+    );
     // A where predicate on a lifetime is its bound.
     let referrer = leak(&["<'a, 'b: 'a, 'c>", "<'a, 'b, 'c> where 'b: 'a"]);
     assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(s(referrer.generics(0)), "< 'a , 'b : 'a , 'c >");
-    assert!(referrer.generics(0).where_clause.is_none());
+    assert_eq!(
+        s(referrer.context_generics(referrer.context(0))),
+        "< 'a , 'b : 'a , 'c >"
+    );
+    assert!(referrer
+        .context_generics(referrer.context(0))
+        .where_clause
+        .is_none());
     // Different bounds are different contexts.
     let referrer = leak(&["<'a, 'b: 'a, 'c>", "<'a, 'b, 'c: 'a>"]);
     assert_eq!(referrer.iter().count(), 2);
@@ -196,7 +210,7 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
     ]);
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
-        s(referrer.generics(0)),
+        s(referrer.context_generics(referrer.context(0))),
         "< F : :: core :: ops :: Fn () -> & 'static dyn :: p :: A >"
     );
     // Before another bound the parentheses are needed, and kept.
@@ -205,7 +219,7 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
         "::zzz::Z + ::core::ops::Fn() -> &'static (dyn ::p::A)",
     ]);
     assert_eq!(
-        s(referrer.generics(0)),
+        s(referrer.context_generics(referrer.context(0))),
         "< F : :: core :: ops :: Fn () -> (& 'static dyn :: p :: A) + :: zzz :: Z >"
     );
 }
@@ -538,7 +552,7 @@ fn self_in_the_bounds_of_the_generics() {
         .iter()
         .all(|item| item.reason != Reason::SelfWithoutMeaning));
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     assert!(err[0].message.contains("Wrap < T >"));
@@ -584,7 +598,7 @@ fn generic_args_of_the_root_and_local_generics() {
     let completed: Vec<GenericArgument> =
         vec![parse_quote!('x), parse_quote!(u8), parse_quote!(u16)];
     let args = referrer
-        .generic_args(0, &tr.generics.params, &completed)
+        .context_generic_args(referrer.context(0), &tr.generics.params, &completed)
         .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
@@ -599,16 +613,18 @@ fn generic_args_of_the_root_and_local_generics() {
     let referrer = leak_trait(tr.clone());
     let completed: Vec<GenericArgument> = vec![parse_quote!({ 1 + 2 }), parse_quote!(u16)];
     let args = referrer
-        .generic_args(0, &tr.generics.params, &completed)
+        .context_generic_args(referrer.context(0), &tr.generics.params, &completed)
         .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "{ 1 + 2 }"]);
     // Too few arguments.
     assert!(matches!(
-        referrer.generic_args(0, &tr.generics.params, &[]),
+        referrer.context_generic_args(referrer.context(0), &tr.generics.params, &[]),
         Err(EncodeError::MissingArgument(_))
     ));
     // Without the parameters of the trait, everything is passed by name.
-    let args = referrer.generic_args(0, &Punctuated::new(), &[]).unwrap();
+    let args = referrer
+        .context_generic_args(referrer.context(0), &Punctuated::new(), &[])
+        .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }
 
@@ -928,7 +944,7 @@ fn node_numbers_follow_the_first_appearance() {
     );
     assert_eq!(
         (0..3)
-            .map(|ix| s(referrer.generics(ix)))
+            .map(|ix| s(referrer.context_generics(referrer.context(ix))))
             .collect::<Vec<_>>(),
         ["< U >", "< T >", ""]
     );

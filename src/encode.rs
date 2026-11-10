@@ -8,131 +8,28 @@ use syn::spanned::Spanned;
 use syn::*;
 use template_quote::quote;
 
-/// Encodes the arguments that a copy gives to the generics of an entry, into the first argument of
-/// the Repeater. It is the counterpart of [`encode_generics_params_to_ty()`] for `params`, with
-/// `const N: usize` as `[(); N]`.
+/// Encodes the const argument `value` of a `usize` parameter as the array type `[(); value]`.
 ///
-/// It is [`encode_generics_args_to_ty_with()`] without the closure, for generics that have no const
-/// parameter or only `usize` ones (which [`encode_generics_params_to_ty()`] encodes alike). For other
-/// const types use [`RepeaterSlots`](crate::RepeaterSlots). The arguments are completed and matched as
-/// in [`encode_generics_args_to_ty_with()`], and the errors are its errors.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<'a, T: 'a, const N: usize>);
-/// let args: Vec<GenericArgument> = vec![
-///     parse_quote!('static),
-///     parse_quote!(u8),
-///     parse_quote!(3),
-/// ];
-/// let ty = encode_generics_args_to_ty(&args, &generics.params).unwrap();
-/// // `encode_generics_params_to_ty()` gives `(&'a (), T, [(); N], &'a T)` for the parameters.
-/// assert_eq!(ty, parse_quote!((&'static (), u8, [(); 3], &'static u8)));
-/// ```
-pub fn encode_generics_args_to_ty<'a>(
-    iter: impl IntoIterator<Item = &'a GenericArgument>,
-    params: &Punctuated<GenericParam, Token![,]>,
-) -> std::result::Result<Type, EncodeError> {
-    encode_generics_args_with_params(iter, params, None, |value, _| Ok(array_length(value)))
-}
-
-/// `[(); value]`, as `encode_generics_params_to_ty()` encodes a const parameter.
-pub(crate) fn array_length(value: &Expr) -> Type {
-    let value = normalize_const_arg(value);
-    parse_quote!([(); #value])
-}
-
-/// Like [`array_length()`], but only for a parameter of type `usize`, the type of an array length:
-/// the encoding of the helpers that have no closure for the consts.
-pub(crate) fn usize_array_length(
-    value: &Expr,
-    param: &ConstParam,
-) -> std::result::Result<Type, EncodeError> {
+/// It is the `const_fn` of [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
+/// [`Referrer::entry_args()`](crate::Referrer::entry_args) for generics whose consts are all
+/// `usize`. Any other type is an [`EncodeError::UnsupportedConstType`]: encode it with
+/// [`RepeaterSlots`](crate::RepeaterSlots).
+pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type, EncodeError> {
     match const_param_primitive(&param.ty) {
-        Some("usize") => Ok(array_length(value)),
+        Some("usize") => {
+            let value = normalize_const_arg(value);
+            Ok(parse_quote!([(); #value]))
+        }
         _ => Err(EncodeError::UnsupportedConstType(Box::new(
             param.ty.clone(),
         ))),
     }
 }
 
-/// Encodes the arguments that a copy gives to the generics of an entry, with `const_fn` encoding
-/// the const arguments. It gives the type that [`encode_generics_params_to_ty_with()`] gives for
-/// `params`.
+/// Encodes the arguments that a copy gives to the generics of an entry: the counterpart of
+/// `encode_generics_params_with()` for `params`.
 ///
-/// `params` are the generics the Leaker encoded: `Referrer::generics()` of an entry with the
-/// arguments of `Referrer::generic_args()`, or `Referrer::context_generics()` of the top-level
-/// context. `const_fn` encodes each const argument as it did for the parameters.
-/// Arguments match by position, lifetimes first. A bare identifier for a const parameter is a
-/// const argument, and bindings such as `Item = u8` are skipped. Omitted arguments take the
-/// defaults of `params`, so complete the arguments of a context with `Referrer::complete_args()`.
-/// Bounds are encoded with the arguments substituted: `T: 'a` with `'static` and `u8` is
-/// `&'static u8`. `Self: 'a` is not: use [`encode_generics_args_to_ty_with_self()`].
-/// The argument of a parameter with a `?Sized` bound is wrapped, as the parameter is:
-/// `T: ?Sized` with `str` is `*const str` (see [`encode_generics_params_to_ty_with()`]).
-///
-/// Fails with [`EncodeError`] for too many or missing arguments, and with
-/// [`EncodeError::UnboundedTraitObject`] for a trait object argument without a lifetime bound.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<T, const B: bool>);
-/// let args: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(true)];
-/// // Encode a const argument as a type of your own: `Flag<true>`.
-/// let ty = encode_generics_args_to_ty_with(&args, &generics.params, |value, _param| {
-///     parse_quote!(Flag<#value>)
-/// })
-/// .unwrap();
-/// assert_eq!(ty, parse_quote!((u8, Flag<true>)));
-/// ```
-pub fn encode_generics_args_to_ty_with<'a, 'b>(
-    iter: impl IntoIterator<Item = &'a GenericArgument>,
-    params: &'b Punctuated<GenericParam, Token![,]>,
-    mut const_fn: impl FnMut(&Expr, &'b ConstParam) -> Type,
-) -> std::result::Result<Type, EncodeError> {
-    encode_generics_args_with_params(iter, params, None, |value, cp| Ok(const_fn(value, cp)))
-}
-
-/// Like [`encode_generics_args_to_ty_with()`], but also encodes `Self: 'a`.
-///
-/// Each lifetime `'a` of `self_outlives` adds `&'b Self` after the bounds, where `'b` is the
-/// argument of `'a`. Pass `Referrer::context_self_outlives()`. `self_ty` is `Self` in the impl of
-/// the Leaker's trait. A lifetime that is not a parameter of `params` is skipped.
-/// It yields the type of [`encode_generics_params_to_ty_with_self()`]. The arguments are those of
-/// `RepeaterSlots::encode_generics_args_to_ty_with_self()`, then `const_fn`. Fails like
-/// [`encode_generics_args_to_ty_with()`], and with [`EncodeError::UnboundedTraitObject`] if
-/// `self_ty` is a trait object without a lifetime bound.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<'a, T: 'a>);
-/// let args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
-/// let self_outlives: Vec<Lifetime> = vec![parse_quote!('a)]; // the types need `Self: 'a`
-/// let ty = encode_generics_args_to_ty_with_self(
-///     &args,
-///     &generics.params,
-///     &parse_quote!(Host),
-///     &self_outlives,
-///     |_value, _param| unreachable!("no const parameter"),
-/// )
-/// .unwrap();
-/// assert_eq!(ty, parse_quote!((&'static (), u8, &'static u8, &'static Host)));
-/// ```
-pub fn encode_generics_args_to_ty_with_self<'a, 'b>(
-    iter: impl IntoIterator<Item = &'a GenericArgument>,
-    params: &'b Punctuated<GenericParam, Token![,]>,
-    self_ty: &Type,
-    self_outlives: &[Lifetime],
-    mut const_fn: impl FnMut(&Expr, &'b ConstParam) -> Type,
-) -> std::result::Result<Type, EncodeError> {
-    encode_generics_args_with_params(iter, params, Some((self_ty, self_outlives)), |value, cp| {
-        Ok(const_fn(value, cp))
-    })
-}
-
+/// The arguments are completed by `complete_generics_args()`, and `const_fn` encodes each const.
 pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
@@ -317,103 +214,12 @@ fn unwrap_block(expr: &Expr) -> &Expr {
     }
 }
 
-/// Encodes the generics of an entry into the type that is the first argument of its Repeater impl,
-/// with `const N: usize` as `[(); N]`.
-///
-/// The result is a tuple type. `[(); N]` constrains `N` in the trait arguments of an impl. Array lengths are `usize`, so other
-/// const types need `RepeaterSlots`, or [`encode_generics_params_to_ty_with()`] with your own
-/// types. That function describes the encoding. `Self: 'a` is encoded by
-/// [`encode_generics_params_to_ty_with_self()`]. The Referrer encodes the arguments with
-/// [`encode_generics_args_to_ty_with()`], which needs the same parameters.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, const N: usize>);
-/// // The bounds follow the parameters.
-/// let ty = encode_generics_params_to_ty(&generics.params);
-/// assert_eq!(ty, parse_quote!((&'a (), &'b (), T, [(); N], &'a &'b (), &'a T)));
-///
-/// // A type parameter that may be unsized is a pointer to it, which is always `Sized`.
-/// let generics: Generics = parse_quote!(<T: ?Sized, U>);
-/// let ty = encode_generics_params_to_ty(&generics.params);
-/// assert_eq!(ty, parse_quote!((*const T, U)));
-/// ```
-pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
-    encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
-}
-
-/// Encodes generic parameters into a tuple type, using `const_fn` for const parameters.
-///
-/// A lifetime `'a` becomes `&'a ()` and a type `T` becomes `T`. A type with a `?Sized` bound
-/// becomes `*const T` instead: all the elements of a tuple but the last must be `Sized`, and a
-/// raw pointer is, whatever it points to. The impl must still declare the `?Sized` bound, which
-/// [`without_encoded_bounds()`] keeps. The bound must be on the parameter, because a where clause
-/// is not seen. The generics of a context have it there: `Referrer::generics()` moves a predicate
-/// `T: ?Sized` to the parameter. The lifetime bounds follow, in the order of the parameters and
-/// their bounds: `T: 'a` becomes `&'a T`, and `'b: 'a` becomes `&'a &'b ()`. Only a bound by a
-/// lifetime parameter of `iter` is encoded.
-/// A reference implies its bound wherever it is written. So the impl must not declare the bounds
-/// it encodes. Declare `Referrer::impl_generics()` or [`without_encoded_bounds()`] instead (see
-/// [Outlives bounds](crate::Leaker#outlives-bounds)). `Self: 'a` is not encoded: use
-/// [`encode_generics_params_to_ty_with_self()`].
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<'a, T, const B: bool>);
-/// // Encode a const parameter as a type of your own: `Flag<B>`.
-/// let ty = encode_generics_params_to_ty_with(&generics.params, |param| {
-///     let ident = &param.ident;
-///     parse_quote!(Flag<#ident>)
-/// });
-/// assert_eq!(ty, parse_quote!((&'a (), T, Flag<B>)));
-/// ```
-pub fn encode_generics_params_to_ty_with<'a>(
-    iter: impl IntoIterator<Item = &'a GenericParam>,
-    mut const_fn: impl FnMut(&'a ConstParam) -> Type,
-) -> Type {
-    encode_generics_params_with(iter, None, |cp| Ok(const_fn(cp)))
-        .expect("the parameters are not trait objects")
-}
-
-/// Like [`encode_generics_params_to_ty_with()`], but also encodes `Self: 'a`.
-///
-/// Each lifetime `'a` of `self_outlives` adds `&'a Self` after the bounds, with `Self` being
-/// `self_ty`. Pass `Referrer::context_self_outlives()` of the context of `iter`. A lifetime that
-/// is not a parameter of `iter` is skipped.
-/// `self_ty` is the type of the impl: `__S` for any implementor (see `Referrer::iter_with_self()`),
-/// or `Self` for an impl for a type. The impl must not declare `__S: 'a`, because the encoding
-/// implies it.
-/// The arguments are those of `RepeaterSlots::encode_generics_params_to_ty_with_self()`, then
-/// `const_fn`. The Referrer encodes the arguments with [`encode_generics_args_to_ty_with_self()`].
-/// Fails with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a
-/// lifetime bound.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<'a, T: 'a>);
-/// let self_outlives: Vec<Lifetime> = vec![parse_quote!('a)]; // the types need `Self: 'a`
-/// let ty = encode_generics_params_to_ty_with_self(
-///     &generics.params,
-///     &parse_quote!(__S),
-///     &self_outlives,
-///     |_param| unreachable!("no const parameter"),
-/// )
-/// .unwrap();
-/// assert_eq!(ty, parse_quote!((&'a (), T, &'a T, &'a __S)));
-/// ```
-pub fn encode_generics_params_to_ty_with_self<'a>(
-    iter: impl IntoIterator<Item = &'a GenericParam>,
-    self_ty: &Type,
-    self_outlives: &[Lifetime],
-    mut const_fn: impl FnMut(&'a ConstParam) -> Type,
-) -> std::result::Result<Type, EncodeError> {
-    encode_generics_params_with(iter, Some((self_ty, self_outlives)), |cp| Ok(const_fn(cp)))
-}
-
 /// The Leaker's encoding, which `encode_generics_args_with_params()` must reproduce.
+///
+/// A lifetime `'a` is `&'a ()`, a type `T` is `T` (`*const T` with a `?Sized` bound, since a tuple
+/// needs `Sized` elements but the last), and a const is the type of `const_fn`. The lifetime bounds
+/// follow: `T: 'a` is `&'a T` and `'b: 'a` is `&'a &'b ()`. Each lifetime `'a` of the `self_outlives`
+/// adds `&'a Self`, with `Self` the type given.
 pub(crate) fn encode_generics_params_with<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
     self_outlives: Option<(&Type, &[Lifetime])>,
@@ -480,7 +286,7 @@ fn lifetime_bounds(param: &GenericParam) -> Vec<&Lifetime> {
     }
 }
 
-/// The only rule that decides which bounds are encoded. [`without_encoded_bounds()`] keeps the
+/// The only rule that decides which bounds are encoded. `without_encoded_bounds()` keeps the
 /// others.
 fn encoded_bound_position(params: &[&GenericParam], bound: &Lifetime) -> Option<usize> {
     params.iter().position(
@@ -488,25 +294,11 @@ fn encoded_bound_position(params: &[&GenericParam], bound: &Lifetime) -> Option<
     )
 }
 
-/// Returns the generics to declare in a Repeater impl: `generics` without the lifetime bounds that
-/// the encoders encode.
-///
-/// Removed: a bound by a lifetime parameter of `generics`, on a type parameter (`T: 'a`) or a
-/// lifetime parameter (`'b: 'a`). Kept: other bounds (`T: 'static`, a bound by a lifetime that is
-/// not a parameter, trait bounds), const parameters and the where clause.
-/// Declare the result as the generics of a Repeater impl. `Referrer::impl_generics()` does this
-/// for a context. Use this function for other generics, such as those of
-/// `Referrer::iter_with_self()`. `where Self: 'a` is not removed. A context has none, because the
-/// Leaker moves it into `Referrer::context_self_outlives()` for the `*_with_self()` encoders.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, U: 'static, V: 'c>);
-/// let declared = without_encoded_bounds(&generics);
-/// assert_eq!(declared, parse_quote!(<'a, 'b, T: Clone, U: 'static, V: 'c>));
-/// ```
-pub fn without_encoded_bounds(generics: &Generics) -> Generics {
+/// Returns `generics` without the lifetime bounds that the encoding of the generics encodes: a bound
+/// by a lifetime parameter of `generics`, on a type parameter (`T: 'a`) or a lifetime parameter
+/// (`'b: 'a`). Other bounds (`T: 'static`, trait bounds), const parameters and the where clause
+/// stay. These are the generics a Repeater impl declares.
+pub(crate) fn without_encoded_bounds(generics: &Generics) -> Generics {
     let params: Vec<&GenericParam> = generics.params.iter().collect();
     let mut declared = generics.clone();
     for param in declared.params.iter_mut() {
@@ -660,8 +452,7 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 }
 
 /// Why the generics of an entry cannot be encoded: the error of `Referrer::repeater_impl()`,
-/// `Referrer::entry_args()` and the other functions that write the first argument of the
-/// Repeater (the encoders).
+/// `Referrer::entry_args()` and `Referrer::complete_args()`.
 ///
 /// It converts into a `syn::Error` at the offending tokens.
 ///
@@ -673,14 +464,16 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 /// leaker.intern_trait(&tr, true);
 /// let referrer = leaker.result().finish().unwrap();
 ///
-/// // Only `const N: usize` is encoded by default.
-/// let err = referrer.repeater_impl(0, ImplSelf::Param(&parse_quote!(__S))).unwrap_err();
+/// // `array_const` encodes `const N: usize` only.
+/// let err = referrer
+///     .repeater_impl(0, ImplSelf::Param(&parse_quote!(__S)), array_const)
+///     .unwrap_err();
 /// match &err {
 ///     EncodeError::UnsupportedConstType(ty) => assert_eq!(**ty, parse_quote!(bool)),
 ///     _ => unreachable!(),
 /// }
-/// // A macro reports it where the parameter is. The fix is `repeater_impl_with()` and
-/// // `RepeaterSlots` (see `repeater_definition()`).
+/// // A macro reports it where the parameter is. The fix is `RepeaterSlots` (see
+/// // `repeater_definition()`).
 /// let error: syn::Error = err.into();
 /// assert_eq!(error.to_string(), "unsupported type of const parameter: 'bool'");
 /// ```
@@ -809,3 +602,6 @@ impl syn::fold::Fold for SubstituteParams {
         self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
     }
 }
+
+#[cfg(test)]
+mod tests;

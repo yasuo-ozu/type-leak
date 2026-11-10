@@ -802,7 +802,7 @@ pub mod scoped {
     }
 
     // An absolute path of another crate is an optional entry: no `Rel` is in it, so there is no
-    // required entry at all, and `has_required()` is `false`: the macro emits no impl (the report
+    // required entry at all, and `required()` is empty: the macro emits no impl (the report
     // says `impls=0`). A Referrer which does not replace it needs none.
     scope_leak! {
         id = 7004, marker = M7004,
@@ -2139,5 +2139,44 @@ pub mod kinds {
         fn m<Y>(&self)
         where
             Y: GenTr<Self::A0>;
+    }
+
+    // Issue 3 of `tests/downstream_findings.rs`: the names `allow_prelude()` took for the prelude.
+
+    /// Issue 3, 9208: `None`, `Some`, `Ok` and `Err` in values, and `DoubleEndedIterator +
+    /// ExactSizeIterator` in a bound, are names of the prelude of every edition. `allow_prelude()`
+    /// refused them (`use absolute path: 'None'`), so the Leaker rejected the item, which the
+    /// Referrer's crate then lacks (`PreludeNamesCopy`). The copy writes them as they are; the
+    /// entries are the relative types.
+    #[prop_leak(
+        id = 9208,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        redeclare = true,
+        values = true,
+        bodies = true
+    )]
+    pub trait PreludeNames {
+        const NOTHING: Option<vals::Local> = None;
+
+        fn pick(&self, n: u8) -> Option<vals::Local> {
+            match n {
+                0 => None,
+                _ => Some(Default::default()),
+            }
+        }
+
+        fn check(&self, n: u8) -> Result<vals::Local, u8> {
+            if n > 0 {
+                Ok(Default::default())
+            } else {
+                Err(n)
+            }
+        }
+
+        fn count<I: DoubleEndedIterator + ExactSizeIterator>(&self, it: I) -> usize {
+            it.len() + it.rev().count()
+        }
     }
 }

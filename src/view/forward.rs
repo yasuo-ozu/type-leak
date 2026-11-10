@@ -75,8 +75,8 @@ impl View<'_> {
     ///     });
     /// let referrer = leaker.result().finish().unwrap();
     /// assert_eq!(referrer.iter().count(), 2);
-    /// assert_eq!(referrer.generics(0).params.len(), 1);
-    /// assert_eq!(referrer.generics(1).params.len(), 1);
+    /// assert_eq!(referrer.context_generics(referrer.context(0)).params.len(), 1);
+    /// assert_eq!(referrer.context_generics(referrer.context(1)).params.len(), 1);
     /// ```
     pub fn visit_item(&mut self, item: &Item) {
         Visit::visit_item(&mut *self.visitor, item)

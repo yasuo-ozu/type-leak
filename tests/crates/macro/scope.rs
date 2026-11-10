@@ -20,7 +20,7 @@
 //! In the Referrer's crate, `leaker::__scope_apply_7001!(path = ::leaker::m)` expands
 //! `__scope_apply!`: it rewrites the self type, the trait path and the type arguments with
 //! `Referrer::visitor(context, ..)`, whose closure writes the path through the Repeater with
-//! `Referrer::entry_args_with(ix, &UseSite::identity(), ..)`, and emits
+//! `Referrer::entry_args(ix, &UseSite::identity(), ..)`, and emits
 //!
 //! - `fn __tl_chk_<id>_<j>() -> PhantomData<rewritten>`, which compiles only if the rewritten type
 //!   is the original one (the witness of the Leaker's crate returns the original),
@@ -214,11 +214,11 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let slots = RepeaterSlots::new(repeater.clone());
 
     // The Repeater's implementation of each required entry, as `coinduction` writes them: only if
-    // there is one (`has_required()`). An optional entry (the type of another crate) needs none
+    // there is one (`required()`). An optional entry (the type of another crate) needs none
     // unless a strict Referrer replaces it (`all = true`).
     let wanted: Vec<usize> = if input.all {
         (0..referrer.iter().count()).collect()
-    } else if referrer.has_required() {
+    } else if referrer.required().next().is_some() {
         referrer.required().map(|(ix, _)| ix).collect()
     } else {
         Vec::new()
@@ -235,7 +235,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
         };
         crate::check_plain(&referrer, ix, &slots)?;
         let r = referrer
-            .repeater_impl_with(ix, target, |value, param| {
+            .repeater_impl(ix, target, |value, param| {
                 slots.encode_const(value, &param.ty)
             })
             .map_err(Error::from)?;
@@ -342,7 +342,7 @@ pub(crate) fn errors(input: TokenStream) -> Result<TokenStream> {
 }
 
 struct ApplyInput {
-    referrer: Referrer,
+    result: LeakerResult,
     context: ContextId,
     scope: ScopeInput,
     path: Path,
@@ -351,12 +351,12 @@ struct ApplyInput {
 
 impl Parse for ApplyInput {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (referrer, context) = {
+        let (result, context) = {
             let content;
             braced!(content in input);
-            let referrer = content.parse()?;
+            let result = content.parse()?;
             content.parse::<Token![,]>()?;
-            (referrer, content.parse()?)
+            (result, content.parse()?)
         };
         let scope = {
             let content;
@@ -377,7 +377,7 @@ impl Parse for ApplyInput {
             true
         };
         Ok(Self {
-            referrer,
+            result,
             context,
             scope,
             path,
@@ -404,17 +404,16 @@ impl VisitMut for Absolutize<'_> {
 /// `__scope_apply!`, the Referrer's side.
 pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let ApplyInput {
-        referrer,
+        mut result,
         context,
         scope,
         path,
         strict,
     } = parse2(input)?;
-    let referrer = if strict {
-        referrer.allow_ambiguous_crate_name(false)
-    } else {
-        referrer
-    };
+    if strict {
+        result.allow_ambiguous_crate_name(false);
+    }
+    let referrer = result.into_referrer();
     let krate = path
         .segments
         .first()
@@ -454,7 +453,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
                     .ok_or_else(|| Error::new(Span::call_site(), "the self type names `Self`"))?,
             };
             let site = UseSite::identity().with_self(owner.clone());
-            let args = referrer.entry_args_with(ix, &site, |value, param| {
+            let args = referrer.entry_args(ix, &site, |value, param| {
                 slots.encode_const(value, &param.ty)
             })?;
             Ok(parse_quote!(<#owner as #repeater<#args, #id, #ix>>::Type))

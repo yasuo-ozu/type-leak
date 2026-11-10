@@ -17,11 +17,11 @@
 //! ```
 //!
 //! The generics each leaked type uses (those of the trait and those of its methods, see
-//! [`Referrer::generics()`]) are encoded into the Repeater's trait arguments with
+//! [`Referrer::context_generics()`]) are encoded into the Repeater's trait arguments with
 //! [`RepeaterSlots`], so the Repeater (defined by [`repeater_definition()`]) is the only item
 //! shared by the Leaker and the Referrer. The lifetime bounds in them (`T: 'a`) are encoded too
-//! (`&'a T`), so the Repeater's implementations declare the generics without them, as
-//! [`Referrer::impl_generics()`] returns them.
+//! (`&'a T`), so the Repeater's implementations declare the generics without them
+//! ([`Referrer::repeater_impl()`]).
 //!
 //! In the Referrer's crate, `MyTrait!` implements `MyTrait` for a wrapper by forwarding each
 //! method to the field `.0`, with the types in the signatures rewritten by the [`Referrer`]:
@@ -146,7 +146,7 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
 /// no argument, no module) and does not name `Self`.
 pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots) -> Result<()> {
     let marker: Type = parse_quote!(__Marker);
-    let r = referrer.repeater_impl_with(ix, ImplSelf::Marker(&marker), |value, param| {
+    let r = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), |value, param| {
         slots.encode_const(value, &param.ty)
     });
     let needs_nothing = match r {
@@ -535,7 +535,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let self_param: Ident = parse_quote!(__S);
     for ix in 0..referrer.iter().count() {
         let r = referrer
-            .repeater_impl_with(ix, ImplSelf::Param(&self_param), |value, param| {
+            .repeater_impl(ix, ImplSelf::Param(&self_param), |value, param| {
                 slots.encode_const(value, &param.ty)
             })
             .map_err(Error::from)?;
@@ -639,28 +639,30 @@ fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
 impl Parse for Input {
     fn parse(input: ParseStream) -> Result<Self> {
         let item_trait = braced_parse(input)?;
-        let (referrer, context) = {
+        let (mut result, context): (LeakerResult, ContextId) = {
             let content;
             braced!(content in input);
-            let referrer = content.parse()?;
+            let result = content.parse()?;
             content.parse::<Token![,]>()?;
-            (referrer, content.parse()?)
+            (result, content.parse()?)
         };
-        let header = Header {
-            item_trait,
-            referrer,
-            context,
-            id: braced_parse(input)?,
-            repeater: braced_parse::<Path>(input)?,
-            module: braced_parse::<Path>(input)?,
-        };
+        let id = braced_parse(input)?;
+        let repeater = braced_parse::<Path>(input)?;
+        let module = braced_parse::<Path>(input)?;
         // `strict` makes the Referrer replace the optional entries as well (it does not trust the
-        // names of the crates, see `Referrer::allow_ambiguous_crate_name()`).
-        let mut header = header;
+        // names of the crates, see `LeakerResult::allow_ambiguous_crate_name()`).
         if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
             input.parse::<Ident>()?;
-            header.referrer = header.referrer.allow_ambiguous_crate_name(false);
+            result.allow_ambiguous_crate_name(false);
         }
+        let header = Header {
+            item_trait,
+            referrer: result.into_referrer(),
+            context,
+            id,
+            repeater,
+            module,
+        };
         if input.peek(Ident) && !input.peek(Token![impl]) {
             let keyword: Ident = input.parse()?;
             if keyword != "copy" && keyword != "show" {
@@ -912,7 +914,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
             let projection = (|| -> Result<Type> {
                 let site =
                     UseSite::substituting(params, &trait_params).with_self(self_in_copy.clone());
-                let encoded = referrer.entry_args_with(ix, &site, |value, param| {
+                let encoded = referrer.entry_args(ix, &site, |value, param| {
                     slots.encode_const(value, &param.ty)
                 })?;
                 Ok(parse_quote!(<#self_in_copy as #repeater<#encoded, #id, #ix>>::Type))
@@ -969,7 +971,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
                       root_params: &Punctuated<GenericParam, Token![,]>,
                       root_args: &[GenericArgument]|
      -> Result<Type> {
-        let encoded = referrer.entry_args_with(
+        let encoded = referrer.entry_args(
             ix,
             &UseSite::substituting(root_params, root_args),
             |value, param| slots.encode_const(value, &param.ty),

@@ -347,7 +347,7 @@ fn reason_self_in_default() {
     assert_eq!(items[0].notes[0].0.to_string(), "Self");
     assert_eq!(
         items[0].message,
-        "`Wrap < Self >` is in the default of a parameter, and names `Self`"
+        "`Wrap<Self>` is in the default of a parameter, and names `Self`"
     );
 }
 
@@ -1093,7 +1093,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
     let item = &items[1];
     assert_eq!(item.to_string(), item.message);
     assert_eq!(
-        item.note(),
+        item.notes.first().map(|(_, n)| n.as_str()),
         Some("it cannot be leaked as a whole because of `'_`")
     );
     assert_eq!(

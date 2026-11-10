@@ -220,9 +220,9 @@
 //!
 //! # Other checks of the macro
 //!
-//! - The helpers agree: `repeater_impl()` declares `impl_generics()` of the context of its entry
-//!   and the parameter of the implementor, `generics()`, `iter_with_generics()`, `required()` and
-//!   `must()` say the same, and `required()` comes first (`HELPERS DISAGREE`).
+//! - The helpers agree: `repeater_impl()` declares the generics of the context of its entry
+//!   without the bounds its arguments encode, and the parameter of the implementor, `required()`
+//!   and `must()` say the same, and `required()` comes first (`HELPERS DISAGREE`).
 //! - A fifth of the cases do not allow the primitive types: `u8` is an entry then, and the copy
 //!   keeps none in a type position (`PRIMITIVE KEPT`).
 //!

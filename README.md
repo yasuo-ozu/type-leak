@@ -44,7 +44,7 @@ A name in Rust means something only where it is written. When a proc macro copie
 ```rust
 use syn::visit_mut::VisitMut;
 use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Signature};
-use type_leak::{ImplSelf, Leaker, UseSite};
+use type_leak::{array_const, ImplSelf, Leaker, UseSite};
 
 let item: ItemTrait = parse_quote! {
     pub trait MyLeaker<T> {
@@ -62,7 +62,7 @@ let referrer = leaker.result().finish().unwrap();
 let self_param: Ident = parse_quote!(__S);
 let impls: Vec<ItemImpl> = (0..referrer.iter().count())
     .map(|ix| {
-        let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param)).unwrap();
+        let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param), array_const).unwrap();
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
         let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
         parse_quote! {
@@ -81,7 +81,7 @@ let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
 referrer
     .clone()
     .visitor(top_level, |_ty, ix| {
-        let args = referrer.entry_args(ix, &site).unwrap();
+        let args = referrer.entry_args(ix, &site, array_const).unwrap();
         parse_quote!(<Self as path::Repeater<#args, 42u64, #ix>>::Type)
     })
     .visit_signature_mut(&mut sig);
@@ -105,5 +105,5 @@ In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (
   - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html), its result: [`repeater_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.repeater_impl) in crate A, [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) and [`entry_args`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.entry_args) in crate B.
   - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait.
   - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`, for reporting errors from your macro (`to_compile_error()`). The `Leaker` [recovers from errors](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery): it records them and goes on.
-- [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked, and [what the Leaker checks](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#what-the-leaker-checks). An error of the Leaker carries a `help` that says what to write instead (`ErrorItem::help`).
+- [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked, and what the Leaker checks. An error of the Leaker carries a `help` that says what to write instead (`ErrorItem::help`).
 - [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros): a complete, tested pair of proc macros.

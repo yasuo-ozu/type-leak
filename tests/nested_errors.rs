@@ -685,8 +685,14 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
         outer("O", &[&same.replace(r#""n""#, r#""n2""#)])
     ));
     result.allow_path(parse_quote!(P));
-    assert_eq!(result.errors()[0].note(), Some("n2"));
-    assert_eq!(result.errors()[1].note(), Some("n"));
+    assert_eq!(
+        result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
+        Some("n2")
+    );
+    assert_eq!(
+        result.errors()[1].notes.first().map(|(_, n)| n.as_str()),
+        Some("n")
+    );
     // The place, the paths and the nested errors are compared as well. The paths after the rule
     // trimmed them: `P` is allowed, so `paths [ P ]` is no path.
     let tail = |tail: &str| same.replace(" }", &format!(" {tail} }}"));

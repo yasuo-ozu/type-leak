@@ -58,7 +58,9 @@ fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
 fn leaked(item: ItemTrait) -> Vec<(String, String)> {
     let referrer = analyze(&item).unwrap_or_else(|e| panic!("{}: {}", s(&item), messages(&e)));
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect()
 }
@@ -73,7 +75,15 @@ fn error(item: ItemTrait) -> (String, String) {
         Ok(_) => panic!("{} is accepted", s(&item)),
         Err(err) => err,
     };
-    (messages(&err), err[0].note().unwrap().to_string())
+    (
+        messages(&err),
+        err[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
+            .unwrap()
+            .to_string(),
+    )
 }
 
 /// The help of the error of a trait.
@@ -448,14 +458,26 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
         parse_quote! { mod m { pub fn g<'a, T: 'a>(x: &Rel<T>) -> &u8 { loop {} } } };
     let mut module_leaker = leaker();
     module_leaker.intern_mod(&item);
-    assert_eq!(module_leaker.result().errors()[0].note(), Some(NOTE));
+    assert_eq!(
+        module_leaker.result().errors()[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str()),
+        Some(NOTE)
+    );
     // And an impl.
     let item: ItemImpl = parse_quote! {
         impl<'a, T: 'a> ::p::Tr<'a, T> for u8 { fn g(x: &Rel<T>) -> &u8 { loop {} } }
     };
     let mut impl_leaker = leaker();
     impl_leaker.intern_impl(&item, true);
-    assert_eq!(impl_leaker.result().errors()[0].note(), Some(NOTE));
+    assert_eq!(
+        impl_leaker.result().errors()[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str()),
+        Some(NOTE)
+    );
 }
 
 #[test]
@@ -634,7 +656,13 @@ fn a_view_walks_the_signature_like_the_leaker() {
     let generics: Generics = parse_quote!(<'a, T: 'a>);
     let mut leaker = leaker();
     leaker.enter_generics(&generics, |view| view.visit_signature(&sig));
-    assert_eq!(leaker.result().errors()[0].note(), Some(NOTE));
+    assert_eq!(
+        leaker.result().errors()[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str()),
+        Some(NOTE)
+    );
     // And the sugar and the function pointers in a type visited alone.
     let ty: Type = parse_quote!(Box<dyn Fn(&Rel<T>) -> &u8>);
     let mut leaker = self::leaker();

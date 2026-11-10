@@ -88,7 +88,10 @@ fn entries(item: &ItemImpl) -> Vec<(String, bool, String)> {
                     .to_token_stream()
                     .to_string(),
                 referrer.must(ix),
-                referrer.generics(ix).to_token_stream().to_string(),
+                referrer
+                    .context_generics(referrer.context(ix))
+                    .to_token_stream()
+                    .to_string(),
             )
         })
         .collect()
@@ -182,7 +185,7 @@ fn allowed_paths_would_change_more() {
     leaker.intern_impl(&f_and_g(), true);
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.iter().all(|ty| *ty != parse_quote!(dyn RelTr)));
-    assert!(!referrer.has_required());
+    assert!(!referrer.required().next().is_some());
 }
 
 #[test]
@@ -264,7 +267,7 @@ fn the_cause_of_an_array_with_a_closure_is_the_type_in_it() {
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].cause, Cause::Type(parse_quote!(u8)));
     assert_eq!(
-        result.errors()[0].note(),
+        result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
         Some("it cannot be leaked as a whole because of `| a : u8 | a`")
     );
     let causes = [Cause::Type(parse_quote!(u8))];
@@ -1447,7 +1450,8 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
 #[test]
 fn the_visitor_leaves_a_part_as_written_and_replaces_the_entry_with_the_same_tokens() {
     let item = elided_and_bare();
-    let (referrer, context) = referrer_of(LeakerConfig::new(), &item);
+    let (result, context) = leak_trait(LeakerConfig::new(), &item);
+    let referrer = result.clone().into_referrer();
     // `f` as written, `g` through the entry `dyn RelTr`.
     let expected: ItemTrait = parse_quote!(
         trait Fg {
@@ -1457,7 +1461,9 @@ fn the_visitor_leaves_a_part_as_written_and_replaces_the_entry_with_the_same_tok
     );
     assert_eq!(rewritten(&referrer, context, &item), expected);
     // A strict Referrer replaces the optional entry as a whole.
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.into_referrer();
     let expected: ItemTrait = parse_quote!(
         trait Fg {
             fn f(&self, x: ::p::Elided<'_, dyn RelTr>);

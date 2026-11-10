@@ -1,6 +1,6 @@
 //! Helpers for inspecting paths and types.
 
-use crate::error::{Cause, ABSOLUTE_PATHS};
+use crate::error::Cause;
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -78,51 +78,114 @@ impl AllowedPaths {
     }
 }
 
+/// How the Leaker treats a name of [`KNOWN_NAMES`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Known {
+    /// A primitive type: `allow_primitive()` allows it.
+    Primitive,
+    /// In the prelude of every edition, as of rustc 1.56: `allow_prelude()` allows it.
+    Prelude,
+    /// In the prelude of some editions or of later versions of rustc only, so the copy's crate may
+    /// not have it: no option allows it, and the help gives its absolute path.
+    Newer,
+}
+
+/// The names that the help gives an absolute path for, and the option that allows each. The one
+/// source of `allow_primitive()`, `allow_prelude()` and the help (`use ::core::.. instead of ..`).
+pub(crate) const KNOWN_NAMES: &[(&str, &str, Known)] = &[
+    // The prelude of every edition (`std::prelude::v1`).
+    ("Copy", "::core::marker::Copy", Known::Prelude),
+    ("Send", "::core::marker::Send", Known::Prelude),
+    ("Sized", "::core::marker::Sized", Known::Prelude),
+    ("Sync", "::core::marker::Sync", Known::Prelude),
+    ("Unpin", "::core::marker::Unpin", Known::Prelude),
+    ("Drop", "::core::ops::Drop", Known::Prelude),
+    ("Fn", "::core::ops::Fn", Known::Prelude),
+    ("FnMut", "::core::ops::FnMut", Known::Prelude),
+    ("FnOnce", "::core::ops::FnOnce", Known::Prelude),
+    ("drop", "::core::mem::drop", Known::Prelude),
+    ("Box", "::std::boxed::Box", Known::Prelude),
+    ("ToOwned", "::std::borrow::ToOwned", Known::Prelude),
+    ("Clone", "::core::clone::Clone", Known::Prelude),
+    ("PartialEq", "::core::cmp::PartialEq", Known::Prelude),
+    ("PartialOrd", "::core::cmp::PartialOrd", Known::Prelude),
+    ("Eq", "::core::cmp::Eq", Known::Prelude),
+    ("Ord", "::core::cmp::Ord", Known::Prelude),
+    ("AsRef", "::core::convert::AsRef", Known::Prelude),
+    ("AsMut", "::core::convert::AsMut", Known::Prelude),
+    ("Into", "::core::convert::Into", Known::Prelude),
+    ("From", "::core::convert::From", Known::Prelude),
+    ("Default", "::core::default::Default", Known::Prelude),
+    ("Iterator", "::core::iter::Iterator", Known::Prelude),
+    ("Extend", "::core::iter::Extend", Known::Prelude),
+    ("IntoIterator", "::core::iter::IntoIterator", Known::Prelude),
+    (
+        "DoubleEndedIterator",
+        "::core::iter::DoubleEndedIterator",
+        Known::Prelude,
+    ),
+    (
+        "ExactSizeIterator",
+        "::core::iter::ExactSizeIterator",
+        Known::Prelude,
+    ),
+    ("Option", "::core::option::Option", Known::Prelude),
+    ("Some", "::core::option::Option::Some", Known::Prelude),
+    ("None", "::core::option::Option::None", Known::Prelude),
+    ("Result", "::core::result::Result", Known::Prelude),
+    ("Ok", "::core::result::Result::Ok", Known::Prelude),
+    ("Err", "::core::result::Result::Err", Known::Prelude),
+    ("String", "::std::string::String", Known::Prelude),
+    ("ToString", "::std::string::ToString", Known::Prelude),
+    ("Vec", "::std::vec::Vec", Known::Prelude),
+    // The prelude of the 2021 edition.
+    ("TryFrom", "::core::convert::TryFrom", Known::Newer),
+    ("TryInto", "::core::convert::TryInto", Known::Newer),
+    ("FromIterator", "::core::iter::FromIterator", Known::Newer),
+    // The prelude of the 2024 edition (`IntoFuture` is from rustc 1.64).
+    ("Future", "::core::future::Future", Known::Newer),
+    ("IntoFuture", "::core::future::IntoFuture", Known::Newer),
+    // The prelude since rustc 1.80.
+    ("size_of", "::core::mem::size_of", Known::Newer),
+    ("size_of_val", "::core::mem::size_of_val", Known::Newer),
+    ("align_of", "::core::mem::align_of", Known::Newer),
+    ("align_of_val", "::core::mem::align_of_val", Known::Newer),
+    ("bool", "::core::primitive::bool", Known::Primitive),
+    ("char", "::core::primitive::char", Known::Primitive),
+    ("str", "::core::primitive::str", Known::Primitive),
+    ("u8", "::core::primitive::u8", Known::Primitive),
+    ("u16", "::core::primitive::u16", Known::Primitive),
+    ("u32", "::core::primitive::u32", Known::Primitive),
+    ("u64", "::core::primitive::u64", Known::Primitive),
+    ("u128", "::core::primitive::u128", Known::Primitive),
+    ("usize", "::core::primitive::usize", Known::Primitive),
+    ("i8", "::core::primitive::i8", Known::Primitive),
+    ("i16", "::core::primitive::i16", Known::Primitive),
+    ("i32", "::core::primitive::i32", Known::Primitive),
+    ("i64", "::core::primitive::i64", Known::Primitive),
+    ("i128", "::core::primitive::i128", Known::Primitive),
+    ("isize", "::core::primitive::isize", Known::Primitive),
+    ("f32", "::core::primitive::f32", Known::Primitive),
+    ("f64", "::core::primitive::f64", Known::Primitive),
+];
+
+/// The names of [`KNOWN_NAMES`] of the kind `known`, as paths of one segment.
+fn known_paths(known: Known) -> Vec<Path> {
+    KNOWN_NAMES
+        .iter()
+        .filter(|(_, _, kind)| *kind == known)
+        .map(|(name, _, _)| crate_path(name))
+        .collect()
+}
+
 /// The primitive type names that `allow_primitive()` allows.
 pub(crate) fn primitive_paths() -> Vec<Path> {
-    const NAMES: [&str; 17] = [
-        "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32",
-        "i64", "i128", "isize", "f32", "f64",
-    ];
-    NAMES.iter().map(|name| crate_path(name)).collect()
+    known_paths(Known::Primitive)
 }
 
 /// The names of the standard prelude that `allow_prelude()` allows.
 pub(crate) fn std_prelude_paths() -> Vec<Path> {
-    const NAMES: [&str; 31] = [
-        "Box",
-        "String",
-        "Vec",
-        "Option",
-        "Result",
-        "Copy",
-        "Send",
-        "Sized",
-        "Sync",
-        "Unpin",
-        "Drop",
-        "Fn",
-        "FnMut",
-        "FnOnce",
-        "Clone",
-        "PartialEq",
-        "PartialOrd",
-        "Eq",
-        "Ord",
-        "AsRef",
-        "AsMut",
-        "Into",
-        "From",
-        "Default",
-        "Iterator",
-        "IntoIterator",
-        "Extend",
-        "FromIterator",
-        "ToOwned",
-        "ToString",
-        "drop",
-    ];
-    NAMES.iter().map(|name| crate_path(name)).collect()
+    known_paths(Known::Prelude)
 }
 
 /// The crates that `allow_std_crates()` allows.
@@ -139,9 +202,9 @@ fn crate_path(name: &str) -> Path {
 }
 
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
-    ABSOLUTE_PATHS
+    KNOWN_NAMES
         .iter()
-        .any(|(name, absolute)| ident == name && absolute.starts_with("::core::primitive::"))
+        .any(|(name, _, kind)| ident == name && *kind == Known::Primitive)
 }
 
 /// Returns `true` if `ty` is `part` or has it as a component, compared as written.
@@ -489,9 +552,9 @@ pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
     }
 }
 
-/// Prints tokens of a path or a type as one writes them (`<Self as Tr>::A`, `Wrap<Rel<T>>`), not with
-/// the spaces that a token stream has. For the messages that suggest what to write. Other
-/// tokens may lose a space (`a < b` is `a<b`).
+/// Prints tokens of a path or a type as one writes them (`<Self as Tr>::A`, `Wrap<Rel<T>>`,
+/// `m!(Self)`), not with the spaces that a token stream has. For the messages that suggest what to
+/// write. Other tokens may lose a space (`a < b` is `a<b`).
 pub(crate) fn tidy(tokens: &TokenStream) -> String {
     tidy_str(&tokens.to_string())
 }
@@ -510,6 +573,23 @@ pub(crate) fn tidy_str(text: &str) -> String {
         (" ,", ","),
     ] {
         text = text.replace(from, to);
+    }
+    // A macro call: `m ! (..)` is `m!(..)`, but `a && ! (b)` keeps its space.
+    for open in ['(', '[', '{'] {
+        let (from, to) = (format!(" ! {}", open), format!("!{}", open));
+        let mut joined = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(&from) {
+            joined.push_str(&rest[..at]);
+            let after_name = joined
+                .chars()
+                .next_back()
+                .map_or(false, |c| c.is_alphanumeric() || c == '_');
+            joined.push_str(if after_name { &to } else { &from });
+            rest = &rest[at + from.len()..];
+        }
+        joined.push_str(rest);
+        text = joined;
     }
     text
 }

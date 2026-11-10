@@ -59,7 +59,9 @@ fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result
 /// about the required ones, and the optional ones are tested by `optional_entries()`.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .enumerate()
         .filter(|(ix, _)| referrer.must(*ix))
         .map(|(_, (ty, generics))| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
@@ -69,7 +71,9 @@ fn entries(referrer: &Referrer) -> Vec<(String, String)> {
 /// The optional leaked types with their generics (and where clause).
 fn optional_entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .enumerate()
         .filter(|(ix, _)| !referrer.must(*ix))
         .map(|(_, (ty, generics))| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))

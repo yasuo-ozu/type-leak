@@ -67,7 +67,9 @@ fn ident(name: &str) -> Ident {
 /// The leaked types with their generics, in the order of the Referrer.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect()
 }
@@ -386,11 +388,13 @@ fn self_has_no_meaning_in_a_module_or_generics() {
     );
     assert!(
         err[0]
-            .note()
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
             .unwrap()
             .contains("`Self` has no meaning here"),
         "{:?}",
-        err[0].note()
+        err[0].notes.first().map(|(_, n)| n.as_str())
     );
     // No entry is left: the scopes recovered, and had none.
     assert!(result.into_referrer().is_empty());
@@ -480,7 +484,7 @@ fn allow_self_decides_whether_self_may_be_interned() {
             let err = result.errors();
             assert!(messages(err).starts_with("use absolute path: 'Rel < Self >'"));
             assert_eq!(
-                err[0].note(),
+                err[0].notes.first().map(|(_, n)| n.as_str()),
                 Some("it cannot be leaked as a whole because of `Self`")
             );
         }
@@ -522,7 +526,7 @@ fn allow_self_decides_whether_self_may_be_interned() {
         });
     });
     assert_eq!(
-        result.errors()[0].note(),
+        result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
 }
@@ -643,7 +647,7 @@ fn a_module_in_a_module_in_a_scope() {
             .map(|ix| {
                 (
                     s(referrer.iter().nth(ix).unwrap()),
-                    s(referrer.generics(ix)),
+                    s(referrer.context_generics(referrer.context(ix))),
                     self_of(&referrer, ix),
                     referrer.context_module(referrer.context(ix)),
                     referrer.must(ix),
@@ -2161,7 +2165,7 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
     });
     let err = result.errors();
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("a default of a parameter cannot depend on `Self`")
     );
     assert_relative_path(err);
@@ -2374,7 +2378,7 @@ fn allow_self_applies_to_traits() {
     let err = result.errors();
     assert!(messages(err).starts_with("use absolute path: 'Rel < Self >'"));
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("it cannot be leaked as a whole because of `Self`")
     );
     // What can be decomposed is, and the receivers are not affected.
@@ -2404,7 +2408,7 @@ fn allow_self_applies_to_traits() {
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     // The same for the scope of the Leaker and of the View.
@@ -2620,7 +2624,7 @@ fn self_without_meaning_is_an_error_of_its_own() {
         "`Self` has no meaning here\n`Self` has no meaning here"
     );
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
             "`Self` has no meaning here: it is declared only by a struct, an enum, a union, an impl \
              or a trait, not by a module or generics"

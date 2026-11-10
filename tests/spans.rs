@@ -30,8 +30,8 @@ fn the_spans_of_the_errors_are_at_the_offending_tokens() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{}\n{}", stdout, stderr);
-    // The tests ran (the other targets of the package have none): 9 of the errors of the Leaker,
+    // The tests ran (the other targets of the package have none): 12 of the errors of the Leaker,
     // and 2 of `EncodeError`.
-    assert!(stdout.contains("test result: ok. 9 passed"), "{}", stdout);
+    assert!(stdout.contains("test result: ok. 12 passed"), "{}", stdout);
     assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
 }

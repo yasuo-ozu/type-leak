@@ -83,7 +83,9 @@ fn leaked(item: ItemTrait) -> Vec<(String, String)> {
 fn leaked_by(leaker: Leaker, item: ItemTrait) -> Vec<(String, String)> {
     let referrer = analyze_with(leaker, &item).unwrap_or_else(|e| panic!("{}", to_syn_error(&e)));
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .enumerate()
         .map(|(ix, (ty, generics))| {
             let mark = if referrer.must(ix) { "" } else { "? " };
@@ -99,7 +101,14 @@ fn e(ty: &str, generics: &str) -> (String, String) {
 /// The message and the first note of the error of a trait.
 fn error(item: ItemTrait) -> (String, Option<String>) {
     let err = analyze(&item).expect_err("expected an error");
-    (messages(&err), err[0].note().map(str::to_string))
+    (
+        messages(&err),
+        err[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
+            .map(str::to_string),
+    )
 }
 
 /// The note of an error in a bound or a predicate, where there is no type holding the binder.
@@ -1019,7 +1028,9 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     let item: ItemTrait = parse_quote! { trait Tr { #(#methods)* } };
     let referrer = analyze(&item).unwrap();
     let found: Vec<_> = referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect();
     assert_eq!(
@@ -1540,11 +1551,15 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
             fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8);
         }
     };
-    let (referrer, context) = analyze_in(leaker_allowing_nothing(), &item).unwrap();
+    let mut leaker = leaker_allowing_nothing();
+    let context = leaker.intern_trait(&item, true);
+    let result = leaker.result();
     let mut kept = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer
+        &mut result
             .clone()
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut kept,
     );
@@ -1557,9 +1572,12 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // The Referrer which replaces them: the type is replaced (with its entry), and `&'x u8`
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer
-            .allow_ambiguous_crate_name(false)
+        &mut strict
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut replaced,
     );
@@ -1575,13 +1593,17 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
             fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, Parser<'x>) -> &'x u8);
         }
     };
-    let (referrer, context) = analyze_in(leaker_allowing_nothing(), &item).unwrap();
+    let mut leaker = leaker_allowing_nothing();
+    let context = leaker.intern_trait(&item, true);
+    let result = leaker.result();
     for allow in [true, false] {
         let mut copy = item.clone();
+        let mut result = result.clone();
+        result.allow_ambiguous_crate_name(allow);
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer
-                .clone()
-                .allow_ambiguous_crate_name(allow)
+            &mut result
+                .finish()
+                .unwrap()
                 .visitor(context, |_, ix| parse_quote!(P<#ix>)),
             &mut copy,
         );
@@ -1594,5 +1616,12 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
 
 fn error_by(leaker: Leaker, item: ItemTrait) -> (String, Option<String>) {
     let err = analyze_with(leaker, &item).expect_err("expected an error");
-    (messages(&err), err[0].note().map(str::to_string))
+    (
+        messages(&err),
+        err[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
+            .map(str::to_string),
+    )
 }

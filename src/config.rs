@@ -78,8 +78,8 @@ impl LeakerConfig {
     /// **A path that is not a type is rejected** unless it means the same wherever it is written:
     /// it is absolute or starts with `$crate`, it is allowed ([`allow_path()`](LeakerConfig::allow_path),
     /// also the names of [`allow_primitive()`](LeakerConfig::allow_primitive) and
-    /// [`allow_prelude()`](LeakerConfig::allow_prelude): `Some` and `None` are not among
-    /// them, write `::core::option::Option::Some`), it starts with a generic or `Self` in scope,
+    /// [`allow_prelude()`](LeakerConfig::allow_prelude): `Some`, `None`, `Ok`, `Err` and `drop` are
+    /// among them, `TryFrom` is not), it starts with a generic or `Self` in scope,
     /// or with a name that the value itself declares (a `let` binding, a closure or function
     /// parameter, a `match`, `if let` or `for` pattern, an item or a `use` in a block). The name
     /// of the item that holds the value is relative like any other. (A name in a pattern is a
@@ -152,7 +152,7 @@ impl LeakerConfig {
     /// let error = &result.errors()[0];
     /// assert_eq!(error.message, "use absolute path: 'inner :: N'");
     /// assert_eq!(
-    ///     error.note(),
+    ///     error.notes.first().map(|(_, note)| note.as_str()),
     ///     Some("it is in the default value of `N`, which the copy writes as it is")
     /// );
     /// ```
@@ -207,7 +207,7 @@ impl LeakerConfig {
     ///     Some(SelfRequirement::Any)
     /// ));
     /// let param: Ident = parse_quote!(__S);
-    /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+    /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param), array_const).unwrap();
     /// let (generics, args, ty) = (&r.generics, &r.args, &r.ty);
     /// let imp: ItemImpl = parse_quote! {
     ///     impl #generics Repeater<#args, 7u64, 0usize> for __S { type Type = #ty; }
@@ -262,7 +262,8 @@ impl LeakerConfig {
     /// Another absolute path, such as `::serde::Wrap<(Rel,)>`, may name a different crate in the
     /// copy, which the Leaker cannot tell. So it is leaked as an *optional entry*
     /// ([`Referrer::must()`](crate::Referrer::must) is `false`), and the Referrer chooses whether a
-    /// copy replaces it ([`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)).
+    /// copy replaces it
+    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     /// `::core::..` and `$crate::..` are never optional, and `::std` and `::alloc` are like any
     /// other crate unless allowed.
     /// [`Referrer::external_crates_require()`](crate::Referrer::external_crates_require) lists the
@@ -289,6 +290,12 @@ impl LeakerConfig {
     ///
     /// Without it, a relative `Clone` in `trait Tr: Clone` is an error, and `Vec<T>` is leaked
     /// whole. You promise that the copy does not shadow the names.
+    ///
+    /// The names are those of the prelude of every edition, as of Rust 1.56 (`Some`, `None`, `Ok`,
+    /// `Err`, `drop`, `DoubleEndedIterator`, ...). A name that a later prelude added is left out,
+    /// as the copy may be in an earlier edition or built by an older rustc: `TryFrom`, `TryInto`,
+    /// `FromIterator`, `Future`, `IntoFuture`, `size_of`, `size_of_val`, `align_of` and
+    /// `align_of_val`. The help gives their absolute paths.
     ///
     /// `Sized` is one of them, as a bound (`where Self: Sized`): a trait named `Sized` in the copy
     /// would be the one required. The relaxed bound `?Sized` needs no option, since rustc accepts

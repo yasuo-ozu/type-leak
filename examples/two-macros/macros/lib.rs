@@ -35,7 +35,7 @@
 //!   the macro of A, so both sides agree.
 //! - The Repeater impls are written for all the entries (`Referrer::iter()`), not only for the
 //!   required ones (`Referrer::required()`), because a Referrer in crate B may be strict
-//!   (`Referrer::allow_ambiguous_crate_name(false)`), which replaces the optional entries too.
+//!   (`LeakerResult::allow_ambiguous_crate_name(false)`), which replaces the optional entries too.
 //!   The impls of the optional entries cost nothing if no one needs them.
 
 use proc_macro::TokenStream;
@@ -49,7 +49,9 @@ use syn::{
     parse_macro_input, parse_quote, GenericArgument, GenericParam, ImplItem, ItemImpl, ItemStruct,
     ItemTrait, Path, PathArguments, Token, TraitItem, Type,
 };
-use type_leak::{ContextId, EncodeError, ErrorItem, ImplSelf, Leaker, Referrer, UseSite};
+use type_leak::{
+    array_const, ContextId, EncodeError, ErrorItem, ImplSelf, Leaker, Referrer, UseSite,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Crate A: `#[export_trait]`
@@ -75,7 +77,7 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let self_param: syn::Ident = parse_quote!(__S);
     let mut impls: Vec<ItemImpl> = vec![];
     for ix in 0..referrer.iter().count() {
-        let r = match referrer.repeater_impl(ix, ImplSelf::Param(&self_param)) {
+        let r = match referrer.repeater_impl(ix, ImplSelf::Param(&self_param), array_const) {
             Ok(r) => r,
             Err(error) => {
                 return syn::Error::new(error.span(), error)
@@ -281,7 +283,7 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                     // The arguments of the Repeater, as written at this site. The paths come out
                     // as the impls of crate A have them, because both use `Referrer`.
                     let args = referrer
-                        .entry_args(ix, &site)
+                        .entry_args(ix, &site, array_const)
                         .expect("the arguments can be encoded");
                     parse_quote!(<Self as #repeater<#args, #id, #ix>>::Type)
                 });

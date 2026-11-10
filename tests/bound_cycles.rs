@@ -54,7 +54,9 @@ fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
 /// The leaked types, required then optional, with their generics.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -69,7 +71,14 @@ fn rejected(item: Item) -> (String, Option<String>) {
         Ok(referrer) => panic!("not rejected: {:?}", entries(&referrer)),
         Err(err) => err,
     };
-    (messages(&err), err[0].note().map(str::to_string))
+    (
+        messages(&err),
+        err[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
+            .map(str::to_string),
+    )
 }
 
 /// The help of the error, as `rejected()` gives the headline and the note.

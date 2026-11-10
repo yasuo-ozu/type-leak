@@ -5,7 +5,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Referrer};
+use type_leak::{array_const, ContextId, ImplSelf, Referrer};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -542,14 +542,14 @@ fn test_has_self() {
         "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
     );
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     assert!(leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Rel;").is_ok());
 }
 
 #[test]
-fn test_iter_with_self() {
+fn test_repeater_impl_replaces_self() {
     let (referrer, context) = referrer_of(parse_quote! {
         trait Tr {
             fn a(&self) -> Rel<Self>;
@@ -562,10 +562,18 @@ fn test_iter_with_self() {
             fn h(&self, a: Rel6<[u8; Self::N]>);
         }
     });
-    let marker: Type = parse_quote!(__S);
-    let items: Vec<(String, String)> = referrer
-        .iter_with_self(&marker)
-        .map(|(ty, generics)| {
+    let marker: Ident = parse_quote!(__S);
+    let items: Vec<(String, String)> = (0..referrer.iter().count())
+        .map(|ix| {
+            let r = referrer
+                .repeater_impl(ix, ImplSelf::Param(&marker), array_const)
+                .unwrap();
+            // The implementor, `__S`, is the last parameter of the impl.
+            let mut generics = r.generics;
+            let mut params: Vec<GenericParam> = generics.params.into_iter().collect();
+            assert!(matches!(params.pop(), Some(GenericParam::Type(p)) if p.ident == marker));
+            generics.params = params.into_iter().collect();
+            let ty = r.ty;
             (
                 quote!(#ty).to_string(),
                 quote!(#generics #{&generics.where_clause}).to_string(),

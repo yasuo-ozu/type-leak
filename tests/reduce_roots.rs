@@ -303,7 +303,8 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     };
     let mut leaker = Leaker::new();
     let context = leaker.intern_struct(&item, true);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry). The
     // two types of external crates are optional entries (old: none), after the required ones: the
     // `Vec` (one cut covers it, whatever else is in it) and the `String`.
@@ -349,9 +350,12 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
     // The Referrer which does not trust the names of the crates replaces them as well: the `Vec`
     // as a whole, and the `String`, with `Rel` inside the tuple.
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut referrer
-            .allow_ambiguous_crate_name(false)
+        &mut strict
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut replaced,
     );
@@ -371,7 +375,9 @@ fn leaked_trait(item: &ItemTrait) -> Vec<(String, String)> {
     leaker.intern_trait(item, true);
     let referrer = leaker.result().finish().unwrap();
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .enumerate()
         .filter(|(ix, _)| referrer.must(*ix))
         .map(|(_, (ty, generics))| (ty_string(ty.clone()), quote!(#generics).to_string()))
@@ -385,7 +391,9 @@ fn optional_trait(item: &ItemTrait) -> Vec<(String, String)> {
     leaker.intern_trait(item, true);
     let referrer = leaker.result().finish().unwrap();
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .enumerate()
         .filter(|(ix, _)| !referrer.must(*ix))
         .map(|(_, (ty, generics))| (ty_string(ty.clone()), quote!(#generics).to_string()))
@@ -1464,7 +1472,9 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     let mut entries: Vec<(String, String)> = referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (ty_string(ty.clone()), quote!(#generics).to_string()))
         .collect();
     entries.sort();

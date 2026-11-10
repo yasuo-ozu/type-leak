@@ -1,5 +1,5 @@
 //! The outlives bounds which a leaked type implies are added to the bounds of the generics it
-//! uses (see `Referrer::generics()`), so that the Repeater's implementation and the copies of the
+//! uses (see `Referrer::context_generics()`), so that the Repeater's implementation and the copies of the
 //! type have them: `T: 'a` for `&'a X`, where `X` mentions `T`, and `'b: 'a` where it mentions
 //! `'b`. A path with a lifetime argument (`Rel<'a, T>`) implies none: its definition is not seen
 //! (`struct Rel<'a, T>(&'a T)` makes `T: 'a` part of it, `struct Loose<'a, T>(&'a (), T)` does
@@ -8,10 +8,7 @@
 
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{
-    encode_generics_params_to_ty, without_encoded_bounds, ContextId, Leaker, Referrer,
-    RepeaterSlots,
-};
+use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -27,7 +24,9 @@ fn leaked(item: ItemTrait) -> Vec<(String, String)> {
 
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -242,7 +241,9 @@ fn a_trait_object_requires_its_arguments_to_outlive_too() {
 /// in the context of each (`Referrer::context_self_outlives()`).
 fn with_self_outlives(referrer: &Referrer) -> Vec<(String, String, Vec<String>)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .enumerate()
         .map(|(ix, (ty, generics))| {
             (
@@ -595,15 +596,19 @@ fn the_bounds_survive_serialization() {
 }
 
 /// The generics of the first entry of a trait with the Repeater's implementation declaring them
-/// (`impl_generics()`), and those the trait arguments encode (`context_generics()`).
+/// (`repeater_impl()`), and those the trait arguments encode (`context_generics()`).
 fn impl_and_context(item: ItemTrait) -> (String, String) {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let context = referrer.context(0);
+    let marker: Type = parse_quote!(crate::Marker);
+    let r = referrer
+        .repeater_impl(0, ImplSelf::Marker(&marker), array_const)
+        .unwrap();
     let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
     (
-        with_where(&referrer.impl_generics(context)),
+        with_where(&r.generics),
         with_where(referrer.context_generics(context)),
     )
 }
@@ -699,79 +704,11 @@ fn impl_generics_drop_the_encoded_bounds() {
     // The generics of the top-level context are the call's (no bound is implied there).
     let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(s(&referrer.impl_generics(top_level)), "< 'a , T >");
     // The context generics are not changed.
     assert_eq!(
         s(referrer.context_generics(referrer.context(0))),
         "< 'a , T : 'a >"
     );
-}
-
-#[test]
-fn without_encoded_bounds_removes_what_the_encoders_encode() {
-    let mut with_where: Generics = parse_quote!(<'a, T>);
-    with_where.where_clause = Some(parse_quote!(where T: 'a, Vec<T>: Clone));
-    let cases: Vec<(Generics, &str)> = vec![
-        (
-            parse_quote!(<'a, 'b: 'a, T: 'a + Clone, U: 'static, V: 'c, W: ?Sized + 'b, const N: usize>),
-            "< 'a , 'b , T : Clone , U : 'static , V : 'c , W : ? Sized , const N : usize >",
-        ),
-        // Only the lifetime parameters of the list count.
-        (parse_quote!(<'b: 'b>), "< 'b >"),
-        (parse_quote!(<T: 'a>), "< T : 'a >"),
-        // The where clause is the encoders' blind spot, so it is kept.
-        (with_where, "< 'a , T > where T : 'a , Vec < T > : Clone"),
-    ];
-    for (generics, expected) in cases {
-        let declared = without_encoded_bounds(&generics);
-        assert_eq!(s(&quote!(#declared #{&declared.where_clause})), expected);
-    }
-    // The encoders encode exactly the bounds which are removed: the elements after the
-    // parameters are as many as the bounds dropped.
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    let count = |generics: &Generics| -> usize {
-        generics
-            .params
-            .iter()
-            .map(|param| match param {
-                GenericParam::Lifetime(param) => param.bounds.len(),
-                GenericParam::Type(param) => param.bounds.len(),
-                GenericParam::Const(_) => 0,
-            })
-            .sum()
-    };
-    for generics in [
-        parse_quote!(<'a, 'b: 'a, T: 'a + 'b + Clone, U: 'static, V: 'c, const N: usize>),
-        parse_quote!(<'a, 'b: 'a + 'c, T: 'a>),
-        parse_quote!(<'a, T: Clone + 'a, U: 'a + 'static>),
-        parse_quote!(<'a, T>),
-        parse_quote!(<>),
-    ] {
-        let generics: Generics = generics;
-        let declared = without_encoded_bounds(&generics);
-        let elements = |ty: Type| match ty {
-            Type::Tuple(tuple) => tuple.elems.len(),
-            _ => unreachable!(),
-        };
-        let extra = |generics: &Generics| -> usize {
-            elements(encode_generics_params_to_ty(&generics.params)) - generics.params.len()
-        };
-        assert_eq!(
-            extra(&generics),
-            count(&generics) - count(&declared),
-            "{}",
-            s(&generics)
-        );
-        // Nothing is left to encode once they are removed.
-        assert_eq!(extra(&declared), 0, "{}", s(&declared));
-        let slotted = slots
-            .encode_generics_params_to_ty(&generics.params)
-            .unwrap();
-        assert_eq!(
-            elements(slotted) - generics.params.len(),
-            count(&generics) - count(&declared)
-        );
-    }
 }

@@ -700,7 +700,12 @@ fn a_bound_on_self_alone_need_not_be_written_by_the_copy() {
         let mut leaker = Leaker::new();
         let context = leaker.intern_trait(tr, true);
         let referrer = leaker.result().finish().unwrap();
-        let predicate = |ix: usize| referrer.generics(ix).where_clause.is_some();
+        let predicate = |ix: usize| {
+            referrer
+                .context_generics(referrer.context(ix))
+                .where_clause
+                .is_some()
+        };
         let mut item = item;
         referrer
             .clone()

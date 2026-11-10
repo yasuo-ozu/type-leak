@@ -517,7 +517,7 @@ fn repeater_impls(referrer: &Referrer, id: u64, strict: bool) -> Result<(Impls, 
     for ix in 0..referrer.iter().count() {
         crate::check_plain(referrer, ix, &slots)?;
         let r = referrer
-            .repeater_impl_with(ix, ImplSelf::Param(&self_param), |value, param| {
+            .repeater_impl(ix, ImplSelf::Param(&self_param), |value, param| {
                 slots.encode_const(value, &param.ty)
             })
             .map_err(Error::from)?;
@@ -590,8 +590,7 @@ fn generics_text(generics: &Generics) -> String {
 }
 
 /// The entries and their helpers agree: `required()` is the entries with `must()`, and they are the
-/// first ones; `generics(ix)` is the generics of the context of the entry, as
-/// `iter_with_generics()` has them, and the context is one of `contexts()`.
+/// first ones; the context of an entry is one of `contexts()`.
 fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
     let n = referrer.iter().count();
     let musts: Vec<usize> = (0..n).filter(|&ix| referrer.must(ix)).collect();
@@ -609,11 +608,6 @@ fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
             musts.len()
         )));
     }
-    if referrer.has_required() != !musts.is_empty() {
-        return Err(helpers_disagree(
-            "`has_required()` and `required()` differ".to_string(),
-        ));
-    }
     if referrer.is_empty() != (n == 0) {
         return Err(helpers_disagree(
             "`is_empty()` and `iter()` differ".to_string(),
@@ -628,46 +622,20 @@ fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
         }
     }
     let contexts: Vec<ContextId> = referrer.contexts().collect();
-    let mut with_generics = referrer.iter_with_generics();
-    for (ix, ty) in referrer.iter().enumerate() {
-        let context = referrer.context(ix);
-        if !contexts.contains(&context) {
+    for ix in 0..n {
+        if !contexts.contains(&referrer.context(ix)) {
             return Err(helpers_disagree(format!(
                 "the context of the entry {} is not in `contexts()`",
                 ix
             )));
         }
-        if generics_text(referrer.generics(ix)) != generics_text(referrer.context_generics(context))
-        {
-            return Err(helpers_disagree(format!(
-                "`generics({})` is not the `context_generics()` of its context",
-                ix
-            )));
-        }
-        match with_generics.next() {
-            Some((other, generics))
-                if other == ty
-                    && generics_text(generics) == generics_text(referrer.generics(ix)) => {}
-            _ => {
-                return Err(helpers_disagree(format!(
-                    "`iter_with_generics()` differs from `iter()` and `generics()` at {}",
-                    ix
-                )))
-            }
-        }
-    }
-    if with_generics.next().is_some() {
-        return Err(helpers_disagree(
-            "`iter_with_generics()` has more entries than `iter()`".to_string(),
-        ));
     }
     Ok(())
 }
 
-/// Normalizes the text of generics that the impl of an entry declares, or that
-/// `Referrer::impl_generics()` returns, so that the two can be compared: the implementor `__S`
-/// replaces `Self` (and `<__S>::A` is `Self::A`), and the parentheses that rustc needs around a
-/// first qualified path are dropped.
+/// Normalizes the text of generics that the impl of an entry declares, or that `declared_generics()`
+/// returns, so that the two can be compared: the implementor `__S` replaces `Self` (and `<__S>::A`
+/// is `Self::A`), and the parentheses that rustc needs around a first qualified path are dropped.
 fn impl_text(text: &str, self_param: &Ident) -> String {
     text.replace(char::is_whitespace, "")
         .replace(&self_param.to_string(), "Self")
@@ -684,9 +652,55 @@ fn implementor_param(generics: &mut Generics) -> Option<GenericParam> {
     last
 }
 
-/// The generics of the impl of an entry are `Referrer::impl_generics()` of its context, with the
-/// parameter of the implementor added (`__S: ?Sized`, and the trait for a `Self` that a trait
-/// bounds) unless the impl is for a type; its module is the context's.
+/// The generics of a context without the lifetime bounds that the trait arguments of a Repeater
+/// impl encode: a bound by a lifetime parameter of the generics (`T: 'a`, `'b: 'a`).
+fn declared_generics(generics: &Generics) -> Generics {
+    let lifetimes: Vec<Lifetime> = generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Lifetime(param) => Some(param.lifetime.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut declared = generics.clone();
+    for param in declared.params.iter_mut() {
+        match param {
+            GenericParam::Lifetime(param) => {
+                param.bounds = param
+                    .bounds
+                    .iter()
+                    .filter(|bound| !lifetimes.contains(bound))
+                    .cloned()
+                    .collect();
+                if param.bounds.is_empty() {
+                    param.colon_token = None;
+                }
+            }
+            GenericParam::Type(param) => {
+                param.bounds = param
+                    .bounds
+                    .iter()
+                    .filter(|bound| {
+                        !matches!(bound, TypeParamBound::Lifetime(lifetime)
+                            if lifetimes.contains(lifetime))
+                    })
+                    .cloned()
+                    .collect();
+                if param.bounds.is_empty() {
+                    param.colon_token = None;
+                }
+            }
+            GenericParam::Const(_) => (),
+        }
+    }
+    declared
+}
+
+/// The generics of the impl of an entry are those of its context without the lifetime bounds that
+/// its trait arguments encode (`declared_generics()`), with the parameter of the implementor added
+/// (`__S: ?Sized`, and the trait for a `Self` that a trait bounds) unless the impl is for a type;
+/// its module is the context's.
 fn check_impl_pieces(
     referrer: &Referrer,
     ix: usize,
@@ -694,7 +708,7 @@ fn check_impl_pieces(
     self_param: &Ident,
 ) -> Result<()> {
     let context = referrer.context(ix);
-    let declared = referrer.impl_generics(context);
+    let declared = declared_generics(referrer.context_generics(context));
     let mut got = r.generics.clone();
     match referrer.context_self(context) {
         Some(SelfRequirement::Type(_)) => (),
@@ -730,7 +744,7 @@ fn check_impl_pieces(
         != impl_text(&generics_text(&declared), self_param)
     {
         return Err(helpers_disagree(format!(
-            "the impl of the entry {} declares `{}` and `impl_generics()` is `{}`",
+            "the impl of the entry {} declares `{}` and the generics of its context declare `{}`",
             ix,
             generics_text(&got),
             generics_text(&declared)
@@ -1374,7 +1388,12 @@ impl Portable<'_> {
             "Iterator",
             "IntoIterator",
             "Extend",
-            "FromIterator",
+            "DoubleEndedIterator",
+            "ExactSizeIterator",
+            "Some",
+            "None",
+            "Ok",
+            "Err",
             "ToOwned",
             "ToString",
             "drop",
@@ -1643,7 +1662,7 @@ impl Projector<'_> {
             UseSite::substituting(&self.root_params, &self.root_args).with_self(self_ty.clone());
         let encoded = self
             .referrer
-            .entry_args_with(ix, &site, |value, param| {
+            .entry_args(ix, &site, |value, param| {
                 slots.encode_const(value, &param.ty)
             })
             .map_err(Error::from)?;
@@ -2225,7 +2244,7 @@ fn rejection_text(errors: &[ErrorItem]) -> String {
                 "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
                 clean(&item.message),
                 clean(&item.cause.to_token_stream().to_string()),
-                clean(item.note().unwrap_or("")),
+                clean(item.notes.first().map(|(_, n)| n.as_str()).unwrap_or("")),
                 item.reason,
                 cause.split('(').next().unwrap_or("")
             )
@@ -2352,13 +2371,13 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     // What the macro of the Referrer carries: the result with its errors, or the Referrer.
     let carried = (mode == Mode::Result).then(|| result.to_token_stream());
     // The recovered Referrer: the parts that conflict are copied as written.
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     let carried = carried.unwrap_or_else(|| referrer.to_token_stream());
 
     let status = if args.accepted { "acc" } else { "ok" };
     let errors = rejection_text(&errors);
     // Count what the Referrer will check, by rewriting a copy here too.
-    let counted = count_copy(&referrer, context, &original, &args, status, twin)?;
+    let counted = count_copy(&result, context, &original, &args, status, twin)?;
     let mut impls = counted.impls;
     let report = counted.report;
     let witnesses = witnesses_of(&original, &args);
@@ -2448,7 +2467,7 @@ fn place(
     })
 }
 
-/// What the macro writes for the copy that a Referrer makes of `original` with `referrer`: the
+/// What the macro writes for the copy that a Referrer makes of `original` with `result`: the
 /// Repeater's impls of its entries, and the report of what the macro counted.
 struct Counted {
     impls: Impls,
@@ -2459,24 +2478,25 @@ struct Counted {
 /// entries, the type positions, those that a witness compares (`status` is `ok`, or `acc` for an
 /// item accepted by `allow()`). Fails if the item has a shape that the macro cannot write.
 fn count_copy(
-    referrer: &Referrer,
+    result: &LeakerResult,
     context: ContextId,
     original: &Item,
     args: &Args,
     status: &str,
     twin: bool,
 ) -> Result<Counted> {
+    let referrer = &result.clone().into_referrer();
     let (id, kind) = (args.id, kind_name(original));
     check_nested_self_is_required(referrer, original, args)?;
     let (impls, skipped) =
         repeater_impls(referrer, args.repeater_id(), args.strict.unwrap_or(true))?;
     let positions = collect_positions(original, None, args);
     let dummy: Path = parse_quote!(::__dummy);
-    let counted = if args.strict == Some(true) {
-        referrer.clone().allow_ambiguous_crate_name(false)
-    } else {
-        referrer.clone()
-    };
+    let mut counted = result.clone();
+    if args.strict == Some(true) {
+        counted.allow_ambiguous_crate_name(false);
+    }
+    let counted = counted.into_referrer();
     let report = match rewrite(&counted, context, original, args, &dummy, false) {
         Ok(rewritten) => {
             let host = host_arg(&rewritten, args, &dummy);
@@ -2702,9 +2722,9 @@ fn stage_copy(
     copy_args.stages = false;
     copy_args.stage = rule.number(side);
     copy_args.accepted = true;
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     let text = rejection_text(&errors);
-    let counted = match count_copy(&referrer, context, original, &copy_args, status, false) {
+    let counted = match count_copy(&result, context, original, &copy_args, status, false) {
         Ok(counted) => counted,
         Err(e) => {
             let report = format!(
@@ -2912,7 +2932,6 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         };
     }
     let errors = crate::report(result.errors());
-    let referrer = result.into_referrer();
     // `strict` makes the Referrer replace the optional entries as well.
     if args.strict.is_some_and(|said| said != strict) {
         return Err(Error::new(
@@ -2920,11 +2939,10 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             "test macro: the item is invoked with another `strict` than the one it was analyzed for",
         ));
     }
-    let referrer = if strict {
-        referrer.allow_ambiguous_crate_name(false)
-    } else {
-        referrer
-    };
+    if strict {
+        result.allow_ambiguous_crate_name(false);
+    }
+    let referrer = result.into_referrer();
     let rewritten = rewrite(&referrer, context, &item, &args, &path, dyn_host)?;
     let id = args.id;
 

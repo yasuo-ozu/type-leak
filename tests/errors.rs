@@ -71,15 +71,6 @@ fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, S
     Ok(referrer.iter().map(|t| quote!(#t).to_string()).collect())
 }
 
-fn ty_string(ty: &Type) -> String {
-    quote!(#ty).to_string()
-}
-
-/// Parses `tokens` as a type and prints it in the same way as [`ty_string()`].
-fn expected_ty(tokens: proc_macro2::TokenStream) -> String {
-    ty_string(&parse2(tokens).unwrap())
-}
-
 // ── limitations ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -137,65 +128,15 @@ fn limit_const_param_ty_alias() {
     // `RepeaterSlots` cannot encode an alias (relative or absolute), because it cannot know which
     // slot to use.
     let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
-    let err = slots
-        .encode_generics_params_to_ty(&abs_item.generics.params)
-        .unwrap_err();
+    let alias = match &abs_item.generics.params[0] {
+        GenericParam::Const(param) => param,
+        _ => unreachable!(),
+    };
+    let err = slots.encode_const(&parse_quote!(N), &alias.ty).unwrap_err();
     assert_eq!(
         err.to_string(),
         "unsupported type of const parameter: ':: my_crate :: Idx'"
     );
-}
-
-#[test]
-fn limit_plain_encoders_usize_only() {
-    // `encode_generics_params_to_ty()` and `encode_generics_args_to_ty_with()` with a `[(); N]` callback encode const generics as
-    // array lengths, which must be `usize`. For other types they produce `[(); B]` or
-    // `[(); true]`, which rustc rejects; `RepeaterSlots` must be used instead.
-    let generics: Generics = parse2(quote!(<const B: bool>)).unwrap();
-    let ty = encode_generics_params_to_ty(&generics.params);
-    assert_eq!(ty_string(&ty), expected_ty(quote!(([(); B],))));
-
-    let args: AngleBracketedGenericArguments = parse2(quote!(<true>)).unwrap();
-    let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |expr, _| {
-        parse2(quote!([(); #expr])).unwrap()
-    })
-    .unwrap();
-    assert_eq!(ty_string(&ty), expected_ty(quote!(([(); true],))));
-
-    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
-    let ty = slots
-        .encode_generics_params_to_ty(&generics.params)
-        .unwrap();
-    assert_eq!(
-        ty_string(&ty),
-        expected_ty(quote!(
-            (*const dyn crate::Repeater<(), 0, 0, B, Type = ()>,)
-        ))
-    );
-    let ty = slots
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    assert_eq!(
-        ty_string(&ty),
-        expected_ty(quote!((
-            *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
-        )))
-    );
-}
-
-#[test]
-fn limit_plain_args_encoder_needs_params() {
-    // A bare `N` (parsed by syn as a type argument) is a const, and omitted arguments take the
-    // parameters' defaults, which the arguments alone cannot tell, so the parameters are required
-    // and the result is that of `encode_generics_params_to_ty()`.
-    let generics: Generics = parse2(quote!(<T, const N: usize, const M: usize = 3>)).unwrap();
-    let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
-
-    let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |expr, _| {
-        parse2(quote!([(); #expr])).unwrap()
-    })
-    .unwrap();
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, [(); N], [(); 3]))));
 }
 
 // ── holes ────────────────────────────────────────────────────────────────────
@@ -583,7 +524,7 @@ fn notes_explain_conflicts() {
         Some("use `::std::boxed::Box` instead of `Box`")
     );
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("it cannot be leaked as a whole because of `'_`")
     );
     assert_eq!(
@@ -618,9 +559,16 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
         .all(|item| item.reason == Reason::UnconstrainedLifetime));
     // The note says why.
     let items = &err;
-    assert!(items[0].note().unwrap().starts_with("it names `'b`"));
+    assert!(items[0]
+        .notes
+        .first()
+        .map(|(_, n)| n.as_str())
+        .unwrap()
+        .starts_with("it names `'b`"));
     assert!(items[1]
-        .note()
+        .notes
+        .first()
+        .map(|(_, n)| n.as_str())
         .unwrap()
         .starts_with("the lifetime of the trait object defaults to `'c`"));
 
@@ -639,7 +587,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     );
     assert_eq!(err[0].reason, Reason::DeniedSelfInBounds);
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
 

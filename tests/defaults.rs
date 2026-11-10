@@ -138,7 +138,9 @@ fn test_default_is_analyzed_with_the_parameters_before_it() {
     let referrer = referrer(&tr);
     assert_eq!(
         referrer
-            .iter_with_generics()
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
             .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
             .collect::<Vec<_>>(),
         [("Rel < T >".to_string(), "< T >".to_string())]
@@ -151,7 +153,9 @@ fn test_default_is_analyzed_with_the_parameters_before_it() {
     let referrer = referrer_of(&tr);
     assert_eq!(
         referrer
-            .iter_with_generics()
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
             .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
             .collect::<Vec<_>>(),
         [
@@ -177,7 +181,10 @@ fn test_default_is_shared_with_the_items() {
     assert_eq!(referrer.contexts().count(), 2);
     assert_ne!(referrer.context(0), top_level);
     assert_eq!(referrer.context_generics(top_level).params.len(), 2);
-    assert_eq!(referrer.generics(0).params.len(), 1);
+    assert_eq!(
+        referrer.context_generics(referrer.context(0)).params.len(),
+        1
+    );
 }
 
 #[test]
@@ -193,10 +200,10 @@ fn test_default_cannot_depend_on_self() {
     assert_eq!(err.len(), 1);
     assert_eq!(
         err[0].message,
-        "`Rel < Self >` is in the default of a parameter, and names `Self`"
+        "`Rel<Self>` is in the default of a parameter, and names `Self`"
     );
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("a default of a parameter cannot depend on `Self`")
     );
     // Nothing is leaked in `::p::W<Self>` or `Self`, which are copied, and in `(Rel, Self)` only
@@ -245,7 +252,7 @@ fn test_defaults_of_several_calls_are_shared() {
     leaker.intern_trait(&bad, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     // The types use no generics, so they are in one context, whichever call found them, and the
     // generics of the calls (without the defaults) are two other contexts. The default of `U`,
     // the type of an external crate, is an optional entry (after the required ones), which uses
@@ -253,8 +260,14 @@ fn test_defaults_of_several_calls_are_shared() {
     // had none).
     assert_eq!(referrer.iter().count(), 3);
     assert_eq!(referrer.contexts().count(), 3);
-    assert_eq!(referrer.generics(0).params.len(), 0);
-    assert_eq!(referrer.generics(1).params.len(), 0);
+    assert_eq!(
+        referrer.context_generics(referrer.context(0)).params.len(),
+        0
+    );
+    assert_eq!(
+        referrer.context_generics(referrer.context(1)).params.len(),
+        0
+    );
     assert!(referrer.must(0) && referrer.must(1) && !referrer.must(2));
     assert_eq!(
         s(referrer.iter().nth(2).unwrap()),
@@ -276,7 +289,9 @@ fn test_defaults_of_several_calls_are_shared() {
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
     // A Referrer which does not trust the names of the crates replaces the default by the entry.
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.into_referrer();
     let mut replaced = Vec::new();
     let completed = strict
         .complete_args(

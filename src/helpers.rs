@@ -3,8 +3,8 @@
 
 use crate::context::{ContextId, SelfRequirement};
 use crate::encode::{
-    encode_generics_args_with_params, encode_generics_params_with, usize_array_length,
-    without_encoded_bounds, EncodeError,
+    encode_generics_args_with_params, encode_generics_params_with, without_encoded_bounds,
+    EncodeError,
 };
 use crate::referrer::Referrer;
 #[cfg(doc)]
@@ -33,17 +33,17 @@ use syn::*;
 ///
 /// // `Wrap<T>` does not name `Self`: the impl may be for a marker type of your crate...
 /// let marker: Type = parse_quote!(crate::Marker);
-/// let r = referrer.repeater_impl(wrap, ImplSelf::Marker(&marker)).unwrap();
+/// let r = referrer.repeater_impl(wrap, ImplSelf::Marker(&marker), array_const).unwrap();
 /// assert_eq!(r.self_ty, marker);
 /// // ...or for any type, with a parameter that the impl declares.
 /// let param: Ident = parse_quote!(__S);
-/// let r = referrer.repeater_impl(wrap, ImplSelf::Param(&param)).unwrap();
+/// let r = referrer.repeater_impl(wrap, ImplSelf::Param(&param), array_const).unwrap();
 /// assert_eq!(r.self_ty, parse_quote!(__S));
 ///
 /// // `Wrap2<Self>` names `Self`: it is for the implementors of the trait, so a marker will not do.
-/// let err = referrer.repeater_impl(wrap2, ImplSelf::Marker(&marker)).unwrap_err();
+/// let err = referrer.repeater_impl(wrap2, ImplSelf::Marker(&marker), array_const).unwrap_err();
 /// assert!(matches!(err, EncodeError::NeedsSelf(_)));
-/// let r = referrer.repeater_impl(wrap2, ImplSelf::Param(&param)).unwrap();
+/// let r = referrer.repeater_impl(wrap2, ImplSelf::Param(&param), array_const).unwrap();
 /// assert_eq!(
 ///     r.generics.params.last().unwrap(),
 ///     &parse_quote!(__S: ?::core::marker::Sized + Tr<T>)
@@ -56,18 +56,17 @@ pub enum ImplSelf<'a> {
     ///
     /// The impl is for any type if the entry does not name `Self`. If the
     /// [`context_self()`](Referrer::context_self) of the entry is [`SelfRequirement::Bound`], the
-    /// parameter has the bound of the trait (`__S: ?Sized + Tr<T>`) and replaces `Self`, as
-    /// [`Referrer::iter_with_self()`] does. If it is [`SelfRequirement::Any`], the parameter
-    /// replaces `Self` in the bounds, and has no bound of its own. The `Self` is a struct, an enum
-    /// or a union, which is `Sized`, and a bound may need it (`(Self, u8)`, `Vec<Self>`): then the
-    /// parameter is `__S`, `Sized` as any. Else it is `?Sized`, as for the others (`__S:
-    /// ?Sized`): rustc before 1.70 cannot prove that a struct is `Sized` if its last field is the
-    /// path through an impl that needs `__S: Sized` (E0275). The bounds do not need it if every
-    /// `Self` is the whole argument of a trait or type of `core` or `std` with a `?Sized`
-    /// parameter (`AsRef<Self>`, `Borrow<Self>`, `PartialEq<Self>`, `Box<Self>`), or is behind a
-    /// reference or a pointer; anything else keeps `Sized`. See [`SelfRequirement::Any`]. If it is
-    /// [`SelfRequirement::Type`], the impl is for that type, with `Self` as written, and no
-    /// parameter is declared.
+    /// parameter has the bound of the trait (`__S: ?Sized + Tr<T>`) and replaces `Self`. If it is
+    /// [`SelfRequirement::Any`], the parameter replaces `Self` in the bounds, and has no bound of
+    /// its own. The `Self` is a struct, an enum or a union, which is `Sized`, and a bound may need
+    /// it (`(Self, u8)`, `Vec<Self>`): then the parameter is `__S`, `Sized` as any. Else it is
+    /// `?Sized`, as for the others (`__S: ?Sized`): rustc before 1.70 cannot prove that a struct is
+    /// `Sized` if its last field is the path through an impl that needs `__S: Sized` (E0275). The
+    /// bounds do not need it if every `Self` is the whole argument of a trait or type of `core` or
+    /// `std` with a `?Sized` parameter (`AsRef<Self>`, `Borrow<Self>`, `PartialEq<Self>`,
+    /// `Box<Self>`), or is behind a reference or a pointer; anything else keeps `Sized`. See
+    /// [`SelfRequirement::Any`]. If it is [`SelfRequirement::Type`], the impl is for that type, with
+    /// `Self` as written, and no parameter is declared.
     Param(&'a Ident),
     /// This type, usually a marker of the user crate (`impl .. for crate::Marker`).
     ///
@@ -90,7 +89,7 @@ pub enum ImplSelf<'a> {
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// let param: Ident = parse_quote!(__S);
-/// let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+/// let r = referrer.repeater_impl(0, ImplSelf::Param(&param), array_const).unwrap();
 /// let (impl_generics, _, where_clause) = r.generics.split_for_impl();
 /// let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
 /// let imp: ItemImpl = parse_quote! {
@@ -118,7 +117,7 @@ pub struct RepeaterImpl {
     /// The generics that the impl declares, with its where clause.
     ///
     /// These are the generics of the entry without the lifetime bounds that
-    /// [`args`](RepeaterImpl::args) encodes ([`Referrer::impl_generics()`]), with `Self` replaced
+    /// [`args`](RepeaterImpl::args) encodes (`T: 'a`, which `&'a T` implies), with `Self` replaced
     /// where it is a parameter. For [`ImplSelf::Param`] they end with the parameter itself (`__S:
     /// ?Sized`, and the bound of the trait for [`SelfRequirement::Bound`]; `__S` alone or `__S:
     /// ?Sized` for [`SelfRequirement::Any`]), unless the impl is for a type. A first where predicate that
@@ -154,13 +153,13 @@ pub struct RepeaterImpl {
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // `impl<'a, T: 'a> Tr<'a, T> for ..` declares the generics: each is passed by its own name.
-/// let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
+/// let args = referrer.entry_args(0, &UseSite::identity(), array_const).unwrap();
 /// assert_eq!(args, parse_quote!((&'a (), T, &'a T)));
 ///
 /// // `impl Tr<'static, u8> for ..` gives them arguments.
 /// let trait_args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
 /// let site = UseSite::substituting(&tr.generics.params, &trait_args);
-/// let args = referrer.entry_args(0, &site).unwrap();
+/// let args = referrer.entry_args(0, &site, array_const).unwrap();
 /// assert_eq!(args, parse_quote!((&'static (), u8, &'static u8)));
 /// ```
 #[derive(Clone, Debug)]
@@ -220,11 +219,11 @@ impl UseSite {
     /// leaker.intern_trait(&tr, true);
     /// let referrer = leaker.result().finish().unwrap();
     /// // The entry `&'a Wrap<Self>` needs `Self: 'a`, which the arguments encode as `&'a Self`.
-    /// let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
+    /// let args = referrer.entry_args(0, &UseSite::identity(), array_const).unwrap();
     /// assert_eq!(args, parse_quote!((&'a (), &'a Self)));
     /// // At a site where `Self` is not available, name the type instead.
     /// let site = UseSite::identity().with_self(parse_quote!(Host));
-    /// let args = referrer.entry_args(0, &site).unwrap();
+    /// let args = referrer.entry_args(0, &site, array_const).unwrap();
     /// assert_eq!(args, parse_quote!((&'a (), &'a Host)));
     /// ```
     pub fn with_self(mut self, self_ty: Type) -> Self {
@@ -236,17 +235,21 @@ impl UseSite {
 impl Referrer {
     /// Returns the first argument of the Repeater for the `ix`-th entry, as written at `site`.
     ///
-    /// It is the encoding of the generics of the entry ([`Referrer::generics()`]) with the
+    /// It is the encoding of the generics of the entry ([`Referrer::context_generics()`]) with the
     /// arguments the site gives them ([`UseSite`]), the lifetime bounds and `Self: 'a` included.
     /// The Repeater impl of the entry has the same encoding for the generics themselves
     /// ([`RepeaterImpl::args`]), so a macro that writes the paths of its copy with this and its
-    /// impls with [`Referrer::repeater_impl()`] cannot disagree with itself. `const N: usize` is
-    /// `[(); N]`: use [`Referrer::entry_args_with()`] for the other const types.
+    /// impls with [`Referrer::repeater_impl()`] cannot disagree with itself.
+    ///
+    /// `const_fn(value, param)` returns the element for the const parameter `param` with the
+    /// argument `value`, as the site writes it. It is the closure of [`Referrer::repeater_impl()`]
+    /// too, which calls it with the parameter itself (`N`) as `value`, so one closure serves both
+    /// sides. Pass [`array_const`](crate::array_const), or for the slots of
+    /// [`repeater_definition()`] `|value, param| slots.encode_const(value, &param.ty)`.
     ///
     /// It fails with [`EncodeError::MissingArgument`] if `site` gives too few arguments, with
     /// [`EncodeError::UnboundedTraitObject`] if an argument is a trait object without a lifetime
-    /// bound where the entry needs one, and with [`EncodeError::UnsupportedConstType`] for a const
-    /// parameter that is not `usize`.
+    /// bound where the entry needs one, and with the error of `const_fn` for a const parameter.
     ///
     /// ```
     /// # use type_leak::*;
@@ -260,74 +263,46 @@ impl Referrer {
     /// let ix = referrer.iter().position(|ty| *ty == parse_quote!(&'a Wrap<T, N>)).unwrap();
     ///
     /// // In the scope of the trait, as in a default method: every generic by its own name.
-    /// let args = referrer.entry_args(ix, &UseSite::identity()).unwrap();
+    /// let args = referrer.entry_args(ix, &UseSite::identity(), array_const).unwrap();
     /// assert_eq!(args, parse_quote!((&'a (), T, [(); N], &'a T)));
     ///
     /// // In `impl Tr<'static, u8, 3> for Host`: the arguments of the trait.
     /// let trait_args: Vec<GenericArgument> =
     ///     vec![parse_quote!('static), parse_quote!(u8), parse_quote!(3)];
     /// let site = UseSite::substituting(&tr.generics.params, &trait_args);
-    /// let args = referrer.entry_args(ix, &site).unwrap();
+    /// let args = referrer.entry_args(ix, &site, array_const).unwrap();
     /// assert_eq!(args, parse_quote!((&'static (), u8, [(); 3], &'static u8)));
     /// ```
-    pub fn entry_args(&self, ix: usize, site: &UseSite) -> std::result::Result<Type, EncodeError> {
-        self.entry_args_with(ix, site, usize_array_length)
-    }
-
-    /// Like [`Referrer::entry_args()`], with `const_fn` encoding the const arguments.
-    ///
-    /// `const_fn(value, param)` returns the element for the const parameter `param` with the
-    /// argument `value`, as the site writes it. It is the closure of
-    /// [`Referrer::repeater_impl_with()`] too, which calls it with the parameter itself (`N`) as
-    /// `value`, so one closure serves both sides. For the slots of [`repeater_definition()`] it is
-    /// `|value, param| slots.encode_const(value, &param.ty)`.
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let tr: ItemTrait = parse_quote! { trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; } };
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    /// let trait_args: Vec<GenericArgument> = vec![parse_quote!(true)];
-    /// let args = referrer
-    ///     .entry_args_with(
-    ///         0,
-    ///         &UseSite::substituting(&tr.generics.params, &trait_args),
-    ///         |value, param| slots.encode_const(value, &param.ty),
-    ///     )
-    ///     .unwrap();
-    /// assert_eq!(args, parse_quote!((*const dyn crate::Repeater<(), 0, 0, true, Type = ()>,)));
-    /// ```
-    pub fn entry_args_with(
+    pub fn entry_args(
         &self,
         ix: usize,
         site: &UseSite,
         const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
     ) -> std::result::Result<Type, EncodeError> {
-        let args = self.generic_args(ix, &site.root_params, &site.completed_args)?;
+        let context = self.contexts[ix];
+        let args = self.context_generic_args(context, &site.root_params, &site.completed_args)?;
         encode_generics_args_with_params(
             &args,
-            &self.generics(ix).params,
-            Some((&site.self_ty, self.context_self_outlives(self.contexts[ix]))),
+            &self.context_generics(context).params,
+            Some((&site.self_ty, self.context_self_outlives(context))),
             const_fn,
         )
     }
 
     /// Describes the Repeater impl of the `ix`-th entry: its generics, trait arguments and type.
     ///
-    /// `target` says what the impl is for ([`ImplSelf`]). The result is what
-    /// [`Referrer::iter_with_self()`], [`without_encoded_bounds()`] and
-    /// [`Referrer::impl_generics()`] give together, with the encoding of the generics and the
-    /// declaration of the parameter for `Self`, which every macro that emits the impls writes by
-    /// hand. `const N: usize` is `[(); N]`: use [`Referrer::repeater_impl_with()`] for the other
-    /// const types. Write the impl in [`RepeaterImpl::module`] if it is `Some`.
+    /// `target` says what the impl is for ([`ImplSelf`]). Write the impl in
+    /// [`RepeaterImpl::module`] if it is `Some`.
+    ///
+    /// `const_fn(value, param)` encodes the const parameters. It is called with the parameter itself
+    /// (`N`) as `value`, where [`Referrer::entry_args()`] calls it with the argument. Pass
+    /// [`array_const`](crate::array_const), or for the slots of [`repeater_definition()`]
+    /// `|value, param| slots.encode_const(value, &param.ty)`.
     ///
     /// It fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry names
-    /// `Self`, and with [`EncodeError::UnsupportedConstType`] for a const parameter that is not
-    /// `usize`. Write the impls of all the entries ([`Referrer::iter()`]): the optional entries need
-    /// one if some Referrer is strict ([`Referrer::allow_ambiguous_crate_name()`]).
+    /// `Self`, and with the error of `const_fn` for a const parameter. Write the impls of all the
+    /// entries ([`Referrer::iter()`]): the optional entries need one if some Referrer is strict
+    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     ///
     /// ```
     /// # use type_leak::*;
@@ -347,7 +322,7 @@ impl Referrer {
     /// let repeater: Path = parse_quote!(crate::Repeater);
     /// let impls: Vec<ItemImpl> = (0..referrer.iter().count())
     ///     .map(|ix| {
-    ///         let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param)).unwrap();
+    ///         let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param), array_const).unwrap();
     ///         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
     ///         let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
     ///         parse_quote! {
@@ -375,40 +350,6 @@ impl Referrer {
     /// assert!(impls.contains(&wrap2));
     /// ```
     pub fn repeater_impl(
-        &self,
-        ix: usize,
-        target: ImplSelf<'_>,
-    ) -> std::result::Result<RepeaterImpl, EncodeError> {
-        self.repeater_impl_with(ix, target, usize_array_length)
-    }
-
-    /// Like [`Referrer::repeater_impl()`], with `const_fn` encoding the const parameters.
-    ///
-    /// `const_fn(value, param)` is called with the parameter itself (`N`) as `value`, where
-    /// [`Referrer::entry_args_with()`] calls it with the argument. For the slots of
-    /// [`repeater_definition()`] it is `|value, param| slots.encode_const(value, &param.ty)`.
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let tr: ItemTrait = parse_quote! { trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; } };
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// let param: Ident = parse_quote!(__S);
-    /// // `const B: bool` is not `usize`: `repeater_impl()` fails...
-    /// let err = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap_err();
-    /// assert!(matches!(err, EncodeError::UnsupportedConstType(_)));
-    /// // ...and the slots of `repeater_definition()` encode it.
-    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    /// let r = referrer
-    ///     .repeater_impl_with(0, ImplSelf::Param(&param), |value, param| {
-    ///         slots.encode_const(value, &param.ty)
-    ///     })
-    ///     .unwrap();
-    /// assert_eq!(r.args, parse_quote!((*const dyn crate::Repeater<(), 0, 0, B, Type = ()>,)));
-    /// ```
-    pub fn repeater_impl_with(
         &self,
         ix: usize,
         target: ImplSelf<'_>,

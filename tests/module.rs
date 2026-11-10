@@ -41,7 +41,9 @@ fn intern_mod_leaks_with_local_generics() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
-            .iter_with_generics()
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
             .map(|(ty, generics)| (quote!(#ty).to_string(), quote!(#generics).to_string()))
             .collect::<BTreeSet<_>>(),
         [
@@ -200,13 +202,15 @@ fn intern_mod_generics_shadow_module_items() {
         }
     };
     // `S` in `A` is the generic parameter. Local generics are interned with the types depending
-    // on them (see `Referrer::generics()`), but `Wrap<S>` is relative either way.
+    // on them (see `Referrer::context_generics()`), but `Wrap<S>` is relative either way.
     let mut leaker = Leaker::new();
     leaker.intern_mod(&m);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
-            .iter_with_generics()
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
             .map(|(ty, generics)| (quote!(#ty).to_string(), quote!(#generics).to_string()))
             .collect::<Vec<_>>(),
         [("Wrap < S >".to_string(), "< S >".to_string())]

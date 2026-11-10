@@ -1976,13 +1976,13 @@ impl AnalyzeVisitor {
                 optional: false,
                 note: Some("a default of a parameter cannot depend on `Self`".to_string()),
                 help: Some(format!(
-                    "write the default without `Self`: name the type instead of `Self` in `{}`",
+                    "name the type instead of `Self` in `{}`",
                     tidy(&quote!(#ty))
                 )),
                 // The fault is not that the path is relative: the first cause is `Self`.
                 headline: Some(format!(
                     "`{}` is in the default of a parameter, and names `Self`",
-                    quote!(#ty)
+                    tidy(&quote!(#ty))
                 )),
                 // The default as a whole is what to change, the note is at the `Self` in it.
                 cause: Some(Cause::Type(ty.clone())),

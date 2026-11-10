@@ -143,7 +143,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let mut impls = TokenStream::new();
     for ix in 0..referrer.iter().count() {
         let r = referrer
-            .repeater_impl(ix, ImplSelf::Param(&self_param))
+            .repeater_impl(ix, ImplSelf::Param(&self_param), array_const)
             .map_err(Error::from)?;
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
         let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
@@ -196,7 +196,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
 /// Input of `__nested_apply!`: the Referrer and the context, the scopes, `path = ::leaker::mod`,
 /// and `, strict`.
 struct Apply {
-    referrer: Referrer,
+    result: LeakerResult,
     context: ContextId,
     nested: Nested,
     path: Path,
@@ -207,7 +207,7 @@ impl Parse for Apply {
     fn parse(input: ParseStream) -> Result<Self> {
         let content;
         braced!(content in input);
-        let referrer = content.parse()?;
+        let result = content.parse()?;
         content.parse::<Token![,]>()?;
         let context = content.parse()?;
         let content;
@@ -221,7 +221,7 @@ impl Parse for Apply {
             true
         };
         Ok(Self {
-            referrer,
+            result,
             context,
             nested,
             path,
@@ -248,13 +248,14 @@ fn probe_types(wrapper: &ItemTrait) -> Vec<Type> {
 /// `__nested_apply!`, the Referrer's side.
 pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let Apply {
-        referrer,
+        mut result,
         context,
         nested,
         path,
         strict,
     } = parse2(input)?;
-    let referrer = referrer.allow_ambiguous_crate_name(!strict);
+    result.allow_ambiguous_crate_name(!strict);
+    let referrer = result.into_referrer();
     let id = nested.id;
     let krate = path
         .segments
@@ -284,7 +285,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     referrer
         .clone()
         .visitor(context, |_, ix| {
-            let args = referrer.entry_args(ix, &UseSite::identity());
+            let args = referrer.entry_args(ix, &UseSite::identity(), array_const);
             match args {
                 Ok(args) => parse_quote!(<() as #repeater<#args, #id, #ix>>::Type),
                 Err(e) => {

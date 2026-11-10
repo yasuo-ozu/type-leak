@@ -95,7 +95,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let mut impls = TokenStream::new();
     for ix in 0..referrer.iter().count() {
         let r = referrer
-            .repeater_impl(ix, ImplSelf::Param(&self_param))
+            .repeater_impl(ix, ImplSelf::Param(&self_param), array_const)
             .map_err(Error::from)?;
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
         let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
@@ -207,7 +207,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         referrer
             .clone()
             .visitor(context, |_, ix| {
-                match referrer.entry_args(ix, &UseSite::identity()) {
+                match referrer.entry_args(ix, &UseSite::identity(), array_const) {
                     Ok(args) => parse_quote!(<() as #repeater<#args, #id, #ix>>::Type),
                     Err(e) => {
                         *error.borrow_mut() = Some(e);

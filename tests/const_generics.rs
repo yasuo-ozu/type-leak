@@ -19,7 +19,9 @@ fn leak(item: &ItemTrait) -> (Referrer, ContextId) {
 /// Returns the leaked types with their local generics (with the where clause), by index.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| {
             let wc = &generics.where_clause;
             (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
@@ -131,7 +133,9 @@ fn test_local_generics_leaked() {
     leaker.reduce_roots();
     let referrer = leaker.result().finish().unwrap();
     let actual: BTreeSet<(String, String)> = referrer
-        .iter_with_generics()
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
         .map(|(ty, generics)| {
             let wc = &generics.where_clause;
             (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
@@ -172,7 +176,12 @@ fn test_local_generics_keep_self() {
     leaker.intern_trait(&item, true);
     leaker.reduce_roots();
     let referrer = leaker.result().finish().unwrap();
-    let (ty, generics) = referrer.iter_with_generics().next().unwrap();
+    let (ty, generics) = referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .next()
+        .unwrap();
     assert_eq!(quote!(#ty).to_string(), quote!(MyWrap<T>).to_string());
     let expected: Generics = parse_quote!(<T: ::core::cmp::PartialEq<Self>>);
     assert_eq!(quote!(#generics).to_string(), quote!(#expected).to_string());

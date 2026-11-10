@@ -343,6 +343,16 @@ fn entry(referrer: &Referrer, ty: &str) -> usize {
         .unwrap_or_else(|| panic!("no entry {}", ty))
 }
 
+/// The generics that the Repeater impl of the entry `ix` declares, for an entry that does not name
+/// `Self`.
+fn impl_generics(referrer: &Referrer, ix: usize) -> Generics {
+    let marker: Type = parse_quote!(crate::Marker);
+    referrer
+        .repeater_impl(ix, ImplSelf::Marker(&marker), array_const)
+        .unwrap()
+        .generics
+}
+
 // ── F1 ───────────────────────────────────────────────────────────────────────
 
 /// The names of the `?Sized` type parameters of `generics`.
@@ -407,79 +417,16 @@ fn bare_unsized_element(generics: &Generics, encoded: &Type) -> Option<Ident> {
 ///
 /// The fix encodes a parameter with a `?Sized` bound as `*const T`, which is `Sized` whatever `T`
 /// is, and the other parameters as before. Both sides agree because both see the bound: the
-/// Leaker encodes `Referrer::generics()` of the entry, and the Referrer encodes the arguments with
+/// Leaker encodes `Referrer::context_generics()` of the entry, and the Referrer encodes the arguments with
 /// the same generics as parameters.
 ///
 /// The assertions: the encoder succeeds, no `?Sized` parameter is a bare element but the last
 /// (the Repeater's argument `T` is `?Sized`, so the last would be fine), and the encoding of the
-/// arguments is that of the parameters.
+/// arguments is that of the parameters. The encoder on generics written by hand is tested in
+/// `src/encode/tests.rs`.
 #[test]
 fn f01_unsized_type_param_encoding() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    let check = |generics: &Generics, expected: Option<&str>, what: &str| {
-        let encoded = slots
-            .encode_generics_params_to_ty(&generics.params)
-            .unwrap_or_else(|e| panic!("{}: `{}`: {}", what, string(generics), e));
-        assert_eq!(
-            bare_unsized_element(generics, &encoded),
-            None,
-            "{}: `{}` encodes `{}` with an unsized parameter in the middle",
-            what,
-            string(generics),
-            string(&encoded)
-        );
-        if let Some(expected) = expected {
-            let expected: Type = parse_str(expected).unwrap();
-            assert_eq!(string(&encoded), string(&expected), "{}", what);
-        }
-        // The Referrer passes each parameter by its own name: the same encoding.
-        let args: Vec<GenericArgument> = generics.params.iter().map(param_arg).collect();
-        let on_referrer_side = slots
-            .encode_generics_args_to_ty(&args, &generics.params)
-            .unwrap();
-        assert_eq!(string(&on_referrer_side), string(&encoded), "{}", what);
-    };
-
-    // The encoder on its own: an unsized parameter first, in the middle and last.
-    check(
-        &parse_quote!(<T: ?Sized, U>),
-        Some("(*const T, U)"),
-        "the encoder",
-    );
-    check(
-        &parse_quote!(<T, U: ?Sized, V>),
-        Some("(T, *const U, V)"),
-        "the encoder",
-    );
-    check(
-        &parse_quote!(<T, U: ?Sized>),
-        Some("(T, *const U)"),
-        "the encoder",
-    );
-    check(
-        &parse_quote!(<T: ?Sized>),
-        Some("(*const T,)"),
-        "the encoder",
-    );
-    // Other bounds stay out of the way, and a lifetime bound is encoded as it is for a sized one.
-    check(
-        &parse_quote!(<'a, T: Clone + ?Sized + 'a, U>),
-        Some("(&'a (), *const T, U, &'a T)"),
-        "the encoder",
-    );
-    // A sized parameter is encoded as before.
-    check(&parse_quote!(<T, U: Sized>), Some("(T, U)"), "the encoder");
-
-    // The Referrer's arguments: a pointer to the argument, whatever it is.
-    let generics: Generics = parse_quote!(<T: ?Sized, U: ?Sized, V>);
-    let args: AngleBracketedGenericArguments =
-        parse_quote!(<str, dyn Tr + Send + 'static, [u8; 2]>);
-    let encoded = slots
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    let expected: Type = parse_quote!((*const str, *const (dyn Tr + Send + 'static), [u8; 2]));
-    assert_eq!(string(&encoded), string(&expected));
-
+    let param: Ident = parse_quote!(__S);
     // The generics of the entry that the Leaker finds: the bound is on the parameter, wherever it
     // was written (a where predicate is moved there).
     let items: Vec<ItemStruct> = vec![
@@ -509,12 +456,30 @@ fn f01_unsized_type_param_encoding() {
             continue;
         };
         let mut entries = 0;
-        for (_, generics) in referrer.iter_with_generics() {
+        for ix in 0..referrer.iter().count() {
+            let generics = referrer.context_generics(referrer.context(ix));
             if generics.params.iter().any(|param| {
                 matches!(param, GenericParam::Type(t) if unsized_params(generics).contains(&t.ident))
             }) {
                 entries += 1;
-                check(generics, None, &string(&item));
+                let what = string(&item);
+                let encoded = referrer
+                    .repeater_impl(ix, ImplSelf::Param(&param), array_const)
+                    .unwrap_or_else(|e| panic!("{}: `{}`: {}", what, string(generics), e))
+                    .args;
+                assert_eq!(
+                    bare_unsized_element(generics, &encoded),
+                    None,
+                    "{}: `{}` encodes `{}` with an unsized parameter in the middle",
+                    what,
+                    string(generics),
+                    string(&encoded)
+                );
+                // The Referrer passes each parameter by its own name: the same encoding.
+                let on_referrer_side = referrer
+                    .entry_args(ix, &UseSite::identity(), array_const)
+                    .unwrap();
+                assert_eq!(string(&on_referrer_side), string(&encoded), "{}", what);
             }
         }
         assert!(
@@ -824,19 +789,15 @@ fn f04_module_crate_relative_path_not_rewritten() {
 /// It is a limitation and not a bug: a guessed bound would make the copy stricter than the
 /// original for a path that needs none (`struct Unrelated<'a, T>(&'a (), T)`). The fix is to write
 /// it: then it is recorded, and encoded in the trait arguments as `&'a T`, which the impl does not
-/// declare (`impl_generics()`).
+/// declare (`RepeaterImpl::generics`).
 #[test]
 fn f05_inferred_outlives_of_self_type() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let encode = |referrer: &Referrer, ix: usize| {
-        let (_, generics) = referrer.iter_with_generics().nth(ix).unwrap();
-        slots
-            .encode_generics_params_to_ty_with_self(
-                &generics.params,
-                &parse_quote!(Self),
-                referrer.context_self_outlives(referrer.context(ix)),
-            )
+        let param: Ident = parse_quote!(__S);
+        referrer
+            .repeater_impl(ix, ImplSelf::Param(&param), array_const)
             .unwrap()
+            .args
     };
 
     // As written: nothing is recorded, so the impl cannot prove `T: 'a`.
@@ -847,7 +808,7 @@ fn f05_inferred_outlives_of_self_type() {
     leaker.intern_impl(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "E < 'a , T >");
-    let generics = referrer.generics(ix);
+    let generics = referrer.context_generics(referrer.context(ix));
     assert_eq!(string(generics), "< 'a , T >");
     assert_eq!(encode(&referrer, ix), parse_quote!((&'a (), T)));
 
@@ -859,11 +820,17 @@ fn f05_inferred_outlives_of_self_type() {
     leaker.intern_impl(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "E < 'a , T >");
-    assert_eq!(string(referrer.generics(ix)), "< 'a , T : 'a >");
+    assert_eq!(
+        string(referrer.context_generics(referrer.context(ix))),
+        "< 'a , T : 'a >"
+    );
     assert_eq!(encode(&referrer, ix), parse_quote!((&'a (), T, &'a T)));
     // The impl declares the generics without the encoded bound.
-    let impl_generics = referrer.impl_generics(referrer.context(ix));
-    assert_eq!(string(&impl_generics), "< 'a , T >");
+    let marker: Type = parse_quote!(crate::Marker);
+    let r = referrer
+        .repeater_impl(ix, ImplSelf::Marker(&marker), array_const)
+        .unwrap();
+    assert_eq!(string(&r.generics), "< 'a , T >");
 }
 
 // ── F6 ───────────────────────────────────────────────────────────────────────
@@ -1032,7 +999,7 @@ fn f07_method_lifetime_in_leaked_path() {
         let result = leaker.result();
         let err = result.errors();
         assert!(!err.is_empty(), "`{}` is accepted", item.ident);
-        let note = err[0].note().unwrap();
+        let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
         assert!(
             note.contains("`'x`") && note.contains("(E0195)"),
             "`{}`: {}",
@@ -1159,7 +1126,7 @@ fn ambiguous_in(generics: &Generics) -> Vec<String> {
 /// another order. Found by the property test with `TYPE_LEAK_PROP_FEATURES=bound_merge_syntax`.
 ///
 /// The assertion is on the generics that a macro prints for the Repeater's impl
-/// (`impl_generics()`): no bound of the sugar of `Fn` with such a return type is followed by
+/// (`RepeaterImpl::generics`): no bound of the sugar of `Fn` with such a return type is followed by
 /// another bound, and both bounds are still there. (Parsing the printed generics back with syn
 /// does not show it: syn accepts what rustc rejects.)
 ///
@@ -1177,7 +1144,7 @@ fn f08_merged_bound_ambiguous_plus() {
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Rel < T >");
-    let generics = referrer.impl_generics(referrer.context(ix));
+    let generics = impl_generics(&referrer, ix);
     let printed = string(&generics);
     let ambiguous = ambiguous_in(&generics);
     assert!(
@@ -1224,7 +1191,12 @@ fn f08_merged_bound_ambiguous_plus() {
         let mut leaker = new_leaker();
         leaker.intern_struct(item, true);
         let referrer = leaker.result().finish().unwrap();
-        for (ix, (_, generics)) in referrer.iter_with_generics().enumerate() {
+        for (ix, (_, generics)) in referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .enumerate()
+        {
             let ambiguous = ambiguous_in(generics);
             assert!(
                 ambiguous.is_empty(),
@@ -1234,7 +1206,7 @@ fn f08_merged_bound_ambiguous_plus() {
                 string(generics),
                 ambiguous
             );
-            let impl_generics = referrer.impl_generics(referrer.context(ix));
+            let impl_generics = impl_generics(&referrer, ix);
             assert_eq!(
                 ambiguous_in(&impl_generics),
                 Vec::<String>::new(),
@@ -1321,8 +1293,8 @@ impl<'ast> Visit<'ast> for UnparenthesizedPointees {
 /// Trigger: `impl Tr for &'static unsafe fn(i32, R0)` with `where Self: 'y` on a method. A copy
 /// where `Self` is the type has the predicate `&'static unsafe fn(i32, R0): 'y`, which rustc does
 /// not parse (`return types are denoted using `->``): the bounded type needs parentheses.
-/// `Visitor::with_self()` makes the replacement (`Referrer::iter_with_self()` uses the same one
-/// for the generics of an entry). Found by the property test with
+/// `Visitor::with_self()` makes the replacement (the generics of an entry that the Referrer gives
+/// the Repeater impl use the same one). Found by the property test with
 /// `TYPE_LEAK_PROP_FEATURES=fn_pointer_self`. Note that what failed to compile there is the
 /// witness function of the test macro (`tests/crates/macro/prop.rs`, `SelfSubst`), which makes the
 /// same replacement with its own code: it is the replacement in the library that is pinned here.
@@ -1331,7 +1303,7 @@ impl<'ast> Visit<'ast> for UnparenthesizedPointees {
 /// pointer as the bounded type, unparenthesized (`fn(..): 'y` alone and `&dyn Any: 'y` are fine).
 ///
 /// Fixed: the replacement parenthesizes a bounded type that needs it (`(&fn(..)): 'y`), in the
-/// visitor, in `iter_with_self()` and where the Leaker rewrites a bound for another `Self`. The
+/// visitor, in the generics of an entry and where the Leaker rewrites a bound for another `Self`. The
 /// same holds for the pointee of a reference or a pointer that `Self` replaces and that has several
 /// bounds (`&(dyn Any + Send)`): the second part pins it.
 #[test]
@@ -1367,20 +1339,6 @@ fn f09_fn_pointer_self_predicate_print() {
             string(&self_ty),
             found.0
         );
-        // The generics of the entry `Rel<Self>`, which has `where Self: Clone`.
-        let mut seen = false;
-        for (_, generics) in referrer.iter_with_self(&self_ty) {
-            let mut found = UnparenthesizedPredicates(Vec::new());
-            found.visit_generics(&generics);
-            seen |= generics.where_clause.is_some();
-            assert!(
-                found.0.is_empty(),
-                "Self = `{}`: iter_with_self() has {:?}",
-                string(&self_ty),
-                found.0
-            );
-        }
-        assert!(seen, "the entry `Rel<Self>` has no where predicate");
     }
 
     // The pointee of a reference and of a pointer.
@@ -1443,7 +1401,10 @@ fn f10_module_bound_names_declared_item() {
     let module = referrer.context_module(referrer.context(ix)).unwrap();
     assert_eq!(module, context);
     assert_eq!(referrer.module_path(module), Some(&[][..]));
-    assert_eq!(string(referrer.generics(ix)), "< T : Cv >");
+    assert_eq!(
+        string(referrer.context_generics(referrer.context(ix))),
+        "< T : Cv >"
+    );
     assert_eq!(referrer.iter().count(), 1);
     // The copy of the module keeps the bound, and replaces the entry.
     let mut file = File {
@@ -1494,9 +1455,12 @@ fn f11_copied_impl_param_constrained_only_by_leaked_type() {
     let context = leaker.intern_mod(&item);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Imp < T >");
-    assert_eq!(string(referrer.generics(ix)), "< T >");
+    assert_eq!(
+        string(referrer.context_generics(referrer.context(ix))),
+        "< T >"
+    );
     let args = referrer
-        .generic_args(ix, &Punctuated::new(), &[])
+        .context_generic_args(referrer.context(ix), &Punctuated::new(), &[])
         .unwrap()
         .iter()
         .map(string)
@@ -1623,7 +1587,6 @@ fn f12_copy_with(
     mut leaker: Leaker,
     item: &ItemTrait,
 ) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let context = leaker.intern_trait(item, true);
     let referrer = leaker.result().finish()?;
     let root_args: Vec<GenericArgument> = item.generics.params.iter().map(param_arg).collect();
@@ -1631,17 +1594,9 @@ fn f12_copy_with(
     referrer
         .clone()
         .visitor(context, |_, ix| {
-            let args = referrer
-                .generic_args(ix, &item.generics.params, &root_args)
-                .unwrap();
-            let encoded = slots
-                .encode_generics_args_to_ty_with_self(
-                    &args,
-                    &referrer.generics(ix).params,
-                    &parse_quote!(()),
-                    referrer.context_self_outlives(referrer.context(ix)),
-                )
-                .unwrap();
+            let site = UseSite::substituting(&item.generics.params, &root_args)
+                .with_self(parse_quote!(()));
+            let encoded = referrer.entry_args(ix, &site, array_const).unwrap();
             parse_quote!(<() as crate::Repeater<#encoded, 0, #ix>>::Type)
         })
         .visit_item_trait_mut(&mut copy);
@@ -1755,7 +1710,7 @@ fn f12_elided_lifetime_in_fn_sugar_with_generics() {
         let err = f12_copy(&item)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
-        let note = err[0].note().unwrap();
+        let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
 }
@@ -1804,7 +1759,7 @@ fn self_referential_entries(referrer: &Referrer) -> Vec<String> {
                 referrer.context_self(referrer.context(*ix)),
                 Some(SelfRequirement::Type(self_ty)) if type_contains(self_ty, &string(*ty))
             );
-            own_self && generics_name_self(referrer.generics(*ix))
+            own_self && generics_name_self(referrer.context_generics(referrer.context(*ix)))
         })
         .map(|(_, ty)| string(ty))
         .collect()
@@ -2035,7 +1990,10 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
             self_referential_entries(&result.clone().into_referrer())
         );
         let headline = "is in the self type of the impl, and a bound of its generics names `Self`";
-        let (shown, note) = (joined_messages(err), err[0].note().unwrap());
+        let (shown, note) = (
+            joined_messages(err),
+            err[0].notes.first().map(|(_, n)| n.as_str()).unwrap(),
+        );
         assert!(shown.contains(headline), "{}: {}", string(item), shown);
         assert!(
             note.contains("has no type to write for `Self`"),
@@ -2084,8 +2042,9 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
     for item in copied.iter().chain(&controls) {
         let mut leaker = f13_leaker();
         let context = leaker.intern_impl(item, true);
-        let referrer = leaker
-            .result()
+        let mut result = leaker.result();
+        let referrer = result
+            .clone()
             .finish()
             .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         assert!(
@@ -2095,8 +2054,10 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         );
         // A strict Referrer replaces the optional entries too, but not those in the self type.
         let mut copy = Item::Impl(item.clone());
-        referrer
-            .allow_ambiguous_crate_name(false)
+        result.allow_ambiguous_crate_name(false);
+        result
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>))
             .visit_item_mut(&mut copy);
         if let Item::Impl(copy) = copy {
@@ -2117,14 +2078,17 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
     );
     let mut leaker = f13_leaker();
     let context = leaker.intern_impl(&item, true);
-    let referrer = leaker.result().finish().unwrap();
+    let mut result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(
         referrer.iter().map(|t| string(&t)).collect::<Vec<_>>(),
         [":: ext :: S < T >"]
     );
     let mut copy = Item::Impl(item);
-    referrer
-        .allow_ambiguous_crate_name(false)
+    result.allow_ambiguous_crate_name(false);
+    result
+        .finish()
+        .unwrap()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_mut(&mut copy);
     let copy = match copy {
@@ -2181,10 +2145,11 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<
     config.allow_path(parse_quote!(::p));
     let mut leaker = Leaker::from_config(config);
     let context = leaker.intern_impl(item, true);
-    let mut referrer = leaker.result().finish()?;
+    let mut result = leaker.result();
     if strict {
-        referrer = referrer.allow_ambiguous_crate_name(false);
+        result.allow_ambiguous_crate_name(false);
     }
+    let referrer = result.finish()?;
     let mut copy = Item::Impl(item.clone());
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
@@ -2453,7 +2418,7 @@ fn f15_copy(
 /// whole or rejected, as above: a lifetime that a path hides (`fn(::core::slice::Iter<u8>, Self) ->
 /// &u8`, which the Leaker takes as the elided one, F28) and a method, which has no binder to
 /// write. The copy of an impl keeps `Self`, and so does a trait, whose Repeater impl writes
-/// `Self::A` as `<__S>::A` (`Referrer::iter_with_self()`), and `with_self(Host)` the same, so they
+/// `Self::A` as `<__S>::A` (`Referrer::repeater_impl()`), and `with_self(Host)` the same, so they
 /// are not affected (rustc accepts `fn(&<__S>::A) -> &u8`, and rejects `fn(&<__Self as
 /// Tr<'a>>::A) -> &u8`).
 ///
@@ -2561,7 +2526,7 @@ fn f15_self_rewritten_in_elided_signature() {
         let err = f15_copy(&item, false)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
-        let note = err[0].note().unwrap();
+        let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
     // An entry that adds lifetimes to the inputs makes the signature the holder, as in F12: here
@@ -2684,7 +2649,7 @@ fn f15_self_rewritten_in_elided_signature() {
         let err = f15_copy(&item, true)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
-        let note = err[0].note().unwrap();
+        let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
     // The copy of an impl keeps `Self`, and so does that of a trait, whose `Self::A` is written
@@ -2807,7 +2772,6 @@ fn generics_say_outlives(generics: &Generics, name: &str, lifetime: &str) -> boo
 /// Self: 'x, T: 'x, 'a: 'x`), which are recorded as before.
 #[test]
 fn f16_implied_outlives_of_self_projection_lost() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     // (the trait, whether `Self: 'x` is recorded, the encoded arguments). `Self: 'x` is recorded
     // where a where clause writes it, and not for the projection alone (F34: it is more than the
     // original has, which the receiver implies at best).
@@ -2875,7 +2839,7 @@ fn f16_implied_outlives_of_self_projection_lost() {
                 continue;
             }
             checked += 1;
-            let generics = referrer.generics(ix);
+            let generics = referrer.context_generics(referrer.context(ix));
             let predicate_recorded = generics
                 .where_clause
                 .iter()
@@ -2912,12 +2876,8 @@ fn f16_implied_outlives_of_self_projection_lost() {
                     ty
                 );
             }
-            let arguments = slots
-                .encode_generics_params_to_ty_with_self(
-                    &generics.params,
-                    &parse_quote!(Self),
-                    self_outlives,
-                )
+            let arguments = referrer
+                .entry_args(ix, &UseSite::identity(), array_const)
                 .unwrap();
             assert_eq!(string(&arguments), *encoded, "`{}`", string(item));
         }
@@ -2947,7 +2907,7 @@ fn f16_implied_outlives_of_self_projection_lost() {
     leaker.intern_trait(&control, true);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Rel < & 'x mut Self :: A0 >");
-    let generics = referrer.generics(ix);
+    let generics = referrer.context_generics(referrer.context(ix));
     assert!(generics_say_outlives(generics, "T", "'x"));
     assert!(generics_say_outlives(generics, "'a", "'x"));
     assert_eq!(
@@ -2982,7 +2942,7 @@ fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
     referrer
         .iter()
         .enumerate()
-        .filter(|(ix, ty)| generics_name_type(referrer.generics(*ix), ty))
+        .filter(|(ix, ty)| generics_name_type(referrer.context_generics(referrer.context(*ix)), ty))
         .map(|(_, ty)| string(ty))
         .collect()
 }
@@ -3133,10 +3093,11 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
     let copy_of = |config: LeakerConfig, strict: bool| {
         let mut leaker = Leaker::from_config(config);
         let context = leaker.intern_trait(&item, true);
-        let mut referrer = leaker.result().finish().unwrap();
+        let mut result = leaker.result();
         if strict {
-            referrer = referrer.allow_ambiguous_crate_name(false);
+            result.allow_ambiguous_crate_name(false);
         }
+        let referrer = result.finish().unwrap();
         let mut copy = item.clone();
         referrer
             .visitor(context, |_, ix| parse_quote!(P<#ix>))
@@ -3295,11 +3256,11 @@ fn f18_the_optional_entries_that_hold_a_method_lifetime_are_copied_as_written() 
         let what = string(item);
         let mut leaker = new_leaker();
         let context = intern(&mut leaker, item);
-        let referrer = leaker
-            .result()
+        let mut result = leaker.result();
+        result.allow_ambiguous_crate_name(false);
+        let referrer = result
             .finish()
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)))
-            .allow_ambiguous_crate_name(false);
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)));
         let entries: Vec<String> = (0..referrer.iter().count())
             .filter(|&ix| !referrer.must(ix))
             .map(|ix| {
@@ -3399,7 +3360,7 @@ fn entries_with_self_bound_in_predicates(
         .iter()
         .filter(|&&ix| {
             ix < referrer.iter().count()
-                && generics_name_self(referrer.generics(ix))
+                && generics_name_self(referrer.context_generics(referrer.context(ix)))
                 && self_is_leaked(referrer, referrer.context(ix))
         })
         .map(|&ix| string(referrer.iter().nth(ix).unwrap()))
@@ -3929,7 +3890,7 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
         intern(&mut leaker, item);
         let err = errors_of(leaker);
         assert!(!err.is_empty(), "`{}` is accepted", string(item));
-        let note = err[0].note().unwrap();
+        let note = err[0].notes.first().map(|(_, n)| n.as_str()).unwrap();
         assert!(
             note.contains("(E0195)"),
             "`{}` is rejected, but not for E0195: {}",
@@ -3991,7 +3952,11 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
                 "`{}` is rejected, and its copy compiles: {}\n{}",
                 string(item),
                 joined_messages(&err),
-                err[0].note().unwrap_or_default()
+                err[0]
+                    .notes
+                    .first()
+                    .map(|(_, n)| n.as_str())
+                    .unwrap_or_default()
             );
         }
     }
@@ -4018,14 +3983,24 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
         errors_of(leaker)
     };
     assert!(nested(&inherent).is_empty());
-    assert!(nested(&of_trait)[0].note().unwrap().contains("(E0195)"));
+    assert!(nested(&of_trait)[0]
+        .notes
+        .first()
+        .map(|(_, n)| n.as_str())
+        .unwrap()
+        .contains("(E0195)"));
     let mut leaker = f13_leaker();
     leaker.enter_generics(&Generics::default(), |view| view.visit_signature(&method));
     let result = leaker.result();
     let err = result.errors();
     // `Self` of the receiver has no meaning here, which is told too, in the order of the syntax.
     assert_eq!(err[0].reason, Reason::SelfWithoutMeaning);
-    assert!(err[1].note().unwrap().contains("(E0195)"));
+    assert!(err[1]
+        .notes
+        .first()
+        .map(|(_, n)| n.as_str())
+        .unwrap()
+        .contains("(E0195)"));
 }
 
 // ── F23 ──────────────────────────────────────────────────────────────────────
@@ -4163,15 +4138,16 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
         ),
     ];
     for (item, allow_self) in &items {
-        let (entries, copy) = f15_copy(item, *allow_self).unwrap_or_else(|e| {
-            panic!(
+        let (entries, copy) =
+            f15_copy(item, *allow_self).unwrap_or_else(|e| {
+                panic!(
                 "`{}` is rejected (allow_self = {}), and its copy compiles with `for<'e>`: {}\n{}",
                 string(item),
                 allow_self,
                 joined_messages(&e),
-                e[0].note().unwrap_or_default()
+                e[0].notes.first().map(|(_, n)| n.as_str()).unwrap_or_default()
             )
-        });
+            });
         assert!(entries.is_empty(), "{}: {:?}", string(item), entries);
         let mut signatures = Signatures::default();
         signatures.visit_item(&copy);
@@ -4271,7 +4247,10 @@ fn f24_self_in_predicate_with_leaked_bound_of_unused_generic() {
                     "`{}` is rejected, and it compiles with the parts as entries: {}\n{}",
                     string(item),
                     joined_messages(&e),
-                    e[0].note().unwrap_or_default()
+                    e[0].notes
+                        .first()
+                        .map(|(_, n)| n.as_str())
+                        .unwrap_or_default()
                 )
             });
         let mut entries: Vec<String> = referrer.iter().map(string).collect();
@@ -4320,7 +4299,10 @@ fn entries_naming_item(referrer: &Referrer, copy: &Item) -> Vec<String> {
     used.visit_item(copy);
     used.0
         .iter()
-        .filter(|&&ix| ix < referrer.iter().count() && generics_name_item(referrer.generics(ix)))
+        .filter(|&&ix| {
+            ix < referrer.iter().count()
+                && generics_name_item(referrer.context_generics(referrer.context(ix)))
+        })
         .map(|&ix| string(referrer.iter().nth(ix).unwrap()))
         .collect()
 }
@@ -4494,7 +4476,9 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
             )
         });
         assert_eq!(
-            generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
+            generics_text(
+                referrer.context_generics(referrer.context(entry(&referrer, "Rel < T >")))
+            ),
             *generics
         );
         assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
@@ -4568,7 +4552,7 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
         assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
         let (referrer, _) = f19_copy_with(f13_leaker(), item).unwrap();
         assert_eq!(
-            string(referrer.generics(entry(&referrer, "Rel < T >"))),
+            string(referrer.context_generics(referrer.context(entry(&referrer, "Rel < T >")))),
             "< T : :: p :: WIter >",
             "{}",
             string(item)
@@ -4601,7 +4585,7 @@ fn generics_text(generics: &Generics) -> String {
 fn repeater_impl_text(referrer: &Referrer, ix: usize) -> String {
     let param: Ident = parse_quote!(__S);
     let r = referrer
-        .repeater_impl(ix, ImplSelf::Param(&param))
+        .repeater_impl(ix, ImplSelf::Param(&param), array_const)
         .unwrap_or_else(|e| panic!("{}", e));
     let repeater: Path = parse_quote!(crate::Repeater);
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
@@ -4720,7 +4704,7 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     // The context leaves out `T: Fn(::p::WIt<T>)`: the Repeater's impl has `T: Iterator<Item = u8>`
     // only, and the copy is as written, with the entry in the predicate.
     assert_eq!(
-        generics_text(referrer.generics(ix)),
+        generics_text(referrer.context_generics(referrer.context(ix))),
         "< T : Iterator < Item = u8 > >"
     );
     assert_eq!(
@@ -4812,7 +4796,7 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
         });
         assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
         assert_eq!(
-            string(referrer.generics(entry(&referrer, "Rel < T >"))),
+            string(referrer.context_generics(referrer.context(entry(&referrer, "Rel < T >")))),
             "< T : Iterator < Item = u8 > >",
             "{}",
             string(item)
@@ -4875,7 +4859,7 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
             )
         });
         assert_eq!(
-            string(referrer.generics(entry(&referrer, "Rel < T >"))),
+            string(referrer.context_generics(referrer.context(entry(&referrer, "Rel < T >")))),
             *generics,
             "{}",
             string(item)
@@ -4895,7 +4879,9 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     leaker.intern_struct(&self_type, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        generics_text(referrer.generics(entry(&referrer, "Wrap2 < Self >"))),
+        generics_text(
+            referrer.context_generics(referrer.context(entry(&referrer, "Wrap2 < Self >")))
+        ),
         "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
     );
     // The self type of an impl, written out, is declared with the bounds of the item. The top-level
@@ -4912,11 +4898,11 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     let context = leaker.intern_impl(&impl_self, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        generics_text(referrer.generics(entry(&referrer, "S < T >"))),
+        generics_text(referrer.context_generics(referrer.context(entry(&referrer, "S < T >")))),
         "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
     );
     assert_eq!(
-        generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
+        generics_text(referrer.context_generics(referrer.context(entry(&referrer, "Rel < T >")))),
         "< T : Iterator < Item = u8 > >"
     );
     assert_eq!(
@@ -4934,7 +4920,9 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     );
     let (referrer, _) = f19_copy_with(f13_leaker(), &assoc).unwrap();
     assert_eq!(
-        generics_text(referrer.generics(entry(&referrer, "Rel < Self :: A >"))),
+        generics_text(
+            referrer.context_generics(referrer.context(entry(&referrer, "Rel < Self :: A >")))
+        ),
         "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
     );
     // The equation of a method is not in the context of the entry (F21), so the bound stays and
@@ -5020,7 +5008,7 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     );
     let (referrer, _) = f19_copy_with(f13_leaker(), &leaked_with_equation).unwrap();
     assert_eq!(
-        generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
+        generics_text(referrer.context_generics(referrer.context(entry(&referrer, "Rel < T >")))),
         "< T : Iterator < Item = u8 > >"
     );
     let leaked: Item = parse_quote!(
@@ -5453,10 +5441,13 @@ fn f29_entry_hides_lifetime() {
         let referrer = leaker.result().finish().unwrap();
         let ix = entry(&referrer, "RelRef < u8 >");
         assert!(
-            referrer.generics(ix).params.is_empty(),
+            referrer
+                .context_generics(referrer.context(ix))
+                .params
+                .is_empty(),
             "`{}`: the entry has the generics `{}`",
             string(&item),
-            string(referrer.generics(ix))
+            string(referrer.context_generics(referrer.context(ix)))
         );
     }
     let mut leaker = new_leaker();
@@ -5471,9 +5462,14 @@ fn f29_entry_hides_lifetime() {
     let result = leaker.result();
     let err = result.errors();
     assert!(
-        err[0].note().unwrap().contains("because of `'_`"),
+        err[0]
+            .notes
+            .first()
+            .map(|(_, n)| n.as_str())
+            .unwrap()
+            .contains("because of `'_`"),
         "{}",
-        err[0].note().unwrap()
+        err[0].notes.first().map(|(_, n)| n.as_str()).unwrap()
     );
 }
 
@@ -5532,7 +5528,6 @@ fn f29_entry_hides_lifetime() {
 /// before.
 #[test]
 fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     // The control: `T: 'x` written, and recorded.
     let control: ItemTrait = parse_quote!(
         pub trait Tr<'x, T: Iterator + 'x> {
@@ -5543,14 +5538,18 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
     leaker.intern_trait(&control, true);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Rel < & 'x T :: Item >");
-    assert!(generics_say_outlives(referrer.generics(ix), "T", "'x"));
+    assert!(generics_say_outlives(
+        referrer.context_generics(referrer.context(ix)),
+        "T",
+        "'x"
+    ));
     // The where predicates, and the generics, of the context of the entry that has `needle`.
     let context_of = |referrer: &Referrer, needle: &str| -> (Vec<String>, Generics) {
         let ix = referrer
             .iter()
             .position(|t| string(t).contains(needle))
             .unwrap_or_else(|| panic!("no entry with `{}`", needle));
-        let generics = referrer.generics(ix).clone();
+        let generics = referrer.context_generics(referrer.context(ix)).clone();
         let predicates = generics
             .where_clause
             .iter()
@@ -5764,8 +5763,12 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
             named,
             string(&generics)
         );
-        let arguments = slots
-            .encode_generics_params_to_ty_with_self(&generics.params, &parse_quote!(Self), &[])
+        let ix = referrer
+            .iter()
+            .position(|t| string(t).contains(needle))
+            .unwrap();
+        let arguments = referrer
+            .entry_args(ix, &UseSite::identity(), array_const)
             .unwrap();
         assert_eq!(string(&arguments), *encoded, "`{}`", string(item));
         // The Referrer finds the entry in the copy, which has the signature and no predicate.
@@ -5967,7 +5970,7 @@ fn needless_parens_in(generics: &Generics) -> Vec<String> {
 /// F32 (fixed): the encoding parenthesized a trait object that needs no parentheses.
 ///
 /// Trigger: the encoding of a `?Sized` parameter whose argument is a trait object with one bound:
-/// `encode_generics_args_to_ty()` gave `(*const (dyn Tr),)` for `T: ?Sized` and `dyn Tr`
+/// the encoding of the arguments gave `(*const (dyn Tr),)` for `T: ?Sized` and `dyn Tr`
 /// (`unsized_element()`), as it gives `*const (dyn Tr + Send)` for two bounds, where without the
 /// parentheses it is E0178 ("ambiguous `+` in a type"). With one bound `*const dyn Tr` parses and
 /// means the same, so those parentheses are for nothing, and rustc's `unused_parens` says "unnecessary
@@ -5996,13 +5999,19 @@ fn needless_parens_in(generics: &Generics) -> Vec<String> {
 /// The assertion: each parenthesis of the output is one that rustc needs (`NeedlessParens`).
 #[test]
 fn f32_parentheses_only_where_rustc_needs_them() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    // The encoding of the arguments of a `T: ?Sized`.
-    let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T: ?Sized);
+    // The encoding of the arguments of a `T: ?Sized`, at a use site of the entry `Rel<T>`.
+    let unsized_trait: ItemTrait = parse_quote!(
+        pub trait Tr<T: ?Sized> {
+            fn f(&self) -> Rel<T>;
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&unsized_trait, true);
+    let unsized_referrer = leaker.result().finish().unwrap();
     let encode = |arg: Type| -> Type {
-        slots
-            .encode_generics_args_to_ty(&[GenericArgument::Type(arg)], &params)
-            .unwrap()
+        let args = [GenericArgument::Type(arg)];
+        let site = UseSite::substituting(&unsized_trait.generics.params, &args);
+        unsized_referrer.entry_args(0, &site, array_const).unwrap()
     };
     // The parentheses that are needed are there, and are not reported.
     for (arg, expected) in [
@@ -6031,13 +6040,21 @@ fn f32_parentheses_only_where_rustc_needs_them() {
         assert_eq!(string(&encoded), expected);
         assert_eq!(needless_parens(&encoded), Vec::<String>::new());
     }
-    let with_lifetime: Punctuated<GenericParam, Token![,]> = parse_quote!('a, T: ?Sized + 'a);
+    let with_lifetime: ItemTrait = parse_quote!(
+        pub trait Tr<'a, T: ?Sized + 'a> {
+            fn f(&self, x: &'a Rel<T>);
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&with_lifetime, true);
+    let with_lifetime_referrer = leaker.result().finish().unwrap();
     let args: Vec<GenericArgument> = vec![
         parse_quote!('x),
         GenericArgument::Type(parse_quote!(dyn ::p::A + 'x)),
     ];
-    let encoded = slots
-        .encode_generics_args_to_ty(&args, &with_lifetime)
+    let site = UseSite::substituting(&with_lifetime.generics.params, &args);
+    let encoded = with_lifetime_referrer
+        .entry_args(0, &site, array_const)
         .unwrap();
     assert!(
         string(&encoded).contains("& 'x (dyn :: p :: A + 'x)"),
@@ -6054,7 +6071,7 @@ fn f32_parentheses_only_where_rustc_needs_them() {
     let mut leaker = new_leaker();
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    let generics = referrer.impl_generics(referrer.context(entry(&referrer, "Rel < T >")));
+    let generics = impl_generics(&referrer, entry(&referrer, "Rel < T >"));
     assert!(string(&generics).contains("-> (& 'static dyn :: core :: any :: Any) + Send"));
     assert_eq!(needless_parens_in(&generics), Vec::<String>::new());
     // `Self` replaced by a trait object, a function pointer.
@@ -6091,7 +6108,11 @@ fn f32_parentheses_only_where_rustc_needs_them() {
         );
     }
     // The Leaker's encoding of the parameter is the Referrer's of the same argument.
-    let leaker_side = slots.encode_generics_params_to_ty(&params).unwrap();
+    let param: Ident = parse_quote!(__S);
+    let leaker_side = unsized_referrer
+        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .unwrap()
+        .args;
     assert_eq!(string(&leaker_side), string(&encode(parse_quote!(T))));
     assert_eq!(string(&leaker_side), "(* const T ,)");
     // A trait object with one bound, and with a lifetime bound (two).
@@ -6693,7 +6714,7 @@ fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
 /// Referrer computes the same context for the copy (`Context::of()` is the one function), where
 /// `Self` is still `Self`: `Referrer::visitor().with_self(..)` replaces it only in what it hands
 /// to the closure, so the entry is found with or without it. The Repeater's impl is for `__S`, and
-/// `iter_with_self()` writes the predicate for it (`where <__S as Tr<'a, T>>::A0: 'x`,
+/// `repeater_impl()` writes the predicate for it (`where <__S as Tr<'a, T>>::A0: 'x`,
 /// `(<__S>::A<'b>): 'x`).
 ///
 /// The property test shows it with `TYPE_LEAK_PROP_FEATURES=self_projection_outlives`: with the
@@ -6713,7 +6734,6 @@ fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
 /// signature and not the predicate, also with `with_self()`.
 #[test]
 fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     // (the trait, a text of the entry, the where predicates of its context, the lifetimes that
     // `Self` outlives, the generics that `: 'x` bounds, the encoded arguments).
     type Case<'a> = (
@@ -6962,7 +6982,7 @@ fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
             .iter()
             .position(|t| string(t).contains(needle))
             .unwrap_or_else(|| panic!("`{}`: no entry with `{}`", string(item), needle));
-        let generics = referrer.generics(ix);
+        let generics = referrer.context_generics(referrer.context(ix));
         let mut predicates: Vec<String> = generics
             .where_clause
             .iter()
@@ -7008,12 +7028,8 @@ fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
                 string(generics)
             );
         }
-        let arguments = slots
-            .encode_generics_params_to_ty_with_self(
-                &generics.params,
-                &parse_quote!(Self),
-                self_outlives,
-            )
+        let arguments = referrer
+            .entry_args(ix, &UseSite::identity(), array_const)
             .unwrap();
         assert_eq!(string(&arguments), *encoded, "`{}`", string(item));
         // The Referrer finds the entry in the copy, which has the signature and no predicate, and
@@ -7053,7 +7069,7 @@ fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
     leaker.intern_trait(&control, true);
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Rel < & 'x < Self as Tr < 'a , T > > :: A0 >");
-    let generics = referrer.generics(ix);
+    let generics = referrer.context_generics(referrer.context(ix));
     assert!(generics_say_outlives(generics, "T", "'x"));
     assert!(generics_say_outlives(generics, "'a", "'x"));
     assert_eq!(
@@ -7133,7 +7149,6 @@ fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
 /// signatures of its methods alone, also after the Referrer is written as tokens and parsed back.
 #[test]
 fn f35_gat_where_clause_of_self_projection_not_recorded() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     // (the trait, a text of the entry, the where predicates of its context, the lifetimes that
     // `Self` outlives, the generics that `: 'x` bounds, the encoded arguments).
     type Case<'a> = (
@@ -7363,7 +7378,7 @@ fn f35_gat_where_clause_of_self_projection_not_recorded() {
             .iter()
             .position(|t| string(t).contains(needle))
             .unwrap_or_else(|| panic!("`{}`: no entry with `{}`", string(item), needle));
-        let generics = referrer.generics(ix);
+        let generics = referrer.context_generics(referrer.context(ix));
         let mut predicates: Vec<String> = generics
             .where_clause
             .iter()
@@ -7409,12 +7424,8 @@ fn f35_gat_where_clause_of_self_projection_not_recorded() {
                 string(generics)
             );
         }
-        let arguments = slots
-            .encode_generics_params_to_ty_with_self(
-                &generics.params,
-                &parse_quote!(Self),
-                self_outlives,
-            )
+        let arguments = referrer
+            .entry_args(ix, &UseSite::identity(), array_const)
             .unwrap();
         assert_eq!(string(&arguments), *encoded, "`{}`", string(item));
         // The Referrer finds the entry in the copy, which has the signature and no predicate, also
@@ -7604,13 +7615,13 @@ fn nested_copy_recovering(
                 .0
         }
     };
-    let result = leaker.result();
+    let mut result = leaker.result();
+    result.allow_ambiguous_crate_name(!strict);
     let referrer = if recover {
         result.into_referrer()
     } else {
         result.finish().unwrap()
-    }
-    .allow_ambiguous_crate_name(!strict);
+    };
     let (mut visitor, calls): (Box<dyn VisitMut>, NestedCalls) = if nested {
         let (visitor, calls) = nested_visitor(&referrer, context);
         (Box::new(visitor), calls)
@@ -8257,7 +8268,9 @@ fn f37_nested_type_with_a_bound_that_names_its_own_self_is_supported() {
             // enum or a union), and the parameter replaces `Self` in the bound. It is `Sized`
             // where a bound needs it (`(Self, u8)`), else `?Sized`: see
             // `f37_the_impl_is_sized_only_where_the_bounds_need_it`.
-            let r = referrer.repeater_impl(ix, ImplSelf::Param(&param)).unwrap();
+            let r = referrer
+                .repeater_impl(ix, ImplSelf::Param(&param), array_const)
+                .unwrap();
             assert_eq!(r.self_ty, parse_quote!(__S), "{}", what);
             let last = r.generics.params.last().unwrap();
             let needs_sized = string(item).contains("(Self");
@@ -8275,7 +8288,7 @@ fn f37_nested_type_with_a_bound_that_names_its_own_self_is_supported() {
             let marker: Type = parse_quote!(crate::Marker);
             assert!(
                 matches!(
-                    referrer.repeater_impl(ix, ImplSelf::Marker(&marker)),
+                    referrer.repeater_impl(ix, ImplSelf::Marker(&marker), array_const),
                     Err(EncodeError::NeedsSelf(_))
                 ),
                 "{}",
@@ -8473,7 +8486,9 @@ fn f37_the_impl_is_sized_only_where_the_bounds_need_it() {
                     nest,
                     string(item)
                 );
-                let r = referrer.repeater_impl(ix, ImplSelf::Param(&param)).unwrap();
+                let r = referrer
+                    .repeater_impl(ix, ImplSelf::Param(&param), array_const)
+                    .unwrap();
                 assert_eq!(
                     r.generics.params.last().unwrap(),
                     expected,
@@ -8496,7 +8511,9 @@ fn f37_the_impl_is_sized_only_where_the_bounds_need_it() {
     let referrer = nested_analysis(Nest::EnterMod, &item, &["S"])
         .finish()
         .unwrap();
-    let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+    let r = referrer
+        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .unwrap();
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
     let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
     let imp: ItemImpl = parse_quote! {
@@ -8562,7 +8579,11 @@ fn f37_the_copy_passes_its_own_type() {
                 other => panic!("{:?}", other),
             };
             let args = referrer
-                .entry_args(ix, &UseSite::identity().with_self(self_ty.clone()))
+                .entry_args(
+                    ix,
+                    &UseSite::identity().with_self(self_ty.clone()),
+                    array_const,
+                )
                 .unwrap();
             parse_quote!(<#self_ty as Repeater<#args, 7u64, #ix>>::Type)
         })
@@ -9479,7 +9500,9 @@ fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_
     assert_eq!(string(&file.items[0]), string(&expected));
     // The Repeater's arguments of the entry include `U` (the argument of `Self: Tr<T, U>`), which
     // a declaration cannot pass to the default of `U`.
-    let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
+    let args = referrer
+        .entry_args(0, &UseSite::identity(), array_const)
+        .unwrap();
     assert_eq!(string(&args), "(T , U)");
 
     // Without a host (no `with_nested_self()`), the entry is left as written, as the same entry
@@ -9931,13 +9954,18 @@ fn values_leaker() -> Leaker {
     Leaker::from_config(values_config())
 }
 
-/// Analyzes the trait `source` with the option, and returns its Referrer and its context.
-fn f40_trait(source: &str) -> (ItemTrait, Referrer, ContextId) {
+/// Analyzes the trait `source` with the option, and returns its result and its context.
+fn f40_result(source: &str) -> (ItemTrait, LeakerResult, ContextId) {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     let mut leaker = values_leaker();
     let context = leaker.intern_trait(&item, true);
-    let referrer = leaker
-        .result()
+    (item, leaker.result(), context)
+}
+
+/// Analyzes the trait `source` with the option, and returns its Referrer and its context.
+fn f40_trait(source: &str) -> (ItemTrait, Referrer, ContextId) {
+    let (item, result, context) = f40_result(source);
+    let referrer = result
         .finish()
         .unwrap_or_else(|e| panic!("{}: {}", source, joined_messages(&e)));
     (item, referrer, context)
@@ -9957,7 +9985,12 @@ fn f40_errors(source: &str) -> Vec<(String, String)> {
     assert!(!err.is_empty(), "`{}` is accepted", source);
     err.iter()
         .map(|item| {
-            let note = item.note().unwrap_or("").to_string();
+            let note = item
+                .notes
+                .first()
+                .map(|(_, n)| n.as_str())
+                .unwrap_or("")
+                .to_string();
             (item.message.clone(), note)
         })
         .collect()
@@ -10016,7 +10049,7 @@ fn f40_a_type_in_the_default_of_an_associated_const_is_carried() {
 
     // The Repeater's impl is written like the one of an entry of a signature.
     let r = referrer
-        .repeater_impl(0, ImplSelf::Marker(&parse_quote!(())))
+        .repeater_impl(0, ImplSelf::Marker(&parse_quote!(())), array_const)
         .unwrap();
     assert_eq!(string(&r.ty), "inner :: Local");
 
@@ -10235,7 +10268,8 @@ fn f40_every_type_position_of_a_value_is_replaced() {
 fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
     let source =
         "trait Tr { fn f(&self) { let _: ::p::Wrap<inner::Local> = ::core::unimplemented!(); } }";
-    let (item, referrer, context) = f40_trait(source);
+    let (item, result, context) = f40_result(source);
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(
         referrer
             .iter()
@@ -10254,7 +10288,9 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
         }
     );
     assert_eq!(trusting, string(&expected));
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.finish().unwrap();
     let expected: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self) {
@@ -10711,7 +10747,9 @@ fn f41_a_default_that_needs_self_only_through_a_bound_is_accepted() {
                 what
             );
             // Its impl is for any type, with no bound of its own.
-            let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+            let r = referrer
+                .repeater_impl(0, ImplSelf::Param(&param), array_const)
+                .unwrap();
             assert_eq!(r.self_ty, parse_quote!(__S), "{}", what);
             assert_eq!(
                 r.generics.params.last().unwrap(),
@@ -10722,7 +10760,7 @@ fn f41_a_default_that_needs_self_only_through_a_bound_is_accepted() {
             assert!(!string(&r.generics).contains("Self"), "{}", what);
             // A marker will do as well.
             referrer
-                .repeater_impl(0, ImplSelf::Marker(&marker))
+                .repeater_impl(0, ImplSelf::Marker(&marker), array_const)
                 .unwrap_or_else(|e| panic!("{}: {}", what, e));
             // The serialized form keeps it.
             let again: Referrer = parse2(quote!(#referrer)).unwrap();
@@ -10737,7 +10775,9 @@ fn f41_a_default_that_needs_self_only_through_a_bound_is_accepted() {
     let referrer = nested_analysis(Nest::EnterMod, &item, &["S"])
         .finish()
         .unwrap();
-    let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+    let r = referrer
+        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .unwrap();
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
     let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
     let imp: ItemImpl = parse_quote! {
@@ -10784,7 +10824,9 @@ fn f41_the_copy_writes_an_ordinary_default() {
     let (context, ()) = leaker.enter_mod("m", names(&["S"]), |view| view.visit_item(&item));
     let referrer = leaker.result().finish().unwrap();
     let mut file = file_of(vec![item.clone()]);
-    let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
+    let args = referrer
+        .entry_args(0, &UseSite::identity(), array_const)
+        .unwrap();
     referrer
         .clone()
         .visitor(
@@ -11067,7 +11109,9 @@ fn f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it() {
             );
             // The impl: `Self` is the parameter in the type and in the bounds. It is `Sized`
             // (not `?Sized`), as the type needs it.
-            let r = referrer.repeater_impl(ix, ImplSelf::Param(&param)).unwrap();
+            let r = referrer
+                .repeater_impl(ix, ImplSelf::Param(&param), array_const)
+                .unwrap();
             assert_eq!(r.self_ty, parse_quote!(__S), "{}", what);
             let (impl_generics, _, where_clause) = r.generics.split_for_impl();
             let (args, self_ty, r_ty) = (&r.args, &r.self_ty, &r.ty);
@@ -11083,7 +11127,7 @@ fn f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it() {
             // A marker is not what the copy has the bound for.
             assert!(
                 matches!(
-                    referrer.repeater_impl(ix, ImplSelf::Marker(&marker)),
+                    referrer.repeater_impl(ix, ImplSelf::Marker(&marker), array_const),
                     Err(EncodeError::NeedsSelf(_))
                 ),
                 "{}",
@@ -11154,7 +11198,11 @@ fn f42_the_copy_passes_its_own_type() {
                 other => panic!("{:?}", other),
             };
             let args = referrer
-                .entry_args(ix, &UseSite::identity().with_self(self_ty.clone()))
+                .entry_args(
+                    ix,
+                    &UseSite::identity().with_self(self_ty.clone()),
+                    array_const,
+                )
                 .unwrap();
             parse_quote!(<#self_ty as Repeater<#args, 7u64, #ix>>::Type)
         })
@@ -11480,7 +11528,7 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
     let (result, context) = f43_analyze(std_config(), &[], &nested);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     assert_eq!(
         parts_of(&referrer),
         ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable"]
@@ -11492,7 +11540,9 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
         (false, format!(":: p :: Bare < P < {}usize > >", object)),
         (true, format!("P < {}usize >", bare)),
     ] {
-        let referrer = referrer.clone().allow_ambiguous_crate_name(!strict);
+        let mut result = result.clone();
+        result.allow_ambiguous_crate_name(!strict);
+        let referrer = result.into_referrer();
         let expected = format!(
             "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : {}) {{ }} }} }} }}",
             x, g
@@ -11989,7 +12039,7 @@ fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self
         let (referrer, copy) = leaked(item);
         let ix = entry(&referrer, "Rel < Y >");
         assert_eq!(
-            generics_text(referrer.generics(ix)),
+            generics_text(referrer.context_generics(referrer.context(ix))),
             "< 'x , Y : 'x + Iterator < Item = u8 > > where Rel < Y > : Default",
             "{}",
             string(item)
@@ -12000,8 +12050,8 @@ fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self
         let again: Referrer = parse2(quote!(#referrer)).unwrap();
         assert_eq!(again, referrer);
         assert_eq!(
-            generics_text(again.generics(ix)),
-            generics_text(referrer.generics(ix))
+            generics_text(again.context_generics(again.context(ix))),
+            generics_text(referrer.context_generics(referrer.context(ix)))
         );
     }
     // The generic that the description of `Self` names keeps every bound (`Tr<T>`, `S<T>`), a
@@ -12034,7 +12084,7 @@ fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self
     for item in &described {
         let (referrer, copy) = leaked(item);
         assert_eq!(
-            string(referrer.generics(entry(&referrer, "Rel < T , Y >"))),
+            string(referrer.context_generics(referrer.context(entry(&referrer, "Rel < T , Y >")))),
             "< 'x , T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > , Y : 'x + Iterator < \
              Item = u8 > >",
             "{}",
@@ -12051,7 +12101,9 @@ fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self
     );
     let (referrer, _) = leaked(&names_self);
     assert_eq!(
-        string(referrer.generics(entry(&referrer, "Rel < Self :: A , Y >"))),
+        string(
+            referrer.context_generics(referrer.context(entry(&referrer, "Rel < Self :: A , Y >")))
+        ),
         "< Y : Fn (:: p :: WIt < Y >) + Iterator < Item = u8 > >"
     );
 }

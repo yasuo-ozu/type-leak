@@ -43,7 +43,8 @@ pub(crate) const PRELUDE_TRAITS: &[(&str, &str)] = &[
     ("Iterator", "::core::iter::Iterator"),
     ("IntoIterator", "::core::iter::IntoIterator"),
     ("Extend", "::core::iter::Extend"),
-    ("FromIterator", "::core::iter::FromIterator"),
+    ("DoubleEndedIterator", "::core::iter::DoubleEndedIterator"),
+    ("ExactSizeIterator", "::core::iter::ExactSizeIterator"),
     ("PartialEq", "::core::cmp::PartialEq"),
     ("PartialOrd", "::core::cmp::PartialOrd"),
     ("Eq", "::core::cmp::Eq"),
@@ -281,7 +282,7 @@ fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
                 |v, t| v.visit_type_mut(t),
             );
             let context = referrer.context(ix);
-            let generics = generics_text(referrer.generics(ix), only_relaxed_sized);
+            let generics = generics_text(referrer.context_generics(context), only_relaxed_sized);
             let self_text = match referrer.context_self(context) {
                 None => "-".to_string(),
                 Some(SelfRequirement::Bound(path)) => format!("bound {}", quote!(#path)),

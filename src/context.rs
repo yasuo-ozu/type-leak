@@ -205,10 +205,9 @@ impl Scope {
 pub enum SelfRequirement {
     /// `Self` is any implementor of the trait, e.g. `Self: MyTrait<T, U>`.
     ///
-    /// In the impl for the implementors, `Self` is a type parameter (`__S`). Take the type and
-    /// generics of the entry from [`Referrer::iter_with_self()`](crate::Referrer::iter_with_self)
-    /// with `__S`, which [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) does:
-    /// `Self::Item` becomes `<__S>::Item`, and `Self: Sized` becomes `__S: Sized`. The copy uses
+    /// In the impl for the implementors, `Self` is a type parameter (`__S`), which
+    /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) declares and writes for `Self`
+    /// in the entry: `Self::Item` becomes `<__S>::Item`, and `Self: Sized` becomes `__S: Sized`. The copy uses
     /// `<Self as Repeater<..>>::Type`, where `Self` is the implementor, so the impl in the other
     /// crate must provide the associated types that the type uses (`type Item = u8;`).
     ///
@@ -267,7 +266,7 @@ pub enum SelfRequirement {
     /// The ways out are to put the field first (not the last one of a struct), to add `where Self:
     /// Sized` to the item, to write the type with an absolute path that both crates resolve (a
     /// Referrer that trusts the names of the crates copies it as written, see
-    /// [`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)),
+    /// [`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)),
     /// or to use a bound that needs no `Sized`, where the impl is `?Sized`.
     Any,
 }
@@ -1266,7 +1265,9 @@ impl std::hash::Hash for Context {
 /// let referrer = leaker.result().finish().unwrap();
 /// // `Rel` uses no generic. `Wrap<T>` uses `T`. `Wrap<U>` uses `U` and, through the bound
 /// // `U: Into<T>`, `T`.
-/// let used: Vec<usize> = (0..3).map(|ix| referrer.generics(ix).params.len()).collect();
+/// let used: Vec<usize> = (0..3)
+///     .map(|ix| referrer.context_generics(referrer.context(ix)).params.len())
+///     .collect();
 /// assert_eq!(used, [0, 1, 2]);
 /// ```
 ///

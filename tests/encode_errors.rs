@@ -7,26 +7,55 @@
 //! cannot have.
 
 use syn::*;
+use template_quote::ToTokens;
 use type_leak::*;
 
 fn slots() -> RepeaterSlots {
     RepeaterSlots::new(parse_quote!(crate::Repeater))
 }
 
-/// The error of encoding the arguments in `args` for the parameters in `generics`.
+/// The error of encoding the arguments in `args` for the parameters in `generics`: completing
+/// them, then writing them at a use site of an entry that uses every generic.
 fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
-    slots()
-        .encode_generics_args_to_ty(&args.args, &generics.params)
+    let empty = Leaker::new().result().into_referrer();
+    let completed =
+        match empty.complete_args(&args.args, &generics.params, |_, _, _| unreachable!()) {
+            Ok(completed) => completed,
+            Err(error) => return error,
+        };
+    let used = generics.params.iter().map(|param| match param {
+        GenericParam::Lifetime(param) => param.lifetime.to_token_stream(),
+        GenericParam::Type(param) => param.ident.to_token_stream(),
+        GenericParam::Const(param) => param.ident.to_token_stream(),
+    });
+    let item: ItemTrait = parse_quote!(trait Tr #generics { fn f(&self) -> Wrap<#(#used),*>; });
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    referrer
+        .entry_args(
+            0,
+            &UseSite::substituting(&generics.params, &completed),
+            |value, param| slots().encode_const(value, &param.ty),
+        )
         .unwrap_err()
 }
 
-/// The error of encoding `generics` itself.
+/// The error of encoding `generics` itself: the const parameter of the first one.
 fn params_error(generics: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
+    let param = generics
+        .params
+        .iter()
+        .find_map(|param| match param {
+            GenericParam::Const(param) => Some(param),
+            _ => None,
+        })
+        .unwrap();
     slots()
-        .encode_generics_params_to_ty(&generics.params)
+        .encode_const(&parse_quote!(N), &param.ty)
         .unwrap_err()
 }
 
@@ -43,7 +72,7 @@ fn needs_self_error(source: &str) -> EncodeError {
         .unwrap();
     let marker: Type = parse_quote!(crate::Marker);
     referrer
-        .repeater_impl(wrap, ImplSelf::Marker(&marker))
+        .repeater_impl(wrap, ImplSelf::Marker(&marker), array_const)
         .unwrap_err()
 }
 

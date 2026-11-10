@@ -18,10 +18,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{
-    without_encoded_bounds, ContextId, EncodeError, Leaker, Referrer, RepeaterSlots,
-    SelfRequirement,
-};
+use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer, SelfRequirement, UseSite};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -63,10 +60,6 @@ fn outlives(referrer: &Referrer) -> Vec<(Vec<String>, Vec<String>)> {
             (types, outlives)
         })
         .collect()
-}
-
-fn slots() -> RepeaterSlots {
-    RepeaterSlots::new(parse_quote!(crate::Repeater))
 }
 
 #[test]
@@ -241,14 +234,11 @@ fn the_context_of_a_struct_has_it_too() {
     assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
     // The encoding in the implementation `impl<'a, T> Repeater<(&'a (), T, &'a Self), ..> for
     // MyStruct<'a, T>`; and `T: 'a` follows from it (`MyStruct<'a, T>: 'a`).
-    let generics = referrer.context_generics(context);
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(
-            &generics.params,
-            &parse_quote!(Self),
-            referrer.context_self_outlives(context),
-        )
-        .unwrap();
+    let param: Ident = parse_quote!(__S);
+    let encoded = referrer
+        .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        .unwrap()
+        .args;
     let expected: Type = parse_quote!((&'a (), T, &'a Self));
     assert_eq!(s(&encoded), s(&expected));
     // A concrete type in place of `Self` is as good.
@@ -256,13 +246,8 @@ fn the_context_of_a_struct_has_it_too() {
         Some(SelfRequirement::Type(ty)) => ty,
         _ => unreachable!(),
     };
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(
-            &generics.params,
-            self_ty,
-            referrer.context_self_outlives(context),
-        )
-        .unwrap();
+    let site = UseSite::identity().with_self(self_ty.clone());
+    let encoded = referrer.entry_args(0, &site, array_const).unwrap();
     let expected: Type = parse_quote!((&'a (), T, &'a MyStruct<'a, T>));
     assert_eq!(s(&encoded), s(&expected));
 }
@@ -293,119 +278,6 @@ fn it_is_part_of_the_identity_of_the_context() {
     // The ids of the contexts are distinct.
     let contexts: Vec<ContextId> = referrer.contexts().collect();
     assert_eq!(contexts.len(), 3);
-}
-
-#[test]
-fn the_encoders_encode_it_after_the_lifetime_bounds() {
-    let referrer = of_trait(parse_quote! {
-        trait Tr { fn f<'a, T>(&self, x: &'a Rel<(Self, T)>); }
-    });
-    let context = referrer.context(0);
-    let generics = referrer.context_generics(context);
-    assert_eq!(s(generics), "< 'a , T : 'a >");
-    let outlives = referrer.context_self_outlives(context);
-    // The Repeater's implementation for the implementor `__S`: the parameters, the bounds and then
-    // `&'a __S`.
-    let marker: Type = parse_quote!(__S);
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &marker, outlives)
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), T, &'a T, &'a __S));
-    assert_eq!(s(&encoded), s(&expected));
-    // Without it, the encoding is that of the generics alone.
-    let encoded = slots()
-        .encode_generics_params_to_ty(&generics.params)
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), T, &'a T));
-    assert_eq!(s(&encoded), s(&expected));
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &marker, &[])
-        .unwrap();
-    assert_eq!(s(&encoded), s(&expected));
-    // At the use site, with the arguments substituted, and `Self` being the implementor.
-    let args: Vec<GenericArgument> = vec![parse_quote!('q), parse_quote!(u8)];
-    let self_ty: Type = parse_quote!(Self);
-    let encoded = slots()
-        .encode_generics_args_to_ty_with_self(&args, &generics.params, &self_ty, outlives)
-        .unwrap();
-    let expected: Type = parse_quote!((&'q (), u8, &'q u8, &'q Self));
-    assert_eq!(s(&encoded), s(&expected));
-    let args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
-    let encoded = slots()
-        .encode_generics_args_to_ty_with_self(&args, &generics.params, &self_ty, outlives)
-        .unwrap();
-    let expected: Type = parse_quote!((&'static (), u8, &'static u8, &'static Self));
-    assert_eq!(s(&encoded), s(&expected));
-    // A lifetime which is not a parameter is skipped, like a bound by one.
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &marker, &lifetimes(&["'z"]))
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), T, &'a T));
-    assert_eq!(s(&encoded), s(&expected));
-}
-
-#[test]
-fn a_trait_object_without_a_lifetime_bound_cannot_be_encoded() {
-    let generics: Generics = parse_quote!(<'a>);
-    let outlives = lifetimes(&["'a"]);
-    // `&'a dyn Tr` would default to `&'a (dyn Tr + 'a)`.
-    let unbounded: Type = parse_quote!(dyn Tr);
-    assert!(matches!(
-        slots().encode_generics_params_to_ty_with_self(&generics.params, &unbounded, &outlives),
-        Err(EncodeError::UnboundedTraitObject(_))
-    ));
-    // Nothing to encode: no error.
-    assert!(slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &unbounded, &[])
-        .is_ok());
-    let bounded: Type = parse_quote!(dyn Tr + 'static);
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &bounded, &outlives)
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), &'a (dyn Tr + 'static)));
-    assert_eq!(s(&encoded), s(&expected));
-}
-
-#[test]
-fn the_implementation_does_not_declare_it() {
-    let referrer = of_trait(parse_quote! {
-        trait Tr { fn f<'a, T>(&self, x: &'a Rel<(Self, T)>) where Self: ::core::marker::Sized; }
-    });
-    let context = referrer.context(0);
-    // The generics of the context do not mention it (`Self` is not a generic, and the predicate
-    // `Self: Sized` is the one written), and neither do those the implementation declares.
-    let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
-    assert_eq!(
-        with_where(referrer.context_generics(context)),
-        "< 'a , T : 'a > where Self : :: core :: marker :: Sized"
-    );
-    assert_eq!(
-        with_where(&referrer.impl_generics(context)),
-        "< 'a , T > where Self : :: core :: marker :: Sized"
-    );
-    // For the generics of `iter_with_self()` as well.
-    let marker: Type = parse_quote!(__S);
-    let (_, replaced) = referrer.iter_with_self(&marker).next().unwrap();
-    assert_eq!(
-        with_where(&without_encoded_bounds(&replaced)),
-        "< 'a , T > where __S : :: core :: marker :: Sized"
-    );
-    // A bound `Self: 'a` which is written is the same as one which is implied: it is moved to
-    // `context_self_outlives()`, and the other bounds of the predicate are kept (see
-    // `a_written_bound_is_the_same_as_an_implied_one`).
-    let referrer = of_trait(parse_quote! {
-        trait Tr { fn f<'a>(&self, x: Rel<'a, Self>) where Self: ::core::marker::Sized + 'a; }
-    });
-    let context = referrer.context(0);
-    assert_eq!(
-        with_where(referrer.context_generics(context)),
-        "< 'a > where Self : :: core :: marker :: Sized"
-    );
-    assert_eq!(
-        with_where(&referrer.impl_generics(context)),
-        "< 'a > where Self : :: core :: marker :: Sized"
-    );
-    assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
 }
 
 #[test]
@@ -497,7 +369,7 @@ fn the_referrer_finds_the_entries_with_the_lifetimes_declared_where_the_copy_is(
 
 /// The generics (with the where clause) of the context of the entry `ix`.
 fn declared(referrer: &Referrer, ix: usize) -> String {
-    let generics = referrer.generics(ix);
+    let generics = referrer.context_generics(referrer.context(ix));
     let where_clause = &generics.where_clause;
     s(&quote!(#generics #where_clause))
 }
@@ -817,45 +689,6 @@ fn a_bound_by_a_lifetime_parameter_under_a_binder_stays_a_predicate() {
     );
 }
 
-#[test]
-fn a_written_bound_is_encoded_and_never_declared() {
-    let referrer = of_trait(parse_quote! {
-        trait Tr {
-            fn f<'a, T: 'a>(&self, x: Rel<'a, (Self, T)>) where Self: ::core::marker::Sized + 'a;
-        }
-    });
-    let context = referrer.context(0);
-    let outlives = referrer.context_self_outlives(context);
-    assert_eq!(outlives, lifetimes(&["'a"]));
-    // Neither the generics of the context nor those the implementation declares have it, and
-    // `Sized` of the same predicate is kept.
-    let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
-    assert_eq!(
-        with_where(referrer.context_generics(context)),
-        "< 'a , T : 'a > where Self : :: core :: marker :: Sized"
-    );
-    assert_eq!(
-        with_where(&referrer.impl_generics(context)),
-        "< 'a , T > where Self : :: core :: marker :: Sized"
-    );
-    let marker: Type = parse_quote!(__S);
-    let (_, replaced) = referrer.iter_with_self(&marker).next().unwrap();
-    assert_eq!(
-        with_where(&without_encoded_bounds(&replaced)),
-        "< 'a , T > where __S : :: core :: marker :: Sized"
-    );
-    // It is encoded as `&'a __S`, as the implied one is.
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(
-            &referrer.context_generics(context).params,
-            &marker,
-            outlives,
-        )
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), T, &'a T, &'a __S));
-    assert_eq!(s(&encoded), s(&expected));
-}
-
 /// Rewrites a copy of `tr` in the scope `top_level` with each leaked type replaced by `P<index>`,
 /// as the lookup `how` finds them (`"declared"`: the generics of the trait are declared again by
 /// the copy, `"leakers"`: they are those of the context), and counts those it found.
@@ -1021,7 +854,7 @@ fn a_written_bound_still_needs_self_to_be_leakable() {
         .err()
         .unwrap();
     assert_eq!(
-        err[0].note(),
+        err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     // Without it, or with a bound which the type does not mention, it is fine (nothing in the
