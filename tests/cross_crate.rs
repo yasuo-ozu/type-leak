@@ -402,9 +402,9 @@ fn every_item_kind_is_leaked_across_crates() {
             rejected("struct", "useabsolutepath:'Wrap<Self>'"),
         ),
         (9004, __tl_report_9004!(), ok("struct", 3, 3, 3)),
-        // a where clause on a type that is not a parameter, in the context of its entry (the Leaker
-        // allows `::std`: the predicate `Vec<T>: Clone` must stay as written, or the impl of the
-        // entry does not hold in the copy)
+        // a where clause on a type that is not a parameter, in the context of its entry (`Vec<T>` of
+        // `::std` is no entry, F71: the predicate `Vec<T>: Clone` must stay as written, or the impl of
+        // the entry does not hold in the copy)
         (9005, __tl_report_9005!(), ok("struct", 1, 1, 1)),
         // enums
         (9011, __tl_report_9011!(), ok("enum", 4, 5, 5)),
@@ -610,6 +610,19 @@ fn every_item_kind_is_leaked_across_crates() {
         // a strict Referrer replaces by a path that names the lifetime of the site).
         (9234, __tl_report_9234!(), ok("struct", 2, 2, 2)),
         (9235, __tl_report_9235!(), ok("struct", 2, 2, 2)),
+        // F71: a type of a crate that the rule does not allow, in a where predicate that the context of
+        // an entry carries, is no entry (the predicate does not hold without itself): in the bound of
+        // a predicate on `u8`, nested, held in a field too, with no other entry, in the predicate of a
+        // method, of the trait and of the impl. The last has a type that names no generic: its
+        // context is empty, and it stays an entry (2 entries: it and the struct that has the predicate).
+        (9237, __tl_report_9237!(), ok("struct", 1, 1, 1)),
+        (9238, __tl_report_9238!(), ok("struct", 1, 1, 1)),
+        (9239, __tl_report_9239!(), ok("struct", 1, 2, 2)),
+        (9240, __tl_report_9240!(), ok("struct", 0, 1, 1)),
+        (9241, __tl_report_9241!(), ok("trait", 1, 2, 2)),
+        (9242, __tl_report_9242!(), ok("trait", 1, 2, 2)),
+        (9243, __tl_report_9243!(), ok("impl-inherent", 2, 3, 3)),
+        (9244, __tl_report_9244!(), ok("struct", 2, 1, 1)),
     ];
     for (id, text, expected) in table {
         assert_eq!(reported(id, text), expected, "item {}: {}", id, text);

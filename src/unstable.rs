@@ -32,10 +32,12 @@
 //!
 //! A where predicate that is not a bound of a generic (`Vec<T::Item>: Default`, `u8:
 //! Into<T::Item>`) is proved by an impl, so it names no unstable bound as far as a leaked type,
-//! `Self` or an associated type of an impl goes. It is not so for the `T::Item` that a predicate in
-//! scope defines (an enclosing item or a method equates it: `T: Iterator<Item = Rel<T>>`): rustc
-//! normalizes it with that predicate, which names the type whose impl needs the predicate, so the
-//! impl overflows (E0275) while it proves its own predicate.
+//! `Self` or an associated type of an impl goes; an optional type in it does, as the Leaker cannot
+//! tell that an impl proves it (`::std::vec::Vec<T>: Clone` holds only because the predicate says
+//! so, F71), and is no entry. It is not so for the `T::Item` that a predicate in scope defines (an
+//! enclosing item or a method equates it: `T: Iterator<Item = Rel<T>>`): rustc normalizes it with
+//! that predicate, which names the type whose impl needs the predicate, so the impl overflows
+//! (E0275) while it proves its own predicate.
 
 use crate::context::{binds_assoc, bound_text, bounded_ident, hiding_bounds};
 use crate::util::{ident_name, tidy_str, token_names, unwrap_type_group};

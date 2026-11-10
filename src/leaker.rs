@@ -70,7 +70,10 @@ use template_quote::{quote, ToTokens};
 ///   ([`Rules::external_crates()`](crate::Rules::external_crates)): then it is
 ///   no entry, and the copy writes it as it is (you promise that the crate is the same on both
 ///   sides). A type that has a type that depends on the context in it (`::foo::W<Rel>`) is always
-///   an entry.
+///   an entry. Otherwise, one in a bound or a where predicate that names a generic
+///   (`T: Into<::foo::W<T>>`, `::foo::W<T>: Clone`) is no entry, whatever the rule: replaced,
+///   rustc could not prove the predicate for the Repeater's impl (E0277). The copy writes it as it
+///   is, so its crate must resolve there.
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
 /// - Values and bodies are not analyzed unless [`Options::check_values()`] is on.
 ///

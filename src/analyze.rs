@@ -2957,8 +2957,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// Returns the first bound of the generics of `context` that names a type that is leaked, if
-    /// the type being visited is in a predicate of the item. With `optional`, a type that the
-    /// Referrer may replace counts too.
+    /// the type being visited is in a predicate of the item. With `optional`, an optional type (one
+    /// of another crate, which the Referrer replaces) counts too, and in every where predicate.
     fn env_leaked_bound(&mut self, context: &Context, optional: bool) -> Option<TokenStream> {
         if self.env_depth == 0 || !self.check_env {
             return None;
@@ -2973,27 +2973,36 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         if !bounded {
             return None;
         }
-        let mut names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor<'_, A>)| {
+        // A type that must be an entry counts where the environment must prove the bound, and an
+        // optional one counts everywhere.
+        let mut names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor<'_, A>), environment: bool| {
             self.probe(context, |probe| {
                 visit(probe);
-                !probe.musts.is_empty() || (optional && has_optional(&probe.frame.effects))
+                (environment && !probe.musts.is_empty())
+                    || (optional && has_optional(&probe.frame.effects))
             })
         };
         for param in &generics.params {
             if let GenericParam::Type(param) = param {
-                if names_leaked(&|probe| probe.visit_type_param(param)) {
+                if names_leaked(&|probe| probe.visit_type_param(param), true) {
                     return Some(quote!(#param));
                 }
             }
         }
         // A where predicate that is not on a parameter has the types of the leaked type in its
-        // bounded type, and rustc may prove it by an impl: it does not need the environment.
+        // bounded type, and rustc may prove it by an impl: it does not need the environment. A
+        // type that must be an entry is left out there. An optional one is not: the Leaker cannot
+        // tell that an impl proves the predicate (`::std::vec::Vec<T>: Clone` it does not, F71),
+        // and the type may be written as it is.
         generics
             .where_clause
             .iter()
             .flat_map(|where_clause| &where_clause.predicates)
-            .filter(|predicate| needs_environment(predicate, context))
-            .find(|predicate| names_leaked(&|probe| probe.visit_where_predicate(predicate)))
+            .find(|predicate| {
+                let environment = needs_environment(predicate, context);
+                (environment || optional)
+                    && names_leaked(&|probe| probe.visit_where_predicate(predicate), environment)
+            })
             .map(|predicate| quote!(#predicate))
     }
 

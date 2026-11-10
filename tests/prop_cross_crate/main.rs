@@ -2678,6 +2678,7 @@ const SHAPE_TAGS: &[(&str, &str)] = &[
     (gen::TAG_QUALIFIED_PATH, "<T>::X path"),
     (gen::TAG_MACRO_CALL, "macro call"),
     (gen::TAG_WIDE_CONST, "wide const type"),
+    (gen::TAG_OPTIONAL_PREDICATE, "optional type in a predicate"),
     (gen::FORCED_VALUE_PATH, "relative path in a value"),
 ];
 

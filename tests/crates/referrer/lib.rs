@@ -298,6 +298,17 @@ pub mod kinds {
     // the Repeater names the lifetime (F70).
     type_leak_test_leaker::__tl_prop_9234!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
     type_leak_test_leaker::__tl_prop_9235!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
+    // A type of a crate that the rule does not allow, in a where predicate that the context of an
+    // entry carries, is no entry: the copy writes it as it is (F71). The last is the control, whose
+    // type names no generic and stays an entry.
+    type_leak_test_leaker::__tl_prop_9237!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9238!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9239!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9240!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9241!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9242!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9243!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9244!(path = ::type_leak_test_leaker::kinds);
     // Const generics of type `u64` and `u128`: the slot `U64` and the `KEY` of the Repeater.
     type_leak_test_leaker::__tl_prop_9236!(path = ::type_leak_test_leaker::kinds);
 }

@@ -971,7 +971,11 @@ pub mod kinds {
     where
         ::std::vec::Vec<T>: ::core::clone::Clone;
 
-    #[prop_leak(id = 9005, allow_self = false, allow = "::std")]
+    /// F71: `Vec<T>` of `::std` is a type of another crate in the predicate that the context of
+    /// `Cl<T>` carries, and the predicate does not hold without itself (`T` is not `Clone`). It is no
+    /// entry: the copy writes it as it is, and the Repeater's impl of `Cl<T>` holds. Replaced, the copy
+    /// was E0277 (`required for `u32` to implement `Repeater<(T,), ..>``).
+    #[prop_leak(id = 9005, allow_self = false)]
     pub struct Needs<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -2516,6 +2520,108 @@ pub mod kinds {
         pub ::core::marker::PhantomData<dyn ::core::ops::Fn(&::std::vec::Vec<T>) -> &u8>,
         pub Rel,
     );
+
+    // F71 (`tests/findings.rs`): a type of a crate that the rule does not allow, in a where predicate
+    // that the context of an entry carries: it is no entry, and the copy writes it as it is (the
+    // predicate does not hold without itself: `Vec<T>: Clone` needs `T: Clone`). Each fails to
+    // build on the code before the fix, except the controls.
+
+    /// The entry of the fixtures below whose predicate has the type of `::std` in the bound, not
+    /// as the bounded type.
+    pub struct ClInto<T>(pub T)
+    where
+        u8: ::core::convert::Into<::std::vec::Vec<T>>;
+
+    /// The entry of 9238: the predicate names two types of `::std`, one in the other.
+    pub struct ClBox<T>(pub T)
+    where
+        ::std::vec::Vec<::std::boxed::Box<T>>: ::core::clone::Clone;
+
+    /// F71: the type of `::std` is in the bound of the predicate, and the bounded type is no
+    /// generic (`u8`).
+    #[prop_leak(id = 9237, allow_self = false)]
+    pub struct InBound<T>
+    where
+        u8: ::core::convert::Into<::std::vec::Vec<T>>,
+    {
+        pub cl: ClInto<T>,
+    }
+
+    /// F71: nested types of `::std` (`Vec<Box<T>>`): none is an entry.
+    #[prop_leak(id = 9238, allow_self = false)]
+    pub struct NestedBounded<T>
+    where
+        ::std::vec::Vec<::std::boxed::Box<T>>: ::core::clone::Clone,
+    {
+        pub cl: ClBox<T>,
+    }
+
+    /// F71: the type of `::std` is in a field too, and an entry in another field has the predicate in
+    /// its context.
+    #[prop_leak(id = 9239, allow_self = false)]
+    pub struct BoundedAndHeld<T>
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone,
+    {
+        pub held: ::std::vec::Vec<T>,
+        pub cl: Cl<T>,
+    }
+
+    /// F71: no entry but the type in the predicate (`Vec<T>`), whose own context carries it: there
+    /// is none now.
+    #[prop_leak(id = 9240, allow_self = false)]
+    pub struct OnlyBounded<T>
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone,
+    {
+        pub marker: ::core::marker::PhantomData<T>,
+    }
+
+    /// F71: the predicate is a predicate of a method, on a generic of the method.
+    #[prop_leak(id = 9241, allow_self = false)]
+    pub trait BoundedMethod {
+        fn m<U>(&self, a: Cl<U>) -> Cl<U>
+        where
+            ::std::vec::Vec<U>: ::core::clone::Clone;
+    }
+
+    /// F71: the predicate is a predicate of the trait.
+    #[prop_leak(id = 9242, allow_self = false)]
+    pub trait BoundedTrait<T>
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone,
+    {
+        fn m(&self, a: Cl<T>) -> Cl<T>;
+    }
+
+    /// F71: the predicate is a predicate of the impl.
+    #[prop_leak(id = 9243, allow_self = false)]
+    impl<T> Holder<T>
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone,
+    {
+        pub fn bounded(&self, a: Cl<T>) -> Cl<T> {
+            a
+        }
+    }
+
+    /// The entry of 9244: its predicate has a type of `::std` that names no generic, and a bound that
+    /// names one (`U`).
+    pub struct ClConcrete<U>(pub U)
+    where
+        ::std::vec::Vec<u8>: ::core::convert::Into<U>;
+
+    /// Control, the shape that compiled before: `Vec<u8>` names no generic, so its context is empty
+    /// and carries no predicate, and it is an entry that the copy replaces, as `Wrap<Rel>` is. The
+    /// predicate is in the context of `ClConcrete<U>`: the copy's environment has it normalized,
+    /// as `Vec<u8>` has no bounds to prove.
+    #[prop_leak(id = 9244, allow_self = false)]
+    pub struct ConcreteBounded<U>
+    where
+        ::std::vec::Vec<u8>: ::core::convert::Into<U>,
+    {
+        pub cl: ClConcrete<U>,
+    }
 
     /// A type with const parameters of the two types that `RepeaterSlots` puts where no other goes.
     pub struct Keyed<const N: u64, const M: u128>;

@@ -98,6 +98,14 @@
 //! most of the instantiations, and the copy must name the elided lifetime, written by the use site
 //! (F69) or by the path through the Repeater that replaces the entry (F70).
 //!
+//! A where predicate of a struct, an enum or a union on a type of another crate that names a type
+//! parameter and holds only because the predicate says so (`::std::vec::Vec<T>: Clone`, `String:
+//! Into<Vec<T>>`, `Vec<Box<T>>: Clone`, `OPTIONAL_PREDICATE_PERCENT`, F71), for a parameter that no
+//! signature above names and that has no `Clone` bound, and in most of them one more field of a type
+//! of the Leaker's crate that names the parameter (`crate::base::B1<T>`), an entry whose context has the
+//! predicate. The type of the predicate is no entry, and the copy writes it as it is. Its impls have
+//! the predicate too. The tag is `optional_predicate` (`SHAPE_TAGS`); the Leaker accepts it.
+//!
 //! Not generated: type macros (the test macro's witness cannot return a type that a macro
 //! expands to), and unsized or `dyn` implementors. Const expressions with types in them, and the
 //! values of items, only with `Flags::values`; paths of `std` without the leading `::`, only with
@@ -719,6 +727,10 @@ pub const TAG_DISCRIMINANT: &str = "discriminant";
 pub const TAG_QUALIFIED_PATH: &str = "qualified_path";
 pub const TAG_MACRO_CALL: &str = "macro_call";
 pub const TAG_WIDE_CONST: &str = "wide_const";
+/// `optional_predicate`: a where predicate of a struct, an enum or a union names a type of another
+/// crate that holds only because the predicate says so (`::std::vec::Vec<T>: Clone`), F71; the
+/// Leaker accepts it, and the copy writes the type as it is. An impl of such an item has it too.
+pub const TAG_OPTIONAL_PREDICATE: &str = "optional_predicate";
 /// The shapes the Leaker must reject, under the settings of every item (`main.rs`, `FORCED`, which
 /// says which `Reason` rejects each). Of the tags above `nested_self_in_bounds`,
 /// `self_without_meaning`, `self_in_default` and `unreadable_value` are such shapes. The others are
@@ -887,6 +899,16 @@ const ELIDED_PARAM_PERCENT: u32 = 30;
 /// only then does the path through the Repeater name the lifetimes of the use site (F70): so it is
 /// made often.
 const ELIDED_ENTRY_PERCENT: u32 = 80;
+/// The share of the structs, enums and unions with a type parameter that no field above names in a
+/// signature that relies on elision, and that has no `Clone` bound, that have one more where predicate:
+/// a type of another crate (`::std::vec::Vec<T>: Clone`, `String: Into<Vec<T>>`, `Vec<Box<T>>: Clone`) that
+/// holds only because the predicate says so, and most of them one more field of a type of the Leaker's
+/// crate that names the parameter, whose entry has the predicate in its context
+/// ([`optional_predicate()`]). The copy writes the type as it is (F71): a Referrer that replaced it
+/// failed to compile.
+const OPTIONAL_PREDICATE_PERCENT: u32 = 50;
+/// ... and the share of those that have the field.
+const OPTIONAL_PREDICATE_FIELD_PERCENT: u32 = 60;
 
 // ---------------------------------------------------------------------------------------------
 // The model: bounds, types, the generics in scope.
@@ -4638,6 +4660,7 @@ impl Gen {
         // state, which draws nothing. An enum's variant with no field is written without a draw
         // for its style, so it is left as it is: the other choices of the generator are the same
         // with or without the field.
+        let mut elided_names: Vec<String> = Vec::new();
         let elided_tag = format!("elided_param {}", name);
         if !sk.tys.is_empty() && self.hash_percent(elided_tag.as_bytes(), ELIDED_PARAM_PERCENT) {
             let draw = self.hash_draw(format!("{} shape", elided_tag).as_bytes());
@@ -4648,6 +4671,7 @@ impl Gen {
                 .find(|fields| kind != AdtKind::Enum || !fields.is_empty())
             {
                 used_tys.insert(param.name.clone());
+                elided_names.push(param.name.clone());
                 fields.push(if kind == AdtKind::Union {
                     format!("::core::mem::ManuallyDrop<{}>", text)
                 } else {
@@ -4673,6 +4697,7 @@ impl Gen {
                 .find(|fields| kind != AdtKind::Enum || !fields.is_empty())
             {
                 used_tys.insert(param.name.clone());
+                elided_names.push(param.name.clone());
                 fields.push(if kind == AdtKind::Union {
                     format!("::core::mem::ManuallyDrop<{}>", text)
                 } else {
@@ -4680,6 +4705,55 @@ impl Gen {
                 });
             }
         }
+        // A where predicate that names a type of another crate and a type parameter, and holds only
+        // because it is a predicate (`OPTIONAL_PREDICATE_PERCENT`, F71): the type is no entry, and the
+        // copy writes it as it is. For most of the items a field names the parameter in a type of the
+        // Leaker's crate, an entry whose context has the predicate. The predicate is added to the
+        // where clause below, after the draws of the predicates and the defaults, so that nothing
+        // else changes.
+        let optional_tag = format!("optional_predicate {}", name);
+        let optional_predicate =
+            if self.hash_percent(optional_tag.as_bytes(), OPTIONAL_PREDICATE_PERCENT) {
+                let draw = self.hash_draw(format!("{} shape", optional_tag).as_bytes());
+                let free: Vec<&TyParam> = sk
+                    .tys
+                    .iter()
+                    .filter(|t| {
+                        t.sized
+                            && !t.iter
+                            && t.fixed_item == 0
+                            && t.bound_texts.iter().all(|text| marker_bound(text))
+                            && !t.bounds.clone
+                            && !t
+                                .bound_texts
+                                .iter()
+                                .any(|text| text.contains("Clone") || text.contains("Copy"))
+                            && !elided_names.contains(&t.name)
+                    })
+                    .collect();
+                if free.is_empty() {
+                    None
+                } else {
+                    let param = free[(draw / 100) as usize % free.len()].name.clone();
+                    if (draw / 10_000) % 100 < u64::from(OPTIONAL_PREDICATE_FIELD_PERCENT) {
+                        let field = format!("crate::base::B1<{}>", param);
+                        if let Some(fields) = variants
+                            .iter_mut()
+                            .find(|fields| kind != AdtKind::Enum || !fields.is_empty())
+                        {
+                            used_tys.insert(param.clone());
+                            fields.push(if kind == AdtKind::Union {
+                                format!("::core::mem::ManuallyDrop<{}>", field)
+                            } else {
+                                field
+                            });
+                        }
+                    }
+                    Some((param.clone(), optional_predicate(&param, draw / 1_000_000)))
+                }
+            } else {
+                None
+            };
         // Every type and lifetime parameter must be used.
         let mut phantoms: Vec<String> = Vec::new();
         for l in &sk.lifetimes {
@@ -4699,6 +4773,14 @@ impl Gen {
         self.preds(Level::Item, &sc, &mut sk, 2);
         self.self_prob = saved_prob;
         self.defaults(&mut sk, false);
+        // Not for a parameter with a default: rustc checks the predicate for the default (`T =
+        // (Vec<u8>, ..)` does not satisfy `String: Into<Vec<T>>`).
+        if let Some((param, predicate)) = optional_predicate {
+            if !sk.defaults.iter().any(|(name, _)| *name == param) {
+                sk.preds.push(predicate);
+                self.tags.insert(TAG_OPTIONAL_PREDICATE.to_string());
+            }
+        }
 
         let attr = self.attr_with(ann, scope);
         let params = sk.params_decl();
@@ -7258,6 +7340,32 @@ fn elided_param_signature(param: &str, sized: bool, draw: u64) -> String {
         1 => format!("for<'hp> fn(&'hp {}) -> &u8", param),
         2 => format!("::std::boxed::Box<dyn ::core::ops::Fn(&{}) -> &u8>", param),
         _ => format!("fn(&::core::cell::Cell<[{}; 1]>) -> &u8", param),
+    }
+}
+
+/// A where predicate on a type of `::std` that names the type parameter `param` (`Sized`, with no
+/// `Clone` bound): most hold only because the predicate says so (`Vec<T>` is `Clone` only for a
+/// `Clone` parameter), one is provable without it (`&Vec<T>: IntoIterator`, which the Leaker cannot
+/// tell from the others). `draw` chooses.
+fn optional_predicate(param: &str, draw: u64) -> String {
+    match draw % 5 {
+        0 => format!("::std::vec::Vec<{}>: ::core::clone::Clone", param),
+        1 => format!(
+            "::std::string::String: ::core::convert::Into<::std::vec::Vec<{}>>",
+            param
+        ),
+        2 => format!(
+            "::std::vec::Vec<::std::boxed::Box<{}>>: ::core::clone::Clone",
+            param
+        ),
+        3 => format!(
+            "for<'hq> &'hq ::std::vec::Vec<{}>: ::core::iter::IntoIterator",
+            param
+        ),
+        _ => format!(
+            "::std::collections::BTreeMap<{}, ::std::string::String>: ::core::clone::Clone",
+            param
+        ),
     }
 }
 

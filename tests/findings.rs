@@ -79,6 +79,7 @@
 //! | `f68_every_unstable_bound_keeps_an_optional_self_type_from_being_an_entry` | the optional self type of an impl, next to an entry in a predicate whose context has a bound that names `Self`, stayed an optional entry when another bound of the context names a leaked or optional type (`X: AsRef<(&'static ::ext::B0, bool)>`): only the first unstable bound was looked at, so the copy replaced it and was E0277; every unstable bound counts now, and it is written as it is | fixed |
 //! | `f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetimes` | `UseSite::substitute()` and `complete_args()` wrote an argument with lifetimes into `fn(&Cell<[U; 1]>) -> &u8` (or `Fn(&U) -> &u8`, `Self` with lifetimes): two lifetimes in the inputs, E0106; the elided one is named with a `for<'e>` binder | fixed |
 //! | `f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_lifetimes_into_its_inputs` | the Visitor wrote the path through the Repeater of an entry whose arguments name lifetimes (`entry_args()` at a use site with `&'static str`) into `fn(&Vec<T>) -> &u8` (or `Fn(&Vec<T>) -> &u8`): two lifetimes in the inputs, E0106; the elided one is named after `type_fn` has written | fixed |
+//! | `f71_an_optional_type_in_a_where_predicate_that_a_context_carries_is_written_as_it_is` | an optional type (a type of another crate) in a where predicate that is not a bound of a generic (`::std::vec::Vec<T>: Clone`), carried by the context of an entry, was an optional entry that the copy replaced: the Repeater's impl of the entry needs the predicate, which the copy's environment has only in the form that names the path, so E0277 (the fixture 9005 allowed `::std` to hide it); it is written as it is, as for the bound cycles of F17, F18 and F68 | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -15183,4 +15184,350 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         complete("u8"),
         expected(&["u8", &format!("fn(&{}) -> &u8", p_u8)])
     );
+}
+
+// ── F71 ──────────────────────────────────────────────────────────────────────
+
+/// What a Referrer makes of `item` (analyzed with the rule `config`): the errors of the analysis,
+/// the entries (as written), and the copy, with each entry replaced by `P<ix>`.
+fn f71_copy<A: Allow>(config: A, item: &Item) -> (Vec<Reason>, Vec<String>, String) {
+    let mut leaker = Leaker::from_config(config, Options::new());
+    let context = intern(&mut leaker, item);
+    let (referrer, errors) = leaker.result().into_parts();
+    let entries = common::types(&referrer).map(string).collect();
+    let mut copy = item.clone();
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut copy);
+    (
+        errors.iter().map(|e| e.reason).collect(),
+        entries,
+        string(&copy),
+    )
+}
+
+/// F71 (fixed): an optional type in a where predicate that the context of an entry carries was an
+/// optional entry, which the copy replaced, and the Repeater's impl of the entry did not hold
+/// there (E0277).
+///
+/// Trigger, with a Leaker that does not allow `::std` (the cross-crate fixture 9005, `allow =
+/// "::std"` hid it): `struct Cl<T>(T) where ::std::vec::Vec<T>: Clone;` and `struct Needs<T> where
+/// ::std::vec::Vec<T>: Clone { cl: Cl<T> }`. `Vec<T>` is an optional entry, and so is `Cl<T>`
+/// (required), whose context has the predicate: the Repeater's impl has `where Vec<T>: Clone` for
+/// each of them. The copy has `where <u32 as Repeater<(T,), ..>>::Type: Clone` and `cl: <u32 as
+/// Repeater<(T,), ..>>::Type`. To use a path through the Repeater rustc proves the where clause of
+/// its impl, `Vec<T>: Clone`, in the environment of the copy, which has the predicate only in the
+/// form that names the path: E0277 "the trait bound `T: Clone` is not satisfied", "required for
+/// `Vec<T>` to implement `Clone`", "required for `u32` to implement `Repeater<(T,), ..>`" (stable
+/// 1.99.1; the copy of a trait, an impl and a struct all fail). It was no problem while the
+/// optional entries were left as written by a Referrer that did not replace them.
+///
+/// What breaks, found by building the copies of each shape with the Leaker and the Referrer of the
+/// cross-crate fixtures: every type of another crate that names a generic and is in a where
+/// predicate that is not a bound of the generic itself, whether it is the bounded type
+/// (`Vec<T>: Clone`), in the bound (`u8: Into<Vec<T>>`, `Vec<T>: Into<U>`), nested (`Vec<Box<T>>:
+/// Clone`), behind a reference (`for<'a> &'a Vec<T>: IntoIterator`), or in the predicate of a
+/// method (on a generic of the method), of a trait or of an impl; whether it is the only entry, an
+/// entry beside it has the predicate in its context, or it is in a field too. A type that names no
+/// generic (`Vec<u8>: Clone`) has an empty context, so no predicate in it, and breaks nothing: the
+/// impl of an entry whose context carries that predicate finds it normalized in the environment
+/// (`Vec<u8>: Into<U>`, a control).
+///
+/// Cause: the check of F2 and F17 (`env_leaked_bound()`) looked at the bounds of the generics of the
+/// context and at the where predicates on a generic (`T: Into<::ext::W<T>>`, `T::Item: Clone`), and
+/// left the others out: their bounded type is no generic, and "rustc proves it by an impl", which
+/// does not need the environment (F33 says so too). That is so for `Wrap<T>: Default`, but not for
+/// `::std::vec::Vec<T>: Clone`, whose impl needs `T: Clone`, which only the predicate says. The
+/// Leaker cannot tell the two.
+///
+/// Fix: an optional type in any where predicate of a context counts as one in the bound of a generic
+/// (`env_leaked_bound()` asks for the optional types in every predicate; a type that must be an
+/// entry still counts only where the environment must prove the bound): it is no optional entry,
+/// wherever it is, and the copy writes it as it is, as for the bound cycles of F17, F18 and F68. No
+/// error. A type in a predicate that its context does not carry (it names no generic) stays an
+/// entry, and so does every optional type in no predicate. The cost is that of the bound cycles:
+/// the crate of the type must resolve in the Referrer's crate. The Leaker writes as it is also what
+/// an impl would prove (`T: Clone` beside `Vec<T>: Clone`, `Vec<&'a T>: Clone`, `Vec<[u8; N]>:
+/// Debug` were entries that compiled).
+///
+/// Limitations: a type that must be an entry cannot be written as it is: a relative path
+/// (`Pair<T, T>: Clone` in the context of an entry; `Pair` derives `Clone`, which needs `T: Clone`),
+/// or a primitive type that the rule does not allow (`BTreeMap<T, u8>: Clone` with `primitive`
+/// off: `u8` is one, so the map is) is the same E0277 in the copy, and the Leaker, which assumes
+/// that an impl proves such a predicate, does not reject it. A predicate of a method that names a
+/// generic of the item only (`fn m(&self, a: Cl<T>) where Vec<T>: Clone`) is not in the context of
+/// `Cl<T>`, so the impl of the entry does not hold in the Leaker's crate (E0277 there, with and
+/// without the fix).
+///
+/// The property test shows it (`optional_predicate`: a predicate on a type of `::std` that names a
+/// parameter is added to a share of the structs, enums and unions, with a field of an entry that has
+/// it in its context in most of them; and the predicates `B1<X>: Default` that it already wrote, on
+/// a type of the Leaker's own crate, which its rule does not allow, are no entries any more). There
+/// are cross-crate fixtures in `tests/cross_crate.rs` (9005, 9237 to 9244): each but the control
+/// 9244 failed to build on the code before the fix.
+#[test]
+fn f71_an_optional_type_in_a_where_predicate_that_a_context_carries_is_written_as_it_is() {
+    // The entries of the item, and the copy: the item with each entry replaced by `P<ix>`.
+    let cases: Vec<(Item, Vec<&str>)> = vec![
+        // The bounded type, with the entry that has the predicate in its context (the fixture 9005).
+        (
+            parse_quote!(
+                pub struct S<T>
+                where
+                    ::std::vec::Vec<T>: ::core::clone::Clone,
+                {
+                    pub cl: Cl<T>,
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        // The type in the bound of a predicate on a type that is no generic, and in one on another.
+        (
+            parse_quote!(
+                pub struct S<T>
+                where
+                    u8: ::core::convert::Into<::std::vec::Vec<T>>,
+                {
+                    pub cl: Cl<T>,
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        (
+            parse_quote!(
+                pub struct S<T, U>
+                where
+                    ::std::vec::Vec<T>: ::core::convert::Into<U>,
+                {
+                    pub cl: Cl<U>,
+                }
+            ),
+            vec!["Cl < U >"],
+        ),
+        // Nested: neither type is an entry.
+        (
+            parse_quote!(
+                pub struct S<T>
+                where
+                    ::std::vec::Vec<::std::boxed::Box<T>>: ::core::clone::Clone,
+                {
+                    pub cl: Cl<T>,
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        // Behind a reference with a binder.
+        (
+            parse_quote!(
+                pub struct S<T>
+                where
+                    for<'a> &'a ::std::vec::Vec<T>: ::core::iter::IntoIterator,
+                {
+                    pub cl: Cl<T>,
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        // The type is in a field too: the same type in the same context is no entry there either.
+        (
+            parse_quote!(
+                pub struct S<T>
+                where
+                    ::std::vec::Vec<T>: ::core::clone::Clone,
+                {
+                    pub held: ::std::vec::Vec<T>,
+                    pub cl: Cl<T>,
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        // No other entry: the type in the predicate was the only one, and its own context carries it.
+        (
+            parse_quote!(
+                pub struct S<T>
+                where
+                    ::std::vec::Vec<T>: ::core::clone::Clone,
+                {
+                    pub marker: ::core::marker::PhantomData<T>,
+                }
+            ),
+            vec![],
+        ),
+        // The predicate of a method (on a generic of the method), of a trait and of an impl.
+        (
+            parse_quote!(
+                pub trait Tr {
+                    fn m<U>(&self, a: Cl<U>) -> Cl<U>
+                    where
+                        ::std::vec::Vec<U>: ::core::clone::Clone;
+                }
+            ),
+            vec!["Cl < U >"],
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<T>
+                where
+                    ::std::vec::Vec<T>: ::core::clone::Clone,
+                {
+                    fn m(&self, a: Cl<T>) -> Cl<T>;
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        (
+            parse_quote!(
+                impl<T> Holder<T>
+                where
+                    ::std::vec::Vec<T>: ::core::clone::Clone,
+                {
+                    pub fn m(&self, a: Cl<T>) -> Cl<T> {
+                        a
+                    }
+                }
+            ),
+            vec!["Cl < T >", "Holder < T >"],
+        ),
+        // What an impl would prove (`T: Clone` is a bound of the generic), a lifetime, a const: the
+        // Leaker cannot tell, the type is written as it is.
+        (
+            parse_quote!(
+                pub struct S<T: ::core::clone::Clone>
+                where
+                    ::std::vec::Vec<T>: ::core::clone::Clone,
+                {
+                    pub cl: Cl<T>,
+                }
+            ),
+            vec!["Cl < T >"],
+        ),
+        (
+            parse_quote!(
+                pub struct S<'a, T: 'a>
+                where
+                    ::std::vec::Vec<&'a T>: ::core::clone::Clone,
+                {
+                    pub cl: Cl<&'a T>,
+                }
+            ),
+            vec!["Cl < & 'a T >"],
+        ),
+        (
+            parse_quote!(
+                pub struct S<const N: usize>
+                where
+                    ::std::vec::Vec<[u8; N]>: ::core::fmt::Debug,
+                {
+                    pub cl: Cl<[u8; N]>,
+                }
+            ),
+            vec!["Cl < [u8 ; N] >"],
+        ),
+    ];
+    for (item, entries) in &cases {
+        // The types of `::std` are no entries whether the Leaker trusts `::std` or not.
+        for trusting in [false, true] {
+            let (errors, found, copy) = if trusting {
+                f71_copy(Rules::new().primitive().prelude().external_crates(), item)
+            } else {
+                f71_copy(Rules::new().primitive().prelude(), item)
+            };
+            assert_eq!(errors, [], "{}", string(item));
+            assert_eq!(&found, entries, "{}", string(item));
+            // The copy is the item, with the entries replaced and the types of `::std` as written.
+            let mut expected = string(item);
+            for (ix, entry) in entries.iter().enumerate() {
+                expected = expected.replace(entry, &format!("P < {}usize >", ix));
+            }
+            assert_eq!(copy, expected, "{}", string(item));
+        }
+    }
+
+    // Controls, what was an entry and is. A type that names no generic: its context is empty (it
+    // has no predicate), and the entry that carries the predicate finds it normalized.
+    let concrete: Item = parse_quote!(
+        pub struct S<U>
+        where
+            ::std::vec::Vec<u8>: ::core::convert::Into<U>,
+        {
+            pub cl: Cl<U>,
+        }
+    );
+    let (errors, entries, copy) = f71_copy(Rules::new().primitive().prelude(), &concrete);
+    assert_eq!(errors, []);
+    assert_eq!(entries, ["Cl < U >", ":: std :: vec :: Vec < u8 >"]);
+    assert_eq!(
+        copy,
+        string(&concrete)
+            .replace("Cl < U >", "P < 0usize >")
+            .replace(":: std :: vec :: Vec < u8 >", "P < 1usize >")
+    );
+    // The type of another generic: it has no predicate in its context.
+    let other: Item = parse_quote!(
+        pub struct S<T, U>
+        where
+            ::std::vec::Vec<T>: ::core::clone::Clone,
+        {
+            pub v: ::std::vec::Vec<U>,
+            pub cl: Cl<T>,
+        }
+    );
+    let (errors, entries, copy) = f71_copy(Rules::new().primitive().prelude(), &other);
+    assert_eq!(errors, []);
+    assert_eq!(entries, ["Cl < T >", ":: std :: vec :: Vec < U >"]);
+    assert_eq!(
+        copy,
+        string(&other)
+            .replace("Cl < T >", "P < 0usize >")
+            .replace(":: std :: vec :: Vec < U >", "P < 1usize >")
+    );
+    // No predicate: the type is an entry, unless the Leaker trusts `::std`.
+    let plain: Item = parse_quote!(
+        pub struct S<T> {
+            pub v: ::std::vec::Vec<T>,
+        }
+    );
+    let (_, entries, _) = f71_copy(Rules::new().primitive().prelude(), &plain);
+    assert_eq!(entries, [":: std :: vec :: Vec < T >"]);
+    let (_, entries, _) = f71_copy(Rules::new().primitive().prelude().external_crates(), &plain);
+    assert_eq!(entries, Vec::<String>::new());
+    // The bound of a generic: no entry before the fix either (F2, F17).
+    let bound: Item = parse_quote!(
+        pub struct S<T: ::core::convert::Into<::std::vec::Vec<T>>> {
+            pub cl: Cl<T>,
+        }
+    );
+    let (_, entries, _) = f71_copy(Rules::new().primitive().prelude(), &bound);
+    assert_eq!(entries, ["Cl < T >"]);
+
+    // The limitation: a type that must be an entry is in the predicate, and the copy replaces it.
+    let required: Item = parse_quote!(
+        pub struct S<T>
+        where
+            Pair<T, T>: ::core::clone::Clone,
+        {
+            pub cl: Cl<T>,
+        }
+    );
+    let (errors, entries, _) = f71_copy(Rules::new().primitive().prelude(), &required);
+    assert_eq!(errors, []);
+    assert_eq!(entries, ["Cl < T >", "Pair < T , T >"]);
+    // The same for a primitive type that the rule does not allow, which must be an entry: the map
+    // that holds it is one (and the map without it is not).
+    let primitive: Item = parse_quote!(
+        pub struct S<T>
+        where
+            ::std::collections::BTreeMap<T, u8>: ::core::clone::Clone,
+        {
+            pub cl: Cl<T>,
+        }
+    );
+    let (errors, entries, _) = f71_copy(Rules::new().prelude(), &primitive);
+    assert_eq!(errors, []);
+    assert_eq!(
+        entries,
+        [":: std :: collections :: BTreeMap < T , u8 >", "Cl < T >"]
+    );
+    let (_, entries, _) = f71_copy(Rules::new().primitive().prelude(), &primitive);
+    assert_eq!(entries, ["Cl < T >"]);
 }
