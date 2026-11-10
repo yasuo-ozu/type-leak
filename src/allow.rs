@@ -1,81 +1,228 @@
-//! What the Leaker accepts of its errors: the one set of rules behind `allow*()` of both
-//! [`LeakerConfig`](crate::LeakerConfig) and [`LeakerResult`](crate::LeakerResult).
+//! The rules of what a [`Leaker`](crate::Leaker) leaves as written and accepts: [`Allow`], and the
+//! filter that applies them to errors. [`LeakerResult`](crate::LeakerResult) applies them too.
 
-use crate::error::{Cause, ErrorItem};
-use crate::util::{path_starts_with, primitive_paths, std_crate_paths, std_prelude_paths};
+#[cfg(doc)]
+use crate::error::Cause;
+use crate::error::ErrorItem;
+use crate::util::{ask_rule, heads_self, starts_with_known, Known, STD_CRATES};
+#[cfg(doc)]
+use crate::view::View;
 use proc_macro2::TokenStream;
+use std::fmt;
 use syn::Path;
 use template_quote::ToTokens;
 
-/// Rules that accept errors. An error is accepted when any rule applies:
+/// What a [`Leaker`](crate::Leaker) leaves as written and accepts. Pass it to
+/// [`Leaker::from_config()`](crate::Leaker::from_config).
 ///
-/// - its cause equals one of `causes` (the same kind and tokens, spans ignored);
-/// - `values` is set and it was found in a value ([`ErrorItem::in_value`]);
-/// - `defaults` is set and it was found in a default ([`ErrorItem::in_default`]);
-/// - it has relative paths ([`ErrorItem::paths`]) and each starts with one of `paths`; if only some
-///   do, the error stays without them.
+/// The methods accept the same errors as those of [`LeakerResult`](crate::LeakerResult). Here the
+/// path rules also keep the paths out of the entries; on a result they only drop errors. `P` and
+/// `E` are the types of its rules on paths and on errors, which the methods build.
 ///
-/// The `paths` also make those paths context-free during the analysis, when the rules are those of
-/// a `LeakerConfig`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct Allow {
-    paths: Vec<Path>,
-    causes: Vec<Cause>,
-    values: bool,
-    defaults: bool,
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// // You promise that `::serde` is the same crate on both sides.
+/// let allow = Allow::new()
+///     .allow_primitive()
+///     .allow_prelude()
+///     .allow_path_if(|p| p.leading_colon.is_some() && p.segments[0].ident == "serde");
+/// let mut leaker = Leaker::from_config(allow, false, false);
+/// // `Vec` and `u8` are allowed, so only `MyType` is leaked.
+/// let item: ItemStruct = parse_quote!(struct S { a: Vec<u8>, b: MyType });
+/// leaker.intern_struct(&item, true);
+/// assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
+/// ```
+///
+/// Each method returns another type, so choose a built-in rule at run time inside one closure with
+/// the functions [`is_primitive_path()`] and the like:
+///
+/// ```
+/// # use type_leak::*;
+/// # let primitive = true;
+/// let allow = Allow::new().allow_path_if(move |p| primitive && is_primitive_path(p));
+/// # let _ = Leaker::from_config(allow, false, false);
+/// ```
+#[derive(Clone)]
+pub struct Allow<P = fn(&Path) -> bool, E = fn(&ErrorItem) -> bool> {
+    /// Set by [`Allow::allow_path_if()`] and the like.
+    pub(crate) paths: P,
+    /// Set by [`Allow::allow()`] and the like.
+    pub(crate) errors: E,
+}
+
+impl<P, E> fmt::Debug for Allow<P, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Allow").finish_non_exhaustive()
+    }
 }
 
 impl Allow {
-    pub(crate) fn cause(&mut self, cause: Cause) {
-        self.causes.push(cause);
+    /// Creates rules that allow nothing.
+    pub fn new() -> Self {
+        let paths: fn(&Path) -> bool = |_| false;
+        let errors: fn(&ErrorItem) -> bool = |_| false;
+        Self { paths, errors }
+    }
+}
+
+impl Default for Allow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Allow<P, E> {
+    /// Accepts the errors for which `rule` returns `true`: the part is copied as written. Rules add
+    /// up: an error is accepted if any of them accepts it. See
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
+    pub fn allow<F: Fn(&ErrorItem) -> bool>(
+        self,
+        rule: F,
+    ) -> Allow<P, impl Fn(&ErrorItem) -> bool> {
+        let errors = self.errors;
+        Allow {
+            paths: self.paths,
+            errors: move |error: &ErrorItem| errors(error) || rule(error),
+        }
     }
 
-    pub(crate) fn path(&mut self, path: Path) {
-        self.paths.push(path);
+    /// Leaves the paths for which `rule` returns `true` as written instead of leaking them, such
+    /// as `::serde`. Rules add up.
+    ///
+    /// The rule sees each path without its generic arguments (which are still analyzed), as
+    /// [`ErrorItem::paths`] has it: a relative path, or an absolute one in a type, but not
+    /// `::core::..` or `$crate::..`. It is never asked about a path that starts with `Self` or a
+    /// generic in scope. It is called on every check of a path: keep it cheap. You promise that an
+    /// allowed crate is the same on both sides. An error whose relative paths are all allowed is
+    /// accepted.
+    ///
+    /// Another absolute path (`::serde::Wrap<(Rel,)>`) is leaked as an *optional entry*
+    /// ([`Referrer::must()`](crate::Referrer::must) is `false`), which the Referrer replaces or not
+    /// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)).
+    /// `::core::..` and `$crate::..` are never optional. An absolute type that names the `Self` of
+    /// a nested struct, enum or union (`::serde::Wrap<Self>` in [`View::visit_item()`]) is copied
+    /// as written whatever the Referrer chooses
+    /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)).
+    pub fn allow_path_if<F: Fn(&Path) -> bool>(self, rule: F) -> Allow<impl Fn(&Path) -> bool, E> {
+        let paths = self.paths;
+        Allow {
+            paths: move |path: &Path| paths(path) || rule(path),
+            errors: self.errors,
+        }
     }
 
-    pub(crate) fn primitive(&mut self) {
-        self.paths.extend(primitive_paths());
+    /// Allows the primitive types (`u8`, `bool`, `str`, ...): [`is_primitive_path()`].
+    pub fn allow_primitive(self) -> Allow<impl Fn(&Path) -> bool, E> {
+        self.allow_path_if(is_primitive_path)
     }
 
-    pub(crate) fn prelude(&mut self) {
-        self.paths.extend(std_prelude_paths());
+    /// Allows the names of the standard prelude (`Vec`, `Option`, `Clone`, ...):
+    /// [`is_prelude_path()`].
+    ///
+    /// Without it, a relative `Clone` in `trait Tr: Clone` is an error, and `Vec<T>` is leaked
+    /// whole. You promise that the copy does not shadow the names.
+    ///
+    /// The names are those of the prelude of every edition, as of Rust 1.56. A name that a later
+    /// prelude added is left out, as the copy may be older: `TryFrom`, `TryInto`, `FromIterator`,
+    /// `Future`, `IntoFuture`, `size_of`, `size_of_val`, `align_of` and `align_of_val`. The help
+    /// gives their absolute paths. `Sized` is allowed as a bound; `?Sized` needs no option.
+    pub fn allow_prelude(self) -> Allow<impl Fn(&Path) -> bool, E> {
+        self.allow_path_if(is_prelude_path)
     }
 
-    pub(crate) fn std_crates(&mut self) {
-        self.paths.extend(std_crate_paths());
+    /// Allows the relative paths that start with `std`, `core` or `alloc`: [`is_std_crate_path()`].
+    /// A path with a leading `::` is context-free in any case.
+    pub fn allow_std_crates(self) -> Allow<impl Fn(&Path) -> bool, E> {
+        self.allow_path_if(is_std_crate_path)
     }
 
-    pub(crate) fn crate_root(&mut self) {
-        self.paths.push(syn::parse_quote!(crate));
+    /// Allows paths that start with `crate`: [`is_crate_path()`].
+    ///
+    /// Use it only if the copy is in the same crate as the item: `crate::Foo` names another type
+    /// in another crate.
+    pub fn allow_crate(self) -> Allow<impl Fn(&Path) -> bool, E> {
+        self.allow_path_if(is_crate_path)
     }
 
-    pub(crate) fn values(&mut self) {
-        self.values = true;
+    /// Accepts the errors found in a value: a const or static value, the body of a function, a
+    /// trait's default value or body. It has an effect only with the `check_values` argument of
+    /// [`Leaker::from_config()`](crate::Leaker::from_config).
+    pub fn allow_values(self) -> Allow<P, impl Fn(&ErrorItem) -> bool> {
+        self.allow(|error| error.in_value)
     }
 
-    pub(crate) fn defaults(&mut self) {
-        self.defaults = true;
+    /// Accepts the errors found in a default: a default body or an associated const default of a
+    /// trait, and the default of a generic parameter (`U = Rel<'_>`, `T = Wrap<Self>`).
+    pub fn allow_default(self) -> Allow<P, impl Fn(&ErrorItem) -> bool> {
+        self.allow(|error| error.in_default)
     }
+}
 
-    /// The allowed paths, which are context-free for the analysis of a Leaker.
-    pub(crate) fn paths(&self) -> &[Path] {
-        &self.paths
-    }
+/// The rule of [`Allow::allow_primitive()`]: a relative path that starts with a primitive type name.
+///
+/// A rule sees paths without generic arguments ([`Allow::allow_path_if()`]).
+pub fn is_primitive_path(path: &Path) -> bool {
+    starts_with_known(path, Known::Primitive)
+}
 
-    /// Returns `true` if the path `path` of an error is allowed.
-    fn allows_path(&self, path: &Path) -> bool {
-        self.paths
+/// The rule of [`Allow::allow_prelude()`]: a relative path that starts with a name of the prelude.
+///
+/// A rule sees paths without generic arguments ([`Allow::allow_path_if()`]).
+pub fn is_prelude_path(path: &Path) -> bool {
+    starts_with_known(path, Known::Prelude)
+}
+
+/// The rule of [`Allow::allow_std_crates()`]: a relative path that starts with `std`, `core` or
+/// `alloc`.
+///
+/// A rule sees paths without generic arguments ([`Allow::allow_path_if()`]).
+pub fn is_std_crate_path(path: &Path) -> bool {
+    path.leading_colon.is_none()
+        && path
+            .segments
+            .first()
+            .map_or(false, |seg| STD_CRATES.iter().any(|name| seg.ident == name))
+}
+
+/// The rule of [`Allow::allow_crate()`]: a relative path that starts with `crate`.
+///
+/// A rule sees paths without generic arguments ([`Allow::allow_path_if()`]).
+pub fn is_crate_path(path: &Path) -> bool {
+    path.leading_colon.is_none()
+        && path
+            .segments
+            .first()
+            .map_or(false, |seg| seg.ident == "crate")
+}
+
+/// Returns `true` if `path` starts with `prefix`, segment by segment by identifier.
+///
+/// Both must have a leading `::` or neither; the generic arguments of the segments are ignored. A
+/// rule sees paths without generic arguments ([`Allow::allow_path_if()`]).
+pub fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    prefix.leading_colon.is_some() == path.leading_colon.is_some()
+        && prefix.segments.len() <= path.segments.len()
+        && prefix
+            .segments
             .iter()
-            .any(|allowed| path_starts_with(path, allowed))
+            .zip(path.segments.iter())
+            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
+}
+
+impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Allow<P, E> {
+    /// Returns `true` if the rules accept `error`: the rule on errors accepts it, or it has
+    /// relative paths ([`ErrorItem::paths`]) and the rule on paths accepts each. If only some are
+    /// accepted, the error stays without them ([`filter()`](Self::filter)).
+    pub(crate) fn accepts(&self, error: &ErrorItem) -> bool {
+        (self.errors)(error)
+            || (!error.paths.is_empty() && error.paths.iter().all(|path| self.allows_path(path)))
     }
 
-    /// Returns `true` if the rules accept `error`.
-    pub(crate) fn accepts(&self, error: &ErrorItem) -> bool {
-        self.causes.contains(&error.cause)
-            || (self.values && error.in_value)
-            || (self.defaults && error.in_default)
-            || (!error.paths.is_empty() && error.paths.iter().all(|path| self.allows_path(path)))
+    /// Returns `true` if the rule on paths accepts `path`, which is as [`ErrorItem::paths`] has it.
+    /// It is never asked about a path that starts with `Self`.
+    fn allows_path(&self, path: &Path) -> bool {
+        !heads_self(path) && ask_rule(&self.paths, path)
     }
 
     /// Drops the errors that the rules accept, and puts their nested errors in their place
@@ -85,9 +232,9 @@ impl Allow {
     /// other add up as they do in one set (and in the serialization of the error, which carries its
     /// paths); its nested errors are filtered too, for when it is dropped later.
     ///
-    /// A nested error that comes up is skipped if it is identical but for its spans to an error that
-    /// stays, before it or after it ([`same()`]). Errors that did not come up, and errors that come
-    /// up, are never merged with each other.
+    /// A nested error that comes up is skipped if it is identical but for its spans to an error
+    /// that stays, before it or after it ([`same()`]). Errors that did not come up, and errors that
+    /// come up, are never merged with each other.
     pub(crate) fn filter(&self, errors: &mut Vec<ErrorItem>) {
         // The errors that stay, and for each group that comes up the number of those before it.
         let mut stays = Vec::new();
@@ -124,9 +271,9 @@ impl Allow {
         self.filter(&mut error.nested);
     }
 
-    /// Puts `error`, which came up, in `came_up` after `before` errors that stay if the rules do not
-    /// accept it and it is not `same()` as one of `stays`, else its nested errors that they do not
-    /// accept.
+    /// Puts `error`, which came up, in `came_up` after `before` errors that stay if the rules do
+    /// not accept it and it is not `same()` as one of `stays`, else its nested errors that they do
+    /// not accept.
     fn raise(
         &self,
         mut error: ErrorItem,

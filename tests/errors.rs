@@ -40,10 +40,8 @@ fn notes_of(item: &ErrorItem) -> Vec<(String, String)> {
         .collect()
 }
 
-fn leaker_config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_crate();
-    config
+fn leaker_config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_crate()
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
@@ -61,7 +59,7 @@ fn expect_errors<R>(leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> V
 
 /// Runs a Leaker on `item_trait`, returning the leaked types or the error message.
 fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
-    let mut leaker = Leaker::from_config(leaker_config());
+    let mut leaker = Leaker::from_config(leaker_config(), false, false);
     leaker.intern_trait(item_trait, true);
     leaker.reduce_roots();
     let referrer = leaker
@@ -328,7 +326,7 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
             "use absolute path: 'MyBound'",
             Some(
                 "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-                 with `LeakerConfig::allow_path()`"
+                 with `Allow::allow_path_if()`"
             )
         )
     );
@@ -344,7 +342,7 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
             "use absolute path: 'my_mod :: Clone'",
             Some(
                 "write `my_mod::Clone` with an absolute path (e.g. `::my_crate::my_mod::Clone`), \
-                 or allow it with `LeakerConfig::allow_path()`"
+                 or allow it with `Allow::allow_path_if()`"
             )
         )
     );
@@ -366,9 +364,9 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
         helps,
         [
             "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `LeakerConfig::allow_path()`",
+             allow it with `Allow::allow_path_if()`",
             "write `super::Other` with an absolute path (e.g. `::my_crate::Other`), or allow it \
-             with `LeakerConfig::allow_path()`"
+             with `Allow::allow_path_if()`"
         ]
     );
 }
@@ -398,7 +396,7 @@ fn help_in_syn_error() {
     assert_eq!(
         err.to_string(),
         "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. \
-         `::my_crate::MyBound`), or allow it with `LeakerConfig::allow_path()`\n"
+         `::my_crate::MyBound`), or allow it with `Allow::allow_path_if()`\n"
     );
 }
 
@@ -501,8 +499,8 @@ fn all_relative_paths_are_reported() {
         syn_err.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
         vec![
             "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n",
-            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it with `LeakerConfig::allow_path()`\n",
-            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allow_path()`\n",
+            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it with `Allow::allow_path_if()`\n",
+            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `Allow::allow_path_if()`\n",
         ]
     );
 }
@@ -658,7 +656,7 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
     let item: ItemTrait = parse_quote! {
         pub trait Tr { fn f(&self, x: [u8; { let c = |a: u8| a; 3 }]); }
     };
-    let mut leaker = Leaker::from_config(leaker_config());
+    let mut leaker = Leaker::from_config(leaker_config(), false, false);
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let err = result.errors();
@@ -677,7 +675,7 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
     let item: ItemTrait = parse_quote! {
         pub trait Tr { fn f(&self, x: [u8; { let c = 3; c }]); }
     };
-    let mut leaker = Leaker::from_config(leaker_config());
+    let mut leaker = Leaker::from_config(leaker_config(), false, false);
     leaker.intern_trait(&item, true);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }

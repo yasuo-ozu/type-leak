@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{allow_every_cause, Rule};
+use common::{allow_every_cause, starts_with, Rule};
 use std::cell::RefCell;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -27,18 +27,21 @@ thread_local! {
 }
 
 /// `config`, with the rules of `with_rules()`.
-fn configured(mut config: LeakerConfig) -> LeakerConfig {
-    RULES.with(|rules| {
-        for rule in rules.borrow().iter() {
-            rule.on_config(&mut config);
-        }
-    });
+fn configured<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
+) -> Allow<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
+    let for_paths = RULES.with(|rules| rules.borrow().clone());
+    let for_errors = for_paths.clone();
     config
+        .allow_path_if(move |path| for_paths.iter().any(|rule| rule.accepts_path(path)))
+        .allow(move |error| for_errors.iter().any(|rule| rule.accepts_error(error)))
 }
 
-/// The Leaker of the triggers: `Leaker::from_config(config)` with the rules of `with_rules()`.
-fn leaker_from(config: LeakerConfig) -> Leaker {
-    Leaker::from_config(configured(config))
+/// The Leaker of the triggers: `Leaker::from_config(config, ..)` with the rules of `with_rules()`.
+fn leaker_from<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
+) -> Leaker<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
+    Leaker::from_config(configured(config), false, false)
 }
 
 /// Runs `f` with `rules` added to the config of the triggers.
@@ -50,29 +53,30 @@ fn with_rules<R>(rules: &[Rule], f: impl FnOnce() -> R) -> R {
 }
 
 /// The config of the triggers with `::p` allowed (the crate of the property test).
-fn allowing_config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config.allow_path(parse_quote!(::p));
-    config
+fn allowing_config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(starts_with(parse_quote!(::p)))
 }
 
-fn allowing() -> Leaker {
+fn allowing() -> Leaker<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
     leaker_from(allowing_config())
 }
 
-/// The config of the triggers that read the values of the items too.
-fn reading_values_config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude().check_values();
-    config
+/// The config of the triggers that read the values of the items too (`check_values`).
+fn reading_values_config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_prelude()
 }
 
 /// An analysis of an item that goes wrong.
 type Trigger = fn() -> LeakerResult;
 
 /// Runs `analyze` on `leaker` and returns its result.
-fn run<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> LeakerResult {
+fn run<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool, R>(
+    mut leaker: Leaker<P, E>,
+    analyze: impl FnOnce(&mut Leaker<P, E>) -> R,
+) -> LeakerResult {
     analyze(&mut leaker);
     leaker.result()
 }
@@ -130,14 +134,14 @@ fn help_of(item: &ErrorItem) -> Option<(String, String)> {
 /// The analysis of a trait with these items. `check_values` reads the values too.
 fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     let item: ItemTrait = parse_str(source).unwrap();
-    let config = if check_values {
-        reading_values_config()
+    if check_values {
+        let leaker = Leaker::from_config(configured(reading_values_config()), true, false);
+        run(leaker, |leaker| leaker.intern_trait(&item, true))
     } else {
-        allowing_config()
-    };
-    run(leaker_from(config), |leaker| {
-        leaker.intern_trait(&item, true)
-    })
+        run(leaker_from(allowing_config()), |leaker| {
+            leaker.intern_trait(&item, true)
+        })
+    }
 }
 
 /// The errors that a trait with these items gives. `check_values` reads the values too.
@@ -154,7 +158,7 @@ fn relative_path() -> LeakerResult {
             fn f(&self, a: MyType<'_>);
         }
     );
-    run(leaker_from(LeakerConfig::new()), |leaker| {
+    run(leaker_from(Allow::new()), |leaker| {
         leaker.intern_trait(&item, true)
     })
 }
@@ -198,7 +202,7 @@ fn reason_self_without_meaning() {
     );
 }
 
-/// Syntax that the Leaker cannot read in a body, read with `check_values()`.
+/// Syntax that the Leaker cannot read in a body, read with `check_values`.
 fn unreadable() -> LeakerResult {
     trait_result(
         "trait Tr { fn f(&self) { macro_rules! m { () => {} } ::p::mac!(a b c); } }",
@@ -523,7 +527,10 @@ fn the_cause_of_a_bound_is_the_trait() {
 // ── the kind of the cause is that of the syntax node which holds the part reported ──────────
 
 /// The errors that a type gives in the generics `<T>`, where `Self` has no meaning.
-fn type_errors(mut leaker: Leaker, ty: Type) -> Vec<ErrorItem> {
+fn type_errors<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    mut leaker: Leaker<P, E>,
+    ty: Type,
+) -> Vec<ErrorItem> {
     leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&ty));
     leaker.result().errors().to_vec()
 }
@@ -897,7 +904,7 @@ fn the_serialized_form_is_one_brace_group_for_each_item() {
         "{ type (MyType < '_ >) RelativePath \"use absolute path: 'MyType < '_ >'\" \
          [('_) \"it cannot be leaked as a whole because of `'_`\"] \
          (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it \
-         with `LeakerConfig::allow_path()`\" paths [MyType] }"
+         with `Allow::allow_path_if()`\" paths [MyType] }"
     );
     // A serialization is not a report: it is no `compile_error!`.
     let all: proc_macro2::TokenStream = items.iter().map(ToTokens::to_token_stream).collect();
@@ -1100,7 +1107,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
         item.help_text(),
         Some(
             "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `LeakerConfig::allow_path()`"
+             `Allow::allow_path_if()`"
         )
     );
     // It is a `std::error::Error`, and `From<ErrorItem>` is the `syn::Error` of the layout of
@@ -1113,7 +1120,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
         "use absolute path: 'MyType < '_ >'\n\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
          \x20 = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it \
-         with `LeakerConfig::allow_path()`\n"
+         with `Allow::allow_path_if()`\n"
     );
 }
 
@@ -1185,7 +1192,7 @@ fn messages(items: &[ErrorItem]) -> Vec<&str> {
 fn allowing_causes(trigger: Trigger, causes: &[Cause]) -> LeakerResult {
     let mut result = trigger();
     for cause in causes {
-        result.allow(cause.clone());
+        result.allow(|e| e.cause == cause.clone());
     }
     result
 }
@@ -1315,7 +1322,7 @@ fn a_path_rule_leaves_the_errors_that_have_a_path_it_does_not_allow() {
     // Allowing the first path of an error that has several leaves it.
     let result = relative_path();
     let mut left = result.clone();
-    left.allow_path(parse_quote!(MyType));
+    left.allow_path_if(starts_with(parse_quote!(MyType)));
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
     assert_eq!(text(&left.errors()[0].cause), "Clone");
@@ -1400,7 +1407,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
     );
     assert_eq!(copy, expected);
     // Allowing the cause drops the error and leaves the Referrer.
-    result.allow(Cause::Trait(parse_quote!(RelTr)));
+    result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
     assert_same_referrer(&referrer, &result.finish().unwrap(), "S");
 }
 
@@ -1443,17 +1450,17 @@ fn the_errors_of_self_are_reported_with_the_others() {
     assert_eq!(referrer.iter().count(), 0);
     let mut allowed = analyze();
     for cause in causes_of(&errors) {
-        allowed.allow(cause);
+        allowed.allow(|e| e.cause == cause);
     }
     assert!(allowed.errors().is_empty());
     assert_same_referrer(&referrer, &allowed.into_referrer(), "Self");
     // Allowing the conflict leaves the mention, and the other way round.
     let mut left = analyze();
-    left.allow(errors[0].cause.clone());
+    left.allow(|e| e.cause == errors[0].cause.clone());
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::SelfWithoutMeaning);
     let mut left = analyze();
-    left.allow(errors[1].cause.clone());
+    left.allow(|e| e.cause == errors[1].cause.clone());
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
 }

@@ -69,7 +69,7 @@ pub struct CheckResult {
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`), which the Referrer may not share. `must` holds only its
-    /// parts. See [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path).
+    /// parts. See [`Allow::allow_path_if()`](crate::Allow::allow_path_if).
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no meaning).
     /// Reported first.
@@ -103,11 +103,11 @@ pub struct CheckResult {
 }
 
 /// Where in an item the analysis was when it found an error: what
-/// [`LeakerConfig::allow_values()`](crate::LeakerConfig::allow_values) and
-/// [`LeakerConfig::allow_default()`](crate::LeakerConfig::allow_default) accept.
+/// [`Allow::allow_values()`](crate::Allow::allow_values) and
+/// [`Allow::allow_default()`](crate::Allow::allow_default) accept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Place {
-    /// While a value is read (`LeakerConfig::check_values()`), including trait default values and
+    /// While a value is read (`check_values`), including trait default values and
     /// bodies.
     pub(crate) value: bool,
     /// In the default of a generic parameter, a trait default body or an associated const default.

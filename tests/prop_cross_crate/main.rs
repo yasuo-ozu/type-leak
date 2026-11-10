@@ -141,7 +141,7 @@
 //!
 //! # The copies after the analysis without a rule (`TYPE_LEAK_PROP_FEATURES=allow_stages`)
 //!
-//! `LeakerConfig::allow_X()` and `LeakerResult::allow_X()` are one rule, but the result judges an
+//! `Allow::allow_X()` and `LeakerResult::allow_X()` are one rule, but the result judges an
 //! analysis made without it, so for a path rule it can leave other errors and other entries (see
 //! `tests/allow_stages.rs`). With `allow_stages` the macro of each item takes each rule of
 //! `gen::rules()` in turn and makes two copies, and the test builds them, to see whether the
@@ -156,7 +156,7 @@
 //!   errors that remain are allowed, and its Referrer copies the item (`__tl_st_<rule>_cfg_<id>!`).
 //!
 //! The rules are `prelude` (`allow_prelude()`, every item), `crate` (`allow_crate()`), `path`
-//! (`allow_path(super::base)`: the module `base` as the modules at depth 1 name it), `std`
+//! (`allow_path_if(super::base)`: the module `base` as the modules at depth 1 name it), `std`
 //! (`allow_std_crates()`, with `relative_std`), `values` (`allow_values()`, with `values`) and
 //! `default` (`allow_default()`). A rule is made for the items where it matters: it drops or trims an
 //! error of the analysis without it, or the config finds other errors or another Referrer than the
@@ -295,7 +295,7 @@
 //!   `self_bound_adts` (F41: a struct, an enum or a union nested in `enter_mod` with a generic
 //!   whose bound names its own `Self` and a default that uses it; the Leaker must accept it, which
 //!   `unexplained()` checks) and `nested_self_entries` (F42: the macro asks for
-//!   `LeakerConfig::nested_self_entries()` for the items nested in `enter_mod`, and those of
+//!   `nested_self_entries` for the items nested in `enter_mod`, and those of
 //!   `self_bound_adts` have a field that names `Self` in a relative type),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
@@ -317,8 +317,8 @@
 //!   (`gen::Flags::values`): bodies of functions, methods and default methods, the values of
 //!   constants and statics, the defaults of associated constants and of const parameters, with
 //!   the types of the Leaker's crate in a `let`, a turbofish and a cast, which the Leaker leaks with
-//!   `check_values()` and the witnesses check (`Args::bodies`), and in a share of them a relative path
-//!   of a value (`crate::base::bf()`, `RLEN`), which it rejects (the tag `value_path`).
+//!   `check_values` and the witnesses check (`Args::bodies`), and in a share of them a relative
+//!   path of a value (`crate::base::bf()`, `RLEN`), which it rejects (the tag `value_path`).
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
@@ -1620,7 +1620,7 @@ fn family(error: &Rejection) -> Option<Family> {
         ));
     }
     // A relative path in a value (`crate::base::bf`, `RLEN`), which the Leaker reads with
-    // `check_values()` and copies as written: the note says which value (`values`).
+    // `check_values` and copies as written: the note says which value (`values`).
     if error.note.contains("which the copy writes as it is") {
         reasons.push((
             "a relative path in a value, which the copy writes as it is",

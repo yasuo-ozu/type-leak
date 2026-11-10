@@ -14,19 +14,26 @@
 //!
 //! The nightly layout (a `help` of the `Diagnostic`, with its own span) is in `tests/diagnostic.rs`.
 
+mod common;
+
+use common::starts_with;
 use syn::*;
 use type_leak::*;
 
 /// The config of the rows with `::p` allowed (the crate of the property test).
-fn allowing() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config.allow_path(parse_quote!(::p));
-    Leaker::from_config(config)
+fn allowing() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(starts_with(parse_quote!(::p)));
+    Leaker::from_config(config, false, false)
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
-fn errors<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+fn errors<P: Fn(&Path) -> bool, R>(
+    mut leaker: Leaker<P>,
+    analyze: impl FnOnce(&mut Leaker<P>) -> R,
+) -> Vec<ErrorItem> {
     analyze(&mut leaker);
     leaker.result().errors().to_vec()
 }
@@ -81,7 +88,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'MyBound'",
             "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `LeakerConfig::allow_path()`",
+             with `Allow::allow_path_if()`",
         )],
     },
     Row {
@@ -95,7 +102,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'crate :: m :: Bound'",
             "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `LeakerConfig::allow_path()`",
+             allow it with `Allow::allow_path_if()`",
         )],
     },
     Row {
@@ -111,7 +118,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'MyType < '_ >'",
             "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `LeakerConfig::allow_path()`",
+             `Allow::allow_path_if()`",
         )],
     },
     Row {
@@ -125,7 +132,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'Idx'",
             "write `Idx` with an absolute path (e.g. `::my_crate::Idx`), or allow it with \
-             `LeakerConfig::allow_path()`",
+             `Allow::allow_path_if()`",
         )],
     },
     Row {
@@ -141,7 +148,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'RelTr'",
             "write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it with \
-             `LeakerConfig::allow_path()`, or name the lifetime of the trait object (e.g. \
+             `Allow::allow_path_if()`, or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)",
         )],
     },
@@ -158,7 +165,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'Rel < Self >'",
             "write `Rel` with an absolute path (e.g. `::my_crate::Rel`), allow it with \
-             `LeakerConfig::allow_path()`, or analyze the item with `allow_self = true`",
+             `Allow::allow_path_if()`, or analyze the item with `allow_self = true`",
         )],
     },
     // ── a bare identifier that may be a const ────────────────────────────────────────────────
@@ -175,7 +182,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), allow it with `LeakerConfig::allow_path()`, or analyze the item with \
+             const), allow it with `Allow::allow_path_if()`, or analyze the item with \
              `allow_self = true`",
         )],
     },
@@ -260,7 +267,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or allow it with `LeakerConfig::allow_path()`",
+             const), or allow it with `Allow::allow_path_if()`",
         )],
     },
     // ── `Self` ───────────────────────────────────────────────────────────────────────────────
@@ -311,7 +318,7 @@ const ROWS: &[Row] = &[
             (
                 "use absolute path: 'Tr'",
                 "write `Tr` with an absolute path (e.g. `::my_crate::Tr`), or allow it with \
-                 `LeakerConfig::allow_path()`",
+                 `Allow::allow_path_if()`",
             ),
             (
                 "write `<Self as Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \

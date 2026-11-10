@@ -3,7 +3,7 @@
 //!
 //! `type_leak_test_leaker::x::ExtDep` names `::type_leak_test_ext::Ext<..>`. It is an optional
 //! entry (see `Referrer::must()`): the Referrer leaves it as written by default, and the copy then
-//! names a crate that the Referrer's crate does not have; with `allow_ambiguous_crate_name(false)`
+//! names a crate that the Referrer's crate does not have; with `deny_ambiguous_crate_name()`
 //! the whole type is replaced with the Repeater's projection, and the crate does not need it.
 //! `tests/cross_crate.rs` has the text of both copies. This is the trusting one, which rustc
 //! rejects, and the same crate with the strict flag, which it accepts and whose own tests (the

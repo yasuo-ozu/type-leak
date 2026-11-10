@@ -1,7 +1,9 @@
 //! Helpers for inspecting paths and types.
 
+use crate::allow::path_starts_with;
 use crate::error::Cause;
 use proc_macro2::TokenStream;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use syn::ext::IdentExt;
@@ -23,36 +25,86 @@ pub(crate) fn bound_cause(bound: &TraitBound) -> Cause {
     Cause::Unreadable(quote!(#bound))
 }
 
-/// Returns `true` if `path` starts with `prefix`, comparing identifiers. Both have a leading `::`
-/// or neither.
-pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
-    prefix.leading_colon.is_some() == path.leading_colon.is_some()
-        && prefix.segments.len() <= path.segments.len()
-        && prefix
-            .segments
-            .iter()
-            .zip(path.segments.iter())
-            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
+/// `path` without the arguments of its segments: `Vec`, not `Vec<Rel<'_>>`.
+pub(crate) fn without_arguments(path: &Path) -> Path {
+    let mut path = path.clone();
+    for seg in path.segments.iter_mut() {
+        seg.arguments = PathArguments::None;
+    }
+    path
 }
 
-/// The paths a Leaker treats as context-free: a copy of its allowed paths taken when an analysis
-/// starts, shared by the throwaway visitors of that analysis.
-#[derive(Clone)]
-pub(crate) struct AllowedPaths(Rc<[Path]>);
+/// Returns `true` if `path` starts with `Self`.
+pub(crate) fn heads_self(path: &Path) -> bool {
+    path.leading_colon.is_none()
+        && matches!(path.segments.first(), Some(seg) if seg.ident == "Self")
+}
 
-impl AllowedPaths {
-    pub(crate) fn new(paths: &[Path]) -> Self {
-        Self(Rc::from(paths))
+/// Asks the rule on paths about `path`, without the generic arguments of its segments: the form of
+/// [`ErrorItem::paths`](crate::ErrorItem::paths), wherever the rule is asked.
+pub(crate) fn ask_rule<R: Fn(&Path) -> bool + ?Sized>(rule: &R, path: &Path) -> bool {
+    if path.segments.iter().all(|seg| seg.arguments.is_none()) {
+        rule(path)
+    } else {
+        rule(&without_arguments(path))
+    }
+}
+
+/// Sets the flag when it is dropped: the rule did not return.
+struct Unwound<'a>(&'a Cell<bool>);
+
+impl Drop for Unwound<'_> {
+    fn drop(&mut self) {
+        self.0.set(true)
+    }
+}
+
+/// The paths a Leaker treats as context-free: the paths rule of its `Allow` and the paths a probe
+/// adds, shared by the throwaway visitors of an analysis. The rule is called at every check.
+pub(crate) struct AllowedPaths<P> {
+    rule: Rc<P>,
+    extra: Rc<[Path]>,
+    /// Set if the rule panicked: shared by the clones, which are all of one analysis.
+    panicked: Rc<Cell<bool>>,
+}
+
+impl<P> Clone for AllowedPaths<P> {
+    fn clone(&self) -> Self {
+        Self {
+            rule: self.rule.clone(),
+            extra: self.extra.clone(),
+            panicked: self.panicked.clone(),
+        }
+    }
+}
+
+impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
+    pub(crate) fn new(rule: Rc<P>) -> Self {
+        Self {
+            rule,
+            extra: Rc::from(Vec::new()),
+            panicked: Rc::new(Cell::new(false)),
+        }
     }
 
     /// The allowed paths and `more`.
     pub(crate) fn with(&self, more: &[Path]) -> Self {
-        Self(self.0.iter().chain(more).cloned().collect())
+        Self {
+            rule: self.rule.clone(),
+            extra: self.extra.iter().chain(more).cloned().collect(),
+            panicked: self.panicked.clone(),
+        }
     }
 
-    /// Returns `true` if `path` is absolute, starts with `$crate`, or starts with an allowed path.
-    /// A type with an absolute path may still be an optional entry (see `is_soft_path()`).
-    pub(crate) fn is_context_free_path(&self, path: &Path) -> bool {
+    /// Returns `true` if the rule panicked in this analysis, even if the panic was caught: what
+    /// the visitor recorded after it is not reliable.
+    pub(crate) fn rule_panicked(&self) -> bool {
+        self.panicked.get()
+    }
+
+    /// Returns `true` if `path` is absolute, starts with `$crate`, or is allowed. A type with an
+    /// absolute path may still be an optional entry (see `is_soft_path()`). `ask`: see `is_allowed_path()`.
+    pub(crate) fn is_context_free_path(&self, path: &Path, ask: bool) -> bool {
         path.leading_colon.is_some()
             || matches!(
                 path.segments.iter().next(),
@@ -61,12 +113,18 @@ impl AllowedPaths {
                     arguments: PathArguments::None,
                 }) if ident == "$crate"
             )
-            || self.is_allowed_path(path)
+            || self.is_allowed_path(path, ask)
     }
 
-    /// Returns `true` if `path` starts with an allowed path.
-    pub(crate) fn is_allowed_path(&self, path: &Path) -> bool {
-        self.0.iter().any(|allowed| path_starts_with(path, allowed))
+    /// Returns `true` if the rule allows `path`, or it starts with a path that a probe allowed.
+    /// `ask` is `false` for a path that starts with `Self` or a generic in scope, which the
+    /// rule never sees.
+    pub(crate) fn is_allowed_path(&self, path: &Path, ask: bool) -> bool {
+        (ask && self.call_rule(path))
+            || self
+                .extra
+                .iter()
+                .any(|allowed| path_starts_with(path, allowed))
     }
 
     /// Returns `true` for an absolute path to an external crate (not `::core`, not allowed). The
@@ -74,7 +132,16 @@ impl AllowedPaths {
     pub(crate) fn is_soft_path(&self, path: &Path) -> bool {
         path.leading_colon.is_some()
             && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
-            && !self.is_allowed_path(path)
+            && !self.is_allowed_path(path, true)
+    }
+
+    /// Asks the rule. If it panics, the analysis is not to be trusted any more, whoever catches
+    /// the panic ([`AllowedPaths::rule_panicked()`]).
+    fn call_rule(&self, path: &Path) -> bool {
+        let unwound = Unwound(&self.panicked);
+        let allowed = ask_rule(&*self.rule, path);
+        std::mem::forget(unwound);
+        allowed
     }
 }
 
@@ -169,37 +236,19 @@ pub(crate) const KNOWN_NAMES: &[(&str, &str, Known)] = &[
     ("f64", "::core::primitive::f64", Known::Primitive),
 ];
 
-/// The names of [`KNOWN_NAMES`] of the kind `known`, as paths of one segment.
-fn known_paths(known: Known) -> Vec<Path> {
-    KNOWN_NAMES
-        .iter()
-        .filter(|(_, _, kind)| *kind == known)
-        .map(|(name, _, _)| crate_path(name))
-        .collect()
-}
-
-/// The primitive type names that `allow_primitive()` allows.
-pub(crate) fn primitive_paths() -> Vec<Path> {
-    known_paths(Known::Primitive)
-}
-
-/// The names of the standard prelude that `allow_prelude()` allows.
-pub(crate) fn std_prelude_paths() -> Vec<Path> {
-    known_paths(Known::Prelude)
+/// Returns `true` if `path` is relative and starts with a name of [`KNOWN_NAMES`] of the kind
+/// `known`: the rule of the option that allows that kind.
+pub(crate) fn starts_with_known(path: &Path, known: Known) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.first().map_or(false, |seg| {
+            KNOWN_NAMES
+                .iter()
+                .any(|(name, _, kind)| seg.ident == name && *kind == known)
+        })
 }
 
 /// The crates that `allow_std_crates()` allows.
-pub(crate) fn std_crate_paths() -> Vec<Path> {
-    ["std", "core", "alloc"]
-        .iter()
-        .map(|name| crate_path(name))
-        .collect()
-}
-
-/// The path of one segment, `name`.
-fn crate_path(name: &str) -> Path {
-    Path::from(Ident::new(name, proc_macro2::Span::call_site()))
-}
+pub(crate) const STD_CRATES: &[&str] = &["std", "core", "alloc"];
 
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
     KNOWN_NAMES

@@ -8,8 +8,8 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    Cause, ContextId, ErrorItem, Leaker, LeakerConfig, LeakerResult, Reason, Referrer,
-    SelfRequirement, View,
+    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Reason, Referrer, SelfRequirement,
+    View,
 };
 
 fn s(x: &impl ToTokens) -> String {
@@ -813,8 +813,8 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
     // Accepting the causes afterwards drops the errors, and does not change the Referrer.
     let mut accepted = failed.result.clone();
     accepted
-        .allow(Cause::Type(parse_quote!(Bad1<'_>)))
-        .allow(Cause::Type(parse_quote!(Bad2<'_, U>)));
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad1<'_>)))
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad2<'_, U>)));
     assert!(accepted.errors().is_empty());
     let accepted = accepted.finish().unwrap();
     let ok = ok.result.finish().unwrap();
@@ -929,10 +929,9 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
 }
 
 /// A Leaker that allows the primitive types and the names of the standard prelude.
-fn leaker_with_std() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    Leaker::from_config(config)
+fn leaker_with_std() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new().allow_primitive().allow_prelude();
+    Leaker::from_config(config, false, false)
 }
 
 /// `Leaker::enter_generics()` docs: a scope keeps what it recorded when it has errors. The
@@ -975,7 +974,7 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
 /// bounds) is an error of the outermost call too. Audit mutant `rb_leave_env_errors`.
 #[test]
 fn the_cycle_of_a_failed_inner_scope_is_an_error_of_the_outer_one() {
-    let inner = |view: &mut View<'_>| {
+    fn inner<P: Fn(&Path) -> bool>(view: &mut View<'_, P>) {
         // `Self` is the self type `W<V>`, which the copy writes through the Repeater because of
         // `Rel`, and the bound `V: Fn(Rel)` names it: a cycle of the inner scope.
         view.enter_impl(
@@ -986,15 +985,15 @@ fn the_cycle_of_a_failed_inner_scope_is_an_error_of_the_outer_one() {
                 view.visit_where_clause(&parse_quote!(where Self: Sized));
             },
         );
-    };
+    }
     let mut leaker = leaker_with_std();
-    leaker.enter_generics(&parse_quote!(<T>), |view| inner(view));
+    leaker.enter_generics(&parse_quote!(<T>), inner);
     let result = leaker.result();
     assert!(!result.errors().is_empty());
     let found = messages(result.errors());
     // The same scope on its own has the same error.
     let mut leaker = leaker_with_std();
-    leaker.enter_generics(&Generics::default(), |view| inner(view));
+    leaker.enter_generics(&Generics::default(), inner);
     assert_eq!(messages(leaker.result().errors()), found);
 }
 
@@ -1053,7 +1052,7 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
     assert!(result.errors().iter().all(|error| error.cause == cause));
     let tokens = result.clone().into_referrer().to_token_stream().to_string();
     let mut accepted = result.clone();
-    accepted.allow(cause);
+    accepted.allow(|e| e.cause == cause);
     assert!(accepted.errors().is_empty());
     assert_eq!(
         accepted.finish().unwrap().to_token_stream().to_string(),
@@ -1498,7 +1497,8 @@ fn the_format_of_the_previous_version_is_rejected() {
     // the default of a parameter of a struct, an enum or a union nested in the visited syntax when a
     // bound of an earlier parameter names `Self` (`U = Wrap<T>` with `T: AsRef<Self>`): the
     // Leaker rejected it, and now the entry is analyzed without the bounds that name `Self`. It
-    // finds an entry for any type that names the `Self` too (`LeakerConfig::nested_self_entries()`).
+    // finds an entry for any type that names the `Self` too (the `nested_self_entries` argument of
+    // `Leaker::from_config()`).
     let old: proc_macro2::TokenStream = "\"type-leak-format-13\" 2 < T > ; () < T > ; (Rel)"
         .parse()
         .unwrap();

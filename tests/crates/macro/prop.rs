@@ -72,13 +72,13 @@ pub(crate) struct Args {
     /// How the item is analyzed: `""` by the `intern_*` method of its kind, or by a scope (see
     /// [`analyze()`]): `"mod"`, `"generics"`, `"trait"` or `"impl"`.
     scope: String,
-    /// The Referrer replaces the optional entries too (`allow_ambiguous_crate_name(false)`), so it
+    /// The Referrer replaces the optional entries too (`deny_ambiguous_crate_name()`), so it
     /// needs the Repeater's impl of every entry. A trusting Referrer needs those of the required
     /// entries only, and that is all this macro emits then, as a downstream crate does. Not said:
     /// the impls of all the entries, for any Referrer; the Referrer's invocation says which it is
     /// (`strict`), and the two must agree if it is said.
     strict: Option<bool>,
-    /// The Leaker allows the primitive types (`LeakerConfig::allow_primitive()`).
+    /// The Leaker allows the primitive types (`Allow::allow_primitive()`).
     primitive: bool,
     /// The expectation about a bare `?Sized` without the prelude: `true` if the Leaker accepts it
     /// whatever the prelude (the `?` applies to the real `Sized` only), `false` if it is a relative
@@ -89,7 +89,7 @@ pub(crate) struct Args {
     /// Its parameter defaults are rewritten for a declaration, which cannot name the defaulted
     /// parameter itself (E0128): see [`rewrite_defaults()`].
     redeclare: bool,
-    /// The Leaker reads the values of the item (`LeakerConfig::check_values()`): the default of an
+    /// The Leaker reads the values of the item (`check_values`): the default of an
     /// associated const, the value of a const or static, the body of a function. A type in a type
     /// position of a value is an entry, and the copy replaces it. The witnesses compare the types
     /// of the signatures only; the copy of a value compiles in the Referrer's crate only if every
@@ -101,7 +101,7 @@ pub(crate) struct Args {
     /// `unimplemented!()` and a value of the type of the constant.
     bodies: bool,
     /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
-    /// that does (`LeakerConfig::nested_self_entries()`).
+    /// that does (the `nested_self_entries` argument of `Leaker::from_config()`).
     nested_self_entries: bool,
     /// `marker = "::path::Marker"`: the impls of the entries where `Referrer::needs_self()` is false
     /// are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner, where
@@ -228,7 +228,7 @@ impl Args {
 enum Side {
     /// The analysis without the rule, whose result is given the rule (`LeakerResult::allow_*()`).
     Result,
-    /// The analysis of a config that has the rule (`LeakerConfig::allow_*()`). Its copy is what the
+    /// The analysis of a config that has the rule (`Allow::allow_*()`). Its copy is what the
     /// copy of `Result` is compared with: if the one that fails is only `Result`'s, the rule after
     /// the analysis is what makes it fail.
     Config,
@@ -263,7 +263,7 @@ enum Rule {
     Prelude,
     /// `allow_crate()`.
     Crate,
-    /// `allow_path(super::base)`: the module `base` as the modules at depth 1 (`m0`, `mm0`) name it.
+    /// `allow_path_if(super::base)`: the module `base` as the modules at depth 1 (`m0`, `mm0`) name it.
     /// The paths of the deeper ones (`super::super::base`) are other paths.
     Path,
     /// `allow_std_crates()`.
@@ -318,22 +318,14 @@ impl Rule {
         ident(&format!("__tl_stages_{}_{}", self.name(), id))
     }
 
-    fn on_config(self, config: &mut LeakerConfig) {
-        match self {
-            Rule::Prelude => config.allow_prelude(),
-            Rule::Crate => config.allow_crate(),
-            Rule::Path => config.allow_path(parse_quote!(super::base)),
-            Rule::StdCrates => config.allow_std_crates(),
-            Rule::Values => config.allow_values(),
-            Rule::Default => config.allow_default(),
-        };
-    }
-
     fn on_result(self, result: &mut LeakerResult) {
         match self {
             Rule::Prelude => result.allow_prelude(),
             Rule::Crate => result.allow_crate(),
-            Rule::Path => result.allow_path(parse_quote!(super::base)),
+            Rule::Path => {
+                let base = base_path();
+                result.allow_path_if(move |path| path_starts_with(path, &base))
+            }
             Rule::StdCrates => result.allow_std_crates(),
             Rule::Values => result.allow_values(),
             Rule::Default => result.allow_default(),
@@ -341,7 +333,12 @@ impl Rule {
     }
 }
 
-/// `std`, `core` or `alloc` as a relative path (`LeakerConfig::allow_std_crates()`).
+/// The path that [`Rule::Path`] allows: the module `base`, as the modules at depth 1 name it.
+fn base_path() -> Path {
+    parse_quote!(super::base)
+}
+
+/// `std`, `core` or `alloc` as a relative path (`Allow::allow_std_crates()`).
 fn is_std_crate(path: &Path) -> bool {
     path.leading_colon.is_none()
         && path.segments.len() == 1
@@ -382,7 +379,7 @@ fn ident(name: &str) -> Ident {
 ///   are visited (the shape of a macro that resolves the trait by its name). The generics and the
 ///   items of the impl are not analyzed, and not compared.
 fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
-    analyze_with(item, args, |_| ())
+    analyze_with(item, args, None)
 }
 
 /// [`analyze()`] with `rule` given to the config as well: `allow_stages` compares it with the same
@@ -390,26 +387,39 @@ fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
 fn analyze_with(
     item: &Item,
     args: &Args,
-    rule: impl FnOnce(&mut LeakerConfig),
+    rule: Option<Rule>,
 ) -> (LeakerResult, ContextId, TokenStream) {
-    let mut config = LeakerConfig::new();
-    if args.primitive {
-        config.allow_primitive();
-    }
-    if args.prelude {
-        config.allow_prelude();
-    }
-    if args.values {
-        config.check_values();
-    }
-    if args.nested_self_entries {
-        config.nested_self_entries();
-    }
-    for path in &args.allow {
-        config.allow_path(path.clone());
-    }
-    rule(&mut config);
-    let mut leaker = Leaker::from_config(config);
+    let allowed = args.allow.clone();
+    let (primitive, prelude) = (args.primitive, args.prelude);
+    let base = base_path();
+    let config = Allow::new()
+        .allow_path_if(move |path| {
+            allowed.iter().any(|prefix| path_starts_with(path, prefix))
+                || (primitive && is_primitive_path(path))
+                || (prelude && is_prelude_path(path))
+                || match rule {
+                    Some(Rule::Prelude) => is_prelude_path(path),
+                    Some(Rule::Crate) => is_crate_path(path),
+                    Some(Rule::Path) => path_starts_with(path, &base),
+                    Some(Rule::StdCrates) => is_std_crate_path(path),
+                    _ => false,
+                }
+        })
+        .allow(move |error| match rule {
+            Some(Rule::Values) => error.in_value,
+            Some(Rule::Default) => error.in_default,
+            _ => false,
+        });
+    analyze_config(item, args, config)
+}
+
+/// [`analyze()`] with the whole `config`.
+fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    item: &Item,
+    args: &Args,
+    config: Allow<P, E>,
+) -> (LeakerResult, ContextId, TokenStream) {
+    let mut leaker = Leaker::from_config(config, args.values, args.nested_self_entries);
     let allow_self = args.allow_self;
     let context = match (args.scope.as_str(), item) {
         ("mod", Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_)) => {
@@ -2131,7 +2141,7 @@ fn host_impl(
     }
 }
 
-/// Without `LeakerConfig::allow_primitive()`, `u8` is a relative path like any other (a module may
+/// Without `Allow::allow_primitive()`, `u8` is a relative path like any other (a module may
 /// declare its own `u8`): the type that has it is an entry, and the copy replaces it. A copy that
 /// keeps a primitive in a type position copies a name that means something else in the Referrer's
 /// crate, whatever it is equal to there.
@@ -2577,7 +2587,7 @@ fn count_copy(
     let dummy: Path = parse_quote!(::__dummy);
     let mut counted = result.clone();
     if args.strict == Some(true) {
-        counted.allow_ambiguous_crate_name(false);
+        counted.deny_ambiguous_crate_name();
     }
     let counted = counted.into_referrer();
     let report = match rewrite(&counted, context, original, args, &dummy, false) {
@@ -2666,7 +2676,7 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
     }
     let (plain, plain_context, plain_assertions) = analyze(original, &plain_args);
     let (before, before_context, before_assertions) =
-        analyze_with(original, &plain_args, |config| rule.on_config(config));
+        analyze_with(original, &plain_args, Some(rule));
     let plain_errors = plain.errors().to_vec();
     let mut after = plain.clone();
     rule.on_result(&mut after);
@@ -2860,24 +2870,24 @@ fn stage_copy(
 
 /// What the Referrer's invocation allows of the errors it got (`allow(std_crates, trait Path, type
 /// Ty)`).
-enum Allow {
+enum AllowArg {
     /// `LeakerResult::allow_std_crates()`
     StdCrates,
     /// `LeakerResult::allow(cause)`: `trait Path` is a `Cause::Trait`, `type Ty` a `Cause::Type`.
     Cause(Cause),
 }
 
-impl Parse for Allow {
+impl Parse for AllowArg {
     fn parse(input: ParseStream) -> Result<Self> {
         if input.parse::<Option<Token![trait]>>()?.is_some() {
-            return Ok(Allow::Cause(Cause::Trait(input.parse()?)));
+            return Ok(AllowArg::Cause(Cause::Trait(input.parse()?)));
         }
         if input.parse::<Option<Token![type]>>()?.is_some() {
-            return Ok(Allow::Cause(Cause::Type(input.parse()?)));
+            return Ok(AllowArg::Cause(Cause::Type(input.parse()?)));
         }
         let word: Ident = input.parse()?;
         match word.to_string().as_str() {
-            "std_crates" => Ok(Allow::StdCrates),
+            "std_crates" => Ok(AllowArg::StdCrates),
             _ => Err(Error::new(
                 word.span(),
                 "expected `std_crates`, `trait <path>` or `type <type>`",
@@ -2903,7 +2913,7 @@ struct ApplyInput {
     /// copy is made there and not in the other crate, see [`apply()`].
     accept: bool,
     /// What the invocation allows of the errors of the result.
-    allow: Vec<Allow>,
+    allow: Vec<AllowArg>,
     /// The crate of the invocation has none of the Leaker's names (`allow_stages`): a module copy
     /// drops its imports as the copy of an ordinary item does, and the names that the rule allows
     /// are the only ones to resolve.
@@ -2952,7 +2962,7 @@ impl Parse for ApplyInput {
                 "allow" => {
                     let content;
                     parenthesized!(content in input);
-                    allow.extend(Punctuated::<Allow, Token![,]>::parse_terminated(&content)?);
+                    allow.extend(Punctuated::<AllowArg, Token![,]>::parse_terminated(&content)?);
                 }
                 _ => return Err(Error::new(
                     keyword.span(),
@@ -3010,8 +3020,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     }
     for allowed in allow {
         match allowed {
-            Allow::StdCrates => result.allow_std_crates(),
-            Allow::Cause(cause) => result.allow(cause),
+            AllowArg::StdCrates => result.allow_std_crates(),
+            AllowArg::Cause(cause) => result.allow(|e| e.cause == cause),
         };
     }
     let errors = crate::report(result.errors());
@@ -3023,7 +3033,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         ));
     }
     if strict {
-        result.allow_ambiguous_crate_name(false);
+        result.deny_ambiguous_crate_name();
     }
     let referrer = result.into_referrer();
     let rewritten = rewrite(&referrer, context, &item, &args, &path, dyn_host)?;

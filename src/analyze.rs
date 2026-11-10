@@ -6,8 +6,6 @@ use crate::analysis::{
     scope_error, shift_seen, unshift_seen, CheckResult, Effect, Part, PendingType, Place,
     SelfMention, SignatureFacts, SignatureMark,
 };
-#[cfg(doc)]
-use crate::config::LeakerConfig;
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
     SelfRequirement, UnnameableSelf,
@@ -23,7 +21,8 @@ use crate::util::{
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
     is_primitive_name, or_list, self_in_param, self_in_predicate, selves_in_generics, tidy,
     token_names, trait_object_of, type_mentions_self, unwrap_type_group,
-    where_predicate_mentions_self, without_crate_prefix, without_defaults, AllowedPaths,
+    where_predicate_mentions_self, without_arguments, without_crate_prefix, without_defaults,
+    AllowedPaths,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -500,17 +499,20 @@ impl ScopeSpec {
 /// Where a scope is entered: the Leaker (outermost) or a [`View`] (nested). The public `enter_*`
 /// methods build the [`ScopeSpec`] here and differ only in `enter_spec()`.
 pub(crate) trait Scopes {
+    /// The paths rule of the Leaker's [`Allow`](crate::Allow), for the paths left as written.
+    type Rule: Fn(&Path) -> bool;
+
     fn enter_spec<R>(
         &mut self,
         spec: ScopeSpec,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R);
 
     fn enter_mod<R>(
         &mut self,
         hint: impl Display,
         declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let names = ModuleNames {
             names: declared
@@ -533,7 +535,7 @@ pub(crate) trait Scopes {
     fn enter_generics<R>(
         &mut self,
         generics: &Generics,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let generics = generics.clone();
         self.enter_spec(
@@ -551,7 +553,7 @@ pub(crate) trait Scopes {
         generics: &Generics,
         declares: DeclaredSelf,
         trait_path: Option<&Path>,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let spec = ScopeSpec::Generics {
             generics: generics.clone(),
@@ -566,7 +568,7 @@ pub(crate) trait Scopes {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::of_item(ident, generics),
@@ -582,7 +584,7 @@ pub(crate) trait Scopes {
         generics: &Generics,
         self_ty: &Type,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         self.enter_impl_of(generics, self_ty, None, allow_self, f)
     }
@@ -595,7 +597,7 @@ pub(crate) trait Scopes {
         self_ty: &Type,
         trait_path: Option<&Path>,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::Type(self_ty.clone()),
@@ -611,7 +613,7 @@ pub(crate) trait Scopes {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         self.enter_trait_of(ident, generics, Vec::new(), allow_self, f)
     }
@@ -623,7 +625,7 @@ pub(crate) trait Scopes {
         generics: &Generics,
         gats: Vec<Gat>,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::of_trait(ident, generics),
@@ -689,8 +691,8 @@ struct Checkpoint {
 }
 
 /// What a probe for nested errors puts back when it ends ([`AnalyzeVisitor::begin_probe()`]).
-struct Probe {
-    allowed: AllowedPaths,
+struct Probe<P> {
+    allowed: AllowedPaths<P>,
     checkpoint: Checkpoint,
     probing: bool,
     /// The mentions of `Self` and the cycles that the visitor had when the probe began.
@@ -743,8 +745,8 @@ pub(crate) struct Finished {
     pub(crate) not_optional: Vec<(Context, String)>,
 }
 
-pub(crate) struct AnalyzeVisitor {
-    allowed: AllowedPaths,
+pub(crate) struct AnalyzeVisitor<P> {
+    allowed: AllowedPaths<P>,
     /// The Leaker's table while it analyzes (see [`AnalyzeVisitor::swap_contexts()`]), an empty one
     /// in a throwaway visitor.
     contexts: Contexts,
@@ -862,11 +864,11 @@ pub(crate) struct AnalyzeVisitor {
     /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
     /// effects, like `self_errors`.
     env_errors: Vec<CheckResult>,
-    /// The values of an item are read too (see [`LeakerConfig::check_values()`]).
+    /// The values of an item are read too (see [`check_values`](crate::Leaker::from_config)).
     check_values: bool,
     /// An entry whose type names the `Self` of a struct, an enum or a union nested in the analyzed
     /// syntax, and a bound of whose generics does, is for any type (see
-    /// [`LeakerConfig::nested_self_entries()`]).
+    /// [`nested_self_entries`](crate::Leaker::from_config)).
     nested_self_entries: bool,
     /// A value is being read ([`AnalyzeVisitor::place()`]).
     in_value: bool,
@@ -915,8 +917,8 @@ impl Inherits {
     }
 }
 
-impl AnalyzeVisitor {
-    pub(crate) fn new(allowed: AllowedPaths, generics: &Generics) -> Self {
+impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
+    pub(crate) fn new(allowed: AllowedPaths<P>, generics: &Generics) -> Self {
         Self {
             allowed,
             contexts: Contexts::default(),
@@ -970,7 +972,7 @@ impl AnalyzeVisitor {
     }
 
     /// Makes the visitor read the values of the items it visits, or not (see
-    /// [`LeakerConfig::check_values()`]).
+    /// [`check_values`](crate::Leaker::from_config)).
     pub(crate) fn reading_values(mut self, check_values: bool) -> Self {
         self.check_values = check_values;
         self
@@ -978,7 +980,7 @@ impl AnalyzeVisitor {
 
     /// Accepts an entry whose type names the `Self` of a nested struct, enum or union together with
     /// a bound that does, as an entry for any type (see
-    /// [`LeakerConfig::nested_self_entries()`]), or not.
+    /// [`nested_self_entries`](crate::Leaker::from_config)), or not.
     pub(crate) fn with_nested_self_entries(mut self, nested_self_entries: bool) -> Self {
         self.nested_self_entries = nested_self_entries;
         self
@@ -990,10 +992,16 @@ impl AnalyzeVisitor {
         std::mem::swap(&mut self.contexts, other);
     }
 
+    /// Returns `true` if the rule on paths panicked during this analysis, even if the panic was
+    /// caught since: the frames of the visitor are not reliable.
+    pub(crate) fn rule_panicked(&self) -> bool {
+        self.allowed.rule_panicked()
+    }
+
     fn alone<R>(
-        allowed: AllowedPaths,
+        allowed: AllowedPaths<P>,
         generics: &Generics,
-        f: impl FnOnce(&mut AnalyzeVisitor) -> R,
+        f: impl FnOnce(&mut AnalyzeVisitor<P>) -> R,
     ) -> R {
         f(&mut AnalyzeVisitor::new(allowed, generics))
     }
@@ -1001,7 +1009,7 @@ impl AnalyzeVisitor {
     /// Analyzes the default `ty` of a type parameter, with the parameters before it as the root
     /// generics. Returns the effects and the mentions of `Self` that have no meaning.
     fn analyze_default(
-        allowed: AllowedPaths,
+        allowed: AllowedPaths<P>,
         ty: &Type,
         generics: &Generics,
         declares_self: bool,
@@ -1264,7 +1272,7 @@ impl AnalyzeVisitor {
                 && matches!(path.segments.first(), Some(seg)
                     if seg.ident != "crate" && seg.ident != "$crate" && seg.ident != "Self")
                 && !self.starts_with_generic(path)
-                && !self.allowed.is_context_free_path(path)
+                && !self.is_free_path(path)
         });
         finder.visit_generics(context.generics());
         match context.self_ty() {
@@ -1301,9 +1309,9 @@ impl AnalyzeVisitor {
     /// environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does not hold for in
     /// the copy, whose own type has it (E0277), and the impl cannot be for any type unless the
     /// Leaker is configured to accept the risk: what the type needs of `Self` to be well-formed is
-    /// not known ([`LeakerConfig::nested_self_entries()`]; see `own_context()`). A predicate on
-    /// another type, which an impl proves (`Self: Sized`, `Vec<Self>: Clone`), and `Self: 'a` are
-    /// fine.
+    /// not known ([`nested_self_entries`](crate::Leaker::from_config); see `own_context()`). A
+    /// predicate on another type, which an impl proves (`Self: Sized`, `Vec<Self>: Clone`), and
+    /// `Self: 'a` are fine.
     fn self_in_bounds(&self, context: &Context) -> Option<Cause> {
         if self.self_nested {
             return match context.self_ty() {
@@ -1384,7 +1392,7 @@ impl AnalyzeVisitor {
         let mut effects = std::mem::take(&mut self.frame.effects);
         for (index, _, default) in defaulted(generics) {
             let root = without_defaults(generics, index);
-            let (found, self_errors) = AnalyzeVisitor::analyze_default(
+            let (found, self_errors) = Self::analyze_default(
                 self.allowed.clone(),
                 default,
                 &root,
@@ -1650,13 +1658,13 @@ impl AnalyzeVisitor {
     /// cause, or no path that is not allowed (each probe allows at least one more, which ends the
     /// nesting). The caller visits the syntax of the part again where the visitor is, then calls
     /// [`AnalyzeVisitor::end_probe()`].
-    fn begin_probe(&mut self, conflict: &CheckResult) -> Option<Probe> {
+    fn begin_probe(&mut self, conflict: &CheckResult) -> Option<Probe<P>> {
         let open = conflict.part.is_some()
             && !conflict.must.is_empty()
             && conflict
                 .paths
                 .iter()
-                .any(|path| !self.allowed.is_allowed_path(path));
+                .any(|path| !self.is_allowed_path(path));
         if !open {
             return None;
         }
@@ -1675,7 +1683,7 @@ impl AnalyzeVisitor {
 
     /// Ends a probe, and returns the errors it found. Nothing it recorded stays, but the types that
     /// `Self` or `Self::A` in the part keeps as written (`probe_kept`).
-    fn end_probe(&mut self, probe: Probe) -> Vec<ErrorItem> {
+    fn end_probe(&mut self, probe: Probe<P>) -> Vec<ErrorItem> {
         let Probe {
             allowed,
             checkpoint,
@@ -2078,7 +2086,8 @@ impl AnalyzeVisitor {
                      without `Self`, write the type with an absolute path (it is copied as \
                      written, and its `Self` is the copy's own), analyze the item with its own \
                      `intern_*` call, which writes its `Self` as the Leaker's type, or accept \
-                     the entry for any type with `LeakerConfig::nested_self_entries()`",
+                     the entry for any type with the `nested_self_entries` argument of \
+                     `Leaker::from_config()`",
                     tidy(&quote!(#ty)),
                     tidy(&self_path.shown())
                 )),
@@ -2156,9 +2165,7 @@ impl AnalyzeVisitor {
     /// item of the module: `Local<MY_CONST>`, as opposed to `Other<Local, MY_CONST>`.
     fn names_module_head(&self, ty: &Type) -> bool {
         let item = |path: &Path| {
-            !self.starts_with_generic(path)
-                && !self.allowed.is_context_free_path(path)
-                && self.is_module_path(path)
+            !self.starts_with_generic(path) && !self.is_free_path(path) && self.is_module_path(path)
         };
         match ty {
             Type::Path(TypePath { path, .. }) => item(path),
@@ -2191,7 +2198,7 @@ impl AnalyzeVisitor {
                 !names.iter().any(|name| name == "array" || name == "simd")
             }
             (false, Some("Box" | "Vec" | "Option" | "Result")) => {
-                names.len() == 1 && self.allowed.is_context_free_path(path)
+                names.len() == 1 && self.is_free_path(path)
             }
             _ => false,
         }
@@ -2289,7 +2296,7 @@ impl AnalyzeVisitor {
             None => {
                 let mut options = vec![
                     absolute,
-                    "allow it with `LeakerConfig::allow_path()`".to_string(),
+                    "allow it with `Allow::allow_path_if()`".to_string(),
                 ];
                 if denied_self {
                     options.push("analyze the item with `allow_self = true`".to_string());
@@ -2401,7 +2408,7 @@ impl AnalyzeVisitor {
                     .unwrap_or_default();
                 conflict.help = Some(format!(
                     "import `{0}` with an absolute `use` (`use ::my_crate::{0};`), or allow it \
-                     with `LeakerConfig::allow_path()`",
+                     with `Allow::allow_path_if()`",
                     name
                 ));
             }
@@ -2816,12 +2823,12 @@ impl AnalyzeVisitor {
     }
 
     /// Like `env_cycle()` for an entry in a predicate that names the `Self` of a nested struct, enum
-    /// or union and is for any type (`LeakerConfig::nested_self_entries()`). Its impl leaves out the
-    /// generics the type does not use, so `context` does not have a bound that names a leaked type
-    /// (`T: AsRef<Rel<Self>>`), but the impl of an entry that uses the generic has it, and the copy
-    /// has only the rewritten form in its environment (E0277, `Rel<(Self, T)>` beside it). So the
-    /// type is judged with the generics that `Self` names, as `intern_*` judges it, which writes
-    /// `Self` as the Leaker's type.
+    /// or union and is for any type (the `nested_self_entries` argument of
+    /// `Leaker::from_config()`). Its impl leaves out the generics the type does not use, so
+    /// `context` does not have a bound that names a leaked type (`T: AsRef<Rel<Self>>`), but the
+    /// impl of an entry that uses the generic has it, and the copy has only the rewritten form in
+    /// its environment (E0277, `Rel<(Self, T)>` beside it). So the type is judged with the generics
+    /// that `Self` names, as `intern_*` judges it, which writes `Self` as the Leaker's type.
     fn nested_self_cycle(
         &self,
         ty: &Type,
@@ -2985,7 +2992,7 @@ impl AnalyzeVisitor {
 
     /// Runs `visit` on a probe visitor that has the generics and the `Self` of `context`, and
     /// checks nothing itself.
-    fn probe<R>(&self, context: &Context, visit: impl FnOnce(&mut AnalyzeVisitor) -> R) -> R {
+    fn probe<R>(&self, context: &Context, visit: impl FnOnce(&mut AnalyzeVisitor<P>) -> R) -> R {
         Self::alone(self.allowed.clone(), context.generics(), |probe| {
             probe.check_env = false;
             probe.modules = self.modules.clone();
@@ -3069,7 +3076,7 @@ impl AnalyzeVisitor {
         if !bounded {
             return None;
         }
-        let names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor)| {
+        let names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor<P>)| {
             self.probe(context, |probe| {
                 visit(probe);
                 !probe.musts.is_empty() || (optional && has_optional(&probe.frame.effects))
@@ -3275,7 +3282,7 @@ impl AnalyzeVisitor {
     /// The relative paths in the syntax that `visit` walks, without their arguments, each once, in
     /// order: those that mean something else wherever they are written ([`AnalyzeVisitor::is_relative_path()`]).
     /// A cause that is copied as written holds them all, also those in the arguments of its path.
-    fn relative_paths_in(&self, visit: impl FnOnce(&mut RelativePaths<'_>)) -> Vec<Path> {
+    fn relative_paths_in(&self, visit: impl FnOnce(&mut RelativePaths<'_, P>)) -> Vec<Path> {
         let mut finder = RelativePaths {
             visitor: self,
             found: Vec::new(),
@@ -3332,7 +3339,7 @@ impl AnalyzeVisitor {
     /// is an entry anyway) would be a cycle, so the graph does not choose it: its parts are the
     /// entries, whose bounds the check looks at. A type that must be an entry is an error.
     fn block_unstable_self_types(&mut self, start: usize, end: usize) {
-        fn block(visitor: &AnalyzeVisitor, effects: &mut [Effect]) {
+        fn block<P: Fn(&Path) -> bool>(visitor: &AnalyzeVisitor<P>, effects: &mut [Effect]) {
             for effect in effects {
                 let pending = match effect {
                     Effect::Type(pending) => pending,
@@ -3436,7 +3443,27 @@ impl AnalyzeVisitor {
     }
 
     fn is_context_free(&self, path: &Path) -> bool {
-        self.allowed.is_context_free_path(path) || self.is_module_path(path)
+        self.is_free_path(path) || self.is_module_path(path)
+    }
+
+    /// Returns `true` if `path` starts with `Self` or a generic in scope: the rule on paths is
+    /// never asked about it.
+    fn heads_own_name(&self, path: &Path) -> bool {
+        path.leading_colon.is_none()
+            && matches!(path.segments.first(), Some(seg)
+                if seg.ident == "Self" || self.is_generic(&seg.ident))
+    }
+
+    /// [`AllowedPaths::is_context_free_path()`] for `path`.
+    fn is_free_path(&self, path: &Path) -> bool {
+        self.allowed
+            .is_context_free_path(path, !self.heads_own_name(path))
+    }
+
+    /// [`AllowedPaths::is_allowed_path()`] for `path`.
+    fn is_allowed_path(&self, path: &Path) -> bool {
+        self.allowed
+            .is_allowed_path(path, !self.heads_own_name(path))
     }
 
     fn is_relative(&self, path: &Path) -> bool {
@@ -4233,10 +4260,7 @@ impl AnalyzeVisitor {
 
     /// Returns `true` if `path` is an associated item of a generic in scope or of `Self` (`T::A`).
     fn is_projection(&self, path: &Path) -> bool {
-        path.leading_colon.is_none()
-            && path.segments.len() > 1
-            && matches!(path.segments.first(), Some(seg)
-                if seg.ident == "Self" || self.is_generic(&seg.ident))
+        path.segments.len() > 1 && self.heads_own_name(path)
     }
 }
 
@@ -4354,7 +4378,7 @@ fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)
 
 /// What a [`View`] asks of the analysis it wraps. The view forwards the `visit_*` methods the
 /// analysis overrides to it.
-impl AnalyzeVisitor {
+impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// Checks `ty` where the visitor is, as [`View::check()`] does: what the visit of `ty` finds,
     /// and nothing stays recorded.
     ///
@@ -4389,7 +4413,7 @@ impl AnalyzeVisitor {
     pub(crate) fn enter<R>(
         &mut self,
         spec: ScopeSpec,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         let mark = self.enter_scope(&spec, false);
         // The closure may panic and the scope around may catch it: leave the scope as if it failed.
@@ -4429,13 +4453,13 @@ impl PathOf {
     }
 }
 
-impl AnalyzeVisitor {
+impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// Visits the path `i`. `of` says what it is the path of: a mention of `Self` that has no
     /// meaning is an error about that syntax.
     fn visit_path_of(&mut self, i: &Path, of: PathOf) {
         let in_type = self.type_depth > 0;
         let starts_with_generic = self.starts_with_generic(i);
-        let free = self.allowed.is_context_free_path(i);
+        let free = self.is_free_path(i);
         let in_module = !starts_with_generic && !free && self.is_module_path(i);
         if in_type {
             if starts_with_generic {
@@ -4501,7 +4525,7 @@ impl AnalyzeVisitor {
     }
 }
 
-impl<'ast> Visit<'ast> for AnalyzeVisitor {
+impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
     fn visit_type_param(&mut self, i: &TypeParam) {
         if i.default.is_some() && self.is_alone_default(&i.ident) {
             let mut i = i.clone();
@@ -4541,7 +4565,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         for attr in &i.attrs {
             self.visit_attribute(attr);
         }
-        // The default body is read only with `LeakerConfig::check_values()`.
+        // The default body is read only with `check_values`.
         self.method_signature(&i.sig, |visitor| {
             if let Some(block) = &i.default {
                 visitor.check_body(&i.sig, block, true);
@@ -5160,12 +5184,12 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
 }
 
 /// Collects the relative paths in the syntax it visits ([`AnalyzeVisitor::relative_paths_in()`]).
-struct RelativePaths<'a> {
-    visitor: &'a AnalyzeVisitor,
+struct RelativePaths<'a, P> {
+    visitor: &'a AnalyzeVisitor<P>,
     found: Vec<Path>,
 }
 
-impl RelativePaths<'_> {
+impl<P: Fn(&Path) -> bool> RelativePaths<'_, P> {
     /// Records `path` alone, if it is relative.
     fn visit_head(&mut self, path: &Path) {
         if self.visitor.is_relative_path(path) {
@@ -5177,7 +5201,7 @@ impl RelativePaths<'_> {
     }
 }
 
-impl<'ast> Visit<'ast> for RelativePaths<'_> {
+impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for RelativePaths<'_, P> {
     fn visit_path(&mut self, i: &'ast Path) {
         self.visit_head(i);
         syn::visit::visit_path(self, i)
@@ -5208,15 +5232,6 @@ fn paths_of<'a>(musts: impl Iterator<Item = &'a Must>) -> Vec<Path> {
         }
     }
     paths
-}
-
-/// `path` without the arguments of its segments: `Vec`, not `Vec<Rel<'_>>`.
-fn without_arguments(path: &Path) -> Path {
-    let mut path = path.clone();
-    for seg in path.segments.iter_mut() {
-        seg.arguments = PathArguments::None;
-    }
-    path
 }
 
 /// Pushes the lifetimes that `ty` (an input) keeps constrained as written in the copy. A reference

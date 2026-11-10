@@ -26,6 +26,9 @@
 //! entry as a whole, a rejected one expands to nothing, and the identifier that is a type is leaked
 //! alone where it is a soft cause.
 
+mod common;
+
+use common::starts_with;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -39,8 +42,8 @@ macro_rules! item {
 }
 
 /// Analyzes `item` with the `intern_*` of its kind.
-fn analyze_with(
-    mut leaker: Leaker,
+fn analyze_with<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     item: &Item,
     allow_self: bool,
 ) -> std::result::Result<Referrer, Vec<ErrorItem>> {
@@ -57,9 +60,8 @@ fn analyze_with(
 }
 
 fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive();
-    analyze_with(Leaker::from_config(config), item, allow_self)
+    let config = Allow::new().allow_primitive();
+    analyze_with(Leaker::from_config(config, false, false), item, allow_self)
 }
 
 /// The required entries, as text.
@@ -119,7 +121,7 @@ fn absolute(name: &str) -> String {
     )
 }
 
-const ALLOW: &str = "allow it with `LeakerConfig::allow_path()`";
+const ALLOW: &str = "allow it with `Allow::allow_path_if()`";
 const ALLOW_SELF: &str = "analyze the item with `allow_self = true`";
 
 /// The note that says what the holder cannot be leaked because of.
@@ -174,7 +176,7 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
          \n\
          \x20 = note: it cannot be leaked as a whole because of `Self`\n\
          \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
-         `{ ::my_crate::ILEN }` for a const), allow it with `LeakerConfig::allow_path()`, or \
+         `{ ::my_crate::ILEN }` for a const), allow it with `Allow::allow_path_if()`, or \
          analyze the item with `allow_self = true`\n"
     );
     // With `Self` allowed the path is the entry: it holds `ILEN` for a type and for a const.
@@ -203,9 +205,8 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
         assert!(entries(&referrer).is_empty(), "{}", quote!(#item));
     }
     // Allowed by the config: left as written, so it is no cause either.
-    let mut config = LeakerConfig::new();
-    config.allow_path(parse_quote!(ILEN));
-    let referrer = analyze_with(Leaker::from_config(config), &item, false).unwrap();
+    let config = Allow::new().allow_path_if(starts_with(parse_quote!(ILEN)));
+    let referrer = analyze_with(Leaker::from_config(config, false, false), &item, false).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -915,14 +916,16 @@ fn module_with(nested: bool, ilen: &str, place: &str, holder: &str) -> Item {
 }
 
 /// The config of the tests of modules: primitives and the prelude (`Vec`, `Box`, ..) are copied.
-fn module_config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config
+fn module_config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_prelude()
 }
 
 fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
-    analyze_with(Leaker::from_config(module_config()), item, true)
+    analyze_with(
+        Leaker::from_config(module_config(), false, false),
+        item,
+        true,
+    )
 }
 
 /// `ILEN` imported from outside the module (not declared by it), nested or not.
@@ -981,7 +984,7 @@ fn a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type()
          declares again, so it is not leaked as a whole\n\
          \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
          `{ ::my_crate::ILEN }` for a const), import `ILEN` with an absolute `use` \
-         (`use ::my_crate::ILEN;`), or allow it with `LeakerConfig::allow_path()`\n"
+         (`use ::my_crate::ILEN;`), or allow it with `Allow::allow_path_if()`\n"
     );
 }
 
@@ -1029,9 +1032,8 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
     }
     // Allowed by the config: left as written, so it is no cause either.
     let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
-    let mut config = module_config();
-    config.allow_path(parse_quote!(ILEN));
-    let referrer = analyze_with(Leaker::from_config(config), &item, true).unwrap();
+    let config = module_config().allow_path_if(starts_with(parse_quote!(ILEN)));
+    let referrer = analyze_with(Leaker::from_config(config, false, false), &item, true).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -1234,7 +1236,7 @@ fn a_name_that_enter_mod_declares_beside_the_identifier_is_an_error_too() {
             .iter()
             .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
             .collect();
-        let mut leaker = Leaker::from_config(module_config());
+        let mut leaker = Leaker::from_config(module_config(), false, false);
         leaker.enter_mod("m", declared, |view| view.visit_item(&item));
         leaker.result().finish()
     };

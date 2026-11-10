@@ -19,7 +19,7 @@ use template_quote::{quote, ToTokens};
 ///
 /// It is usually the whole syntax that cannot be accepted (`MyType<'_, Rel>`, not `MyType`). Causes
 /// are equal if they have the same kind and tokens (spans and spacing ignored), so a cause written
-/// by hand (`Cause::Trait(parse_quote!(RelTr))`) can be passed to
+/// by hand (`Cause::Trait(parse_quote!(RelTr))`) can be compared with `==` in a rule of
 /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -31,7 +31,7 @@ pub enum Cause {
     /// qualified path in a value (`<u8 as Rel>::f()`).
     Trait(Path),
     /// An expression: a path in a const expression (an array length, a discriminant) or, with
-    /// [`check_values()`](crate::LeakerConfig::check_values), in a value; also an expression that
+    /// [`check_values`](crate::Leaker::from_config), in a value; also an expression that
     /// cannot be leaked (a closure in an array length). A path is an [`Expr::Path`], as written.
     Expr(Expr),
     /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`). A macro that is a
@@ -281,7 +281,7 @@ pub enum Reason {
     /// `Self` where no scope gives it a meaning: in a module, or in generics that no struct, enum,
     /// union, impl or trait encloses.
     SelfWithoutMeaning,
-    /// Syntax that the Leaker cannot read, with `check_values()`: a macro whose arguments are not
+    /// Syntax that the Leaker cannot read, with `check_values`: a macro whose arguments are not
     /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed.
     Unreadable,
     /// A bare identifier among the arguments of a path, which may be a const, in a type that cannot
@@ -305,7 +305,7 @@ pub enum Reason {
     /// A type that names the `Self` of a nested struct, enum or union and uses a generic whose
     /// bound names it too (`Wrap<Self, T>` with `T: AsRef<Self>`). Write it with an absolute path,
     /// or accept it with
-    /// [`nested_self_entries()`](crate::LeakerConfig::nested_self_entries).
+    /// [`nested_self_entries`](crate::Leaker::from_config).
     NestedSelfInBounds,
     /// A type in a bound or where predicate that the copy cannot write through the Repeater
     /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)).
@@ -399,7 +399,8 @@ impl Reason {
 #[non_exhaustive]
 pub struct ErrorItem {
     /// The part of the item that cannot be interned, as written, and where the error is reported
-    /// ([`ErrorItem::span()`]). Pass it to [`LeakerResult::allow()`](crate::LeakerResult::allow).
+    /// ([`ErrorItem::span()`]). Compare it with `==` in a rule of
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
     pub cause: Cause,
     /// Why it cannot be interned.
     pub reason: Reason,
@@ -410,14 +411,14 @@ pub struct ErrorItem {
     pub notes: Vec<(TokenStream, String)>,
     /// What to write instead, with the tokens it is about. Every error has one.
     pub help: Option<(TokenStream, String)>,
-    /// Found while reading a value ([`check_values()`](crate::LeakerConfig::check_values)); see
+    /// Found while reading a value ([`check_values`](crate::Leaker::from_config)); see
     /// [`allow_values()`](crate::LeakerResult::allow_values).
     pub in_value: bool,
     /// Found in a default: of a trait's method or const, or of a parameter; see
     /// [`allow_default()`](crate::LeakerResult::allow_default).
     pub in_default: bool,
     /// The relative paths that the cause depends on, without their arguments (`Vec<Rel<'_>>` has
-    /// `Vec` and `Rel`). A path rule drops the error if all start with an allowed path.
+    /// `Vec` and `Rel`). A path rule drops the error if it accepts all of them.
     pub paths: Vec<Path>,
     /// What is wrong inside the part if its [`paths`](ErrorItem::paths) are allowed. They take the
     /// place of this error when an `allow*()` drops it.
@@ -796,13 +797,13 @@ fn absolute_path_help(
                     "write `{}` with an absolute path (e.g. `{}`)",
                     name, example
                 ));
-                options.push("allow it with `LeakerConfig::allow_path()`".to_string());
+                options.push("allow it with `Allow::allow_path_if()`".to_string());
             }
             Some(path) => {
                 let (name, _) = path_names(path);
                 options.push(format!(
                     "write `{}` where it is not leaked, or allow it with \
-                     `LeakerConfig::allow_path()`",
+                     `Allow::allow_path_if()`",
                     name
                 ));
             }

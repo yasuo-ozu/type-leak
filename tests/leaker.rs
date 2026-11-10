@@ -5,7 +5,7 @@ mod common;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, ErrorItem, Leaker, LeakerConfig};
+use type_leak::{to_syn_error, Allow, ErrorItem, Leaker};
 
 #[test]
 fn test_leaker() {
@@ -119,14 +119,14 @@ fn test_leaker_construction() {
 
 /// The number of entries of `struct S(<ty>);` with the Leaker `leaker` (`ty` is a path written
 /// the relative way, which is leaked unless it is allowed).
-fn entries_of_a_field(leaker: Leaker, ty: &str) -> usize {
+fn entries_of_a_field<P: Fn(&Path) -> bool>(leaker: Leaker<P>, ty: &str) -> usize {
     let item: ItemStruct = parse_str(&format!("struct S({});", ty)).unwrap();
     let mut leaker = leaker;
     leaker.intern_struct(&item, true);
     leaker.result().finish().unwrap().iter().count()
 }
 
-/// The docs of `LeakerConfig`: `allow_primitive()` allows the primitive types, and
+/// The docs of `Allow`: `allow_primitive()` allows the primitive types, and
 /// `allow_prelude()` the names of the standard prelude: a relative path with such a name is not
 /// leaked, while `Leaker::new()` allows no path and leaks it. Audit mutants `cfg_primitive_f64`,
 /// `cfg_primitive_f32`, `cfg_primitive_i128`, `cfg_prelude_drop`, `cfg_prelude_toowned` and
@@ -174,54 +174,53 @@ fn test_config_allows_the_documented_names() {
         "ToOwned",
         "ToString",
     ];
-    let mut only_primitives = LeakerConfig::new();
-    only_primitives.allow_primitive();
-    let mut only_prelude = LeakerConfig::new();
-    only_prelude.allow_prelude();
+    let only_primitives = || Allow::new().allow_primitive();
+    let only_prelude = || Allow::new().allow_prelude();
     for name in primitives.iter().chain(prelude.iter()) {
         // Nothing is allowed by default.
         assert_eq!(entries_of_a_field(Leaker::new(), name), 1, "{}", name);
         // Each list allows its names, and not the other list's.
         let (own, other) = if primitives.contains(name) {
-            (&only_primitives, &only_prelude)
+            let own =
+                entries_of_a_field(Leaker::from_config(only_primitives(), false, false), name);
+            (
+                own,
+                entries_of_a_field(Leaker::from_config(only_prelude(), false, false), name),
+            )
         } else {
-            (&only_prelude, &only_primitives)
+            let own = entries_of_a_field(Leaker::from_config(only_prelude(), false, false), name);
+            (
+                own,
+                entries_of_a_field(Leaker::from_config(only_primitives(), false, false), name),
+            )
         };
-        assert_eq!(
-            entries_of_a_field(Leaker::from_config(own.clone()), name),
-            0,
-            "{}",
-            name
-        );
-        assert_eq!(
-            entries_of_a_field(Leaker::from_config(other.clone()), name),
-            1,
-            "{}",
-            name
-        );
+        assert_eq!(own, 0, "{}", name);
+        assert_eq!(other, 1, "{}", name);
     }
     // The function `drop` is a name of the prelude too (here in an array length).
     let item: ItemStruct = parse_quote!(
         struct S([::core::primitive::u8; drop]);
     );
-    let entries = |config: LeakerConfig| {
-        let mut leaker = Leaker::from_config(config);
-        leaker.intern_struct(&item, true);
+    fn entries<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+        config: Allow<P, E>,
+        item: &ItemStruct,
+    ) -> usize {
+        let mut leaker = Leaker::from_config(config, false, false);
+        leaker.intern_struct(item, true);
         leaker.result().finish().unwrap().iter().count()
-    };
-    assert_eq!(entries(LeakerConfig::new()), 1);
-    assert_eq!(entries(only_primitives.clone()), 1);
-    assert_eq!(entries(only_prelude.clone()), 0);
+    }
+    assert_eq!(entries(Allow::new(), &item), 1);
+    assert_eq!(entries(only_primitives(), &item), 1);
+    assert_eq!(entries(only_prelude(), &item), 0);
     // `allow_crate()` allows the paths that start with `crate`, and the lists add up.
     let item: ItemStruct = parse_quote!(
         struct S(crate::A, u8, Vec<crate::B>);
     );
-    let mut all = LeakerConfig::new();
-    all.allow_primitive().allow_prelude().allow_crate();
-    let mut leaker = Leaker::from_config(all);
+    let all = Allow::new().allow_primitive().allow_prelude().allow_crate();
+    let mut leaker = Leaker::from_config(all, false, false);
     leaker.intern_struct(&item, true);
     assert!(leaker.result().finish().unwrap().is_empty());
-    let mut leaker = Leaker::from_config(only_prelude);
+    let mut leaker = Leaker::from_config(only_prelude(), false, false);
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
@@ -244,9 +243,8 @@ fn test_intern() {
         }
     };
     let item: ItemTrait = parse_quote!(#tokens);
-    let mut config = LeakerConfig::new();
-    config.allow_crate();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_crate();
+    let mut leaker = Leaker::from_config(config, false, false);
 
     leaker.intern_trait(&item, true);
     leaker.reduce_roots();
@@ -265,9 +263,8 @@ fn messages(errors: &[ErrorItem]) -> String {
 }
 
 fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
-    let mut config = type_leak::LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config);
+    let config = type_leak::Allow::new().allow_primitive().allow_prelude();
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_struct(item, true);
     let referrer = leaker
         .result()
@@ -277,9 +274,8 @@ fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
 }
 
 fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
-    let mut config = type_leak::LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config);
+    let config = type_leak::Allow::new().allow_primitive().allow_prelude();
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(item, true);
     let referrer = leaker
         .result()
@@ -508,9 +504,8 @@ fn test_assertions_for_assumed_primitives() {
             fn f<const M: u8>(&self, x: u16) -> ::core::primitive::u32;
         }
     };
-    let mut config = type_leak::LeakerConfig::new();
-    config.allow_primitive();
-    let mut leaker = Leaker::from_config(config);
+    let config = type_leak::Allow::new().allow_primitive();
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(&item, true);
     let assertions = leaker.assertions().to_string();
     assert!(leaker.result().errors().is_empty());

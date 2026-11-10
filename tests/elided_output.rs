@@ -27,12 +27,11 @@ mod common;
 use common::check_in;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Cause, ErrorItem, Leaker, LeakerConfig, Referrer};
+use type_leak::{to_syn_error, Allow, Cause, ErrorItem, Leaker, Referrer};
 
-fn leaker() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    Leaker::from_config(config)
+fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new().allow_primitive().allow_prelude();
+    Leaker::from_config(config, false, false)
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {

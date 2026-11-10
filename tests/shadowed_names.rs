@@ -31,10 +31,8 @@ fn text<T: ToTokens>(t: &T) -> String {
     quote!(#t).to_string()
 }
 
-fn config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config
+fn config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_prelude()
 }
 
 /// The Referrer as the macro of the Referrer's crate reads it.
@@ -104,7 +102,7 @@ fn replace(
     found.into_inner()
 }
 
-fn analyze_item(leaker: &mut Leaker, item: &Item) -> ContextId {
+fn analyze_item<P: Fn(&Path) -> bool>(leaker: &mut Leaker<P>, item: &Item) -> ContextId {
     match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
         Item::Trait(i) => leaker.intern_trait(i, true),
@@ -127,7 +125,7 @@ enum Scope {
 /// that the visitor found every required entry, so that the copy has no path left.
 fn round_trip(source: &str, scope: Scope) {
     let item: Item = parse_str(source).unwrap();
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let name = match &item {
         Item::Struct(i) => i.ident.clone(),
         Item::Trait(i) => i.ident.clone(),
@@ -289,7 +287,7 @@ fn a_path_named_like_a_generic_is_replaced_in_an_impl() {
 fn the_context_of_a_path_named_like_a_generic_has_only_what_the_type_names() {
     for path in ["self::U", "crate::U"] {
         let item: ItemStruct = parse_str(&format!("struct S<U>(U, {0}, {0}<U>);", path)).unwrap();
-        let mut leaker = Leaker::from_config(config());
+        let mut leaker = Leaker::from_config(config(), false, false);
         let context = leaker.intern_struct(&item, true);
         let referrer = through_tokens(leaker.result().finish().unwrap());
         let alone = index(&referrer, path, "", false);
@@ -312,7 +310,7 @@ fn the_copy_of_an_impl_has_the_entry_of_the_path_named_like_a_generic() {
     for path in ["crate::U", "self::U"] {
         let item: ItemImpl =
             parse_str(&format!("impl<U> S<U> {{ fn f(b: {}) {{}} }}", path)).unwrap();
-        let mut leaker = Leaker::from_config(config());
+        let mut leaker = Leaker::from_config(config(), false, false);
         let context = leaker.intern_impl(&item, true);
         let referrer = through_tokens(leaker.result().finish().unwrap());
         let self_ty = index(&referrer, "S < U >", "< U >", false);
@@ -338,7 +336,7 @@ fn a_path_named_like_a_generic_is_replaced_in_the_arguments_of_an_impl() {
         ))
         .unwrap();
         let (_, trait_path, _) = item.trait_.clone().unwrap();
-        let mut leaker = Leaker::from_config(config());
+        let mut leaker = Leaker::from_config(config(), false, false);
         let (context, ()) = leaker.enter_impl(&item.generics, &item.self_ty, false, |view| {
             for seg in &trait_path.segments {
                 view.visit_path_arguments(&seg.arguments);
@@ -365,7 +363,7 @@ fn a_path_named_like_a_generic_is_replaced_in_the_arguments_of_an_impl() {
 /// the Referrer, as a `File`. Returns the Referrer, and the copy of the items.
 fn module_copy(source: &str) -> (Referrer, File, BTreeSet<usize>) {
     let item: ItemMod = parse_str(source).unwrap();
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let context = leaker.intern_mod(&item);
     let result = leaker.result();
     assert!(
@@ -457,7 +455,7 @@ fn every_entry_that_names_a_generic_of_the_name_of_a_declared_item_is_found() {
                 format!("mod m {{ pub struct X; pub fn f() {{ fn g<X>(a: {}) {{}} }} }}", ty),
             ] {
                 let item: ItemMod = parse_str(&source).unwrap();
-                let mut leaker = Leaker::from_config(config());
+                let mut leaker = Leaker::from_config(config(), false, false);
                 // A rejected module (a relative path that cannot be leaked) is no case.
                 let context = leaker.intern_mod(&item);
                 let referrer = match leaker.result().finish() {
@@ -492,7 +490,7 @@ fn enter_mod_declaring_the_name_of_a_generic_keeps_the_entry_of_the_generic() {
     let item: ItemFn = parse_quote!(
         pub fn f<X>(a: crate::base::B1<X>) {}
     );
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let declared: [Ident; 2] = [parse_quote!(X), item.sig.ident.clone()];
     let (context, ()) = leaker.enter_mod("m", declared, |view| {
         view.visit_item(&Item::Fn(item.clone()))
@@ -530,7 +528,7 @@ fn a_declared_name_still_hides_the_entries_that_do_not_name_a_generic() {
             fn g(&self, a: crate::base::B1<X>);
         }
     );
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let context = leaker.intern_trait(&item, true);
     let referrer = through_tokens(leaker.result().finish().unwrap());
     let items = |declare: bool| {
@@ -608,7 +606,7 @@ fn messages(errors: &[ErrorItem]) -> String {
 
 /// Analyzes `item` in `scope` (`declared`: the names the module declares, with `Scope::Mod`).
 fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let name = match item {
         Item::Struct(i) => i.ident.clone(),
         Item::Enum(i) => i.ident.clone(),

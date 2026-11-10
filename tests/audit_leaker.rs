@@ -4,25 +4,25 @@
 
 mod common;
 
-use common::check_in;
+use common::{check_in, starts_with};
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Leaker, LeakerConfig, Referrer, SelfRequirement};
+use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Referrer, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
-fn config() -> LeakerConfig {
-    LeakerConfig::new()
+fn config() -> Allow {
+    Allow::new()
 }
 
 /// The Referrer of `item`, or the text of its errors.
-fn leak_trait_with(
-    config: LeakerConfig,
+fn leak_trait_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
     item: &ItemTrait,
 ) -> std::result::Result<Referrer, String> {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(item, true);
     leaker
         .result()
@@ -36,8 +36,11 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 
 /// The compile-time checks that the analysis of `item` asks for (`Leaker::assertions()`); it has
 /// no error.
-fn assertions_of(config: LeakerConfig, item: &ItemTrait) -> String {
-    let mut leaker = Leaker::from_config(config);
+fn assertions_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
+    item: &ItemTrait,
+) -> String {
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(item, true);
     let assertions = leaker.assertions().to_string();
     leaker.result().finish().unwrap();
@@ -45,8 +48,11 @@ fn assertions_of(config: LeakerConfig, item: &ItemTrait) -> String {
 }
 
 /// The Referrer of the module `item`, or the text of its errors.
-fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result<Referrer, String> {
-    let mut leaker = Leaker::from_config(config);
+fn leak_module_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
+    item: &ItemMod,
+) -> std::result::Result<Referrer, String> {
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_mod(item);
     leaker
         .result()
@@ -202,7 +208,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     assert!(
         err.contains(
             "= help: write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it \
-             with `LeakerConfig::allow_path()`, or name the lifetime of the trait object (e.g. \
+             with `Allow::allow_path_if()`, or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)\n"
         ),
         "{}",
@@ -304,8 +310,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
         assert!(err.contains("E0195"), "{}: {}", s(&y), err);
     }
     // Unless it is allowed, as `::core` is.
-    let mut allowed = config();
-    allowed.allow_path(parse_quote!(::p));
+    let allowed = config().allow_path_if(starts_with(parse_quote!(::p)));
     let referrer = leak_trait_with(
         allowed,
         &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::p::Tr) -> &'a (); } },
@@ -468,10 +473,10 @@ fn type_macros() {
     let item: ItemStruct = parse_quote! {
         struct S { f: ::p::Wrap<::p::m!(Self)> }
     };
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     leaker.intern_struct(&item, true);
     assert!(leaker.result().finish().is_ok());
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     leaker.intern_struct(&item, false);
     let result = leaker.result();
     assert!(!result.errors().is_empty());
@@ -493,20 +498,16 @@ fn type_macros() {
 
 #[test]
 fn primitives_are_assumed_when_the_type_is_copied() {
-    let mut config = config();
-    config.allow_primitive();
-    let assertions = assertions_of(
-        config.clone(),
-        &parse_quote! { trait Tr { fn f(&self) -> &u8; } },
-    );
+    let config = || config().allow_primitive();
+    let assertions = assertions_of(config(), &parse_quote! { trait Tr { fn f(&self) -> &u8; } });
     assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
     let assertions = assertions_of(
-        config.clone(),
+        config(),
         &parse_quote! { trait Tr { fn f(&self) -> impl ::p::Into<u16>; } },
     );
     assert!(assertions.contains("__type_leak_assert_u16_is_primitive"));
     // The analysis recovers from an error, so what it found is recorded: `u8` is copied.
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::from_config(config(), false, false);
     let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> u8; } };
     leaker.intern_trait(&item, true);
     assert!(leaker

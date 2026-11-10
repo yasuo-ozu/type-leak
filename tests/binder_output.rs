@@ -21,26 +21,26 @@
 
 mod common;
 
-use common::check_in;
+use common::{check_in, starts_with};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Cause, ContextId, ErrorItem, Leaker, LeakerConfig, Referrer};
+use type_leak::{to_syn_error, Allow, Cause, ContextId, ErrorItem, Leaker, Referrer};
 
 /// A Leaker which allows `::p`, standing for an external crate which the Referrer's crate is known
 /// to have as the Leaker's: its types may be an anchor. The types of the other external crates may
 /// be replaced by the Referrer, so they are not (see `external_crate_types_do_not_anchor`).
-fn leaker() -> Leaker {
+fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
     leaker_with(&[parse_quote!(::p)])
 }
 
-fn leaker_with(allowed: &[Path]) -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    for path in allowed {
-        config.allow_path(path.clone());
-    }
-    Leaker::from_config(config)
+fn leaker_with(allowed: &[Path]) -> Leaker<impl Fn(&Path) -> bool> {
+    let allowed = allowed.to_vec();
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(move |path| allowed.iter().any(|a| starts_with(a.clone())(path)));
+    Leaker::from_config(config, false, false)
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {
@@ -60,13 +60,16 @@ fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     analyze_with(leaker(), item)
 }
 
-fn analyze_with(leaker: Leaker, item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+fn analyze_with<P: Fn(&Path) -> bool>(
+    leaker: Leaker<P>,
+    item: &ItemTrait,
+) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     analyze_in(leaker, item).map(|(referrer, _)| referrer)
 }
 
 /// Like `analyze_with()`, with the top-level context of the trait: the scope of its copy.
-fn analyze_in(
-    mut leaker: Leaker,
+fn analyze_in<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     item: &ItemTrait,
 ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
     let context = leaker.intern_trait(item, true);
@@ -80,7 +83,7 @@ fn leaked(item: ItemTrait) -> Vec<(String, String)> {
 
 /// The leaked types of a trait with the generics each uses, by the given Leaker. An optional entry
 /// (see `Referrer::must()`) is preceded by `?`.
-fn leaked_by(leaker: Leaker, item: ItemTrait) -> Vec<(String, String)> {
+fn leaked_by<P: Fn(&Path) -> bool>(leaker: Leaker<P>, item: ItemTrait) -> Vec<(String, String)> {
     let referrer = analyze_with(leaker, &item).unwrap_or_else(|e| panic!("{}", to_syn_error(&e)));
     referrer
         .iter()
@@ -1214,13 +1217,13 @@ fn check_tells_the_anchored_type_is_interned_alone() {
 }
 
 /// The Leaker which allows `::other`, as `::p` is allowed by `leaker()`.
-fn leaker_allowing_other() -> Leaker {
+fn leaker_allowing_other() -> Leaker<impl Fn(&Path) -> bool> {
     leaker_with(&[parse_quote!(::other)])
 }
 
 /// Same, which allows nothing external: `::other` is an optional entry, which the Referrer may
 /// replace.
-fn leaker_allowing_nothing() -> Leaker {
+fn leaker_allowing_nothing() -> Leaker<impl Fn(&Path) -> bool> {
     leaker_with(&[])
 }
 
@@ -1256,7 +1259,7 @@ fn external_crate_types_do_not_anchor_the_lifetime() {
         let (_, note) = error_by(leaker_allowing_nothing(), item.clone());
         assert_eq!(note.as_deref(), Some(NOTE), "{}", s(&item));
     }
-    // It is an anchor where the crate is allowed (an absolute path given to `allow_path()`).
+    // It is an anchor where the crate is allowed (an absolute path given to `allow_path_if()`).
     assert_eq!(
         leaked_by(leaker_allowing_other(), item.clone()),
         [e("Parser < 'x >", "< 'x >")]
@@ -1573,7 +1576,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
     let mut strict = result;
-    strict.allow_ambiguous_crate_name(false);
+    strict.deny_ambiguous_crate_name();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
         &mut strict
             .finish()
@@ -1599,7 +1602,9 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     for allow in [true, false] {
         let mut copy = item.clone();
         let mut result = result.clone();
-        result.allow_ambiguous_crate_name(allow);
+        if !allow {
+            result.deny_ambiguous_crate_name();
+        }
         syn::visit_mut::VisitMut::visit_item_trait_mut(
             &mut result
                 .finish()
@@ -1614,7 +1619,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     }
 }
 
-fn error_by(leaker: Leaker, item: ItemTrait) -> (String, Option<String>) {
+fn error_by<P: Fn(&Path) -> bool>(leaker: Leaker<P>, item: ItemTrait) -> (String, Option<String>) {
     let err = analyze_with(leaker, &item).expect_err("expected an error");
     (
         messages(&err),

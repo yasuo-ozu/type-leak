@@ -197,7 +197,7 @@ impl Referrer {
     /// [`Referrer::entry_args()`], but gets the parameter itself (`N`) as `value`. Write the impl
     /// in [`RepeaterImpl::module`] if it is `Some`, and one for every entry ([`Referrer::iter()`]):
     /// optional entries need one if some Referrer is strict
-    /// ([`allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
+    /// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)).
     ///
     /// Fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry
     /// [needs `Self`](Referrer::needs_self), and with the error of `const_fn`.
@@ -361,7 +361,7 @@ fn bucket_type(id: u64, ix: usize) -> Type {
 ///
 /// `declared` are the generics of the impl without `param`, in which `param` replaced `Self`, and
 /// `ty` is the type of the impl. A type that names `Self` (`Rel2<Self, T>`, with
-/// [`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries)) needs it as
+/// [`nested_self_entries`](crate::Leaker::from_config)) needs it as
 /// the bounds do: `Rel2<__S, T>` is well-formed for `__S: Sized` only, unless the declaration of
 /// `Rel2` relaxes it, which the Leaker cannot see. They need no `Sized` if every use of `param` is
 ///

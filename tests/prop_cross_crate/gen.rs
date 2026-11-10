@@ -48,7 +48,7 @@
 //! Structs, enums and unions with a generic whose bound names their own `Self` and a default that
 //! uses it (`Features::self_bound_adts`, F41): `struct S<T: Clone + AsRef<Self>, U = Rel<T>>`, nested
 //! in `enter_mod` (`Gen::gen_self_bound_adt()`). With `Features::nested_self_entries` (F42) the
-//! attribute asks for `LeakerConfig::nested_self_entries()` (all the items nested in `enter_mod`),
+//! attribute asks for `nested_self_entries` (all the items nested in `enter_mod`),
 //! and some have a field that names `Self` in a relative type (`Rel2<Self, T>`), which is for any
 //! type that the bound holds for.
 //!
@@ -97,7 +97,7 @@ use std::hash::Hasher;
 /// `?` applies to the real `Sized` only, so `T: ?Sized` is no more context-dependent than
 /// `T: ?::core::marker::Sized`. `type-leak` at fb11f41 does not know it: it takes the bare `Sized`
 /// of `?Sized` for a relative path like any other bare name of the prelude, and rejects it unless
-/// `LeakerConfig::allow_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
+/// `Allow::allow_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
 /// to the real `Sized` only), so it is `true`; it is the only place that says so. It reaches
 /// three places: the generator (a bare `?Sized` is an expected rejection without the prelude only
 /// if it is `false`: the tag `bare:?Sized`), the macro (`relaxed_sized` argument of `prop_leak`:
@@ -190,7 +190,7 @@ pub struct Features {
     /// written, and so does a where predicate: they are the limitation F5 and the test macro's
     /// witness (no receiver).
     pub implied_outlives: bool,
-    /// A strict Referrer (`allow_ambiguous_crate_name(false)`) replaces the optional entries too.
+    /// A strict Referrer (`deny_ambiguous_crate_name()`) replaces the optional entries too.
     /// An optional entry in a where predicate that names a lifetime (`T: Fn(&'a ::ext::W<T,
     /// ::ext::B0>)`) has the predicate in its context, so it is replaced by a path that needs
     /// itself (E0277, F17): `not_optional` of the Leaker misses the type that holds another
@@ -315,7 +315,7 @@ pub struct Features {
     /// item (F41: fixed, on by default). A field of the same type is an entry for any type, which the
     /// copy passes its own type for (F37).
     pub self_bound_adts: bool,
-    /// The Leaker is configured with `LeakerConfig::nested_self_entries()` for the items nested in
+    /// The Leaker is configured with `nested_self_entries` for the items nested in
     /// `enter_mod` (`nested_self_entries = true` in the attribute), and the structs, enums and unions
     /// of `self_bound_adts` have a field that names their `Self` in a relative type (`Rel2<Self, T>`
     /// with `T: AsRef<Self>`), which the Leaker rejects without the option (F42: on by default). The
@@ -331,7 +331,7 @@ pub struct Features {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Flags {
     /// `allow_stages`: for each rule of [`Flags::rules()`] the macro compares the errors that remain
-    /// with the rule given to `LeakerConfig` and to `LeakerResult` for every item and makes the copy
+    /// with the rule given to `Allow` and to `LeakerResult` for every item and makes the copy
     /// of each (`stages = true` in the attribute, which only asks it to report both counts and to
     /// write the copies), and the harness prints how many items differ and builds the copies
     /// (`main.rs`: "The copies after the analysis without a rule").
@@ -343,7 +343,7 @@ pub struct Flags {
     /// `values`: the generated items have values (`Gen::method_body()`, `Gen::value_const()`): the
     /// bodies of functions, methods and default methods, the values of constants and statics, the
     /// defaults of associated constants. They have the types of the Leaker's crate in type positions
-    /// (a `let`, a turbofish, a cast), which the Leaker leaks with `check_values()`, and some have a
+    /// (a `let`, a turbofish, a cast), which the Leaker leaks with `check_values`, and some have a
     /// relative path of a value (`crate::base::bf()`), which it rejects. There are more defaults of
     /// const parameters that name a relative constant. The rules `values` and `default` of
     /// `allow_stages` have errors to drop.
@@ -517,7 +517,7 @@ pub struct Config {
     pub allow_std: bool,
     /// The Leaker allows its own crate.
     pub allow_crate: bool,
-    /// The Leaker allows the primitive types (`LeakerConfig::allow_primitive()`). Without it, `u8`
+    /// The Leaker allows the primitive types (`Allow::allow_primitive()`). Without it, `u8`
     /// is a relative path like any other: each is an entry of the item.
     pub primitive: bool,
 }
@@ -581,7 +581,7 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
 /// `value_path`: a body, a constant or a default has a relative path of a value (`crate::base::bf()`,
-/// `RLEN`), which `LeakerConfig::check_values()` rejects (`values`).
+/// `RLEN`), which the `check_values` argument of `Leaker::from_config()` rejects (`values`).
 pub const TAG_VALUE_PATH: &str = "value_path";
 /// `relative_std`: a path of `std`, `core` or `alloc` is written without the leading `::` in the item.
 /// The Leaker leaks it unless it allows them (the rule `std` of `allow_stages` does not), so in a

@@ -6,9 +6,12 @@
 //! is analyzed with its own generics as those of the Leaker, which is what the top-level context is
 //! that of.
 
+mod common;
+
+use common::starts_with;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, Leaker, LeakerConfig, Referrer, SelfRequirement};
+use type_leak::{Allow, ContextId, Leaker, Referrer, SelfRequirement};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -292,9 +295,8 @@ fn intern_mod() {
 fn from_config_and_the_items_accumulate() {
     // A Leaker with a configuration analyzes the items like one without it, and the contexts of
     // the items are numbered in the order they appear.
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_primitive().allow_prelude();
+    let mut leaker = Leaker::from_config(config, false, false);
     let first: ItemStruct = parse_quote!(
         struct A<T> {
             x: Vec<(Rel, u8)>,
@@ -344,9 +346,8 @@ fn from_config_and_the_items_accumulate() {
     assert_eq!(s(referrer.context_generics(b)), "< T >");
     assert!(referrer.context_generics(c).params.is_empty());
     // `from_config()` is what `new()` is with the allowed paths.
-    let mut config = LeakerConfig::new();
-    config.allow_path(parse_quote!(Vec));
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_path_if(starts_with(parse_quote!(Vec)));
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_struct(&first, true);
     // `Vec` is allowed, and `u8` is not (it is a relative path, as it is not a configured one).
     assert_eq!(

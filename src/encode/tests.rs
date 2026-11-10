@@ -1253,21 +1253,19 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
 
 // ── The helpers against what a macro wrote by hand before them ───────────────────────────────
 
-use crate::{ErrorItem, ImplSelf, LeakerConfig, SelfRequirement, UseSite};
+use crate::{Allow, ErrorItem, ImplSelf, SelfRequirement, UseSite};
 
 fn t(ty: Type) -> String {
     s(&ty)
 }
 
-fn config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config
+fn config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_prelude()
 }
 
 /// Analyzes a whole item the way a downstream macro does.
 fn analyze(item: &Item) -> (Referrer, ContextId) {
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let context = match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
         Item::Enum(i) => leaker.intern_enum(i, true),
@@ -1791,7 +1789,7 @@ fn f09_fn_pointer_self_predicate_print_in_the_generics_of_an_entry() {
             fn r(&self) -> Rel<Self> where Self: Clone;
         }
     };
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let self_tys: Vec<Type> = vec![

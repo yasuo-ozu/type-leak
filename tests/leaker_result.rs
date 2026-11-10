@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::allow_every_cause;
+use common::{allow_every_cause, starts_with};
 use proc_macro2::{Literal, TokenStream, TokenTree};
 use syn::parse::Parser;
 use syn::*;
@@ -161,8 +161,8 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
 
     for cause in &causes {
         let (mut before, mut after) = (result.clone(), read_back.clone());
-        before.allow(cause.clone());
-        after.allow(cause.clone());
+        before.allow(|e| e.cause == cause.clone());
+        after.allow(|e| e.cause == cause.clone());
         assert!(before.errors().len() < result.errors().len());
         assert_eq!(describe_all(&after), describe_all(&before));
     }
@@ -186,7 +186,7 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     assert_eq!(all.finish().unwrap(), referrer);
 }
 
-/// The path, value and default rules (`LeakerResult::allow_path()` and the others) give the same
+/// The path, value and default rules (`LeakerResult::allow_path_if()` and the others) give the same
 /// errors on the other side of the trip. A path rule leaves the paths it does not allow in the
 /// error, which is serialized with them, so rules given in two macros add up as they do in one.
 #[test]
@@ -199,9 +199,8 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
             }
         }
     );
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().check_values();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_primitive();
+    let mut leaker = Leaker::from_config(config, true, false);
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.errors().iter().any(|e| e.in_value && e.in_default));
@@ -212,7 +211,7 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
     type Rule = fn(&mut LeakerResult);
     let rules: [(&str, Rule); 7] = [
         ("path", |r| {
-            r.allow_path(parse_quote!(my));
+            r.allow_path_if(starts_with(parse_quote!(my)));
         }),
         ("prelude", |r| {
             r.allow_prelude();

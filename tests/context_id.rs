@@ -255,7 +255,7 @@ fn a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted() {
     let referrer = result.clone().into_referrer();
     // Accepting the causes drops the errors, and neither the ids nor the Referrer change.
     let mut accepted = result.clone();
-    accepted.allow(cause);
+    accepted.allow(|e| e.cause == cause);
     assert!(accepted.errors().is_empty());
     let accepted_referrer = accepted.finish().unwrap();
     assert_eq!(referrer, accepted_referrer);

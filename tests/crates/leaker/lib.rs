@@ -1432,7 +1432,7 @@ pub mod kinds {
     pub struct TwoDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, U>>(pub T, pub U, pub V);
 
     // Items nested in a module whose generics have a bound that names their own `Self`, and a type
-    // that names it too (`LeakerConfig::nested_self_entries()`, `nested_self_entries = true`). The
+    // that names it too (`nested_self_entries`, `nested_self_entries = true`). The
     // entry is for any type that the bound holds for, with `Self` as the implementor in the type
     // too, and the copy passes its own: the field is `Link<MyStruct<T>, T>`, as in the original.
     // The Repeater's impl keeps `Sized` (the leaked type may need it). An entry whose bound is
@@ -1755,7 +1755,7 @@ pub mod kinds {
         }
     }
 
-    // The types in the values of an item (`LeakerConfig::check_values()`, `values = true`): the
+    // The types in the values of an item (`check_values`, `values = true`): the
     // default of an associated const, a default method, the const, static and function of a
     // module. The Leaker leaks the type in a cast, a `let`, a closure, a turbofish and a qualified
     // path, and the copy replaces it. The Referrer's crate names none of these types, so it

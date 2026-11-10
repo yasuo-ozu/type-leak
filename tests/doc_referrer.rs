@@ -386,7 +386,7 @@ fn nested_self_keeps_an_absolute_self_type_as_written_for_a_strict_referrer() {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let mut result = leaker.result();
-    result.allow_ambiguous_crate_name(false); // strict
+    result.deny_ambiguous_crate_name(); // strict
     let referrer = result.finish().unwrap();
     assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
 

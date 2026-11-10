@@ -290,7 +290,7 @@ fn test_defaults_of_several_calls_are_shared() {
     );
     // A Referrer which does not trust the names of the crates replaces the default by the entry.
     let mut strict = result;
-    strict.allow_ambiguous_crate_name(false);
+    strict.deny_ambiguous_crate_name();
     let strict = strict.into_referrer();
     let mut replaced = Vec::new();
     let completed = strict

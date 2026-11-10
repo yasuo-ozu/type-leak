@@ -32,7 +32,7 @@ use template_quote::{quote, ToTokens};
 /// A's macro passes the `Referrer` and the top-level [`ContextId`] to B's as tokens ([`ToTokens`],
 /// [`Parse`]); both crates must use the same version of `type-leak`. Emit an impl for every entry,
 /// not only the [`required()`](Referrer::required) ones: B may be strict
-/// ([`allow_ambiguous_crate_name(false)`](crate::LeakerResult::allow_ambiguous_crate_name)).
+/// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)).
 /// `examples/two-macros` is a complete pair.
 ///
 /// ```
@@ -405,7 +405,7 @@ impl Referrer {
                 }
                 // A bound that has no name here (see `Context::of()`) is in no entry. An entry for
                 // any type has the `Self` of a nested struct, enum or union as the implementor,
-                // also where its type names it (`LeakerConfig::nested_self_entries()`).
+                // also where its type names it (`nested_self_entries`).
                 let any = nested_type && matches!(entry.self_ty(), Some(SelfRequirement::Any));
                 let context = if any {
                     Context::of_any(ty, scopes, self_ty, nested_type, enclosing)
@@ -465,7 +465,7 @@ impl Referrer {
     ///
     /// An entry is optional if only its own path is an absolute path that names an external crate:
     /// a non-strict Referrer copies it as written, a strict one replaces it
-    /// ([`allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
+    /// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)).
     /// Required entries have the smaller indices.
     ///
     /// ```
@@ -1081,7 +1081,7 @@ impl Declares {
 /// as written ([recovery](crate::Leaker#errors-and-recovery)) are left as they are. Items and
 /// imports declared in a block hide the leaked types that name them there, and those declared in a
 /// module or a `File` hide the entries of no module that name them. Values are visited too: a type
-/// there is an entry only with [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values).
+/// there is an entry only with [`check_values`](crate::Leaker::from_config).
 ///
 /// `G` is the closure of [`Visitor::with_nested_self()`]; none by default.
 ///
@@ -1221,7 +1221,7 @@ where
     /// - [`SelfRequirement::Any`] (a struct, enum or union whose generic has a bound that names
     ///   `Self`: `Rel<T>` with `T: AsRef<Self>`): any type that the bound holds for. Pass the
     ///   copy's own `Self` (what `UseSite::identity()` has), not the Leaker's type (E0277). With
-    ///   [`nested_self_entries()`](crate::LeakerConfig::nested_self_entries) the type of the entry
+    ///   [`nested_self_entries`](crate::Leaker::from_config) the type of the entry
     ///   may name `Self` too. The impl is `?Sized` unless a bound or the type needs `Self: Sized`;
     ///   then, before rustc 1.70, a struct whose last field is the entry is E0275 (put the field
     ///   first, or add `where Self: Sized`).
@@ -1777,7 +1777,7 @@ impl Referrer {
     // the analyzed syntax has no bound of the generics that names the item's `Self` (`U =
     // Wrap<T>` with `T: Clone + AsRef<Self>` is `T: Clone`, any type), which the Referrer
     // computes for a copy, so the entries of 13 are not found the same way; and an entry that is
-    // for any type may name `Self` in its type (`LeakerConfig::nested_self_entries()`), which
+    // for any type may name `Self` in its type (`nested_self_entries`), which
     // the Referrer finds too. 15: the context of an entry leaves out a bound of a generic that
     // names the generic in the arguments of its path (`T: Fn(Alias<T>)`), if another bound of it
     // fixes an associated type (`T: Iterator<Item = u8>`), which the Referrer computes for a copy,

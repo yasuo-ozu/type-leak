@@ -332,10 +332,10 @@ fn bad_generics() -> Generics {
 /// Accepts the causes of the errors of the scope which fails in `failing()`.
 fn accept_failing(result: &mut LeakerResult) {
     result
-        .allow(Cause::Type(parse_quote!(Bad1<'_>)))
-        .allow(Cause::Type(parse_quote!(Bad<'_, A>)))
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad1<'_>)))
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad<'_, A>)))
         // A module declares no `Self`.
-        .allow(Cause::Type(parse_quote!(Self)));
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Self)));
 }
 
 /// Enters a module with a scope around which succeeds, one which does not if `fail` (`kind` is the

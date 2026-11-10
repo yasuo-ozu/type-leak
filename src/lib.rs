@@ -9,7 +9,6 @@ extern crate proc_macro;
 mod allow;
 mod analysis;
 mod analyze;
-mod config;
 mod context;
 mod elided;
 mod encode;
@@ -25,8 +24,10 @@ mod view;
 
 pub use syn;
 
+pub use crate::allow::{
+    is_crate_path, is_prelude_path, is_primitive_path, is_std_crate_path, path_starts_with, Allow,
+};
 pub use crate::analysis::CheckResult;
-pub use crate::config::LeakerConfig;
 pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{array_const, EncodeError};
 pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};

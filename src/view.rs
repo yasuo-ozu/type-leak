@@ -26,6 +26,9 @@ mod forward;
 /// `visit_path` at the root analyzes only the arguments of the path: to check the root too, use
 /// [`View::visit_type_param_bound()`].
 ///
+/// `P` is the rule on paths of the Leaker: a helper takes a `View` as `fn f<P: Fn(&Path) ->
+/// bool>(view: &mut View<'_, P>)`.
+///
 /// A function that is itself the analyzed item has no local generics, so do not visit its
 /// signature. Enter a scope that declares its generics, and visit its types and where clause:
 ///
@@ -50,12 +53,12 @@ mod forward;
 ///     });
 /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 3);
 /// ```
-pub struct View<'v> {
-    visitor: &'v mut AnalyzeVisitor,
+pub struct View<'v, P = fn(&Path) -> bool> {
+    visitor: &'v mut AnalyzeVisitor<P>,
 }
 
-impl<'v> View<'v> {
-    pub(crate) fn new(visitor: &'v mut AnalyzeVisitor) -> Self {
+impl<'v, P: Fn(&Path) -> bool> View<'v, P> {
+    pub(crate) fn new(visitor: &'v mut AnalyzeVisitor<P>) -> Self {
         Self { visitor }
     }
 
@@ -73,7 +76,7 @@ impl<'v> View<'v> {
         &mut self,
         hint: impl Display,
         declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_mod(self, hint, declared, f)
     }
@@ -83,7 +86,7 @@ impl<'v> View<'v> {
     pub fn enter_generics<R>(
         &mut self,
         generics: &Generics,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_generics(self, generics, f)
     }
@@ -95,7 +98,7 @@ impl<'v> View<'v> {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_type(self, ident, generics, allow_self, f)
     }
@@ -106,7 +109,7 @@ impl<'v> View<'v> {
         generics: &Generics,
         self_ty: &Type,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_impl(self, generics, self_ty, allow_self, f)
     }
@@ -118,17 +121,19 @@ impl<'v> View<'v> {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
     }
 }
 
-impl Scopes for View<'_> {
+impl<P: Fn(&Path) -> bool> Scopes for View<'_, P> {
+    type Rule = P;
+
     fn enter_spec<R>(
         &mut self,
         spec: ScopeSpec,
-        f: impl FnOnce(&mut View<'_>) -> R,
+        f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
         self.visitor.enter(spec, f)
     }

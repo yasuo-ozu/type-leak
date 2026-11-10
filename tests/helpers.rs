@@ -32,15 +32,13 @@ fn slots() -> RepeaterSlots {
     RepeaterSlots::new(parse_quote!(crate::Repeater))
 }
 
-fn config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config
+fn config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_prelude()
 }
 
 /// Analyzes a whole item the way a downstream macro does.
 fn analyze(item: &Item) -> (Referrer, ContextId) {
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     let context = match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
         Item::Enum(i) => leaker.intern_enum(i, true),
@@ -128,7 +126,7 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
             d: ::bar::Y,
         }
     );
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     leaker.intern_struct(&item, true);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
@@ -156,7 +154,7 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
     assert!(referrer.required().next().is_some());
     // Not affected by how the Referrer treats the optional entries.
     let mut strict = result;
-    strict.allow_ambiguous_crate_name(false);
+    strict.deny_ambiguous_crate_name();
     let strict = strict.finish().unwrap();
     assert_eq!(
         strict.required().map(|(ix, _)| ix).collect::<Vec<_>>(),
@@ -181,7 +179,7 @@ fn a_referrer_with_only_optional_entries_has_no_required_entry() {
             b: u8,
         }
     );
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert!(!referrer.is_empty());
@@ -190,7 +188,7 @@ fn a_referrer_with_only_optional_entries_has_no_required_entry() {
     assert!(!referrer.required().next().is_some());
     assert_eq!(referrer.required().count(), 0);
     // Nothing at all.
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::from_config(config(), false, false);
     leaker.intern_struct(
         &parse_quote!(
             struct S {
@@ -705,7 +703,7 @@ fn items_has_every_offending_path() {
         items[1].help_text(),
         Some(
             "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `LeakerConfig::allow_path()`"
+             with `Allow::allow_path_if()`"
         )
     );
     assert!(items[2]

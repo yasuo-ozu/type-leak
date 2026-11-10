@@ -119,9 +119,8 @@ impl ToTokens for Nested {
 /// `nested_leak!`, the Leaker's side.
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let nested: Nested = parse2(input)?;
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_primitive().allow_prelude();
+    let mut leaker = Leaker::from_config(config, false, false);
     let (context, ()) =
         leaker.enter_trait(&nested.trait_ident, &nested.trait_generics, true, |view| {
             view.enter_impl(&nested.impl_generics, &nested.self_ty, true, |view| {
@@ -254,7 +253,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         path,
         strict,
     } = parse2(input)?;
-    result.allow_ambiguous_crate_name(!strict);
+    if strict {
+        result.deny_ambiguous_crate_name();
+    }
     let referrer = result.into_referrer();
     let id = nested.id;
     let krate = path

@@ -19,16 +19,20 @@
 //! and the note of the lifetime that a path hides, where the holder of the signature cannot be
 //! leaked.
 
+mod common;
+
+use common::starts_with;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// The config of the property test, with `::p` allowed.
-fn leaker() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config.allow_path(parse_quote!(::p));
-    Leaker::from_config(config)
+fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(starts_with(parse_quote!(::p)));
+    Leaker::from_config(config, false, false)
 }
 
 /// What an error says.
@@ -76,7 +80,10 @@ fn messages(errors: &[ErrorItem]) -> String {
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
-fn errors_of<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+fn errors_of<P: Fn(&Path) -> bool, R>(
+    mut leaker: Leaker<P>,
+    analyze: impl FnOnce(&mut Leaker<P>) -> R,
+) -> Vec<ErrorItem> {
     analyze(&mut leaker);
     leaker.result().errors().to_vec()
 }

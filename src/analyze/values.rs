@@ -1,5 +1,5 @@
-//! The check of the values of an item, for [`LeakerConfig::check_values()`]: the default of an
-//! associated const, the value of a const or a static, and the body of a function.
+//! The check of the values of an item, for [`check_values`](crate::Leaker::from_config): the
+//! default of an associated const, the value of a const or a static, and the body of a function.
 //!
 //! The copy writes a value as it is, since an expression cannot go through the Repeater. So the
 //! check rejects every path of the value that depends on where it is written, with the error of a
@@ -32,8 +32,6 @@
 
 use super::{self_segment, without_arguments, AnalyzeVisitor};
 use crate::analysis::{CheckResult, Effect, Part, Place};
-#[cfg(doc)]
-use crate::config::LeakerConfig;
 use crate::error::{Cause, Reason};
 use crate::util::{ident_name, is_primitive_name, tidy, token_names};
 use proc_macro2::TokenStream;
@@ -45,7 +43,7 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 
-impl AnalyzeVisitor {
+impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
     /// the default of an associated const of a trait.
     pub(super) fn check_value(&mut self, name: &Ident, default: bool, expr: &Expr) {
@@ -110,8 +108,8 @@ struct Names {
     items: HashSet<String>,
 }
 
-struct ValueWalk<'a> {
-    visitor: &'a mut AnalyzeVisitor,
+struct ValueWalk<'a, P> {
+    visitor: &'a mut AnalyzeVisitor<P>,
     /// Where the walk is, as the notes say it: "the default value of `N`".
     what: String,
     /// Never empty. The first is the scope of the value itself.
@@ -127,8 +125,8 @@ struct ValueWalk<'a> {
     declared_name: Option<String>,
 }
 
-impl<'a> ValueWalk<'a> {
-    fn new(visitor: &'a mut AnalyzeVisitor, what: String) -> Self {
+impl<'a, P: Fn(&Path) -> bool> ValueWalk<'a, P> {
+    fn new(visitor: &'a mut AnalyzeVisitor<P>, what: String) -> Self {
         Self {
             visitor,
             what,
@@ -530,7 +528,7 @@ impl<'a> ValueWalk<'a> {
     }
 }
 
-impl<'ast> Visit<'ast> for ValueWalk<'_> {
+impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for ValueWalk<'_, P> {
     fn visit_attribute(&mut self, _: &'ast Attribute) {}
 
     fn visit_visibility(&mut self, _: &'ast Visibility) {}
@@ -747,12 +745,12 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
 /// Collects the relative paths in a path of a value and in its arguments, without their arguments,
 /// each once: those that mean something else wherever they are written, and that the value does
 /// not declare ([`CheckResult::paths`]). `found` has the path itself.
-struct ArgumentPaths<'w, 'a> {
-    walk: &'w ValueWalk<'a>,
+struct ArgumentPaths<'w, 'a, P> {
+    walk: &'w ValueWalk<'a, P>,
     found: &'w mut Vec<Path>,
 }
 
-impl<'ast> Visit<'ast> for ArgumentPaths<'_, '_> {
+impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for ArgumentPaths<'_, '_, P> {
     fn visit_path(&mut self, i: &'ast Path) {
         if self.walk.visitor.is_relative_path(i) && !self.walk.is_local(i) {
             let path = without_arguments(i);
@@ -766,15 +764,15 @@ impl<'ast> Visit<'ast> for ArgumentPaths<'_, '_> {
 
 /// What a type of a value names that decides how it is read: a name the value declares, and syntax
 /// that `syn` leaves unparsed.
-struct Scan<'w, 'a> {
-    walk: &'w ValueWalk<'a>,
+struct Scan<'w, 'a, P> {
+    walk: &'w ValueWalk<'a, P>,
     /// The first name that the value declares (an item, a generic or a lifetime of an item in a
     /// block, a `use`).
     declared: Option<String>,
     unreadable: bool,
 }
 
-impl Scan<'_, '_> {
+impl<P: Fn(&Path) -> bool> Scan<'_, '_, P> {
     fn name(&mut self, name: &str) {
         if self.declared.is_none() && self.walk.declares(name) {
             self.declared = Some(name.to_string());
@@ -782,7 +780,7 @@ impl Scan<'_, '_> {
     }
 }
 
-impl<'ast> Visit<'ast> for Scan<'_, '_> {
+impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for Scan<'_, '_, P> {
     fn visit_path(&mut self, i: &'ast Path) {
         if self.declared.is_none() && self.walk.is_local(i) {
             self.declared = i.segments.first().map(|seg| ident_name(&seg.ident));
@@ -1090,7 +1088,7 @@ fn macro_help(path: &Path) -> String {
     }
     format!(
         "write `{0}!` with an absolute path (e.g. `::my_crate::{0}!`), or allow it with \
-         `LeakerConfig::allow_path()`",
+         `Allow::allow_path_if()`",
         name
     )
 }

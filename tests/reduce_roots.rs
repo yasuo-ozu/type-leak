@@ -2,12 +2,12 @@
 
 mod common;
 
-use common::{check_in, enter_function, finish_as_strings};
+use common::{check_in, enter_function, finish_as_strings, starts_with};
 use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, ErrorItem, Leaker, LeakerConfig};
+use type_leak::{to_syn_error, Allow, ErrorItem, Leaker};
 
 #[test]
 fn test_reduce_roots_empty_leaker() {
@@ -252,9 +252,8 @@ fn test_reduce_roots_prefers_inner_type_on_a_tie() {
 fn test_reduce_roots_allowed_path_is_neutral() {
     // A type under an explicitly allowed path prefix is neutral → empty.
     let item: ItemStruct = parse_quote! { struct S { a: some_mod::SomeType } };
-    let mut config = LeakerConfig::new();
-    config.allow_path(parse_quote!(some_mod));
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_path_if(starts_with(parse_quote!(some_mod)));
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
@@ -351,7 +350,7 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     // The Referrer which does not trust the names of the crates replaces them as well: the `Vec`
     // as a whole, and the `String`, with `Rel` inside the tuple.
     let mut strict = result;
-    strict.allow_ambiguous_crate_name(false);
+    strict.deny_ambiguous_crate_name();
     syn::visit_mut::VisitMut::visit_item_struct_mut(
         &mut strict
             .finish()

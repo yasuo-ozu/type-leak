@@ -190,13 +190,18 @@ pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots)
     ))
 }
 
+/// The rule that accepts the paths that start with one of `prefixes` (`path_starts_with()`).
+pub(crate) fn starts_with(prefixes: Vec<Path>) -> impl Fn(&Path) -> bool {
+    move |path: &Path| prefixes.iter().any(|prefix| path_starts_with(path, prefix))
+}
+
 /// Allows the cause of every error that remains, until none does: an error that is dropped puts its
 /// nested errors in its place (`ErrorItem::nested`), which have causes of their own.
 pub(crate) fn allow_every_cause(result: &mut LeakerResult) {
     while !result.errors().is_empty() {
         let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
         for cause in causes {
-            result.allow(cause);
+            result.allow(|e| e.cause == cause);
         }
     }
 }
@@ -457,14 +462,13 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         allowed,
         item,
     } = parse_macro_input!(input as CheckLeakInput);
-    let mut leaker = Leaker::from_config({
-        let mut config = LeakerConfig::new();
-        config.allow_primitive();
-        for path in allowed {
-            config.allow_path(path);
-        }
-        config
-    });
+    let mut leaker = Leaker::from_config(
+        Allow::new()
+            .allow_primitive()
+            .allow_path_if(starts_with(allowed)),
+        false,
+        false,
+    );
     match &item {
         Item::Trait(item) => leaker.intern_trait(item, true),
         Item::Struct(item) => leaker.intern_struct(item, true),
@@ -512,14 +516,14 @@ pub fn leak(
 }
 
 fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
-    let mut leaker = Leaker::from_config({
-        let mut config = LeakerConfig::new();
-        config.allow_primitive().allow_prelude();
-        if let Some(path) = args.allow.clone() {
-            config.allow_path(path);
-        }
-        config
-    });
+    let mut leaker = Leaker::from_config(
+        Allow::new()
+            .allow_primitive()
+            .allow_prelude()
+            .allow_path_if(starts_with(args.allow.clone().into_iter().collect())),
+        false,
+        false,
+    );
     let context = leaker.intern_trait(&item_trait, true);
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
     let assertions = leaker.assertions();
@@ -663,10 +667,10 @@ impl Parse for Input {
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
         // `strict` makes the Referrer replace the optional entries as well (it does not trust the
-        // names of the crates, see `LeakerResult::allow_ambiguous_crate_name()`).
+        // names of the crates, see `LeakerResult::deny_ambiguous_crate_name()`).
         if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
             input.parse::<Ident>()?;
-            result.allow_ambiguous_crate_name(false);
+            result.deny_ambiguous_crate_name();
         }
         let header = Header {
             item_trait,

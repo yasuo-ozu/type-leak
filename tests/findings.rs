@@ -48,9 +48,9 @@
 //! | `f37_nested_type_with_a_bound_that_names_its_own_self_is_supported` | an entry that uses a generic whose bound names the own `Self` of a struct, enum or union nested in a module: the bound holds for the copy's type, the Repeater's impl needed it for the Leaker's; the impl is for any type now, and the copy passes its own (`SelfRequirement::Any`) | fixed |
 //! | `f38_an_absolute_type_that_names_the_own_self_is_copied_as_written` | an absolute type that names the own `Self` of a struct, enum or union nested in a module (`::std::boxed::Box<Self>`) was an optional entry: a strict Referrer replaced it with the Leaker's type, and a trusting one left the copy's own; it is no entry now, and both copy it as written | fixed |
 //! | `f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host` | the default of a parameter of a trait (`U = Rel<T>` with `T: AsRef<Self>`) has an entry for the trait's `Self`, and the Visitor left it as written: it is looked up with the trait's own `Self` too, and written by `with_nested_self()`; the default of the trait itself is looked up without `Self`, as it is analyzed | fixed |
-//! | `f40_a_type_in_the_default_of_an_associated_const_is_carried` | a type in a value (the default of an associated const, a function body) was never carried, so the copy kept a relative path: with `LeakerConfig::check_values()` a type in a type position of a value (a cast, a `let`, a closure, a turbofish, a qualified path) is an entry, which the Visitor replaces; a path that is not a type stays rejected | fixed |
+//! | `f40_a_type_in_the_default_of_an_associated_const_is_carried` | a type in a value (the default of an associated const, a function body) was never carried, so the copy kept a relative path: with the `check_values` argument of `Leaker::from_config()` a type in a type position of a value (a cast, a `let`, a closure, a turbofish, a qualified path) is an entry, which the Visitor replaces; a path that is not a type stays rejected | fixed |
 //! | `f41_a_default_that_needs_self_only_through_a_bound_is_accepted` | the default of a parameter of a struct, enum or union nested in a module that uses a generic with a bound that names the own `Self` (`U = Wrap<T>` with `T: Clone + AsRef<Self>`) was rejected: its entry has no `Self` and none of the bounds that name it now, and the copy writes an ordinary default | fixed |
-//! | `f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it` | a type that names the own `Self` of such an item and a bound of the generics it uses does too (`Rel2<Self, T>` with `T: AsRef<Self>`) was rejected: with `LeakerConfig::nested_self_entries()` it is an entry for any type, with `Self` as the parameter of the impl, and the copy passes its own type | fixed (opt-in) |
+//! | `f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it` | a type that names the own `Self` of such an item and a bound of the generics it uses does too (`Rel2<Self, T>` with `T: AsRef<Self>`) was rejected: with the `nested_self_entries` argument of `Leaker::from_config()` it is an entry for any type, with `Self` as the parameter of the impl, and the copy passes its own type | fixed (opt-in) |
 //! | `f43_a_type_whose_context_cannot_be_written_is_copied_as_written` | a type whose context cannot be written (a bound names a `Self` that has no name there) is copied as written, and the Referrer replaced the entries inside it: the part has no context (`unwritable`) | fixed |
 //! | `f44_a_part_that_names_self_is_found_when_no_entry_does` | a part whose context names `Self` was never found when no entry named it: the top-level context of the scope left `Self` out | fixed |
 //! | `f45_a_part_in_a_nested_item_is_left_without_with_nested_self` | a part in an item nested in a scope was replaced by a visitor without `with_nested_self()` | fixed |
@@ -59,7 +59,7 @@
 //! | `f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it` | a type copied as written for the signature it is in (E0195, E0106) was left so in every other item and signature of its context | fixed |
 //! | `f49_a_lifetime_that_another_input_keeps_breaks_elision` | the E0106 check left out the lifetime that the inputs keep, but rustc counts the lifetimes of each input apart: a leaked type in another input that names it breaks the elision | fixed |
 //! | `f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_error` | the paths of the error of a value path left out the relative types in its arguments: a path rule after the analysis dropped the error, and the copy wrote them as they were | fixed |
-//! | `f51_a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected` | `enter_mod` with `nested_self_entries()` accepted `S<T: AsRef<Rel<Self>>>` beside an entry that uses `T`, which `intern_struct()` rejects: E0277 in the copy | fixed |
+//! | `f51_a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected` | `enter_mod` with `nested_self_entries` accepted `S<T: AsRef<Rel<Self>>>` beside an entry that uses `T`, which `intern_struct()` rejects: E0277 in the copy | fixed |
 //! | `f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate` | a part copied as written with `Self::A` in a predicate made no optional entry of the types in the bounds of its context a part too, so a strict Referrer replaced them (E0277) | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
@@ -93,6 +93,9 @@
 //! only decides that an item with an external type that holds a method lifetime is not invoked as
 //! strict.
 
+mod common;
+
+use common::starts_with;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
@@ -104,14 +107,13 @@ use type_leak::*;
 
 /// The config of the property test: primitive types and the names of the standard prelude are
 /// allowed.
-fn new_leaker() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    Leaker::from_config(config)
+fn new_leaker() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new().allow_primitive().allow_prelude();
+    Leaker::from_config(config, false, false)
 }
 
 /// Analyzes `item` with `intern_*`. The errors are read through `Leaker::result()`.
-fn intern(leaker: &mut Leaker, item: &Item) -> ContextId {
+fn intern<P: Fn(&Path) -> bool>(leaker: &mut Leaker<P>, item: &Item) -> ContextId {
     match item {
         Item::Struct(item) => leaker.intern_struct(item, true),
         Item::Trait(item) => leaker.intern_trait(item, true),
@@ -123,8 +125,8 @@ fn intern(leaker: &mut Leaker, item: &Item) -> ContextId {
 
 /// Analyzes `item` with `leaker`, and returns the Referrer with the top-level context, or the
 /// errors that remain.
-fn analyze_in(
-    mut leaker: Leaker,
+fn analyze_in<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     item: &Item,
 ) -> std::result::Result<(ContextId, Referrer), Vec<ErrorItem>> {
     let context = intern(&mut leaker, item);
@@ -132,7 +134,7 @@ fn analyze_in(
 }
 
 /// The errors that remain after the analysis of `leaker`.
-fn errors_of(leaker: Leaker) -> Vec<ErrorItem> {
+fn errors_of<P: Fn(&Path) -> bool>(leaker: Leaker<P>) -> Vec<ErrorItem> {
     leaker.result().errors().to_vec()
 }
 
@@ -1583,8 +1585,8 @@ fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), V
 }
 
 /// Like `f12_copy()`, with the Leaker `leaker`.
-fn f12_copy_with(
-    mut leaker: Leaker,
+fn f12_copy_with<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     item: &ItemTrait,
 ) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
     let context = leaker.intern_trait(item, true);
@@ -1766,11 +1768,12 @@ fn self_referential_entries(referrer: &Referrer) -> Vec<String> {
 }
 
 /// The Leaker of F13: `::p` is allowed.
-fn f13_leaker() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config.allow_path(parse_quote!(::p));
-    Leaker::from_config(config)
+fn f13_leaker() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(starts_with(parse_quote!(::p)));
+    Leaker::from_config(config, false, false)
 }
 
 /// F13: a bound of the generics of an impl names `Self`, and the self type of the impl is leaked.
@@ -1798,7 +1801,7 @@ fn f13_leaker() -> Leaker {
 /// bounds without `Self`).
 ///
 /// What is not rejected: an optional entry (the absolute path of a crate that the Leaker does not
-/// allow): it is copied as written, so a strict Referrer (`allow_ambiguous_crate_name(false)`) does
+/// allow): it is copied as written, so a strict Referrer (`deny_ambiguous_crate_name()`) does
 /// not replace it either. A bound of an outer scope that names its own `Self` is not the impl's
 /// (`the_same_self_changes_nothing` in `outer_self.rs`). The controls are accepted: a self type
 /// that is not leaked (an allowed path), and bounds that do not name `Self`.
@@ -2054,7 +2057,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         );
         // A strict Referrer replaces the optional entries too, but not those in the self type.
         let mut copy = Item::Impl(item.clone());
-        result.allow_ambiguous_crate_name(false);
+        result.deny_ambiguous_crate_name();
         result
             .finish()
             .unwrap()
@@ -2085,7 +2088,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         [":: ext :: S < T >"]
     );
     let mut copy = Item::Impl(item);
-    result.allow_ambiguous_crate_name(false);
+    result.deny_ambiguous_crate_name();
     result
         .finish()
         .unwrap()
@@ -2140,14 +2143,15 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
 /// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a strict Referrer
 /// or not, and whether the Leaker accepts `item`.
 fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config.allow_path(parse_quote!(::p));
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(starts_with(parse_quote!(::p)));
+    let mut leaker = Leaker::from_config(config, false, false);
     let context = leaker.intern_impl(item, true);
     let mut result = leaker.result();
     if strict {
-        result.allow_ambiguous_crate_name(false);
+        result.deny_ambiguous_crate_name();
     }
     let referrer = result.finish()?;
     let mut copy = Item::Impl(item.clone());
@@ -2952,7 +2956,7 @@ fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
 ///
 /// Trigger: `struct S<'a, T: 'a> where T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8 { .. }`, where
 /// `::ext` is a crate that the Leaker does not allow, and a strict Referrer
-/// (`allow_ambiguous_crate_name(false)`, the Referrer's choice, for a Referrer whose dependencies
+/// (`deny_ambiguous_crate_name()`, the Referrer's choice, for a Referrer whose dependencies
 /// may differ from the Leaker's) replaces the optional entries. `&'a ::ext::W<T, ::ext::B0>` is an
 /// optional entry (it holds `::ext::B0`, another optional type, so it is not left alone as
 /// `T: Fn(&'a ::ext::W<T>)` is), and its context has `'a`, `T` and the where predicate that names
@@ -3047,9 +3051,9 @@ fn f17_optional_entry_in_own_context() {
 /// F18 (fixed): a strict Referrer replaced the optional entry that holds a lifetime of a method, so
 /// the copy did not have it where the original did.
 ///
-/// `LeakerConfig::allow_path()` docs: an absolute path of a crate that the Leaker does not allow is an
+/// `Allow::allow_path_if()` docs: an absolute path of a crate that the Leaker does not allow is an
 /// optional entry, which a Referrer leaves as written by default and replaces if it is strict
-/// (`allow_ambiguous_crate_name(false)`). Trigger:
+/// (`deny_ambiguous_crate_name()`). Trigger:
 /// `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the trait, `'x` is
 /// late-bound (the argument holds it, and no bound names it). The Leaker counted the optional type
 /// as an anchor, as the default Referrer keeps it. The strict copy was
@@ -3090,12 +3094,17 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
         }
         lifetimes.named
     };
-    let copy_of = |config: LeakerConfig, strict: bool| {
-        let mut leaker = Leaker::from_config(config);
+    let copy_of = |allow_ext: bool, strict: bool| {
+        let ext: Path = parse_quote!(::ext);
+        let config = Allow::new()
+            .allow_primitive()
+            .allow_prelude()
+            .allow_path_if(move |path| allow_ext && starts_with(ext.clone())(path));
+        let mut leaker = Leaker::from_config(config, false, false);
         let context = leaker.intern_trait(&item, true);
         let mut result = leaker.result();
         if strict {
-            result.allow_ambiguous_crate_name(false);
+            result.deny_ambiguous_crate_name();
         }
         let referrer = result.finish().unwrap();
         let mut copy = item.clone();
@@ -3104,8 +3113,6 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
             .visit_item_trait_mut(&mut copy);
         copy
     };
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
 
     // Every Referrer keeps the optional type, which holds `'x`; `Rel<'x>` is replaced.
     let expected: ItemTrait = parse_quote!(
@@ -3114,14 +3121,13 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
         }
     );
     for strict in [false, true] {
-        let copy = copy_of(config.clone(), strict);
+        let copy = copy_of(false, strict);
         assert_eq!(held(&copy), ["'x"], "strict {}", strict);
         assert_eq!(string(&copy), string(&expected), "strict {}", strict);
     }
     // With the crate allowed it is not an entry, for either.
-    config.allow_path(parse_quote!(::ext));
-    assert_eq!(held(&copy_of(config.clone(), false)), ["'x"]);
-    assert_eq!(held(&copy_of(config, true)), ["'x"]);
+    assert_eq!(held(&copy_of(true, false)), ["'x"]);
+    assert_eq!(held(&copy_of(true, true)), ["'x"]);
 }
 
 /// F18: the shapes. Each is an item, the optional entries it keeps (`?` first), and the copy of a
@@ -3257,7 +3263,7 @@ fn f18_the_optional_entries_that_hold_a_method_lifetime_are_copied_as_written() 
         let mut leaker = new_leaker();
         let context = intern(&mut leaker, item);
         let mut result = leaker.result();
-        result.allow_ambiguous_crate_name(false);
+        result.deny_ambiguous_crate_name();
         let referrer = result
             .finish()
             .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)));
@@ -3326,8 +3332,8 @@ fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>
 
 /// Like `f19_copy()`, with the Leaker that `f13_leaker()` makes (it allows `::p`, so that the self
 /// type of an impl has parts that are entries and a part that is not).
-fn f19_copy_with(
-    mut leaker: Leaker,
+fn f19_copy_with<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     item: &Item,
 ) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>> {
     let context = match item {
@@ -7556,7 +7562,7 @@ fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, V
 }
 
 /// Like `nested_copy()`, for a Referrer that replaces the optional entries too if `strict`
-/// (`allow_ambiguous_crate_name(false)`).
+/// (`deny_ambiguous_crate_name()`).
 fn nested_copy_as(
     nest: Nest,
     item: &Item,
@@ -7579,8 +7585,8 @@ fn nested_copy_with(
 }
 
 /// Like `nested_copy_with()`, analyzed by `leaker`.
-fn nested_copy_in(
-    leaker: Leaker,
+fn nested_copy_in<P: Fn(&Path) -> bool>(
+    leaker: Leaker<P>,
     nest: Nest,
     item: &Item,
     declared: &[&str],
@@ -7592,8 +7598,8 @@ fn nested_copy_in(
 
 /// Like `nested_copy_in()`; with `recover` the errors of the Leaker do not fail the copy:
 /// the part that conflicts is copied as written (`LeakerResult::into_referrer()`).
-fn nested_copy_recovering(
-    mut leaker: Leaker,
+fn nested_copy_recovering<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     nest: Nest,
     item: &Item,
     declared: &[&str],
@@ -7616,7 +7622,9 @@ fn nested_copy_recovering(
         }
     };
     let mut result = leaker.result();
-    result.allow_ambiguous_crate_name(!strict);
+    if strict {
+        result.deny_ambiguous_crate_name();
+    }
     let referrer = if recover {
         result.into_referrer()
     } else {
@@ -8109,8 +8117,8 @@ fn nested_analysis(nest: Nest, item: &Item, declared: &[&str]) -> LeakerResult {
 }
 
 /// Like `nested_analysis()`, in `leaker`.
-fn nested_analysis_in(
-    mut leaker: Leaker,
+fn nested_analysis_in<P: Fn(&Path) -> bool>(
+    mut leaker: Leaker<P>,
     nest: Nest,
     item: &Item,
     declared: &[&str],
@@ -8606,21 +8614,22 @@ fn f37_the_copy_passes_its_own_type() {
 /// does not name `Self` is fine whatever the bounds of the generics it uses say (F41: the entry has
 /// no `Self` and none of those bounds). One that names `Self` too, with a bound that does, is
 /// rejected, with the reason: the original does not compile either (E0735), so the type cannot be in
-/// a default, also with `LeakerConfig::nested_self_entries()`. A default that does not use the
+/// a default, also with `nested_self_entries`. A default that does not use the
 /// generic is as ever.
 #[test]
 fn f37_a_default_that_names_self_with_a_bound_that_names_it_is_rejected() {
     let item: Item = parse_quote!(
         pub struct S<T: ::core::convert::AsRef<Self>, U = Rel2<Self, T>>(pub T, pub U);
     );
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    let mut with_option = config.clone();
-    with_option.nested_self_entries();
-    for config in [config, with_option] {
+    for nested_self_entries in [false, true] {
         for nest in NESTS {
-            let result =
-                nested_analysis_in(Leaker::from_config(config.clone()), nest, &item, &["S"]);
+            let config = Allow::new().allow_primitive().allow_prelude();
+            let result = nested_analysis_in(
+                Leaker::from_config(config, false, nested_self_entries),
+                nest,
+                &item,
+                &["S"],
+            );
             let err = assert_rejected(
                 &item,
                 result.finish(),
@@ -8657,7 +8666,7 @@ fn f37_a_default_that_names_self_with_a_bound_that_names_it_is_rejected() {
 /// its own type. As the item itself (`intern_*`), `Self` is written as the Leaker's type, which
 /// has the bound: accepted. Written with an absolute path (the help says so) the type is no
 /// entry, and the copy has it as written, with its own `Self`: accepted (F38). The help names the
-/// way out that takes the risk of the impl for any type: `LeakerConfig::nested_self_entries()`
+/// way out that takes the risk of the impl for any type: `nested_self_entries`
 /// (F42).
 #[test]
 fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_rejected() {
@@ -8686,7 +8695,7 @@ fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_rejected() {
                      absolute path (it is copied as written, and its `Self` is the copy's own), \
                      analyze the item with its own `intern_*` call, which writes its `Self` as \
                      the Leaker's type, or accept the entry for any type with \
-                     `LeakerConfig::nested_self_entries()`"
+                     the `nested_self_entries` argument of `Leaker::from_config()`"
                 ),
                 "{}",
                 helps[0]
@@ -8806,7 +8815,7 @@ fn f38_entries(referrer: &Referrer) -> Vec<String> {
 /// F38 (fixed): an absolute type that names the own `Self` of a struct, an enum or a union nested in
 /// a scope (`View::visit_item()`, the items of `intern_mod()`) was recorded as an optional entry
 /// (`SelfRequirement::Type`, `must` is `false`), and the copy of a Referrer that replaces the
-/// optional entries (`allow_ambiguous_crate_name(false)`, a strict one) was not the copy of one
+/// optional entries (`deny_ambiguous_crate_name()`, a strict one) was not the copy of one
 /// that does not.
 ///
 /// The type is `::std::boxed::Box<Self>`, `::p::Rel2<Self, T>`: it resolves the same in the copy
@@ -9942,16 +9951,11 @@ fn f39_a_nested_struct_has_no_self_in_the_entry_of_the_default() {
 
 // ── F40 ──────────────────────────────────────────────────────────────────────
 
-/// A Leaker that reads the values (`LeakerConfig::check_values()`), as the downstream crate of F40
-/// has it: primitive types and the names of the standard prelude are allowed.
-fn values_config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude().check_values();
-    config
-}
-
-fn values_leaker() -> Leaker {
-    Leaker::from_config(values_config())
+/// A Leaker that reads the values (the `check_values` argument of `Leaker::from_config()`), as the
+/// downstream crate of F40 has it: primitive types and the names of the standard prelude are
+/// allowed.
+fn values_leaker() -> Leaker<impl Fn(&Path) -> bool> {
+    Leaker::from_config(Allow::new().allow_primitive().allow_prelude(), true, false)
 }
 
 /// Analyzes the trait `source` with the option, and returns its result and its context.
@@ -10002,7 +10006,7 @@ fn f40_errors(source: &str) -> Vec<(String, String)> {
 /// relative path that does not resolve in the Referrer's crate (E0433). Reported by the downstream
 /// crate `announce` (its finding 14, `types_in_associated_const_defaults_are_not_read`).
 ///
-/// The values are not read unless `LeakerConfig::check_values()` is on, which is unchanged (the
+/// The values are not read unless `check_values` is on, which is unchanged (the
 /// first part of the test): a patch release does not reject what it accepted. With the option the
 /// check rejected every relative path in a value, a type as well (`use absolute path:
 /// 'inner :: Local'`). The copy cannot write a path of an expression through the Repeater, but it
@@ -10289,7 +10293,7 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
     );
     assert_eq!(trusting, string(&expected));
     let mut strict = result;
-    strict.allow_ambiguous_crate_name(false);
+    strict.deny_ambiguous_crate_name();
     let strict = strict.finish().unwrap();
     let expected: ItemTrait = parse_quote!(
         trait Tr {
@@ -10899,7 +10903,7 @@ fn f41_the_default_and_the_field_have_their_own_entries() {
 }
 
 /// F41, the controls: a bound that names no `Self` gives the context it always gave; the option
-/// `nested_self_entries()` changes nothing for the default; the trait (F39) and the item itself keep
+/// `nested_self_entries` changes nothing for the default; the trait (F39) and the item itself keep
 /// the bound in the context of the default; and the default is not rewritten by a Visitor that has no
 /// layer for the nested item (the entry of the default is found without one).
 #[test]
@@ -10921,12 +10925,13 @@ fn f41_the_controls_are_unchanged() {
     for (item, name, _) in &f41_items() {
         for nest in NESTS {
             let plain = nested_analysis(nest, item, &[name]);
-            let mut with_option = LeakerConfig::new();
-            with_option
-                .allow_primitive()
-                .allow_prelude()
-                .nested_self_entries();
-            let option = nested_analysis_in(Leaker::from_config(with_option), nest, item, &[name]);
+            let with_option = Allow::new().allow_primitive().allow_prelude();
+            let option = nested_analysis_in(
+                Leaker::from_config(with_option, false, true),
+                nest,
+                item,
+                &[name],
+            );
             assert_eq!(
                 plain.finish().unwrap(),
                 option.finish().unwrap(),
@@ -10954,14 +10959,10 @@ fn f41_the_controls_are_unchanged() {
 
 // ── F42 ──────────────────────────────────────────────────────────────────────
 
-/// A Leaker that accepts the entries of F42 (`LeakerConfig::nested_self_entries()`).
-fn nested_self_leaker() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config
-        .allow_primitive()
-        .allow_prelude()
-        .nested_self_entries();
-    Leaker::from_config(config)
+/// A Leaker that accepts the entries of F42 (`nested_self_entries`).
+fn nested_self_leaker() -> Leaker<impl Fn(&Path) -> bool> {
+    let config = Allow::new().allow_primitive().allow_prelude();
+    Leaker::from_config(config, false, true)
 }
 
 /// The items of F42, with the name of the item, the type of the entry, and its Repeater's impl (with
@@ -11057,7 +11058,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
 /// a type that names it too (`Rel2<Self, T>` in `struct S<T: AsRef<Self>>`), was rejected (F37: the
 /// headline "has a generic whose bound mentions `Self`, which cannot be leaked"): the entry is for
 /// the Leaker's type, which the bound does not hold for in the copy, whose own type has it (E0277).
-/// With `LeakerConfig::nested_self_entries()` it is accepted as an entry for any type that the
+/// With `nested_self_entries` it is accepted as an entry for any type that the
 /// bound holds for (`SelfRequirement::Any`), like the type that does not name `Self` (F37), and
 /// `Self` is the parameter of the impl in the type too:
 ///
@@ -11298,7 +11299,7 @@ fn f42_the_controls_are_unchanged() {
 
     // The item itself: `Self` is written as the Leaker's type, which has the bound, with or without.
     for (item, _, _, _) in &f42_items() {
-        let analyze = |mut leaker: Leaker| {
+        fn analyze<P: Fn(&Path) -> bool>(mut leaker: Leaker<P>, item: &Item) -> Referrer {
             match item {
                 Item::Struct(item) => leaker.intern_struct(item, true),
                 Item::Enum(item) => leaker.intern_enum(item, true),
@@ -11306,8 +11307,11 @@ fn f42_the_controls_are_unchanged() {
                 _ => unreachable!(),
             };
             leaker.result().finish().unwrap()
-        };
-        let (plain, option) = (analyze(new_leaker()), analyze(nested_self_leaker()));
+        }
+        let (plain, option) = (
+            analyze(new_leaker(), item),
+            analyze(nested_self_leaker(), item),
+        );
         assert_eq!(plain, option, "`{}`", string(item));
         assert!(
             (0..plain.iter().count()).all(|ix| !matches!(
@@ -11386,17 +11390,20 @@ fn without_parts(referrer: &Referrer) -> Referrer {
 }
 
 /// The config of `new_leaker()`.
-fn std_config() -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    config
+fn std_config() -> Allow<impl Fn(&Path) -> bool> {
+    Allow::new().allow_primitive().allow_prelude()
 }
 
 /// The scope of F43: the trait `Tr<T: AsRef<Self>>` (a bound of `T` names the `Self` of the trait),
 /// with `direct` visited in it as types, and `nested` an item nested in it
 /// (`View::visit_item()`), which has a `Self` of its own.
-fn f43_analyze(config: LeakerConfig, direct: &[Type], nested: &Item) -> (LeakerResult, ContextId) {
-    let mut leaker = Leaker::from_config(config);
+fn f43_analyze<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
+    check_values: bool,
+    direct: &[Type],
+    nested: &Item,
+) -> (LeakerResult, ContextId) {
+    let mut leaker = Leaker::from_config(config, check_values, false);
     let generics: Generics = parse_quote!(<T: AsRef<Self>>);
     let (context, ()) = leaker.enter_trait(&parse_quote!(Tr), &generics, true, |view| {
         for ty in direct {
@@ -11472,7 +11479,7 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
     );
     // The same tokens where the context can be written: in the trait itself.
     let direct: Vec<Type> = vec![parse_quote!(Rel<T, Other>)];
-    let (result, context) = f43_analyze(std_config(), &direct, &nested);
+    let (result, context) = f43_analyze(std_config(), false, &direct, &nested);
     assert_eq!(
         joined_messages(result.errors()),
         "the bound of `T` mentions a `Self` which has no name here"
@@ -11525,7 +11532,7 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
             fn g(&self, y: ::p::Bare<dyn RelTr>) {}
         }
     );
-    let (result, context) = f43_analyze(std_config(), &[], &nested);
+    let (result, context) = f43_analyze(std_config(), false, &[], &nested);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
     let referrer = result.clone().into_referrer();
@@ -11541,7 +11548,9 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
         (true, format!("P < {}usize >", bare)),
     ] {
         let mut result = result.clone();
-        result.allow_ambiguous_crate_name(!strict);
+        if strict {
+            result.deny_ambiguous_crate_name();
+        }
         let referrer = result.into_referrer();
         let expected = format!(
             "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : {}) {{ }} }} }} }}",
@@ -11558,7 +11567,7 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
 
 /// F43: the same for a bound whose trait path conflicts (`Rel<T, Other>` in `U: RelTrait<T,
 /// Other>`, a node that is no type) and for the path of a value (`inner::make::<T, Other>()`, with
-/// `check_values()`): their contexts cannot be written either.
+/// `check_values`): their contexts cannot be written either.
 #[test]
 fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_copied_as_written() {
     let nested: Item = parse_quote!(
@@ -11568,9 +11577,7 @@ fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_copied_as_written
             }
         }
     );
-    let mut config = std_config();
-    config.check_values();
-    let (result, context) = f43_analyze(config, &[], &nested);
+    let (result, context) = f43_analyze(std_config(), true, &[], &nested);
     assert!(result
         .errors()
         .iter()
@@ -11664,10 +11671,8 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
 
 /// The Leaker of F44: `::p` is allowed (the types of the items are relative, `::core::..` is
 /// absolute), and the prelude and the primitives.
-fn f44_config() -> LeakerConfig {
-    let mut config = std_config();
-    config.allow_path(parse_quote!(::p));
-    config
+fn f44_config() -> Allow<impl Fn(&Path) -> bool> {
+    std_config().allow_path_if(starts_with(parse_quote!(::p)))
 }
 
 /// The copy of the trait, once with `Self`, once with `with_self(Host)`.
@@ -11742,7 +11747,7 @@ fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
     ];
     for (item, allow_self, part, reason, expected) in &items {
         let what = string(item);
-        let mut leaker = Leaker::from_config(f44_config());
+        let mut leaker = Leaker::from_config(f44_config(), false, false);
         let context = leaker.intern_trait(item, *allow_self);
         let result = leaker.result();
         assert_eq!(result.errors().len(), 1, "{}", what);
@@ -11783,7 +11788,7 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
             fn g(&self, y: Other) {}
         }
     );
-    let mut leaker = Leaker::from_config(f44_config());
+    let mut leaker = Leaker::from_config(f44_config(), false, false);
     let context = leaker.intern_impl(&item, true);
     let result = leaker.result();
     assert_eq!(
@@ -11908,7 +11913,7 @@ fn f46_the_help_for_a_relative_std_path_suggests_the_crate_itself() {
     let help = |path: &str, example: &str| {
         format!(
             "write `{}` with an absolute path (e.g. `{}`), or allow it with \
-             `LeakerConfig::allow_path()`",
+             `Allow::allow_path_if()`",
             path, example
         )
     };
@@ -12112,7 +12117,7 @@ fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self
 
 /// The items of F48 in one Leaker, with the errors that remain and their top-level contexts.
 fn f48_leak(items: &[Item]) -> (Referrer, Vec<ContextId>, Vec<Reason>) {
-    let mut leaker = Leaker::from_config(std_config());
+    let mut leaker = Leaker::from_config(std_config(), false, false);
     let contexts = items.iter().map(|item| intern(&mut leaker, item)).collect();
     let result = leaker.result();
     let reasons = result.errors().iter().map(|e| e.reason).collect();
@@ -12244,7 +12249,7 @@ fn f48_a_marked_part_is_left_in_the_arguments_of_a_signature_only() {
             fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
         }
     );
-    let mut leaker = Leaker::from_config(std_config());
+    let mut leaker = Leaker::from_config(std_config(), false, false);
     let context = leaker.intern_trait(&item, true);
     // Another item gives the type an entry, so there is something to replace it with.
     let struct_context = leaker.intern_struct(
@@ -12518,14 +12523,26 @@ fn f49_a_function_pointer_and_fn_sugar_count_each_input() {
 
 // ── F50 ──────────────────────────────────────────────────────────────────────
 
-/// The analysis of `item` with `check_values()` and the primitive types allowed.
-fn f50_analyze(item: &ItemTrait, configure: impl Fn(&mut LeakerConfig)) -> LeakerResult {
-    let mut config = LeakerConfig::new();
-    config.check_values().allow_primitive();
-    configure(&mut config);
-    let mut leaker = Leaker::from_config(config);
-    leaker.intern_trait(item, true);
-    leaker.result()
+/// The analysis of `item` with `check_values` and the primitive types allowed, and the path rule
+/// `rule` (`"std"`, `"crate"` or the prelude) if there is one.
+fn f50_analyze(item: &ItemTrait, rule: Option<&str>) -> LeakerResult {
+    fn run<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+        item: &ItemTrait,
+        config: Allow<P, E>,
+    ) -> LeakerResult {
+        let mut leaker = Leaker::from_config(config, true, false);
+        leaker.intern_trait(item, true);
+        leaker.result()
+    }
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_path_if(move |path| match rule {
+            None => false,
+            Some("std") => is_std_crate_path(path),
+            Some("crate") => is_crate_path(path),
+            Some(_) => is_prelude_path(path),
+        });
+    run(item, config)
 }
 
 /// The paths of the error `at` of `result`, as text.
@@ -12536,7 +12553,7 @@ fn f50_paths(result: &LeakerResult, at: usize) -> Vec<String> {
 /// F50 (fixed): the paths of the error of a path of a value left out the relative types in its
 /// arguments.
 ///
-/// Trigger: `core::mem::size_of::<*const Rel>()` in a default method, with `check_values()`.
+/// Trigger: `core::mem::size_of::<*const Rel>()` in a default method, with `check_values`.
 /// Cause: the error of a relative path of a value (`ValueWalk::relative_part()`) had its own path
 /// alone (`core::mem::size_of`), where the error of a type or a bound has all the relative paths in
 /// it. The whole path is copied as written, `Rel` too, but a path rule after the analysis
@@ -12646,7 +12663,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
     } in cases
     {
         let what = string(&item);
-        let result = f50_analyze(&item, |_| ());
+        let result = f50_analyze(&item, None);
         assert_eq!(result.errors().len(), 1, "{}", what);
         assert_eq!(f50_paths(&result, 0), paths, "{}", what);
         // The rule leaves the error, with the paths it does not allow.
@@ -12659,13 +12676,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
         assert_eq!(after.errors().len(), 1, "{}", what);
         assert_eq!(f50_paths(&after, 0), left, "{}", what);
         // The config that has the rule leaks the types in the arguments: no error, and the entries.
-        let config = f50_analyze(&item, |config| {
-            match rule {
-                "std" => config.allow_std_crates(),
-                "crate" => config.allow_crate(),
-                _ => config.allow_prelude(),
-            };
-        });
+        let config = f50_analyze(&item, Some(rule));
         assert!(config.errors().is_empty(), "{}", what);
         let referrer = config.into_referrer();
         let found: Vec<String> = referrer.iter().map(string).collect();
@@ -12673,7 +12684,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
         // Allowing them too drops the error, and nothing is left inside the part.
         let mut all = after.clone();
         for path in left {
-            all.allow_path(syn::parse_str(path).unwrap());
+            all.allow_path_if(starts_with(syn::parse_str(path).unwrap()));
         }
         assert!(all.errors().is_empty(), "{}", what);
     }
@@ -12696,7 +12707,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
             }
         ),
     ] {
-        let result = f50_analyze(&item, |_| ());
+        let result = f50_analyze(&item, None);
         assert_eq!(
             f50_paths(&result, 0),
             ["core :: mem :: size_of"],
@@ -12708,7 +12719,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
 
 // ── F51 ──────────────────────────────────────────────────────────────────────
 
-/// F51 (fixed): `enter_mod` with `nested_self_entries()` accepted a bound that names a leaked type
+/// F51 (fixed): `enter_mod` with `nested_self_entries` accepted a bound that names a leaked type
 /// that names `Self`, which `intern_struct()` rejects.
 ///
 /// Trigger: `struct S<T: Clone + AsRef<R1<Self>>> { f0: T, f1: R1<(Self, T)> }`. The entry
@@ -12859,12 +12870,11 @@ fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
     );
     assert_eq!(entries(""), (0, vec!["?:: ext :: B0".to_string()]));
     // The path of the part allowed in the config: it is not an error, and `Self::A0` is visited.
-    let mut config = LeakerConfig::new();
-    config
+    let config = Allow::new()
         .allow_primitive()
         .allow_prelude()
-        .allow_path(parse_quote!(RelTr));
-    let mut leaker = Leaker::from_config(config);
+        .allow_path_if(starts_with(parse_quote!(RelTr)));
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(&item("fn m<Y>(&self) where Y: RelTr<Self::A0>;"), true);
     let result = leaker.result();
     assert!(result.errors().is_empty());

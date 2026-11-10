@@ -1,4 +1,4 @@
-//! The names that `LeakerConfig::allow_primitive()` and `LeakerConfig::allow_prelude()` allow.
+//! The names that `Allow::allow_primitive()` and `Allow::allow_prelude()` allow.
 //!
 //! An allowed path is the same on both sides, so it is not leaked: a bound that names it is fine,
 //! and a type that names it has no entry. Without the option the same name is a relative path:
@@ -73,16 +73,8 @@ const PRELUDE_LATER: [(&str, &str); 9] = [
     ("align_of_val", "::core::mem::align_of_val"),
 ];
 
-fn config(primitive: bool, prelude: bool) -> LeakerConfig {
-    let mut config = LeakerConfig::new();
-    if primitive {
-        config.allow_primitive();
-    }
-    if prelude {
-        config.allow_prelude();
-    }
-    config
-}
+/// Whether the config allows the primitive types and the prelude.
+type Options = (bool, bool);
 
 /// Where the name is written, and the headline of the error where that is one.
 struct Form {
@@ -117,10 +109,21 @@ fn forms(name: &str) -> Vec<Form> {
     ]
 }
 
-/// The entries of the Referrer, or the headline of the error.
-fn analyze(config: LeakerConfig, source: &str) -> std::result::Result<Vec<String>, String> {
+/// The entries of the Referrer, or the headline of the error, with the options of `options`.
+fn analyze(options: Options, source: &str) -> std::result::Result<Vec<String>, String> {
+    let (primitive, prelude) = options;
+    let config = Allow::new().allow_path_if(move |path| {
+        (primitive && is_primitive_path(path)) || (prelude && is_prelude_path(path))
+    });
+    analyze_config(config, source)
+}
+
+fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    config: Allow<P, E>,
+    source: &str,
+) -> std::result::Result<Vec<String>, String> {
     let item: ItemTrait = parse_str(source).unwrap();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().map_err(|err| {
         err.iter()
@@ -132,20 +135,20 @@ fn analyze(config: LeakerConfig, source: &str) -> std::result::Result<Vec<String
 }
 
 /// `names` are allowed by the config `allowing`, and not by the other config, nor by none.
-fn check(names: &[&str], allowing: impl Fn() -> LeakerConfig, others: &[LeakerConfig]) {
+fn check(names: &[&str], allowing: Options, others: &[Options]) {
     for name in names {
         for form in forms(name) {
             let context = format!("{} in {}: {}", name, form.label, form.source);
             // Allowed: no error, and nothing leaked.
             assert_eq!(
-                analyze(allowing(), &form.source),
+                analyze(allowing, &form.source),
                 Ok(Vec::new()),
                 "{}",
                 context
             );
             // Not allowed: an error, or an entry for the type.
-            for config in others.iter().cloned().chain([LeakerConfig::new()]) {
-                let result = analyze(config, &form.source);
+            for options in others.iter().copied().chain([(false, false)]) {
+                let result = analyze(options, &form.source);
                 match (&form.headline, &form.entry) {
                     (Some(headline), _) => assert_eq!(
                         result.as_ref().err(),
@@ -169,23 +172,23 @@ fn check(names: &[&str], allowing: impl Fn() -> LeakerConfig, others: &[LeakerCo
 #[test]
 fn allow_primitive_allows_every_primitive_type() {
     assert_eq!(PRIMITIVES.iter().collect::<BTreeSet<_>>().len(), 17);
-    check(&PRIMITIVES, || config(true, false), &[config(false, true)]);
+    check(&PRIMITIVES, (true, false), &[(false, true)]);
 }
 
 #[test]
 fn allow_prelude_allows_every_name_of_the_prelude() {
     let names: Vec<&str> = PRELUDE.iter().map(|(name, _)| *name).collect();
     assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), 36);
-    check(&names, || config(false, true), &[config(true, false)]);
+    check(&names, (false, true), &[(true, false)]);
 }
 
 #[test]
 fn the_names_of_a_later_prelude_are_not_allowed() {
     // Not by either option, nor by both: a crate of an earlier edition has no such name.
-    let both = || config(true, true);
+    let both = (true, true);
     for (name, _) in PRELUDE_LATER {
         for form in forms(name) {
-            let result = analyze(both(), &form.source);
+            let result = analyze(both, &form.source);
             match (&form.headline, &form.entry) {
                 (Some(headline), _) => assert_eq!(result.err().as_ref(), Some(headline)),
                 (_, Some(entry)) => assert_eq!(result.ok(), Some(vec![entry.clone()])),
@@ -225,7 +228,7 @@ fn the_options_allow_those_names_and_no_others() {
     // Another name is a relative path still, with both options.
     for name in ["Foo", "Local", "Rel", "tryfrom"] {
         for form in forms(name) {
-            let result = analyze(config(true, true), &form.source);
+            let result = analyze((true, true), &form.source);
             match (&form.headline, &form.entry) {
                 (Some(headline), _) => assert_eq!(result.err().as_ref(), Some(headline)),
                 (_, Some(entry)) => assert_eq!(result.ok(), Some(vec![entry.clone()])),
@@ -238,38 +241,31 @@ fn the_options_allow_those_names_and_no_others() {
 #[test]
 fn allow_crate_and_allow_std_crates_allow_the_paths_that_start_with_their_roots() {
     // In a supertrait and in a type: the root decides, and the rest of the path does not.
-    type Allowing = fn(&mut LeakerConfig);
-    let analyze_with = |config: Allowing, source: &str| {
-        let mut allowed = LeakerConfig::new();
-        config(&mut allowed);
-        analyze(allowed, source)
+    let analyze_with = |root: &str, source: &str| {
+        let config = Allow::new();
+        match root {
+            "crate" => analyze_config(config.allow_crate(), source),
+            "std crates" => analyze_config(config.allow_std_crates(), source),
+            _ => analyze_config(config, source),
+        }
     };
-    let roots: [(&str, Allowing, &[&str]); 2] = [
-        (
-            "crate",
-            |config| {
-                config.allow_crate();
-            },
-            &["crate::Foo", "crate::a::b::Foo"],
-        ),
+    let roots: [(&str, &[&str]); 2] = [
+        ("crate", &["crate::Foo", "crate::a::b::Foo"]),
         (
             "std crates",
-            |config| {
-                config.allow_std_crates();
-            },
             &["std::fmt::Debug", "core::fmt::Debug", "alloc::vec::Vec"],
         ),
     ];
-    for (label, config, paths) in roots {
+    for (label, paths) in roots {
         for path in paths {
             for source in [
                 format!("trait Tr: {} {{}}", path),
                 format!("trait Tr {{ fn f(&self, x: {}<()>); }}", path),
             ] {
                 // Allowed: no error, and nothing leaked.
-                assert_eq!(analyze_with(config, &source), Ok(Vec::new()), "{}", source);
+                assert_eq!(analyze_with(label, &source), Ok(Vec::new()), "{}", source);
                 // Not by another root, nor by none.
-                let none = analyze_with(|_| (), &source);
+                let none = analyze_with("none", &source);
                 assert!(
                     none != Ok(Vec::new()),
                     "{} ({}) is leaked or an error",
@@ -281,13 +277,11 @@ fn allow_crate_and_allow_std_crates_allow_the_paths_that_start_with_their_roots(
     }
     // A root decides by its first segment only: `my::core::X` is not `core::X`, and the absolute
     // `::core::X` is context-free whatever is allowed.
-    let mut config = LeakerConfig::new();
-    config.allow_std_crates().allow_crate();
-    let relative = analyze(
-        config.clone(),
+    let relative = analyze_config(
+        Allow::new().allow_std_crates().allow_crate(),
         "trait Tr { fn f(&self, x: my::core::X<()>); }",
     );
     assert_eq!(relative, Ok(vec!["my :: core :: X < () >".to_string()]));
-    let absolute = analyze(LeakerConfig::new(), "trait Tr: ::core::fmt::Debug {}");
+    let absolute = analyze((false, false), "trait Tr: ::core::fmt::Debug {}");
     assert_eq!(absolute, Ok(Vec::new()));
 }

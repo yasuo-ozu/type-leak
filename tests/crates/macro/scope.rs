@@ -151,15 +151,19 @@ impl ScopeInput {
 
     /// The analysis, as `coinduction` does it: a scope, in which the arguments are visited.
     fn analyze(&self) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
-        let mut config = LeakerConfig::new();
-        if self.primitive {
-            config.allow_primitive();
-        }
-        if self.prelude {
-            config.allow_prelude();
-        }
-        let mut leaker = Leaker::from_config(config);
-        let visit = |view: &mut View<'_>| {
+        let (primitive, prelude) = (self.primitive, self.prelude);
+        let config = Allow::new().allow_path_if(move |path| {
+            (primitive && is_primitive_path(path)) || (prelude && is_prelude_path(path))
+        });
+        self.analyze_with(config)
+    }
+
+    fn analyze_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+        &self,
+        config: Allow<P, E>,
+    ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
+        let mut leaker = Leaker::from_config(config, false, false);
+        let visit = |view: &mut View<'_, P>| {
             for arguments in self.fragments() {
                 view.visit_path_arguments(arguments);
             }
@@ -414,7 +418,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         strict,
     } = parse2(input)?;
     if strict {
-        result.allow_ambiguous_crate_name(false);
+        result.deny_ambiguous_crate_name();
     }
     let referrer = result.into_referrer();
     let krate = path

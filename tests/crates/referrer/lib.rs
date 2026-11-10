@@ -240,7 +240,7 @@ pub mod kinds {
             ::type_leak_test_leaker::kinds::Rel(0)
         }
     }
-    // The types in the values of an item, with `check_values()`: the copy compiles only if every
+    // The types in the values of an item, with `check_values`: the copy compiles only if every
     // type in a value that this crate cannot name is replaced.
     type_leak_test_leaker::__tl_prop_9141!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9142!(path = ::type_leak_test_leaker::kinds);

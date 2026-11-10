@@ -736,7 +736,7 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9201, __tl_report_9201!()),
             ok("impl-trait", 3, 2, 2),
         ),
-        // the types in the values of an item (`check_values()`): the consts and the default
+        // the types in the values of an item (`check_values`): the consts and the default
         // methods of a trait, and the const, the static and the function of a module
         (
             9141,
@@ -1301,7 +1301,7 @@ fn the_default_of_a_nested_struct_whose_bound_names_its_self_is_the_original_typ
 
 /// A type that names the own `Self` of a struct, an enum or a union nested in a module, in an item
 /// whose generic has a bound that names it too (`struct S<T: AsRef<Self>> { link: Link<Self, T> }`),
-/// with `LeakerConfig::nested_self_entries()` (F42 of `tests/findings.rs`). The entry is for any
+/// with `nested_self_entries` (F42 of `tests/findings.rs`). The entry is for any
 /// type that the bound holds for, and the copy passes its own type as the implementor: the field is
 /// `Link<S<T>, T>` with the copy's `S`, as in the original. Without a bound that names `Self`
 /// (`Unbound`), the entry is for the Leaker's type as before, so the field holds the Leaker's.
@@ -1366,7 +1366,7 @@ fn a_type_that_names_the_own_self_with_a_bound_that_names_it_is_the_copys_own() 
     );
 }
 
-/// The types in the values of an item, with `LeakerConfig::check_values()` (F40 of
+/// The types in the values of an item, with `check_values` (F40 of
 /// `tests/findings.rs`, the finding 14 of a downstream crate): `trait ValueTypes { const N: usize =
 /// size_of::<vals::Local>(); .. }`. The Referrer's crate declares the copy (`ValueTypesCopy`), and
 /// names none of the types of the defaults, so it compiles only if every one of them is replaced
@@ -2240,7 +2240,7 @@ fn a_rule_after_the_analysis_keeps_the_error_for_a_relative_type_in_the_argument
 }
 
 /// F51, fixture 9206: a nested struct whose bound names a leaked type that names `Self`, analyzed
-/// with `nested_self_entries()`, is rejected, as `intern_struct()` rejects it. The Referrer's
+/// with `nested_self_entries`, is rejected, as `intern_struct()` rejects it. The Referrer's
 /// macro expands to nothing (`kinds`, like the other rejected items).
 #[test]
 fn a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {

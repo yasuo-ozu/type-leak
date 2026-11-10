@@ -8,9 +8,12 @@
 //! in a field or in a signature is not in the environment, and a bound that names no leaked type
 //! is fine. See [Bounds that name leaked types](type_leak#bounds-that-name-leaked-types).
 
+mod common;
+
+use common::starts_with;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ErrorItem, Leaker, LeakerConfig, Referrer};
+use type_leak::{Allow, ErrorItem, Leaker, Referrer};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -25,18 +28,21 @@ fn messages(errors: &[ErrorItem]) -> String {
         .join("\n")
 }
 
-fn leaker() -> Leaker {
+fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
     leaker_allowing(&[])
 }
 
 /// Like `leaker()`, with the paths `allowed` too.
-fn leaker_allowing(allowed: &[&str]) -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    for path in allowed {
-        config.allow_path(parse_str(path).unwrap());
-    }
-    Leaker::from_config(config)
+fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Fn(&Path) -> bool> {
+    let allowed: Vec<Path> = allowed
+        .iter()
+        .map(|path| parse_str(path).unwrap())
+        .collect();
+    let config = Allow::new()
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path_if(move |path| allowed.iter().any(|a| starts_with(a.clone())(path)));
+    Leaker::from_config(config, false, false)
 }
 
 /// Analyzes `item` with the matching `intern_*`.
@@ -336,7 +342,7 @@ fn a_reference_that_is_leaked_whole_in_a_cycle_is_rejected() {
 }
 
 /// A Leaker for which the types of `::ext`, a crate that it does not allow, are optional entries.
-fn ext_leaker() -> Leaker {
+fn ext_leaker() -> Leaker<impl Fn(&Path) -> bool> {
     leaker()
 }
 

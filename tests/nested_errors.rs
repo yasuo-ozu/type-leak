@@ -17,16 +17,25 @@
 
 mod common;
 
-use common::{allow_every_cause, Rule};
+use common::{allow_every_cause, starts_with, Rule};
 use syn::parse::Parser;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
-fn analyze(item: &ItemTrait, config: LeakerConfig) -> LeakerResult {
-    let mut leaker = Leaker::from_config(config);
-    leaker.intern_trait(item, true);
-    leaker.result()
+fn analyze<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    item: &ItemTrait,
+    config: Allow<P, E>,
+) -> LeakerResult {
+    common::analyze_trait(item, config, false)
+}
+
+/// [`analyze()`] with `check_values`: the values are read too.
+fn analyze_values<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    item: &ItemTrait,
+    config: Allow<P, E>,
+) -> LeakerResult {
+    common::analyze_trait(item, config, true)
 }
 
 /// The reduced case: the trait of `X: Into<Self::A0>` is relative, so the bound is copied whole,
@@ -76,7 +85,7 @@ fn into_cause() -> Cause {
 
 #[test]
 fn a_bound_copied_whole_has_the_error_inside_it_nested() {
-    let result = analyze(&reduced(), LeakerConfig::new());
+    let result = analyze(&reduced(), Allow::new());
     // `String` is an entry, and the bound is one error whose path is `Into`.
     assert_eq!(result.errors().len(), 1);
     let error = &result.errors()[0];
@@ -99,7 +108,7 @@ fn a_bound_copied_whole_has_the_error_inside_it_nested() {
                 X: ::core::convert::Into<Self::A0>;
         }
     );
-    let direct = analyze(&absolute, LeakerConfig::new());
+    let direct = analyze(&absolute, Allow::new());
     assert_eq!(direct.errors().len(), 1);
     assert_eq!(text(&direct.errors()[0]), text(nested));
     // Looking inside changes nothing else: the Referrer is the one of the absolute bound but for
@@ -114,33 +123,31 @@ fn a_bound_copied_whole_has_the_error_inside_it_nested() {
 fn every_rule_that_drops_the_error_brings_the_nested_error_up() {
     // The cause, the path, and the prelude (which has `Into`) drop the bound; the entry `String` is
     // there all the same, and the error is the one found inside the bound.
-    let mut by_cause = analyze(&reduced(), LeakerConfig::new());
-    by_cause.allow(into_cause());
-    let mut by_path = analyze(&reduced(), LeakerConfig::new());
-    by_path.allow_path(parse_quote!(Into));
-    let mut by_prelude = analyze(&reduced(), LeakerConfig::new());
+    let mut by_cause = analyze(&reduced(), Allow::new());
+    by_cause.allow(|e| e.cause == into_cause());
+    let mut by_path = analyze(&reduced(), Allow::new());
+    by_path.allow_path_if(starts_with(parse_quote!(Into)));
+    let mut by_prelude = analyze(&reduced(), Allow::new());
     by_prelude.allow_prelude();
     for left in [&by_cause, &by_path, &by_prelude] {
         assert_eq!(shape(left.errors()), "Self :: A0 [UnprovableBound]");
         assert!(left.errors()[0].paths.is_empty());
     }
     // A rule that drops nothing leaves the bound, with the nested error still in it.
-    let mut other = analyze(&reduced(), LeakerConfig::new());
+    let mut other = analyze(&reduced(), Allow::new());
     other.allow_primitive().allow_std_crates();
     assert_eq!(
         shape(other.errors()),
         "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
     );
     // A config gives the same: the rule is applied when the analysis finishes.
-    let mut config = LeakerConfig::new();
-    config.allow(into_cause());
+    let config = Allow::new().allow(|e| e.cause == into_cause());
     assert_eq!(
         shape(analyze(&reduced(), config).errors()),
         "Self :: A0 [UnprovableBound]"
     );
     // A config that allows `Into` makes it context-free: the analysis finds the same error.
-    let mut config = LeakerConfig::new();
-    config.allow_path(parse_quote!(Into));
+    let config = Allow::new().allow_path_if(starts_with(parse_quote!(Into)));
     assert_eq!(
         shape(analyze(&reduced(), config).errors()),
         "Self :: A0 [UnprovableBound]"
@@ -155,22 +162,21 @@ fn every_rule_that_drops_the_error_brings_the_nested_error_up() {
 fn a_rule_that_drops_the_nested_error_first_leaves_nothing_when_the_bound_is_dropped() {
     // The rules add up in any order: what a rule accepts is accepted inside a bound that stays, so
     // it does not come up when the bound goes.
-    let mut result = analyze(&reduced(), LeakerConfig::new());
-    result.allow(Cause::Type(parse_quote!(Self::A0)));
+    let mut result = analyze(&reduced(), Allow::new());
+    result.allow(|e| e.cause == Cause::Type(parse_quote!(Self::A0)));
     assert_eq!(shape(result.errors()), "Into < Self :: A0 > [RelativePath]");
     assert!(result.errors()[0].nested.is_empty());
     result.allow_prelude();
     assert!(result.errors().is_empty());
-    let mut other = analyze(&reduced(), LeakerConfig::new());
+    let mut other = analyze(&reduced(), Allow::new());
     other
         .allow_prelude()
-        .allow(Cause::Type(parse_quote!(Self::A0)));
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Self::A0)));
     assert!(other.errors().is_empty());
     // And in one set, as a config has them.
-    let mut config = LeakerConfig::new();
-    config
+    let config = Allow::new()
         .allow_prelude()
-        .allow(Cause::Type(parse_quote!(Self::A0)));
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Self::A0)));
     assert!(analyze(&reduced(), config).errors().is_empty());
 }
 
@@ -188,18 +194,15 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
             }
         }
     );
-    let mut base = LeakerConfig::new();
-    base.check_values();
+    let base = Allow::new();
     for rule in [
         Rule::Cause(into_cause()),
         Rule::Values,
         Rule::Default,
         Rule::Path(parse_quote!(Into)),
     ] {
-        let mut config = base.clone();
-        rule.on_config(&mut config);
-        let before = analyze(&item, config);
-        let mut after = analyze(&item, base.clone());
+        let before = rule.analyze_with(&item, base.clone(), true);
+        let mut after = analyze_values(&item, base.clone());
         rule.on_result(&mut after);
         let both = |result: &LeakerResult| {
             result
@@ -224,7 +227,7 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
     }
     // `allow_values()` drops the error in the body and what is nested in it, which is in the body
     // too; the bound stays. Allowing the cause of the path brings `Rel<'_>` up.
-    let mut result = analyze(&item, base.clone());
+    let mut result = analyze_values(&item, base.clone());
     result.allow_values();
     assert_eq!(
         shape(result.errors()),
@@ -232,10 +235,10 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
     );
     // The path of the value is copied whole, `Rel` in its arguments with it: `Rel` is a path of its
     // error (F50), and allowed in the probe, so `Rel<'_>` is nothing wrong inside it.
-    let mut result = analyze(&item, base);
+    let mut result = analyze_values(&item, base);
     assert_eq!(paths(&result.errors()[1]), ["inner :: f", "Rel"]);
     assert!(result.errors()[1].nested.is_empty());
-    result.allow(Cause::Expr(parse_quote!(inner::f::<Rel<'_>>)));
+    result.allow(|e| e.cause == Cause::Expr(parse_quote!(inner::f::<Rel<'_>>)));
     assert_eq!(
         shape(result.errors()),
         "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
@@ -252,8 +255,7 @@ fn a_part_with_nothing_wrong_inside_has_no_nested_errors() {
             fn n<Y: Other>(&self, a: Vec<Rel<'_>>, b: MyType<'_>);
         }
     );
-    let mut config = LeakerConfig::new();
-    config.allow_primitive();
+    let config = Allow::new().allow_primitive();
     let result = analyze(&item, config);
     // The bound, the other bound, a type with `Vec` and `Rel` among its paths, and one with `MyType`.
     assert_eq!(
@@ -279,7 +281,7 @@ fn an_error_without_a_part_or_a_path_has_none() {
     let item: ItemTrait = parse_quote!(
         trait Tr<T = Wrap<Self>> {}
     );
-    let result = analyze(&item, LeakerConfig::new());
+    let result = analyze(&item, Allow::new());
     assert_eq!(result.errors().len(), 1);
     assert!(result.errors()[0].nested.is_empty());
     let mut leaker = Leaker::new();
@@ -305,7 +307,7 @@ fn a_type_that_cannot_be_leaked_has_what_is_wrong_inside_it_nested() {
                 X: ::p::Tr<Rel<Self::A0>>;
         }
     );
-    let result = analyze(&item, LeakerConfig::new());
+    let result = analyze(&item, Allow::new());
     assert_eq!(
         shape(result.errors()),
         "Rel < Self :: A0 > [UnprovableBound] { Self :: A0 [UnprovableBound] }, \
@@ -316,10 +318,9 @@ fn a_type_that_cannot_be_leaked_has_what_is_wrong_inside_it_nested() {
     // second one of the result, which comes up when the first is dropped and is skipped, as the
     // second is identical to it. So the result has one, as the config.
     let mut result_after = result.clone();
-    result_after.allow_path(parse_quote!(Rel));
+    result_after.allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(shape(result_after.errors()), "Self :: A0 [UnprovableBound]");
-    let mut config = LeakerConfig::new();
-    config.allow_path(parse_quote!(Rel));
+    let config = Allow::new().allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(
         shape(analyze(&item, config).errors()),
         "Self :: A0 [UnprovableBound]"
@@ -338,9 +339,8 @@ fn the_arguments_of_a_value_path_are_paths_of_its_error() {
             }
         }
     );
-    let mut config = LeakerConfig::new();
-    config.check_values();
-    let result = analyze(&item, config);
+    let config = Allow::new();
+    let result = analyze_values(&item, config);
     assert_eq!(result.errors().len(), 1);
     let error = &result.errors()[0];
     assert_eq!(paths(error), ["inner :: f", "Rel", "Wrap", "Rel2"]);
@@ -348,19 +348,18 @@ fn the_arguments_of_a_value_path_are_paths_of_its_error() {
     assert!(error.nested.is_empty());
     // The rules take the paths off one by one, and the error goes with the last.
     let mut result = result;
-    result.allow_path(parse_quote!(inner));
+    result.allow_path_if(starts_with(parse_quote!(inner)));
     assert_eq!(paths(&result.errors()[0]), ["Rel", "Wrap", "Rel2"]);
-    result.allow_path(parse_quote!(Rel));
+    result.allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(paths(&result.errors()[0]), ["Wrap", "Rel2"]);
-    result.allow_path(parse_quote!(Wrap));
-    result.allow_path(parse_quote!(Rel2));
+    result.allow_path_if(starts_with(parse_quote!(Wrap)));
+    result.allow_path_if(starts_with(parse_quote!(Rel2)));
     assert!(result.errors().is_empty());
     // The config that allows the path leaks the types in the arguments, which conflict; the rule
     // after the analysis keeps the error until they are allowed too.
-    let mut config = LeakerConfig::new();
-    config.check_values().allow_path(parse_quote!(inner));
+    let config = Allow::new().allow_path_if(starts_with(parse_quote!(inner)));
     assert_eq!(
-        shape(analyze(&item, config).errors()),
+        shape(analyze_values(&item, config).errors()),
         "Rel < '_ > [RelativePath], Wrap < Rel2 < '_ > > [RelativePath]"
     );
 }
@@ -406,18 +405,18 @@ fn dropping_an_error_brings_up_its_nested_errors_down_to_the_last() {
     );
     // One level at a time.
     let mut result = result;
-    result.allow(Cause::Trait(parse_quote!(A1)));
+    result.allow(|e| e.cause == Cause::Trait(parse_quote!(A1)));
     assert_eq!(
         shape(result.errors()),
         "B1 [RelativePath] { C1 [UnprovableBound], C2 [UnprovableBound] { D1 [Unreadable] } }, \
          E1 [RelativePath]"
     );
-    result.allow(Cause::Type(parse_quote!(B1)));
+    result.allow(|e| e.cause == Cause::Type(parse_quote!(B1)));
     assert_eq!(
         shape(result.errors()),
         "C1 [UnprovableBound], C2 [UnprovableBound] { D1 [Unreadable] }, E1 [RelativePath]"
     );
-    result.allow(Cause::Type(parse_quote!(C2)));
+    result.allow(|e| e.cause == Cause::Type(parse_quote!(C2)));
     assert_eq!(
         shape(result.errors()),
         "C1 [UnprovableBound], D1 [Unreadable], E1 [RelativePath]"
@@ -445,14 +444,14 @@ fn a_rule_filters_the_nested_errors_of_an_error_that_stays() {
     );
     // And a path rule removes the paths it allows from the nested errors too, so rules add up: `Z`
     // is all that `C2` has, so it goes, and `B1` loses `B2` and then goes with its own path.
-    result.allow_path(parse_quote!(Z));
+    result.allow_path_if(starts_with(parse_quote!(Z)));
     assert_eq!(
         shape(result.errors()),
         "A1 [RelativePath] { B1 [RelativePath] { C1 [UnprovableBound] } }, E1 [RelativePath]"
     );
-    result.allow_path(parse_quote!(B2));
+    result.allow_path_if(starts_with(parse_quote!(B2)));
     assert_eq!(paths(&result.errors()[0].nested[0]), ["B1"]);
-    result.allow_path(parse_quote!(B1));
+    result.allow_path_if(starts_with(parse_quote!(B1)));
     assert_eq!(
         shape(result.errors()),
         "A1 [RelativePath] { C1 [UnprovableBound] }, E1 [RelativePath]"
@@ -462,11 +461,11 @@ fn a_rule_filters_the_nested_errors_of_an_error_that_stays() {
     first.allow_values();
     let mut second = first.clone();
     first
-        .allow_path(parse_quote!(Z))
-        .allow_path(parse_quote!(A1));
+        .allow_path_if(starts_with(parse_quote!(Z)))
+        .allow_path_if(starts_with(parse_quote!(A1)));
     second
-        .allow_path(parse_quote!(A1))
-        .allow_path(parse_quote!(Z));
+        .allow_path_if(starts_with(parse_quote!(A1)))
+        .allow_path_if(starts_with(parse_quote!(Z)));
     assert_eq!(shape(first.errors()), shape(second.errors()));
     assert_eq!(
         shape(first.errors()),
@@ -507,7 +506,7 @@ fn a_nested_error_that_the_analysis_also_reports_beside_it_is_listed_once() {
         }
     );
     let rel = Cause::Type(parse_quote!(Rel<Self::A0>));
-    let result = analyze(&item, LeakerConfig::new());
+    let result = analyze(&item, Allow::new());
     assert_eq!(
         shape(result.errors()),
         "Rel < Self :: A0 > [UnprovableBound] { Self :: A0 [UnprovableBound] }, \
@@ -516,16 +515,15 @@ fn a_nested_error_that_the_analysis_also_reports_beside_it_is_listed_once() {
     let sibling = result.errors()[1].to_token_stream().to_string();
     // After the analysis, whichever rule drops the first error: the sibling is the only one left.
     let mut by_cause = result.clone();
-    by_cause.allow(rel.clone());
+    by_cause.allow(|e| e.cause == rel.clone());
     let mut by_path = result.clone();
-    by_path.allow_path(parse_quote!(Rel));
+    by_path.allow_path_if(starts_with(parse_quote!(Rel)));
     for result in [&by_cause, &by_path] {
         assert_eq!(shape(result.errors()), "Self :: A0 [UnprovableBound]");
         assert_eq!(result.errors()[0].to_token_stream().to_string(), sibling);
     }
     // With the rule on the config: the same.
-    let mut config = LeakerConfig::new();
-    config.allow(rel);
+    let config = Allow::new().allow(|e| e.cause == rel);
     let by_config = analyze(&item, config);
     assert_eq!(shape(by_config.errors()), "Self :: A0 [UnprovableBound]");
     assert_eq!(by_config.errors()[0].to_token_stream().to_string(), sibling);
@@ -542,13 +540,13 @@ fn the_errors_that_did_not_come_up_are_never_merged() {
             fn m(&self, a: Wrap<'_>, b: Wrap<'_>);
         }
     );
-    let result = analyze(&item, LeakerConfig::new());
+    let result = analyze(&item, Allow::new());
     assert_eq!(result.errors().len(), 2);
     assert_eq!(text(&result.errors()[0]), text(&result.errors()[1]));
     let mut other = result.clone();
     other
         .allow_prelude()
-        .allow(Cause::Type(parse_quote!(Other)));
+        .allow(|e| e.cause == Cause::Type(parse_quote!(Other)));
     assert_eq!(other.errors().len(), 2);
     // One of them and a nested error that is identical to them: the nested one is skipped, the two
     // that did not come up are kept (the analysis: `Self::A0` beside `Rel<Self::A0>`, twice).
@@ -561,13 +559,13 @@ fn the_errors_that_did_not_come_up_are_never_merged() {
                 Y: ::p::Tr<Rel<Self::A0>>;
         }
     );
-    let mut result = analyze(&item, LeakerConfig::new());
+    let mut result = analyze(&item, Allow::new());
     assert_eq!(
         shape(result.errors()),
         "Rel < Self :: A0 > [UnprovableBound] { Self :: A0 [UnprovableBound] }, \
          Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
     );
-    result.allow_path(parse_quote!(Rel));
+    result.allow_path_if(starts_with(parse_quote!(Rel)));
     assert_eq!(
         shape(result.errors()),
         "Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
@@ -576,13 +574,13 @@ fn the_errors_that_did_not_come_up_are_never_merged() {
     let s = plain("S");
     let mut result = with_errors(&format!("{s} {s} {}", outer("O", &[&s])));
     assert_eq!(result.errors().len(), 3);
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound]"
     );
     let mut result = with_errors(&format!("{s} {s}"));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(result.errors().len(), 2);
 }
 
@@ -592,11 +590,11 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
     let first = |nested: &[&str]| outer("O", nested);
     // The sibling before the outer error.
     let mut result = with_errors(&format!("{s} {}", first(&[&s])));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(shape(result.errors()), "S [UnprovableBound]");
     // The sibling after it.
     let mut result = with_errors(&format!("{} {s}", first(&[&s])));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(shape(result.errors()), "S [UnprovableBound]");
     // The order is kept: what comes up takes the place of its outer error, and what is skipped
     // leaves the sibling where it was.
@@ -606,7 +604,7 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
         first(&[&s, &plain("B"), &t]),
         plain("C"),
     ));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "A [UnprovableBound], B [UnprovableBound], C [UnprovableBound], T [UnprovableBound], \
@@ -615,13 +613,13 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
     // Identical errors that come up are both kept, whether they come from one outer error or from
     // two: only an error that stays skips them (`T` is the sibling that follows).
     let mut result = with_errors(&first(&[&s, &s]));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound]"
     );
     let mut result = with_errors(&format!("{} {}", first(&[&s]), outer("O2", &[&s])));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound]"
@@ -631,7 +629,7 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
         first(&[&s, &t]),
         outer("O2", &[&s, &plain("U")])
     ));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "S [UnprovableBound], S [UnprovableBound], U [UnprovableBound], T [UnprovableBound]"
@@ -640,14 +638,14 @@ fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() 
     // with a sibling that follows the outer error.
     let inner = outer("M", &[&s]);
     let mut result = with_errors(&format!("{} {s}", first(&[&inner])));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(shape(result.errors()), "S [UnprovableBound]");
     // Only what stays in the list is compared, not what a dropped error would have brought up: an
     // error that stays, with the same nested error, does not hide one that comes up.
     let stays =
         r#"{ type ( K ) RelativePath "o" [] paths [ Q ] nested [ NESTED ] }"#.replace("NESTED", &s);
     let mut result = with_errors(&format!("{stays} {}", first(&[&s])));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         shape(result.errors()),
         "K [RelativePath] { S [UnprovableBound] }, S [UnprovableBound]"
@@ -659,7 +657,7 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
     let same = plain("S");
     let differ = |other: String| {
         let mut result = with_errors(&format!("{} {}", outer("O", &[&other]), same));
-        result.allow_path(parse_quote!(P));
+        result.allow_path_if(starts_with(parse_quote!(P)));
         result.errors().len()
     };
     assert_eq!(differ(plain("S")), 1);
@@ -684,7 +682,7 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
         "{} {same}",
         outer("O", &[&same.replace(r#""n""#, r#""n2""#)])
     ));
-    result.allow_path(parse_quote!(P));
+    result.allow_path_if(starts_with(parse_quote!(P)));
     assert_eq!(
         result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
         Some("n2")
@@ -717,7 +715,7 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
         (&tail("value paths [ Z ]"), &tail("paths [ Z ] value"), 1),
     ] {
         let mut result = with_errors(&format!("{} {}", outer("O", &[up]), stays));
-        result.allow_path(parse_quote!(P));
+        result.allow_path_if(starts_with(parse_quote!(P)));
         assert_eq!(result.errors().len(), kept, "{} / {}", up, stays);
     }
     let deep_x = tail(&format!(
@@ -727,7 +725,7 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
     let deep_y = deep_x.replacen("( Z )", "( W )", 1);
     for (other, kept) in [(&deep_x, 1), (&deep_y, 2)] {
         let mut result = with_errors(&format!("{} {}", outer("O", &[other]), deep_x));
-        result.allow_path(parse_quote!(P));
+        result.allow_path_if(starts_with(parse_quote!(P)));
         assert_eq!(result.errors().len(), kept, "{}", other);
     }
 }
@@ -736,7 +734,7 @@ fn a_nested_error_that_differs_in_what_it_says_is_kept() {
 
 #[test]
 fn nested_errors_are_written_after_the_paths_only_if_there_are_some() {
-    let result = analyze(&reduced(), LeakerConfig::new());
+    let result = analyze(&reduced(), Allow::new());
     let error = &result.errors()[0];
     let tokens = error.to_token_stream().to_string();
     assert!(
@@ -774,7 +772,7 @@ fn nested_errors_are_written_after_the_paths_only_if_there_are_some() {
 
 #[test]
 fn nested_errors_are_written_and_read_back_with_every_field() {
-    let result = analyze(&reduced(), LeakerConfig::new());
+    let result = analyze(&reduced(), Allow::new());
     let error = &result.errors()[0];
     let tokens = error.to_token_stream();
     let read: ErrorItem = parse2(tokens.clone()).unwrap();
@@ -811,7 +809,7 @@ fn nested_errors_are_written_and_read_back_with_every_field() {
 #[test]
 fn a_result_is_read_with_the_items_that_follow_it() {
     // The tokens after the errors are not consumed, nested groups are no errors of the list.
-    let result = analyze(&reduced(), LeakerConfig::new());
+    let result = analyze(&reduced(), Allow::new());
     let mut tokens = result.to_token_stream();
     tokens.extend(quote!(trailing tokens));
     let parsed =
@@ -827,7 +825,7 @@ fn a_result_is_read_with_the_items_that_follow_it() {
 
 #[test]
 fn reporting_does_not_show_the_nested_errors() {
-    let result = analyze(&reduced(), LeakerConfig::new());
+    let result = analyze(&reduced(), Allow::new());
     let error = &result.errors()[0];
     let nested = &error.nested[0];
     assert!(!nested.message.is_empty());

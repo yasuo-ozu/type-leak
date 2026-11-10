@@ -159,9 +159,8 @@ fn the_syn_error_has_the_span_of_each_item() {
 fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let source = "trait Tr<T: Fn(Rel)> {\n    fn f(&self, a: Wrap<T>)\n    where\n        Wrap<T>: Sized;\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_prelude();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_primitive().allow_prelude();
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let items = result.errors();
@@ -318,12 +317,12 @@ fn an_accepted_cause_is_the_same_whatever_its_spans() {
     };
     assert_eq!(hash(&cause), hash(&errors[0].cause));
     let mut allowed = result.clone();
-    assert!(allowed.allow(cause).errors().is_empty());
+    assert!(allowed.allow(|e| e.cause == cause).errors().is_empty());
     // Another cause drops nothing.
     let mut other = result.clone();
     assert_eq!(
         other
-            .allow(Cause::Trait(parse_quote!(Other)))
+            .allow(|e| e.cause == Cause::Trait(parse_quote!(Other)))
             .errors()
             .len(),
         1
@@ -368,9 +367,8 @@ fn assert_in_source(tokens: proc_macro2::TokenStream, source: &str) {
 /// length. `u8` is allowed, so `two` is the first error.
 fn macro_error(source: &str) -> ErrorItem {
     let item: ItemStruct = parse_str(source).unwrap();
-    let mut config = LeakerConfig::new();
-    config.allow_primitive();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_primitive();
+    let mut leaker = Leaker::from_config(config, false, false);
     leaker.intern_struct(&item, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1, "{}", messages(result.errors()));
@@ -443,15 +441,14 @@ fn an_error_of_a_macro_cause_is_reported_at_the_name_of_the_macro() {
     assert_eq!(read[0].cause, error.cause);
 }
 
-/// The macro cause of a value (`check_values()`), and of a mention of `Self` that has no meaning
+/// The macro cause of a value (`check_values`), and of a mention of `Self` that has no meaning
 /// (`Self::m!()`), has no token at the call site either.
 #[test]
 fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     let source = "trait Tr {\n    fn f(&self) -> u8 {\n        two!() + 1\n    }\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().check_values();
-    let mut leaker = Leaker::from_config(config);
+    let config = Allow::new().allow_primitive();
+    let mut leaker = Leaker::from_config(config, true, false);
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let items = result.errors();

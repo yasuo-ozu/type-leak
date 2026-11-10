@@ -179,7 +179,7 @@ pub enum SelfRequirement {
     /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound for its
     /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self` as the implementor
     /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)). With
-    /// [`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries) the type
+    /// [`nested_self_entries`](crate::Leaker::from_config) the type
     /// may name `Self` too (`Rel2<Self, T>`).
     ///
     /// The impl is for a parameter (`__S`) that replaces `Self` in the bounds and has no bound of
@@ -728,7 +728,7 @@ impl Context {
 
     /// Like [`Context::of()`], for an entry of a struct, an enum or a union nested in the analyzed
     /// syntax (`nested_type`) that is for any type although its type names `Self`
-    /// ([`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries)): `Self`
+    /// ([`nested_self_entries`](crate::Leaker::from_config)): `Self`
     /// in the type and in the bounds is the implementor of the impl, and the impl does not need the
     /// generics that `Self` has as arguments. Not so with `nested_type` unset, or a `Self` that is
     /// not a type. It is `of()` for a type that does not name `Self`.
