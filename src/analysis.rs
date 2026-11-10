@@ -16,9 +16,8 @@ use template_quote::quote;
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
 /// that forbid it.
 ///
-/// The causes are, for example, a relative path (`must`) and an elided lifetime (`impossible`).
 /// Each is a [`Cause`] of the kind of syntax it is. The first of `must` is the cause of the
-/// [`ErrorItem`] that reports the conflict.
+/// [`ErrorItem`] that reports a conflict.
 ///
 /// - Both empty: copy the type as it is.
 /// - Only `must`: leak the type, or only its parts unless `is_own` (`MyType`,
@@ -26,11 +25,8 @@ use template_quote::quote;
 /// - Only `impossible`: the type cannot be leaked and need not be (`impl ::path::Trait`).
 /// - Both: a conflict (`MyType<'_>`). Unless `is_own`, the parts can be leaked instead.
 ///
-/// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
-/// trait encloses) is an `impossible` cause, with the mention of `Self` as written, a `note` and a
-/// `help`.
-/// A scope reports it as an error ([`Reason::SelfWithoutMeaning`]) and copies the type that names
-/// it as written, so it is no entry.
+/// `Self` where it has no meaning is an `impossible` cause ([`Reason::SelfWithoutMeaning`]): a
+/// scope reports it as an error and copies the type that names it as written.
 ///
 /// ```
 /// # use type_leak::*;
@@ -40,70 +36,50 @@ use template_quote::quote;
 ///     .enter_generics(&Generics::default(), |view| {
 ///         [
 ///             view.check(&parse_quote!(::core::option::Option<::core::primitive::u8>)),
-///             view.check(&parse_quote!(Rel)),            // a relative path
-///             view.check(&parse_quote!(impl ::path::Trait)), // cannot be leaked
-///             view.check(&parse_quote!(Rel<'_>)),        // must be leaked, and cannot be
+///             view.check(&parse_quote!(Rel)),
+///             view.check(&parse_quote!(impl ::path::Trait)),
+///             view.check(&parse_quote!(Rel<'_>)),
 ///         ]
 ///     });
-/// // Nothing depends on the context in `Option<u8>` of the standard library: copy it as it is.
+/// // Nothing depends on the context: copy it as it is.
 /// assert!(results[0].must.is_empty() && results[0].impossible.is_empty());
-/// // Leak `Rel`: `is_own` says that it is the path of the type itself.
+/// // Leak `Rel`, the path of the type itself.
 /// assert_eq!(results[1].must.len(), 1);
 /// assert!(results[1].is_own);
 /// // `impl Trait` can be neither leaked nor needs to be.
 /// assert!(results[2].must.is_empty() && !results[2].impossible.is_empty());
 /// // `Rel<'_>` is a conflict: its path depends on the context, and its lifetime cannot be leaked.
-/// assert!(!results[3].must.is_empty() && !results[3].impossible.is_empty());
 /// assert!(matches!(&results[3].must[0], Cause::Type(_)));
 /// assert!(matches!(&results[3].impossible[0], Cause::Lifetime(_)));
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CheckResult {
-    /// Causes that depend on the context (`A` and `B` in `::path::Wrap<A, B>`). Outermost first,
-    /// then in order of appearance. In a conflict, a path in a type inside the type that is leaked
-    /// alone is not listed: it is no error once the others are fixed (`u8` in `<Self as
-    /// Tr<u8>>::X`, which cannot be leaked whole because of `Self`).
+    /// Causes that depend on the context (`A` and `B` in `::path::Wrap<A, B>`): outermost first,
+    /// then in order of appearance. In a conflict, paths inside a type that is leaked alone are not
+    /// listed.
     pub must: Vec<Cause>,
     /// Causes that cannot be leaked (an elided lifetime, `impl Trait`), in order of appearance,
     /// then the mentions of `Self` that have no meaning.
     pub impossible: Vec<Cause>,
     /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
-    /// must be leaked whole. `false` if `must` is empty or only its parts are causes
+    /// must be leaked whole; `false` if `must` is empty or only its parts are causes
     /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
-    /// holding it, and a conflict if that type cannot be leaked (`::path::Wrap<MyType, Self>` where
-    /// `Self` is denied). See [Bare identifiers and
-    /// consts](crate::Leaker#bare-identifiers-and-consts).
+    /// holding it ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
-    /// an external crate (`::path::X`, `::path::Wrap<(MyType,)>`), which the Referrer may not
-    /// share. `must` holds only its parts, if any. A type with an impossible cause is not one, as
-    /// it is copied as written. See [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path).
+    /// an external crate (`::path::X`), which the Referrer may not share. `must` holds only its
+    /// parts. See [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path).
     pub optional: bool,
-    /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no
-    /// meaning). Reported first. It says why, and `help` says what to write instead.
+    /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no meaning).
+    /// Reported first.
     pub note: Option<String>,
-    /// What to write instead, with the tokens as written (for example "replace `Self::A` with
-    /// `<Self as ::path::Tr>::A`"). If it is `None`, the [`ErrorItem`] suggests the absolute path
-    /// of the first of `must`. See [`ErrorItem::help`](crate::ErrorItem::help).
+    /// What to write instead, as tokens. If it is `None`, the [`ErrorItem`] suggests the absolute
+    /// path of the first of `must` ([`ErrorItem::help`](crate::ErrorItem::help)).
     pub help: Option<String>,
-    /// The headline of the error, if the fault is not that the path of the type is relative. It is
-    /// the message of the [`ErrorItem`]; if it is `None`, the message is `use absolute path: '..'`
-    /// and `note` says why the path cannot be leaked as a whole (`MyType<'_>`, E0106).
-    ///
-    /// It is set when the fault is something else than a path:
-    ///
-    /// - a type that uses a generic whose bound mentions a `Self` that has no name here (see
-    ///   [`View::visit_item()`](crate::View::visit_item)): the fault is that bound, `must` is the
-    ///   type that uses it, and `impossible` is the mention of `Self`;
-    /// - a type that uses a generic whose bound mentions a `Self` that cannot be leaked;
-    /// - a type in the default of a parameter that names `Self`;
-    /// - the bound rules, and `Self::A` where `Self` is a type;
-    /// - a lifetime of a method that the copy would leave unconstrained (E0195): the fault is the
-    ///   lifetime;
-    /// - syntax in a value that the Leaker cannot read, with
-    ///   [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values) ("cannot analyze .. in
-    ///   the body of ..").
+    /// The message of the [`ErrorItem`] if the fault is not that the path of the type is relative.
+    /// If it is `None`, the message is `use absolute path: '..'` and `note` says why the path
+    /// cannot be leaked as a whole (`MyType<'_>`, E0106).
     pub headline: Option<String>,
     /// The cause of the [`ErrorItem`] if it is not the first of `must` (the default of a parameter
     /// that names `Self` is reported whole, with the note at the `Self` in it).

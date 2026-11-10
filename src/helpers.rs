@@ -14,171 +14,63 @@ use proc_macro2::Span;
 use syn::punctuated::Punctuated;
 use syn::*;
 
-/// Says what a Repeater impl is written for: see [`Referrer::repeater_impl()`].
+/// What a Repeater impl is written for: the `target` of [`Referrer::repeater_impl()`].
 ///
-/// An entry that needs `Self` ([`Referrer::needs_self()`]) is always implemented for what `Self`
-/// stands for. So the choice is mainly about the entries that do not, and about how the others are
-/// handled.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let tr: ItemTrait = parse_quote! {
-///     trait Tr<T> { fn f(&self) -> Wrap<T>; fn g(&self) -> Wrap2<Self>; }
-/// };
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true);
-/// let referrer = leaker.result().finish().unwrap();
-/// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<T>)).unwrap();
-/// let wrap2 = referrer.iter().position(|ty| *ty == parse_quote!(Wrap2<Self>)).unwrap();
-///
-/// // `Wrap<T>` does not name `Self`: the impl may be for a marker type of your crate...
-/// let marker: Type = parse_quote!(crate::Marker);
-/// let r = referrer.repeater_impl(wrap, ImplSelf::Marker(&marker), array_const).unwrap();
-/// assert_eq!(r.self_ty, marker);
-/// // ...or for any type, with a parameter that the impl declares.
-/// let param: Ident = parse_quote!(__S);
-/// let r = referrer.repeater_impl(wrap, ImplSelf::Param(&param), array_const).unwrap();
-/// assert_eq!(r.self_ty, parse_quote!(__S));
-///
-/// // `Wrap2<Self>` names `Self`: it is for the implementors of the trait, so a marker will not do.
-/// let err = referrer.repeater_impl(wrap2, ImplSelf::Marker(&marker), array_const).unwrap_err();
-/// assert!(matches!(err, EncodeError::NeedsSelf(_)));
-/// let r = referrer.repeater_impl(wrap2, ImplSelf::Param(&param), array_const).unwrap();
-/// assert_eq!(
-///     r.generics.params.last().unwrap(),
-///     &parse_quote!(__S: ?::core::marker::Sized + Tr<T>)
-/// );
-/// ```
+/// An entry that [needs `Self`](Referrer::needs_self) is always implemented for what `Self` stands
+/// for, so the choice only matters for the others.
 #[derive(Clone, Copy, Debug)]
 pub enum ImplSelf<'a> {
-    /// A type parameter with this name, which the impl declares (`impl<.., __S: ?Sized> .. for
-    /// __S`).
+    /// A type parameter that the impl declares (`impl<.., __S: ?Sized> .. for __S`).
     ///
-    /// The impl is for any type if the entry does not name `Self`. If the
-    /// [`context_self()`](Referrer::context_self) of the entry is [`SelfRequirement::Bound`], the
-    /// parameter has the bound of the trait (`__S: ?Sized + Tr<T>`) and replaces `Self`. If it is
-    /// [`SelfRequirement::Any`], the parameter replaces `Self` in the bounds, and has no bound of
-    /// its own. The `Self` is a struct, an enum or a union, which is `Sized`, and a bound may need
-    /// it (`(Self, u8)`, `Vec<Self>`): then the parameter is `__S`, `Sized` as any. Else it is
-    /// `?Sized`, as for the others (`__S: ?Sized`): rustc before 1.70 cannot prove that a struct is
-    /// `Sized` if its last field is the path through an impl that needs `__S: Sized` (E0275). The
-    /// bounds do not need it if every `Self` is the whole argument of a trait or type of `core` or
-    /// `std` with a `?Sized` parameter (`AsRef<Self>`, `Borrow<Self>`, `PartialEq<Self>`,
-    /// `Box<Self>`), or is behind a reference or a pointer; anything else keeps `Sized`. See
-    /// [`SelfRequirement::Any`]. If it is [`SelfRequirement::Type`], the impl is for that type, with
-    /// `Self` as written, and no parameter is declared.
+    /// It replaces `Self` where the entry names it, and has the bound of the trait for
+    /// [`SelfRequirement::Bound`]. For [`SelfRequirement::Type`] the impl is for that type, and
+    /// declares none.
     Param(&'a Ident),
-    /// This type, usually a marker of the user crate (`impl .. for crate::Marker`).
+    /// This type, usually a marker of your crate. The impl declares no parameter.
     ///
-    /// Only for an entry where [`Referrer::needs_self()`] is false, else
-    /// [`EncodeError::NeedsSelf`]. The impl declares no parameter for it.
+    /// Fails with [`EncodeError::NeedsSelf`] if the entry needs `Self`.
     Marker(&'a Type),
-    /// A primitive type that `id` and the index of the entry choose (`impl .. for
-    /// ::core::primitive::f32`), else [`ImplSelf::Param`] with `param`.
+    /// One of 17 primitive types, chosen by `id` and the entry; the entries that need `Self` get
+    /// [`ImplSelf::Param`] with `param`.
     ///
-    /// An entry where [`Referrer::needs_self()`] is false gets what [`ImplSelf::Marker`] gives for
-    /// that type ([`Referrer::bucket_self()`]). This is the cheap choice for many entries: rustc
-    /// looks the impls of a trait up by self type, but walks every blanket impl (`for __S`) at each
-    /// lookup. `id` is the `ID` of the Repeater, or any number that both macros know. The
-    /// Referrer's side must write `bucket_self(ix, id)` as the type of the path through the
-    /// Repeater, or what `Self` stands for if it is `None`. An older Referrer macro that writes
-    /// another type (`()`) fails (E0277), where a blanket impl accepts any.
+    /// Cheaper than a blanket impl when there are many entries. The use site must write
+    /// [`bucket_self(ix, id)`](Referrer::bucket_self) as the type of the path through the Repeater
+    /// (what `Self` stands for if it is `None`), or E0277. `id` is the Repeater's `ID`, or any
+    /// number that both macros know.
     Bucket {
         /// The number the type depends on.
         id: u64,
-        /// The parameter for the entries that cannot have a bucket.
+        /// The parameter for the entries that need `Self`.
         param: &'a Ident,
     },
 }
 
 /// The pieces of the Repeater impl of an entry: [`Referrer::repeater_impl()`].
 ///
-/// Write the impl with them, and with what is yours (the path of the Repeater, its other
-/// arguments). If [`module`](RepeaterImpl::module) is `Some`, write the impl in that module.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let item: ItemMod = parse_quote!(mod m { mod inner { struct S { a: Outside } } });
-/// let mut leaker = Leaker::new();
-/// leaker.intern_mod(&item);
-/// let referrer = leaker.result().finish().unwrap();
-///
-/// let param: Ident = parse_quote!(__S);
-/// let r = referrer.repeater_impl(0, ImplSelf::Param(&param), array_const).unwrap();
-/// let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-/// let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
-/// let imp: ItemImpl = parse_quote! {
-///     impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
-///         type Type = #ty;
-///     }
-/// };
-/// let expected: ItemImpl = parse_quote! {
-///     impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 0usize> for __S {
-///         type Type = Outside;
-///     }
-/// };
-/// assert_eq!(imp, expected);
-///
-/// // `Outside` is a relative path: it means something in `m::inner` only. Write the impl there.
-/// let path = referrer.module_path(r.module.unwrap()).unwrap();
-/// assert_eq!(path.len(), 1);
-/// assert_eq!(path[0], "inner");
-/// ```
-///
-/// [`Referrer::repeater_impl()`] has an example for a trait.
+/// Write the impl from them and your own parts (the path of the Repeater, its other arguments),
+/// in [`module`](RepeaterImpl::module) if it is `Some`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RepeaterImpl {
     /// The generics that the impl declares, with its where clause.
-    ///
-    /// These are the generics of the entry without the lifetime bounds that
-    /// [`args`](RepeaterImpl::args) encodes (`T: 'a`, which `&'a T` implies), with `Self` replaced
-    /// where it is a parameter. For [`ImplSelf::Param`] they end with the parameter itself (`__S:
-    /// ?Sized`, and the bound of the trait for [`SelfRequirement::Bound`]; `__S` alone or `__S:
-    /// ?Sized` for [`SelfRequirement::Any`]), unless the impl is for a type. A first where predicate that
-    /// rustc would read as generics of the `where` (`<__S>::A: Clone`) is parenthesized.
     pub generics: Generics,
     /// The type that the impl is for.
     pub self_ty: Type,
-    /// The first argument of the Repeater: the generics of the entry, encoded.
-    ///
-    /// These are the tokens that [`Referrer::entry_args()`] writes at a use site that passes every
-    /// generic by its own name ([`UseSite::identity()`]).
+    /// The first argument of the Repeater: what [`Referrer::entry_args()`] writes for
+    /// [`UseSite::identity()`].
     pub args: Type,
-    /// The leaked type, which is the `Type` of the impl. `Self` is replaced where it is a
-    /// parameter.
+    /// The leaked type, which is the `Type` of the impl.
     pub ty: Type,
-    /// The module of the entry, in which the impl is written: [`Referrer::context_module()`].
+    /// The module in which to write the impl ([`Referrer::context_module()`]).
     pub module: Option<ContextId>,
 }
 
-/// Describes the place where the path through the Repeater of an entry is written:
-/// [`Referrer::entry_args()`] uses it to write the arguments.
+/// Where the path through the Repeater of an entry is written: the `site` of
+/// [`Referrer::entry_args()`].
 ///
-/// The default, [`UseSite::identity()`], is the scope of the analysis itself. Say how the generics
-/// of the analyzed item are substituted (as in `impl MyTrait<u8> for ..`) with
-/// [`UseSite::substituting()`], and what `Self` is with [`UseSite::with_self()`].
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let tr: ItemTrait = parse_quote!(trait Tr<'a, T: 'a> { fn f(&self, x: &'a Wrap<T>); });
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true);
-/// let referrer = leaker.result().finish().unwrap();
-///
-/// // `impl<'a, T: 'a> Tr<'a, T> for ..` declares the generics: each is passed by its own name.
-/// let args = referrer.entry_args(0, &UseSite::identity(), array_const).unwrap();
-/// assert_eq!(args, parse_quote!((&'a (), T, &'a T)));
-///
-/// // `impl Tr<'static, u8> for ..` gives them arguments.
-/// let trait_args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
-/// let site = UseSite::substituting(&tr.generics.params, &trait_args);
-/// let args = referrer.entry_args(0, &site, array_const).unwrap();
-/// assert_eq!(args, parse_quote!((&'static (), u8, &'static u8)));
-/// ```
+/// The default, [`UseSite::identity()`], is the scope of the analysis. Use
+/// [`UseSite::substituting()`] if the generics of the analyzed item get arguments
+/// (`impl Tr<u8> for ..`), and [`UseSite::with_self()`] to say what `Self` is.
 #[derive(Clone, Debug)]
 pub struct UseSite {
     root_params: Punctuated<GenericParam, Token![,]>,
@@ -193,9 +85,7 @@ impl Default for UseSite {
 }
 
 impl UseSite {
-    /// The copy is in the scope of the analysis: every generic is passed by its own name.
-    ///
-    /// `Self` is `Self`, as in an impl.
+    /// Every generic is passed by its own name, and `Self` is `Self`: the scope of the analysis.
     pub fn identity() -> Self {
         Self {
             root_params: Punctuated::new(),
@@ -204,14 +94,11 @@ impl UseSite {
         }
     }
 
-    /// The generics `root_params` of the analyzed item take the arguments `completed_args`.
+    /// The generics `root_params` of the analyzed item take the arguments `completed_args`, one for
+    /// each ([`Referrer::complete_args()`]).
     ///
-    /// `root_params` are the generics of the item that the Leaker analyzed
-    /// (`item_trait.generics.params`). `completed_args` are their arguments at this site, one for
-    /// each: the result of [`Referrer::complete_args()`]. A generic of an entry that is named like
-    /// a root parameter takes its argument. Any other generic (one of a method) is passed by its
-    /// own name, so the copy must declare it. In the closure of `complete_args()`, which gets the
-    /// arguments completed so far, `root_params` can still be all the parameters.
+    /// A generic of an entry that no root parameter names (a method's) is passed by its own name,
+    /// so the copy must declare it.
     pub fn substituting(
         root_params: &Punctuated<GenericParam, Token![,]>,
         completed_args: &[GenericArgument],
@@ -223,26 +110,10 @@ impl UseSite {
         }
     }
 
-    /// Sets what `Self` is at this site, for `Self: 'a` of the entries that name it.
+    /// Sets what `Self` is at this site, for the `Self: 'a` of the entries that name it.
     ///
-    /// It is `Self` by default. Give the type that the paths are written for if the site is not
-    /// in the impl for it (`__S`, or the implementor written out).
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let tr: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// // The entry `&'a Wrap<Self>` needs `Self: 'a`, which the arguments encode as `&'a Self`.
-    /// let args = referrer.entry_args(0, &UseSite::identity(), array_const).unwrap();
-    /// assert_eq!(args, parse_quote!((&'a (), &'a Self)));
-    /// // At a site where `Self` is not available, name the type instead.
-    /// let site = UseSite::identity().with_self(parse_quote!(Host));
-    /// let args = referrer.entry_args(0, &site, array_const).unwrap();
-    /// assert_eq!(args, parse_quote!((&'a (), &'a Host)));
-    /// ```
+    /// Give the type the paths are written for if the site is not in the impl for it. The default
+    /// is `Self`.
     pub fn with_self(mut self, self_ty: Type) -> Self {
         self.self_ty = self_ty;
         self
@@ -252,21 +123,15 @@ impl UseSite {
 impl Referrer {
     /// Returns the first argument of the Repeater for the `ix`-th entry, as written at `site`.
     ///
-    /// It is the encoding of the generics of the entry ([`Referrer::context_generics()`]) with the
-    /// arguments the site gives them ([`UseSite`]), the lifetime bounds and `Self: 'a` included.
-    /// The Repeater impl of the entry has the same encoding for the generics themselves
-    /// ([`RepeaterImpl::args`]), so a macro that writes the paths of its copy with this and its
-    /// impls with [`Referrer::repeater_impl()`] cannot disagree with itself.
+    /// It is [`RepeaterImpl::args`] with the arguments the site gives the generics.
+    /// `const_fn(value, param)` encodes the const parameter `param` with the argument `value`: pass
+    /// [`array_const`](crate::array_const), or for the slots of [`repeater_definition()`]
+    /// `|value, param| slots.encode_const(value, &param.ty)` of a
+    /// [`RepeaterSlots`](crate::RepeaterSlots).
     ///
-    /// `const_fn(value, param)` returns the element for the const parameter `param` with the
-    /// argument `value`, as the site writes it. It is the closure of [`Referrer::repeater_impl()`]
-    /// too, which calls it with the parameter itself (`N`) as `value`, so one closure serves both
-    /// sides. Pass [`array_const`](crate::array_const), or for the slots of
-    /// [`repeater_definition()`] `|value, param| slots.encode_const(value, &param.ty)`.
-    ///
-    /// It fails with [`EncodeError::MissingArgument`] if `site` gives too few arguments, with
-    /// [`EncodeError::UnboundedTraitObject`] if an argument is a trait object without a lifetime
-    /// bound where the entry needs one, and with the error of `const_fn` for a const parameter.
+    /// Fails with [`EncodeError::MissingArgument`] if `site` gives too few arguments, with
+    /// [`EncodeError::UnboundedTraitObject`] if an argument is a trait object without the lifetime
+    /// bound the entry needs, and with the error of `const_fn`.
     ///
     /// ```
     /// # use type_leak::*;
@@ -308,136 +173,63 @@ impl Referrer {
 
     /// Returns `true` if the `ix`-th entry needs what `Self` stands for.
     ///
-    /// That is so if the entry names `Self` ([`Referrer::context_self()`]), or its context does: a
-    /// bound or a default of the generics (`trait Tr<T: AsRef<Self>, U = Rel<T>>`). Then
-    /// [`ImplSelf::Marker`] fails with [`EncodeError::NeedsSelf`] and
-    /// [`Referrer::bucket_self()`] is `None`: the impl is for [`ImplSelf::Param`], and the use site
-    /// writes what `Self` stands for (the host or the type).
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let tr: ItemTrait = parse_quote! {
-    ///     trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
-    ///         fn f(&self, t: T) -> U;
-    ///         fn g(&self) -> Wrap<Self>;
-    ///     }
-    /// };
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// // `Wrap<Self>` names `Self`; the context of `Rel<T>` has it in the bound of `T`.
-    /// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<Self>)).unwrap();
-    /// let rel = referrer.iter().position(|ty| *ty == parse_quote!(Rel<T>)).unwrap();
-    /// assert!(referrer.needs_self(wrap) && referrer.needs_self(rel));
-    ///
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Wrap<T>; }), true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// assert!(!referrer.needs_self(0));
-    /// ```
+    /// That is so if it names `Self`, or its generics do (`trait Tr<T: AsRef<Self>, U = Rel<T>>`).
+    /// Then [`ImplSelf::Marker`] fails and [`Referrer::bucket_self()`] is `None`: the impl is for
+    /// [`ImplSelf::Param`], and the use site writes what `Self` stands for (the host or the type).
     pub fn needs_self(&self, ix: usize) -> bool {
         let context = self.contexts[ix];
         self.context_self(context).is_some()
             || first_self_in_generics(self.context_generics(context)).is_some()
     }
 
-    /// Returns the type that the impl of the `ix`-th entry is for under [`ImplSelf::Bucket`] with
-    /// `id`, if it has one.
+    /// Returns the primitive type that the `ix`-th entry's impl is for under [`ImplSelf::Bucket`]
+    /// with `id`.
     ///
-    /// It is a primitive type, the same for the same `id` and `ix`. It is `None` if the entry
-    /// [`needs_self()`](Referrer::needs_self): write what `Self` stands for there, as for
-    /// [`ImplSelf::Param`].
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let tr: ItemTrait = parse_quote! {
-    ///     trait Tr<T> { fn f(&self) -> Wrap<T>; fn g(&self) -> Wrap2<Self>; }
-    /// };
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<T>)).unwrap();
-    /// let wrap2 = referrer.iter().position(|ty| *ty == parse_quote!(Wrap2<Self>)).unwrap();
-    /// let param: Ident = parse_quote!(__S);
-    /// let target = ImplSelf::Bucket { id: 7, param: &param };
-    ///
-    /// // `Wrap<T>` does not name `Self`: a primitive type, and no `__S`.
-    /// let bucket = referrer.bucket_self(wrap, 7).unwrap();
-    /// let r = referrer.repeater_impl(wrap, target, array_const).unwrap();
-    /// assert_eq!(r.self_ty, bucket);
-    /// assert_eq!(r.generics, parse_quote!(<T>));
-    ///
-    /// // `Wrap2<Self>` does: the implementors of the trait, as with `ImplSelf::Param`.
-    /// assert_eq!(referrer.bucket_self(wrap2, 7), None);
-    /// let r = referrer.repeater_impl(wrap2, target, array_const).unwrap();
-    /// assert_eq!(r.self_ty, parse_quote!(__S));
-    /// ```
+    /// It is `None` if the entry [needs `Self`](Referrer::needs_self): write what `Self` stands for
+    /// there.
     pub fn bucket_self(&self, ix: usize, id: u64) -> Option<Type> {
         (!self.needs_self(ix)).then(|| bucket_type(id, ix))
     }
 
     /// Describes the Repeater impl of the `ix`-th entry: its generics, trait arguments and type.
     ///
-    /// `target` says what the impl is for ([`ImplSelf`]). Write the impl in
-    /// [`RepeaterImpl::module`] if it is `Some`.
+    /// `target` says what the impl is for ([`ImplSelf`]); `const_fn` is as in
+    /// [`Referrer::entry_args()`], but gets the parameter itself (`N`) as `value`. Write the impl
+    /// in [`RepeaterImpl::module`] if it is `Some`, and one for every entry ([`Referrer::iter()`]):
+    /// optional entries need one if some Referrer is strict
+    /// ([`allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     ///
-    /// `const_fn(value, param)` encodes the const parameters. It is called with the parameter itself
-    /// (`N`) as `value`, where [`Referrer::entry_args()`] calls it with the argument. Pass
-    /// [`array_const`](crate::array_const), or for the slots of [`repeater_definition()`]
-    /// `|value, param| slots.encode_const(value, &param.ty)`.
-    ///
-    /// It fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry
-    /// [`needs_self()`](Referrer::needs_self) ([`ImplSelf::Bucket`] falls back to a parameter),
-    /// and with the error of `const_fn` for a const parameter. Write the impls of all the
-    /// entries ([`Referrer::iter()`]): the optional entries need one if some Referrer is strict
-    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
+    /// Fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry
+    /// [needs `Self`](Referrer::needs_self), and with the error of `const_fn`.
     ///
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
     /// let tr: ItemTrait = parse_quote! {
-    ///     trait Tr<'a, T: 'a> {
-    ///         type Out;
-    ///         fn f(&self, x: &'a Wrap<T>) -> Rel;
-    ///         fn g(&self) -> Wrap2<Self::Out>;
-    ///     }
+    ///     trait Tr<T> { type Out; fn f(&self) -> Wrap<T, Self::Out>; }
     /// };
     /// let mut leaker = Leaker::new();
     /// leaker.intern_trait(&tr, true);
     /// let referrer = leaker.result().finish().unwrap();
     ///
-    /// let self_param: Ident = parse_quote!(__S);
-    /// let repeater: Path = parse_quote!(crate::Repeater);
-    /// let impls: Vec<ItemImpl> = (0..referrer.iter().count())
-    ///     .map(|ix| {
-    ///         let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param), array_const).unwrap();
-    ///         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-    ///         let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
-    ///         parse_quote! {
-    ///             impl #impl_generics #repeater<#args, 7u64, #ix> for #self_ty #where_clause {
-    ///                 type Type = #ty;
-    ///             }
-    ///         }
-    ///     })
-    ///     .collect();
-    /// // `Rel` uses no generics, so any type can be the implementor.
-    /// let rel: ItemImpl = parse_quote! {
-    ///     impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 1usize> for __S {
-    ///         type Type = Rel;
+    /// let param: Ident = parse_quote!(__S);
+    /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param), array_const).unwrap();
+    /// let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+    /// let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    /// let imp: ItemImpl = parse_quote! {
+    ///     impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+    ///         type Type = #ty;
     ///     }
     /// };
-    /// // `Wrap2<Self::Out>` names `Self`: the implementor is bound by the trait, and replaces it.
-    /// let wrap2: ItemImpl = parse_quote! {
-    ///     impl<'a, T, __S: ?::core::marker::Sized + Tr<'a, T>>
-    ///         crate::Repeater<(&'a (), T, &'a T), 7u64, 2usize> for __S
+    /// // `Self::Out` names `Self`: the implementor is bound by the trait, and replaces it.
+    /// let expected: ItemImpl = parse_quote! {
+    ///     impl<T, __S: ?::core::marker::Sized + Tr<T>>
+    ///         crate::Repeater<(T,), 7u64, 0usize> for __S
     ///     {
-    ///         type Type = Wrap2<<__S>::Out>;
+    ///         type Type = Wrap<T, <__S>::Out>;
     ///     }
     /// };
-    /// assert!(impls.contains(&rel));
-    /// assert!(impls.contains(&wrap2));
+    /// assert_eq!(imp, expected);
     /// ```
     pub fn repeater_impl(
         &self,

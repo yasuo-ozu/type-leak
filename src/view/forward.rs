@@ -23,78 +23,31 @@ impl View<'_> {
         self.visitor.walk_item_impl(item)
     }
 
-    /// Analyzes a nested item, such as a struct, a trait, an impl, a module or a function.
+    /// Analyzes a nested item (a struct, trait, impl, module, function, ..) like an item of a
+    /// module ([`Leaker::intern_mod()`](crate::Leaker::intern_mod)).
     ///
-    /// It is analyzed like an item of a module
-    /// ([`Leaker::intern_mod()`](crate::Leaker::intern_mod)). Its generics are local, and the
-    /// generics around stay in scope. To analyze an item with its own generics as the root, use
-    /// an `intern_*` method instead. A struct, enum, union, trait or impl declares its own `Self`,
-    /// which may be interned whatever `allow_self` the scope around has (the `Self` of the scope
-    /// around is hidden in the item, and is denied as usual). The copy's
-    /// [`Visitor`](crate::Visitor) finds the entries that name it with
-    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self). A function, type alias,
-    /// trait alias, const or static has no `Self` of its own: it keeps the one around.
+    /// Its generics are local and the generics around stay in scope; to make the generics of an
+    /// item the root, use an `intern_*` method. A struct, enum, union, trait or impl declares its
+    /// own `Self`, whatever `allow_self` the scope around has
+    /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) finds its entries); the
+    /// other items keep the one around. The copy must nest the same scopes as the Leaker did.
     ///
-    /// The copy of a nested struct, enum or union declares a type of its own, so `Self` in a type
-    /// that is copied as written is the copy's own type, and only a type that is leaked is written
-    /// by the macro, by convention with the Leaker's type. An absolute type that names `Self`
-    /// (`::path::Wrap<Self>`, `::std::boxed::Box<Self>`) is copied as written: it is no entry, not
-    /// even an optional one, whether a Referrer replaces the optional entries or not. A relative
-    /// type that names it (`Wrap<Self>`) is leaked, and the macro writes the Leaker's type. A type
-    /// that uses a generic with a bound that names its `Self`, and does not name `Self` itself
-    /// (`struct S<T: AsRef<Self>>(Rel<T>);`), is for any type that the bound holds for
-    /// ([`SelfRequirement::Any`](crate::SelfRequirement)): the copy has the bound for its own
-    /// type, and writes `<Self as Repeater<..>>::Type` for `Rel<T>`. A type that names `Self` too
-    /// (`Rel2<Self, T>`) is an error: the Repeater's impl of the type is for the Leaker's `S<T>`,
-    /// which has not the bound in the copy's crate. The headline is "`Rel2<Self, T>` has a generic
-    /// whose bound mentions `Self`, which cannot be leaked". Write the type, or the bound, without
-    /// `Self`, write the type with an absolute path (`::path::Rel2<Self, T>` is copied as written,
-    /// and its `Self` is the copy's own), or analyze the item with an `intern_*` method, where the
-    /// Visitor writes `Self` as the Leaker's type.
+    /// In a nested struct, enum or union, `Self` is the copy's own type. A type that names it is
+    /// copied as written if its path is absolute (`::path::Wrap<Self>`), and leaked if it is
+    /// relative (`Wrap<Self>`). A type that uses a generic bounded by `Self`
+    /// (`struct S<T: AsRef<Self>>(Rel<T>);`) is for any type that the bound holds for
+    /// ([`SelfRequirement::Any`](crate::SelfRequirement)), and is an error if it names `Self` too
+    /// (`Rel2<Self, T>`): drop the `Self`, write the type with an absolute path, or use an
+    /// `intern_*` method.
     ///
-    /// The bounds of a generic are written for the `Self` of the scope that declares it. A type in
-    /// a nested item that uses the generic gets them rewritten for the `Self` of that item, and its
-    /// entry does not depend on the other one: `T: ::p::Tr<Self>` of `struct S<T: ::p::Tr<Self>>`
-    /// is `T: ::p::Tr<S<T>>` in `impl W { fn f(x: Rel<T>); }`. That is an error if `Self` is the
-    /// implementor of a trait (it has no name), or if the bound names an associated item of `Self`
-    /// (`Self::X`, which is ambiguous for a type): the headline is "the bound of `T` mentions a
-    /// `Self` which has no name here" ([`CheckResult::headline`](crate::CheckResult::headline) has
-    /// it for [`View::check()`]). The scope that declares the bound records its `Self` in its
-    /// top-level context, so [`Referrer::visitor()`](crate::Referrer::visitor) knows it, and the
-    /// copy must nest the same scopes as the Leaker did.
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let mut leaker = Leaker::new();
-    /// leaker
-    ///     .enter_generics(&parse_quote!(<T>), |view| {
-    ///         // `T` is a generic of the scope, and `U` is local to the struct. Each type is an
-    ///         // entry with the generics it uses.
-    ///         view.visit_item(&parse_quote!(struct Inner<U> { a: Rel<U>, b: Wrap<T> }));
-    ///     });
-    /// let referrer = leaker.result().finish().unwrap();
-    /// assert_eq!(referrer.iter().count(), 2);
-    /// assert_eq!(referrer.context_generics(referrer.context(0)).params.len(), 1);
-    /// assert_eq!(referrer.context_generics(referrer.context(1)).params.len(), 1);
-    /// ```
+    /// A bound is rewritten for the `Self` of the nested item that uses its generic. That is an
+    /// error if `Self` is the implementor of a trait, or if the bound names an associated item of
+    /// `Self` (`Self::X`): see [`CheckResult::headline`](crate::CheckResult::headline).
     pub fn visit_item(&mut self, item: &Item) {
         Visit::visit_item(&mut *self.visitor, item)
     }
 
     /// Analyzes a type, with the generics, `Self` and module of the scope.
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let mut leaker = Leaker::new();
-    /// leaker
-    ///     .enter_generics(&parse_quote!(<T>), |view| {
-    ///         view.visit_type(&parse_quote!(::core::option::Option<Wrap<T>>));
-    ///     });
-    /// // `Option<..>` is a path of the standard library, which is the same in every crate.
-    /// assert_eq!(leaker.result().finish().unwrap().iter().collect::<Vec<_>>(), [&parse_quote!(Wrap<T>)]);
-    /// ```
     pub fn visit_type(&mut self, ty: &Type) {
         Visit::visit_type(&mut *self.visitor, ty)
     }

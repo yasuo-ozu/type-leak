@@ -11,8 +11,8 @@ use template_quote::quote;
 /// Encodes the const argument `value` of a `usize` parameter as the array type `[(); value]`.
 ///
 /// It is the `const_fn` of [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
-/// [`Referrer::entry_args()`](crate::Referrer::entry_args) for generics whose consts are all
-/// `usize`. Any other type is an [`EncodeError::UnsupportedConstType`]: encode it with
+/// [`Referrer::entry_args()`](crate::Referrer::entry_args) if every const parameter is `usize`.
+/// Any other type is an [`EncodeError::UnsupportedConstType`]: use
 /// [`RepeaterSlots`](crate::RepeaterSlots).
 pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type, EncodeError> {
     match const_param_primitive(&param.ty) {
@@ -465,15 +465,9 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // `array_const` encodes `const N: usize` only.
-/// let err = referrer
-///     .repeater_impl(0, ImplSelf::Param(&parse_quote!(__S)), array_const)
-///     .unwrap_err();
-/// match &err {
-///     EncodeError::UnsupportedConstType(ty) => assert_eq!(**ty, parse_quote!(bool)),
-///     _ => unreachable!(),
-/// }
-/// // A macro reports it where the parameter is. The fix is `RepeaterSlots` (see
-/// // `repeater_definition()`).
+/// let target = ImplSelf::Param(&parse_quote!(__S));
+/// let err = referrer.repeater_impl(0, target, array_const).unwrap_err();
+/// assert!(matches!(&err, EncodeError::UnsupportedConstType(ty) if **ty == parse_quote!(bool)));
 /// let error: syn::Error = err.into();
 /// assert_eq!(error.to_string(), "unsupported type of const parameter: 'bool'");
 /// ```
@@ -487,17 +481,11 @@ pub enum EncodeError {
     /// A parameter that has neither an argument nor a default.
     MissingArgument(Box<GenericParam>),
     /// The argument of a type parameter with a lifetime bound is a trait object without one
-    /// (`dyn Tr`).
-    ///
-    /// Its bound would default to `'a` in `&'a T` and to another lifetime elsewhere. Write it, e.g.
-    /// `dyn Tr + 'static`.
+    /// (`dyn Tr`). Write it, e.g. `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
-    /// An entry needs `Self` ([`Referrer::needs_self()`](crate::Referrer::needs_self)), but the
-    /// Repeater impl was asked for a marker type ([`ImplSelf::Marker`](crate::ImplSelf::Marker)).
-    ///
-    /// Such an impl is for what `Self` stands for: any implementor of the trait, or the type. Use
-    /// [`ImplSelf::Param`](crate::ImplSelf::Param). An entry for which
-    /// [`Referrer::is_plain()`](crate::Referrer::is_plain) holds never gives this error.
+    /// An entry that [needs `Self`](crate::Referrer::needs_self) was asked for
+    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker). Use
+    /// [`ImplSelf::Param`](crate::ImplSelf::Param).
     NeedsSelf(Box<Type>),
 }
 

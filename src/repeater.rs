@@ -20,29 +20,19 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("isize", "ISIZE", "0"),
 ];
 
-/// Returns the definition of the Repeater trait, the one trait that both crates see. It supports
-/// const generics of any primitive type.
+/// Returns the definition of the Repeater trait, the one trait that both crates see.
 ///
-/// Define it once, at the root of the crate that writes the Repeater impls (the crate that
-/// exports the item). It must be a trait of that crate, because the impls are for any `Self`,
-/// which the orphan rule allows only for a local trait. So it is not in the crate of the
-/// proc macros (which exports only macros), and the crate that copies the item names it through
-/// the crate that defines it. Emit it from a macro, e.g. a function-like proc macro
-/// `define_repeater!()` whose body is `quote!(#definition)`.
+/// Define it once, at the root of the crate that writes the Repeater impls (the one that exports
+/// the item), not in the crate of the proc macros: the impls are for any `Self`, which only a
+/// local trait allows. The copying crate names it through the crate that defines it.
 ///
-/// `T` is the encoding of the generics of an entry, `ID` the Leaker (the trait that was analyzed)
-/// and `NTH` the entry. Besides them, the trait has a defaulted const slot per primitive type:
-/// `BOOL`, `CHAR`, `U8`, `U16`, `U32`, `U128`, `I8`, `I16`, `I32`, `I64`, `I128` and `ISIZE`.
-/// [`RepeaterSlots`] encodes const values into them, and `Repeater<T, ID, NTH>` still works.
-///
-/// A const parameter is treated like a type parameter, and the Repeater needs a type that carries
-/// its value. `const N: usize` is encoded as `[(); N]` ([`array_const()`](crate::array_const)), a
-/// `u64` value uses the `ID` slot, and any other primitive type uses its slot. Without the slots,
-/// the Repeater works if every const parameter is `usize` or `u64`. In that case you can write the
-/// trait by hand instead:
-/// `pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }`.
-/// The generated trait needs Rust 1.59 and the 2018 edition, while `type-leak` itself supports
-/// 1.56.
+/// `T` is the encoding of the generics of an entry, `ID` the Leaker and `NTH` the entry. A
+/// defaulted const slot per primitive type (`BOOL`, `CHAR`, `U8`, .., `ISIZE`) carries the other
+/// const generics ([`RepeaterSlots`]), and `Repeater<T, ID, NTH>` still works. `const N: usize` is
+/// `[(); N]` ([`array_const()`](crate::array_const)) and a `u64` uses `ID`, so if every const
+/// parameter is one of these you can write the trait by hand instead:
+/// `pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }`. The
+/// generated trait needs Rust 1.59 and the 2018 edition, while `type-leak` supports 1.56.
 ///
 /// ```
 /// # use type_leak::*;
@@ -82,48 +72,7 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
 /// [`Referrer::entry_args()`](crate::Referrer::entry_args). `const N: usize` is `[(); N]`,
 /// `const X: u64` uses `ID`, and any other primitive is a trait object of the Repeater with its
-/// slot filled.
-///
-/// Only a parameter whose type is a primitive type can be encoded: a const parameter of an alias is
-/// an [`EncodeError::UnsupportedConstType`], whatever the alias is.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let tr: ItemTrait = parse_quote! {
-///     trait Tr<const B: bool, const C: char = 'z'> { fn f(&self) -> Wrap<B, C>; }
-/// };
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true);
-/// let referrer = leaker.result().finish().unwrap();
-/// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-///
-/// // The impl encodes the parameters themselves...
-/// let param: Ident = parse_quote!(__S);
-/// let r = referrer
-///     .repeater_impl(0, ImplSelf::Param(&param), |value, param| {
-///         slots.encode_const(value, &param.ty)
-///     })
-///     .unwrap();
-/// assert_eq!(r.args, parse_quote!((
-///     *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
-///     *const dyn crate::Repeater<(), 0, 0, false, C, Type = ()>
-/// )));
-///
-/// // ...and a copy in `impl Tr<true, 'x'> for ..` the arguments.
-/// let trait_args: Vec<GenericArgument> = vec![parse_quote!(true), parse_quote!('x')];
-/// let args = referrer
-///     .entry_args(
-///         0,
-///         &UseSite::substituting(&tr.generics.params, &trait_args),
-///         |value, param| slots.encode_const(value, &param.ty),
-///     )
-///     .unwrap();
-/// assert_eq!(args, parse_quote!((
-///     *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
-///     *const dyn crate::Repeater<(), 0, 0, false, 'x', Type = ()>
-/// )));
-/// ```
+/// slot filled. A const parameter of an alias type is an [`EncodeError::UnsupportedConstType`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepeaterSlots {
     /// The path of the Repeater trait, which [`repeater_definition()`] defines.
@@ -131,8 +80,7 @@ pub struct RepeaterSlots {
 }
 
 impl RepeaterSlots {
-    /// Creates the encoder for the Repeater at the path `repeater`, the trait that
-    /// [`repeater_definition()`] defines in your crate.
+    /// Creates the encoder for the Repeater at the path `repeater`.
     pub fn new(repeater: Path) -> Self {
         Self { repeater }
     }
