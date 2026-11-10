@@ -1552,10 +1552,7 @@ impl VisitMut for SelfSubst<'_> {
     fn visit_type_mut(&mut self, i: &mut Type) {
         if let Type::Path(TypePath { qself: None, path }) = i {
             if path.leading_colon.is_none()
-                && path
-                    .segments
-                    .first()
-                    .map_or(false, |seg| seg.ident == "Self")
+                && path.segments.first().is_some_and(|seg| seg.ident == "Self")
             {
                 if path.segments.len() == 1 {
                     *i = self.0.ty.clone();
@@ -2054,7 +2051,7 @@ impl<'a> Finish<'a> {
                 last.arguments = PathArguments::None;
             }
         }
-        (id == self.projector.projection.id && path == repeater).then(|| entry)
+        (id == self.projector.projection.id && path == repeater).then_some(entry)
     }
 
     fn finish(&mut self, ty: &mut Type, ix: EntryId) -> Result<()> {
@@ -2862,7 +2859,7 @@ fn elided_candidates(item: &Item, generics: &Generics, replaced: Option<&[String
     elided_signatures(item, generics)
         .into_iter()
         .filter(|signature| {
-            replaced.map_or(true, |replaced| {
+            replaced.is_none_or(|replaced| {
                 signature
                     .inputs
                     .iter()
@@ -2961,7 +2958,7 @@ impl Instance {
             self.params
                 .iter()
                 .position(|param| param_name(param) == *name)
-                .map_or(false, |at| at < self.given.len())
+                .is_some_and(|at| at < self.given.len())
         };
         let count = |pairs: &[String]| {
             (
@@ -3026,7 +3023,7 @@ impl Instance {
             for predicate in &where_clause.predicates {
                 let on_concrete = matches!(predicate, WherePredicate::Type(p)
                     if matches!(&p.bounded_ty, Type::Path(TypePath { qself: None, path })
-                        if path.get_ident().map_or(false, |i| self.concrete.contains(&i.to_string()))));
+                        if path.get_ident().is_some_and(|i| self.concrete.contains(&i.to_string()))));
                 if on_concrete {
                     continue;
                 }
@@ -3425,7 +3422,7 @@ fn instance_check_fn(
         for predicate in wc.predicates.iter() {
             let on_concrete = matches!(predicate, WherePredicate::Type(p)
                 if matches!(&p.bounded_ty, Type::Path(TypePath { qself: None, path })
-                    if path.get_ident().map_or(false, |i| inst.concrete.contains(&i.to_string()))));
+                    if path.get_ident().is_some_and(|i| inst.concrete.contains(&i.to_string()))));
             if on_concrete {
                 continue;
             }
@@ -3435,7 +3432,7 @@ fn instance_check_fn(
         }
         wc.predicates = kept;
     }
-    if pos.self_sub.as_ref().map_or(false, |sub| sub.bound) {
+    if pos.self_sub.as_ref().is_some_and(|sub| sub.bound) {
         let host = host.expect("a trait has a host");
         targs.push(quote!(#host));
     }
@@ -3924,7 +3921,7 @@ fn instance_part(
     }
     check_refusals(
         referrer,
-        (!args.nested()).then(|| context),
+        (!args.nested()).then_some(context),
         &Projection::new(
             repeater_path(path),
             args.repeater_id(),
@@ -4429,7 +4426,7 @@ fn projects_self(pos: &Position) -> bool {
                     let first = i.path.segments.first();
                     self.0 |= i.path.leading_colon.is_none()
                         && i.path.segments.len() > 1
-                        && first.map_or(false, |seg| seg.ident == "Self");
+                        && first.is_some_and(|seg| seg.ident == "Self");
                 }
             }
             syn::visit::visit_type_path(self, i)
@@ -4483,7 +4480,7 @@ fn is_entry(ty: &Type) -> bool {
         if qself.position > 0
             && path.segments.len() > qself.position
             && path.segments[qself.position - 1].ident == "Repeater"
-            && path.segments.last().map_or(false, |seg| seg.ident == "Type"))
+            && path.segments.last().is_some_and(|seg| seg.ident == "Type"))
 }
 
 pub(crate) fn check_fn(
@@ -4495,7 +4492,7 @@ pub(crate) fn check_fn(
 ) -> TokenStream {
     let (generics, ty) = lowered(pos, Implementor::Fixed);
     let mut targs = type_args(&generics);
-    if pos.self_sub.as_ref().map_or(false, |sub| sub.bound) {
+    if pos.self_sub.as_ref().is_some_and(|sub| sub.bound) {
         let host = host.expect("a trait has a host");
         targs.push(quote!(#host));
     }
@@ -5424,7 +5421,7 @@ enum AllowArg {
     /// `Rules::std_crates()`
     StdCrates,
     /// `LeakerResult::allow(cause)`: `trait Path` is a `Cause::Trait`, `type Ty` a `Cause::Type`.
-    Cause(Cause),
+    Cause(Box<Cause>),
     /// `all`: the cause of every error ([`crate::allow_every_cause()`]), as `prop_leak_accept` does.
     AllCauses,
 }
@@ -5432,10 +5429,10 @@ enum AllowArg {
 impl Parse for AllowArg {
     fn parse(input: ParseStream) -> Result<Self> {
         if input.parse::<Option<Token![trait]>>()?.is_some() {
-            return Ok(AllowArg::Cause(Cause::Trait(input.parse()?)));
+            return Ok(AllowArg::Cause(Box::new(Cause::Trait(input.parse()?))));
         }
         if input.parse::<Option<Token![type]>>()?.is_some() {
-            return Ok(AllowArg::Cause(Cause::Type(input.parse()?)));
+            return Ok(AllowArg::Cause(Box::new(Cause::Type(input.parse()?))));
         }
         let word: Ident = input.parse()?;
         match word.to_string().as_str() {
@@ -5452,17 +5449,17 @@ impl Parse for AllowArg {
 /// What the Referrer's invocation ignores (`ignore(trait Path, type Ty, all)`): the error that has
 /// the cause, each with `LeakerResult::ignore()`, or every error (`all`, [`ignore_all()`]).
 enum IgnoreArg {
-    Cause(Cause),
+    Cause(Box<Cause>),
     All,
 }
 
 impl Parse for IgnoreArg {
     fn parse(input: ParseStream) -> Result<Self> {
         if input.parse::<Option<Token![trait]>>()?.is_some() {
-            return Ok(IgnoreArg::Cause(Cause::Trait(input.parse()?)));
+            return Ok(IgnoreArg::Cause(Box::new(Cause::Trait(input.parse()?))));
         }
         if input.parse::<Option<Token![type]>>()?.is_some() {
-            return Ok(IgnoreArg::Cause(Cause::Type(input.parse()?)));
+            return Ok(IgnoreArg::Cause(Box::new(Cause::Type(input.parse()?))));
         }
         let word: Ident = input.parse()?;
         if word != "all" {
@@ -5621,7 +5618,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     // is allowed.
     for ignored in ignore {
         let cause = match ignored {
-            IgnoreArg::Cause(cause) => cause,
+            IgnoreArg::Cause(cause) => *cause,
             IgnoreArg::All => {
                 result = ignore_all(result, &format!("item {}", args.id));
                 continue;
@@ -5642,7 +5639,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     for allowed in allow {
         result = match allowed {
             AllowArg::StdCrates => result.allow(Rules::new().std_crates()),
-            AllowArg::Cause(cause) => result.allow(|c: &Cause, _: Place| *c == cause),
+            AllowArg::Cause(cause) => result.allow(|c: &Cause, _: Place| c == &*cause),
             AllowArg::AllCauses => crate::allow_every_cause(result),
         };
     }
@@ -5727,7 +5724,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         }
     }
     // `TYPE_LEAK_PROP_DUMP=<id>` prints what the copy at an instantiation adds, to debug it.
-    if std::env::var("TYPE_LEAK_PROP_DUMP").map_or(false, |dump| dump == id.to_string()) {
+    if std::env::var("TYPE_LEAK_PROP_DUMP").is_ok_and(|dump| dump == id.to_string()) {
         eprintln!("TYPE_LEAK_PROP_DUMP {}: {}", id, more);
     }
     Ok(quote! {

@@ -74,6 +74,8 @@ jobs:
     - uses: actions/checkout@v4
     - name: Run clippy
       run: cargo clippy --all-targets -- -D warnings
+    - name: Run clippy on the macro crate of the property test (a workspace of its own)
+      run: cargo clippy --manifest-path tests/crates/macro/Cargo.toml --all-targets -- -D warnings
 
   prop:
 

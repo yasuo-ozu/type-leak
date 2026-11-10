@@ -312,9 +312,10 @@ pub(crate) fn check_bucket_self<I>(
 /// cause that is a path without generic arguments, as the analysis asks about one.
 pub(crate) fn starts_with(prefixes: Vec<Path>) -> impl Fn(&Cause, Place) -> bool {
     move |cause: &Cause, _: Place| {
-        cause.path().map_or(false, |path| {
-            path.segments.iter().all(|seg| seg.arguments.is_none())
-        }) && prefixes.iter().any(|prefix| cause.starts_with(prefix))
+        cause
+            .path()
+            .is_some_and(|path| path.segments.iter().all(|seg| seg.arguments.is_none()))
+            && prefixes.iter().any(|prefix| cause.starts_with(prefix))
     }
 }
 
@@ -959,7 +960,7 @@ fn forward_receiver(receiver: &Receiver, field: &Member) -> Result<TokenStream> 
         },
         // `self: Box<Self>`
         Type::Path(TypePath { qself: None, path })
-            if path.segments.last().map_or(false, |seg| {
+            if path.segments.last().is_some_and(|seg| {
                 seg.ident == "Box"
                     && matches!(&seg.arguments, PathArguments::AngleBracketed(args)
                         if args.args.len() == 1
@@ -1105,7 +1106,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         for (n, input) in sig.inputs.iter_mut().enumerate() {
             if let FnArg::Typed(PatType { pat, .. }) = input {
                 let ident = Ident::new(&format!("__arg{}", n), Span::call_site());
-                *pat = Box::new(parse_quote!(#ident));
+                **pat = parse_quote!(#ident);
                 arg_pats.push(ident);
             }
         }

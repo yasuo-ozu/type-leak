@@ -17,7 +17,8 @@
 //! The top level checks how rustc renders the errors of the Leaker (`ErrorItem`) reported by a proc
 //! macro with `ErrorItem::emit()`, by building `tests/crates/diagnostic` (which fails to compile).
 //! (The errors that a macro writes as tokens, reads back and reports keep their spans: the package
-//! of `spans` checks that in-process.)
+//! of `spans` checks that in-process, and on nightly `diagnostic_result`, below, checks that rustc
+//! renders the notes and the help of such an error at their own spans.)
 //!
 //! On nightly, the notes and the help are those of the diagnostic, each with its own span and
 //! source preview; on stable, they are appended to the message (`= note: ..`, then `= help: ..`, as
@@ -42,7 +43,8 @@
 //! `tests/crates/diagnostic_result` is a Referrer's crate whose macro got the errors of the Leaker's
 //! macro in another crate (the serialized `LeakerResult`), allowed some, and reports the others. By
 //! default rustc points an error at the invocation, as it does for every span inside a macro of
-//! another crate; on nightly with `-Zmacro-backtrace` it points at the cause, in the Leaker's crate.
+//! another crate; on nightly with `-Zmacro-backtrace` it points at the cause, in the Leaker's crate,
+//! and its notes and help at their own tokens.
 
 use std::sync::OnceLock;
 use type_leak::Referrer;
@@ -431,19 +433,41 @@ fn to_compile_error_alone_reports_nothing() {
     assert_eq!(built.stderr.trim(), "", "{}", built.stderr);
 }
 
-/// The first position of each error of the output of rustc: `path:line:column` of its first `-->`.
-fn first_positions(stderr: &str) -> Vec<String> {
-    let mut positions = Vec::new();
-    let mut waiting = false;
+/// The diagnostics of each error of the output of rustc, in order: the error, then its notes and
+/// helps (on nightly each is a diagnostic of its own with its own span; stable appends them to the
+/// message, where they have none), each with its level and its position, `path:line:column` of its
+/// first `-->`.
+fn positions_by_diagnostic(stderr: &str) -> Vec<Vec<(&'static str, String)>> {
+    let mut errors: Vec<Vec<(&'static str, String)>> = Vec::new();
+    let mut waiting = None;
     for line in stderr.lines() {
-        if line.starts_with("error") {
-            waiting = !line.starts_with("error: could not compile");
-        } else if let Some(position) = line.trim().strip_prefix("--> ").filter(|_| waiting) {
-            positions.push(position.to_string());
-            waiting = false;
+        let level = ["error", "note", "help"].iter().copied().find(|level| {
+            let rest = line.strip_prefix(level);
+            matches!(
+                rest.and_then(|rest| rest.chars().next()),
+                Some(':') | Some('[')
+            )
+        });
+        match level {
+            // The summary of cargo is no error of the crate.
+            Some("error") if line.starts_with("error: could not compile") => waiting = None,
+            Some("error") => {
+                errors.push(Vec::new());
+                waiting = Some("error");
+            }
+            Some(level) => waiting = Some(level),
+            None => {
+                if let (Some(position), Some(level)) = (line.trim().strip_prefix("--> "), waiting) {
+                    errors
+                        .last_mut()
+                        .unwrap()
+                        .push((level, position.to_string()));
+                    waiting = None;
+                }
+            }
         }
     }
-    positions
+    errors
 }
 
 /// `line:column` of the first `needle` after the first `marker` in the source of the Leaker's crate.
@@ -496,7 +520,10 @@ fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
 
 /// With `-Zmacro-backtrace` (nightly) the spans are not moved to the invocation: the errors are at
 /// the causes in the Leaker's crate, which the serialization and the `macro_rules!` of the other
-/// crate kept. Stable has no such flag; the test above is what it can check.
+/// crate kept. So are the notes and the helps, each a diagnostic of its own on nightly, with the span
+/// it was given: for `Held<'_>` the note is at the `'_` and the help at `Held`, as the direct report
+/// of `note_is_rendered` has them (`MyType<'_>`); `core::fmt::Debug` has the help at its first
+/// segment. Stable has no such flag; the test above is what it can check.
 #[test]
 #[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn the_spans_of_the_causes_survive_the_trip_between_the_crates() {
@@ -506,16 +533,27 @@ fn the_spans_of_the_causes_survive_the_trip_between_the_crates() {
     let built = nested::cargo_rustc("diagnostic_result", &[], &["-Zmacro-backtrace"]);
     assert!(!built.success, "{}", built.stderr);
     let leaker = "/tests/crates/leaker/lib.rs";
+    let held = position_in_leaker("id = 9193", "Held<'_>");
+    let debug = position_in_leaker("id = 9193", "core::fmt::Debug");
     let expected = [
-        position_in_leaker("id = 9193", "Held<'_>"),
-        position_in_leaker("id = 9193", "core::fmt::Debug"),
+        vec![
+            ("error", held.clone()),
+            ("note", position_in_leaker("id = 9193", "'_")),
+            ("help", held),
+        ],
+        vec![("error", debug.clone()), ("help", debug)],
     ];
-    let got: Vec<String> = first_positions(&built.stderr)
-        .iter()
-        .map(|position| {
-            let (path, rest) = position.split_once(leaker).expect(position);
-            assert!(path.starts_with('/'), "{}", position);
-            rest.trim_start_matches(':').to_string()
+    let got: Vec<Vec<(&str, String)>> = positions_by_diagnostic(&built.stderr)
+        .into_iter()
+        .map(|diagnostics| {
+            diagnostics
+                .into_iter()
+                .map(|(level, position)| {
+                    let (path, rest) = position.split_once(leaker).expect(&position);
+                    assert!(path.starts_with('/'), "{}", position);
+                    (level, rest.trim_start_matches(':').to_string())
+                })
+                .collect()
         })
         .collect();
     assert_eq!(got, expected, "{}", built.stderr);

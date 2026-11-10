@@ -382,8 +382,7 @@ struct Absolutize<'a>(&'a Ident);
 
 impl VisitMut for Absolutize<'_> {
     fn visit_path_mut(&mut self, i: &mut Path) {
-        if i.leading_colon.is_none() && i.segments.first().map_or(false, |seg| seg.ident == "crate")
-        {
+        if i.leading_colon.is_none() && i.segments.first().is_some_and(|seg| seg.ident == "crate") {
             i.leading_colon = Some(Default::default());
             i.segments[0].ident = self.0.clone();
         }
