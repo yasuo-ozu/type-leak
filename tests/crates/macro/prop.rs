@@ -269,7 +269,8 @@ impl Side {
 /// result of the analysis without it.
 ///
 /// - The path rules (`Prelude`, `Crate`, `Path`, `StdCrates`) judge an analysis made without them,
-///   so the result can leave other errors and entries than the config (`tests/allow_stages.rs`).
+///   so the result can leave other errors and entries than the config
+///   (`tests/allow/allow_stages.rs`).
 /// - The cause and place rules (`Values`, `Default`) give the same errors and Referrer at both
 ///   stages: the macro tells whether they do ([`rule_stage()`]).
 #[derive(Clone, Copy, PartialEq)]
@@ -2426,6 +2427,28 @@ fn count_name(tokens: TokenStream, name: &str) -> usize {
         .sum()
 }
 
+/// Replaces the host of an instantiation (`Host`, or `dyn Host + 'static`) by `__X`, wherever it
+/// visits: the arguments as they are for another implementor of the trait.
+struct HostAs<'a>(&'a Ident);
+
+impl VisitMut for HostAs<'_> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let is_host = match &*ty {
+            Type::Path(TypePath { qself: None, path }) => path.is_ident(self.0),
+            Type::TraitObject(object) => object
+                .bounds
+                .iter()
+                .any(|bound| matches!(bound, TypeParamBound::Trait(t) if t.path.is_ident(self.0))),
+            _ => false,
+        };
+        if is_host {
+            *ty = parse_quote!(__X);
+        } else {
+            syn::visit_mut::visit_type_mut(self, ty)
+        }
+    }
+}
+
 /// Maps the lifetimes of an instantiation (`'a` to `'static` or `'q0`) wherever it visits.
 struct MapLifetimes<'a>(&'a [(Lifetime, Lifetime)]);
 
@@ -3432,6 +3455,22 @@ fn instance_check_fn(
 /// site left out are the defaults that rustc takes: for a struct, an enum or a union, `S<given>` is
 /// `S<completed>` (a function takes one and returns the other); for a trait, the host that
 /// implements `Tr<given>` implements `Tr<completed>`.
+///
+/// The check of a trait is two functions, as the bounds for `__X` and for the host cannot be in
+/// one environment: a bound that fixes an associated type through `Self` (`T: Fn() -> &Self`) would
+/// fix it twice (`&__X` and `&Host`, E0284).
+///
+/// - `__tl_need_N<.., __X: ?Sized + Tr<completed>>` has the bounds and the predicates of the trait
+///   for `Self = __X`, and none for the host: the arguments are well-formed for any implementor
+///   (rustc requires the predicates of the trait for a bound on it). A completed argument that
+///   names the host (`<Host as Repeater<..>>::Type`, a default that is an entry for `Self`) names
+///   `__X` instead, as it would for another implementor, and normalizes with the bounds for `__X`.
+///   Nothing calls it.
+/// - `__tl_host_N<..> where Host: Tr<completed>` has the bounds and the predicates for `Self =
+///   Host`, and none for `__X`, and the predicate that the host implements the trait with the
+///   arguments completed, which rustc assumes there. `__tl_def_N`, with the same generics, calls
+///   it, so rustc proves the predicate from those bounds: `Host: Tr<given>` holds, and `Host:
+///   Tr<completed>` only if the arguments are the defaults that rustc takes.
 fn defaults_check(inst: &Instance, item: &Item, target: &Path, host: Option<&Type>) -> TokenStream {
     if inst.given.len() == inst.params.len() {
         return TokenStream::new();
@@ -3467,54 +3506,28 @@ fn defaults_check(inst: &Instance, item: &Item, target: &Path, host: Option<&Typ
         Item::Trait(ItemTrait { ident: n, .. }) => {
             let host = host.expect("a trait has a host");
             let (params, where_clause) = with_self(host.clone());
-            // `need` has the bounds of the trait for any `__X` (`T: AsRef<__X>`), and, only if the
-            // arguments name the host (`<Host as Repeater<..>>::Type` for a default), those for the
-            // host (`T: AsRef<Host>`): rustc needs them to normalize that projection. Otherwise they
-            // would only repeat the bounds for `__X` with the host in place of `__X`, and a bound with
-            // an associated type fixed (`T: Fn() -> &Self`) would fix it twice (`&__X` and `&Host`,
-            // E0284). Its caller has the bounds for the host.
-            let (mut need_params, mut need_where) = with_self(parse_quote!(__X));
-            let host_named = completed
-                .iter()
-                .any(|arg| count_name(quote!(#arg), &inst.host().to_string()) > 0);
-            let (host_params, host_where) = if host_named {
-                (params.clone(), where_clause.clone())
-            } else {
-                (Punctuated::new(), None)
-            };
-            for param in need_params.iter_mut() {
-                if let GenericParam::Type(t) = param {
-                    let more = host_params.iter().find_map(|p| match p {
-                        GenericParam::Type(o) if o.ident == t.ident => Some(o.bounds.clone()),
-                        _ => None,
-                    });
-                    for bound in more.into_iter().flatten() {
-                        if !t
-                            .bounds
-                            .iter()
-                            .any(|b| quote!(#b).to_string() == quote!(#bound).to_string())
-                        {
-                            t.bounds.push(bound);
-                        }
-                    }
-                }
+            // Any implementor: the bounds of the trait for `__X` (`T: AsRef<__X>`), and the arguments
+            // as they are for `__X` (the host is `__X`).
+            let (mut need_params, need_where) = with_self(parse_quote!(__X));
+            let mut for_any = completed.clone();
+            for arg in for_any.iter_mut() {
+                HostAs(&inst.host()).visit_generic_argument_mut(arg);
             }
-            if let Some(host_where) = &host_where {
-                let need_where = need_where.get_or_insert_with(|| WhereClause {
-                    where_token: Default::default(),
-                    predicates: Punctuated::new(),
-                });
-                for predicate in &host_where.predicates {
-                    let text = quote!(#predicate).to_string();
-                    if !need_where
-                        .predicates
-                        .iter()
-                        .any(|p| quote!(#p).to_string() == text)
-                    {
-                        need_where.predicates.push(predicate.clone());
-                    }
-                }
+            need_params
+                .push(parse_quote!(__X: ?::core::marker::Sized + #target::#n<#(#for_any),*>));
+            // The host: the bounds for the host, and the predicate that it implements the trait with
+            // the arguments completed (a trait object is parenthesized as the bounded type).
+            let mut bounded = host.clone();
+            if matches!(bounded, Type::TraitObject(_)) {
+                parenthesized(&mut bounded);
             }
+            let mut host_where = where_clause.clone().unwrap_or_else(|| WhereClause {
+                where_token: Default::default(),
+                predicates: Punctuated::new(),
+            });
+            host_where
+                .predicates
+                .push(parse_quote!(#bounded: #target::#n<#(#completed),*>));
             let args: Vec<TokenStream> = params
                 .iter()
                 .filter_map(|param| match param {
@@ -3530,15 +3543,15 @@ fn defaults_check(inst: &Instance, item: &Item, target: &Path, host: Option<&Typ
                 })
                 .collect();
             let need = ident(&format!("__tl_need_{}", inst.id));
-            let mut need_params = need_params;
-            need_params
-                .push(parse_quote!(__X: ?::core::marker::Sized + #target::#n<#(#completed),*>));
+            let on_host = ident(&format!("__tl_host_{}", inst.id));
             quote! {
                 #[allow(non_snake_case, dead_code)]
                 fn #need<#need_params>() #need_where {}
                 #[allow(non_snake_case, dead_code)]
+                fn #on_host<#params>() #host_where {}
+                #[allow(non_snake_case, dead_code)]
                 fn #name<#params>() #where_clause {
-                    #need::<#(#args,)* #host>();
+                    #on_host::<#(#args),*>();
                 }
             }
         }
@@ -4101,7 +4114,7 @@ fn const_value(ty: &Type) -> Expr {
 /// the Leaker's type: the visitor leaves a `Self` that is not in an entry (`Vec<Self>` as a field,
 /// or in an absolute type, `::p::W<Self>`, which no Referrer replaces: F38), which is the copy's
 /// own type, and the check writes the Leaker's for it, as the witness does. (So the check cannot
-/// tell the copy's `Self` from the Leaker's; the fixtures of `tests/cross_crate.rs` do.) The copy of a struct that is not nested has its `Self` replaced
+/// tell the copy's `Self` from the Leaker's; the fixtures of `tests/crates/referrer/tests/cross_crate.rs` do.) The copy of a struct that is not nested has its `Self` replaced
 /// (`Visitor::with_self()`).
 fn host_arg(rewritten: &Rewritten, args: &Args, leaker_path: &Path) -> Option<Host> {
     if let Some(host) = &rewritten.host {
@@ -5996,6 +6009,81 @@ mod tests {
             let wrapped = wrap.around(item.clone());
             assert_ne!(wrapped, item);
             assert_eq!(wrap.inside(wrapped), item);
+        }
+    }
+
+    /// The defaults check of a trait: a bound that fixes `Output` through `Self` is in the function
+    /// for any implementor with `__X`, and in the one for the host with the host, never both in one,
+    /// and the argument that names the host names `__X` in the first. The host is a unit struct or
+    /// `dyn Host`.
+    #[test]
+    fn the_defaults_check_keeps_the_bounds_for_x_and_for_the_host_apart() {
+        for dyn_host in [false, true] {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<T: for<'h> ::core::ops::Fn(&'h u8) -> &'h Self, U = D<T>> {}
+            );
+            let host: Type = host_type(&ident("Host7I"), dyn_host);
+            let entry: Type = parse_quote!(<#host as ::k::Repeater<(T,), 5>>::Type);
+            let mut inst = Instance {
+                id: 7,
+                params: item.generics.params.clone(),
+                given: vec![parse_quote!(T)],
+                completed: vec![parse_quote!(T), GenericArgument::Type(entry)],
+                declared: Generics::default(),
+                lifetimes: Vec::new(),
+                concrete: Default::default(),
+            };
+            inst.declare(&item.generics);
+            let out = defaults_check(&inst, &Item::Trait(item), &parse_quote!(::k), Some(&host));
+            let file: File = parse2(out).unwrap();
+            let text = |name: &str| -> String {
+                let found = file.items.iter().find_map(|item| match item {
+                    Item::Fn(f) if f.sig.ident == name => Some(f),
+                    _ => None,
+                });
+                let found = found.unwrap_or_else(|| panic!("no function `{}`", name));
+                quote!(#found).to_string().replace(' ', "")
+            };
+            let case = format!("dyn_host: {}", dyn_host);
+            // The bounds of `T` for `__X`: `__X` is the host in the argument, once, and the host is
+            // named nowhere.
+            let need = text("__tl_need_7");
+            assert_eq!(need.matches("->&'h__X").count(), 1, "{}: {}", case, need);
+            assert!(!need.contains("Host7I"), "{}: {}", case, need);
+            assert!(
+                need.contains(
+                    "__X:?::core::marker::Sized+::k::Tr<T,<__Xas::k::Repeater<(T,),5>>::Type>"
+                ),
+                "{}: {}",
+                case,
+                need
+            );
+            // The bounds of `T` for the host and the predicate that the host implements the trait
+            // with the arguments completed, and not `__X`; the caller has the bounds, and calls it.
+            let on_host = text("__tl_host_7");
+            let host_text = quote!(#host).to_string().replace(' ', "");
+            let bounded = if dyn_host {
+                format!("({})", host_text)
+            } else {
+                host_text.clone()
+            };
+            assert_eq!(
+                on_host.matches(&format!("->&'h{}", bounded)).count(),
+                1,
+                "{}: {}",
+                case,
+                on_host
+            );
+            assert!(!on_host.contains("__X"), "{}: {}", case, on_host);
+            let predicate = format!(
+                "{}:::k::Tr<T,<{}as::k::Repeater<(T,),5>>::Type>",
+                bounded, host_text
+            );
+            assert!(on_host.contains(&predicate), "{}: {}", case, on_host);
+            let def = text("__tl_def_7");
+            assert!(def.contains("->&'h"), "{}: {}", case, def);
+            assert!(def.contains("__tl_host_7::<T>()"), "{}: {}", case, def);
+            assert!(!def.contains("__X"), "{}: {}", case, def);
         }
     }
 

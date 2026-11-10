@@ -1,5 +1,5 @@
 //! Macros which analyze a fragment of an impl with the scope API, as `coinduction` and `newer-type`
-//! do (tests/cross_crate.rs).
+//! do (tests/crates/referrer/tests/cross_crate.rs).
 //!
 //! `scope_leak!` (the Leaker's side) is given the header of an impl,
 //!

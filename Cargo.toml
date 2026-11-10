@@ -13,13 +13,12 @@ categories = [
   "rust-patterns",
 ]
 license = "MIT"
-# The cross-crate and property tests, and the tests that build a crate with a nested `cargo`
-# (tests/diagnostic.rs), depend on the test crates under tests/crates, which are not published, and
-# on the two-macro example in examples/.
+# The property tests and the tests that build a crate with a nested `cargo` (tests/diagnostic.rs)
+# depend on the test crates under tests/crates (with the cross-crate tests), which are not
+# published, and on the two-macro example in examples/.
 exclude = [
   "examples",
   "tests/crates",
-  "tests/cross_crate.rs",
   "tests/diagnostic.rs",
   "tests/prop_cross_crate",
   "logo.png",
@@ -54,5 +53,13 @@ features = [
 
 [dev-dependencies]
 quote = "1"
-type-leak-test-leaker = { path = "tests/crates/leaker" }
-type-leak-test-referrer = { path = "tests/crates/referrer" }
+
+# The cross-crate tests are in the Referrer's crate (tests/crates/referrer/tests/cross_crate.rs), a
+# default member: `cargo test` runs them, and the tests of type-leak do not wait for the test crates.
+# Its path dependencies stay out (no clippy on them; the macro crate keeps its own lockfile). Name
+# the package of type-leak where only it is meant: `cargo publish -p type-leak`, `cargo build --lib
+# -p type-leak`.
+[workspace]
+members = ["tests/crates/referrer"]
+default-members = [".", "tests/crates/referrer"]
+exclude = ["tests/crates/ext", "tests/crates/leaker", "tests/crates/macro"]

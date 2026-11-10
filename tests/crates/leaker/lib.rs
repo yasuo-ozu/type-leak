@@ -573,7 +573,7 @@ pub mod s {
     /// 9255 (F92): the default of `U` is a pointer to a parameter (`&'static T`), for an impl that
     /// gives `dyn RelTr + Send` for `T` and leaves `U` out. The Referrer's crate completes it
     /// (`Referrer::complete_args()`) and writes it into the signature: `&'static dyn RelTr + Send`
-    /// is E0178; it is `&'static (dyn RelTr + Send)` now.
+    /// is "ambiguous `+` in a type"; it is `&'static (dyn RelTr + Send)` now.
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -997,7 +997,7 @@ pub mod scoped {
 /// Items of every kind, analyzed by the matching `intern_*` (`#[prop_leak]`, see
 /// `tests/crates/macro/prop.rs`): the Referrer's crate invokes `__tl_prop_<id>!` for each and gets
 /// a copy, whose every type position it compares with a witness of this crate, and
-/// `__tl_report_<id>!` says what the Leaker found (tests/cross_crate.rs).
+/// `__tl_report_<id>!` says what the Leaker found (tests/crates/referrer/tests/cross_crate.rs).
 pub mod kinds {
     use core::marker::PhantomData;
     use type_leak_test_macro::{prop_leak, prop_leak_accept, prop_leak_result};
@@ -1729,8 +1729,8 @@ pub mod kinds {
     }
 
     // The scopes of an item that share names, from the findings of a downstream crate
-    // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
-    // generics, bounds and where clause of the scope the entry is written in, and no others.
+    // (`announce`, tests/findings/downstream_findings.rs): the Repeater's impl of every entry has
+    // the generics, bounds and where clause of the scope the entry is written in, and no others.
 
     /// A type that is well-formed only for `T: Clone`.
     pub struct Cloned<T: Clone>(pub T);
@@ -1793,7 +1793,7 @@ pub mod kinds {
         F: for<'b> Fn(Lt<'b, u8>);
 
     // Names that a generic shares with a path or with an item the module declares (the findings of
-    // the property test, tests/shadowed_names.rs).
+    // the property test, tests/leaker/shadowed_names.rs).
 
     /// A type named like a generic: `self::U` is this one, and `crate::U` the one at the root of
     /// the crate (`crate::U`).
@@ -2121,12 +2121,12 @@ pub mod kinds {
         fn show<U: core::fmt::Debug>(&self, u: Wrap<U>) -> Wrap<T>;
     }
 
-    // Parts that the Referrer must find to leave them as written (tests/findings.rs F18, F43 to
-    // F45). Their trait objects take their lifetime from the path around them (`ObjOf`), and the
-    // entry `dyn SharedTr` of `Bare<dyn SharedTr>` is `+ 'static`: a copy that replaced the one in a
-    // part would not be the original type (E0308 in the Referrer's crate). The paths of `ObjOf` and
-    // `Bare` are absolute, as the names of this crate: the copies of the parts resolve in the
-    // Referrer's crate.
+    // Parts that the Referrer must find to leave them as written (tests/findings/findings.rs F18,
+    // F43 to F45). Their trait objects take their lifetime from the path around them (`ObjOf`), and
+    // the entry `dyn SharedTr` of `Bare<dyn SharedTr>` is `+ 'static`: a copy that replaced the one
+    // in a part would not be the original type (E0308 in the Referrer's crate). The paths of
+    // `ObjOf` and `Bare` are absolute, as the names of this crate: the copies of the parts resolve
+    // in the Referrer's crate.
 
     /// A path whose third parameter has a lifetime bound: a trait object there is `+ 'a`.
     pub struct ObjOf<'a, T: ?Sized, O: ?Sized + 'a>(pub PhantomData<(&'a (), *const T, *const O)>);
@@ -2242,8 +2242,8 @@ pub mod kinds {
         ];
     }
 
-    // F50 to F52 (`tests/findings.rs`): what a rule after the analysis, a nested item and an
-    // unrelated error used to get wrong. Each fails to build on the code before its fix.
+    // F50 to F52 (`tests/findings/findings.rs`): what a rule after the analysis, a nested item and
+    // an unrelated error used to get wrong. Each fails to build on the code before its fix.
 
     /// F50: the path of the value is relative (`core::mem::size_of`, no leading `::`), and `Rel` is
     /// in its arguments. The path is written as it is and `Rel` is an entry, so
@@ -2305,7 +2305,8 @@ pub mod kinds {
             Y: GenTr<Self::A0>;
     }
 
-    // Issue 3 of `tests/downstream_findings.rs`: the names `Rules::prelude()` took for the prelude.
+    // Issue 3 of `tests/findings/downstream_findings.rs`: the names `Rules::prelude()` took for the
+    // prelude.
 
     /// Issue 3: `None`, `Some`, `Ok` and `Err` in values, and
     /// `DoubleEndedIterator + ExactSizeIterator` in a bound, are names of the prelude of every
@@ -2343,8 +2344,8 @@ pub mod kinds {
         }
     }
 
-    // F83 (`tests/findings.rs`): what a block declares hides the entries that name it, in the copy.
-    // It fails to build on the code before the fix.
+    // F83 (`tests/findings/findings.rs`): what a block declares hides the entries that name it, in
+    // the copy. It fails to build on the code before the fix.
 
     /// A struct of this crate that has the name of the enum that a block of `BlockNames` imports.
     pub struct Block9249(pub u8);
@@ -2391,7 +2392,7 @@ pub mod kinds {
         }
     }
 
-    // F85 (`tests/findings.rs`): `check_values` reads the values in the default of a type parameter.
+    // F85 (`tests/findings/findings.rs`): `check_values` reads the values in the default of a type parameter.
     // It fails to build on the code before the fix.
 
     /// A constant of this crate, which the Referrer's crate does not have.
@@ -2410,8 +2411,8 @@ pub mod kinds {
             }],
     >(pub T);
 
-    // F101 (`tests/findings.rs`): an item in a block in an array length is part of the type. It
-    // fails to build on the code before the fix.
+    // F101 (`tests/findings/findings.rs`): an item in a block in an array length is part of the
+    // type. It fails to build on the code before the fix.
 
     /// A constant of this crate, which the Referrer's crate does not have.
     pub const REL9264: usize = 2;
@@ -2428,8 +2429,8 @@ pub mod kinds {
         }],
     );
 
-    // F110 (`tests/findings.rs`): a name that a block in an array length declares is local. It
-    // fails to build on the code before the fix.
+    // F110 (`tests/findings/findings.rs`): a name that a block in an array length declares is
+    // local. It fails to build on the code before the fix.
 
     /// F110: the blocks of the lengths declare a closure with the parameter `a`, and a function
     /// with the local `c`. The Leaker took `a` and `c` for relative paths, which the closure kept
@@ -2450,8 +2451,8 @@ pub mod kinds {
         }],
     );
 
-    // F111 (`tests/findings.rs`): an array that is an optional entry only through its length keeps
-    // a method lifetime. It fails to build on the code before the fix.
+    // F111 (`tests/findings/findings.rs`): an array that is an optional entry only through its
+    // length keeps a method lifetime. It fails to build on the code before the fix.
 
     /// The length of the arrays below, named by an absolute path that the rule does not allow.
     pub const LEN9272: usize = 2;
@@ -2470,8 +2471,8 @@ pub mod kinds {
         ) -> Held<'y>;
     }
 
-    // F102 (`tests/findings.rs`): the `Self` of an item in the default of a type parameter is its
-    // own. It fails to build on the code before the fix.
+    // F102 (`tests/findings/findings.rs`): the `Self` of an item in the default of a type parameter
+    // is its own. It fails to build on the code before the fix.
 
     /// F102: the block in the default of `T` declares a struct that names its own `Self` beside a
     /// relative type. The Leaker took that `Self` for the one of `SelfInDefault` and rejected the
@@ -2485,8 +2486,9 @@ pub mod kinds {
             }],
     >(pub T);
 
-    // F89 (`tests/findings.rs`): the arguments of a generic associated type replace its parameters
-    // in the outlives relations of its where clause. It fails to build on the code before the fix.
+    // F89 (`tests/findings/findings.rs`): the arguments of a generic associated type replace its
+    // parameters in the outlives relations of its where clause. It fails to build on the code
+    // before the fix.
 
     /// F89: `G` is declared with the parameter `U` and the relations `U: 'b` and `U::Target: 'b`.
     /// `f` gives `G` the argument `&'x u8`, which is no path. The relation `U::Target: 'x` was
@@ -2503,7 +2505,7 @@ pub mod kinds {
         fn f<'x, U: ::core::ops::Deref>(&self, u: U, a: Wrap<&'x Self::G<'x, &'x u8>>);
     }
 
-    // F107 (`tests/findings.rs`): the arguments of the trait in a generic associated type's path are
+    // F107 (`tests/findings/findings.rs`): the arguments of the trait in a generic associated type's path are
     // paired with the parameters as declared. It fails to build on the code before the fix.
 
     /// F107: `G` needs `B: 'b`, and `B` is declared before `A`, whereas the context of the entry
@@ -2520,8 +2522,9 @@ pub mod kinds {
             B: 'x;
     }
 
-    // F56 (`tests/findings.rs`): an enum discriminant and the default of a const parameter are read
-    // like a value, with or without `check_values`. Each fails to build on the code before the fix.
+    // F56 (`tests/findings/findings.rs`): an enum discriminant and the default of a const parameter
+    // are read like a value, with or without `check_values`. Each fails to build on the code before
+    // the fix.
 
     /// F56: the discriminants bind names (`x`, `y`, `a`, `b`, `z`, `K`): they are local, not
     /// relative paths. The Leaker rejected them (`use absolute path: 'x'`), so the Referrer's crate
@@ -2584,9 +2587,9 @@ pub mod kinds {
     #[prop_leak(id = 9218, scope = "nested")]
     pub struct LiteralDefault<const N: usize = { RelPoint { a: 1 }.a }>(pub [u8; N]);
 
-    // F64 (`tests/findings.rs`): a bound that stays in the context of an entry and names its
-    // generic through a type alias, next to an equation of the generic. It fails to build on the
-    // code before the fix.
+    // F64 (`tests/findings/findings.rs`): a bound that stays in the context of an entry and names
+    // its generic through a type alias, next to an equation of the generic. It fails to build on
+    // the code before the fix.
 
     /// F64: the bounds of the generics name them through the alias `WIt`, which the Leaker cannot
     /// tell from a struct. `Wrap<Self>` in the predicate of `m` keeps `U: Fn(WIt<U>)` whole, and
@@ -2615,8 +2618,9 @@ pub mod kinds {
             Wrap<V>: Default;
     }
 
-    // F65 and F66 (`tests/findings.rs`): the Referrer's crate uses the copy at an instantiation
-    // that leaves the defaults out (`inst(..)`). Each fails to build on the code before the fix.
+    // F65 and F66 (`tests/findings/findings.rs`): the Referrer's crate uses the copy at an
+    // instantiation that leaves the defaults out (`inst(..)`). Each fails to build on the code
+    // before the fix.
 
     /// F65: the default `Defd<T>` of a trait nested in a module, whose bound `T: AsRef<Self>` names
     /// `Self`. The completion of the arguments found no entry for it and left it as written, a type that
@@ -2650,7 +2654,7 @@ pub mod kinds {
         pub Rel,
     );
 
-    // F67 (`tests/findings.rs`): a trait object bounded by a method lifetime under a type of a crate
+    // F67 (`tests/findings/findings.rs`): a trait object bounded by a method lifetime under a type of a crate
     // that the Leaker does not allow. They fail to build on the code before the fix.
 
     /// F67: `Box<dyn Fn(Rel) + 'x>` is the only input of `f` that holds the lifetime, in the
@@ -2685,7 +2689,7 @@ pub mod kinds {
         ) -> &'c u8;
     }
 
-    // F68 (`tests/findings.rs`): the self type of an impl is a type of this crate by an absolute path
+    // F68 (`tests/findings/findings.rs`): the self type of an impl is a type of this crate by an absolute path
     // that the rule does not allow, an optional entry; a bound of a generic names an optional type,
     // another names `Self`, and a predicate is on an entry that uses the generic. A Referrer that
     // replaced the self type had E0277 in the copy. It fails to build on the code before the fix.
@@ -2709,11 +2713,11 @@ pub mod kinds {
         }
     }
 
-    // F69 (`tests/findings.rs`): the copy is used at an instantiation that gives the type parameter
-    // a type with a lifetime (`inst(..)` with `lifetime_args`: `&'static str`, `(&'static str, u8)`,
-    // ..), where the parameter is in the inputs of a function pointer or `Fn(..)` whose output has an
-    // elided lifetime. The use site must name that lifetime. Each fails to build on the code before
-    // the fix.
+    // F69 (`tests/findings/findings.rs`): the copy is used at an instantiation that gives the type
+    // parameter a type with a lifetime (`inst(..)` with `lifetime_args`: `&'static str`, `(&'static
+    // str, u8)`, ..), where the parameter is in the inputs of a function pointer or `Fn(..)` whose
+    // output has an elided lifetime. The use site must name that lifetime. Each fails to build on
+    // the code before the fix.
 
     /// F69: a function pointer over a type of `::core` (no entry), so the use site writes the
     /// argument of `T` into it, and one with a binder whose input names the lifetime. `Rel` is the
@@ -2738,7 +2742,7 @@ pub mod kinds {
     #[prop_leak(id = 9233, prelude = true)]
     pub struct ElidedDefault<T, U = fn(&T) -> &u8>(pub T, pub U, pub Rel);
 
-    // F70 (`tests/findings.rs`): the same where an entry is in the inputs, and the Referrer replaces
+    // F70 (`tests/findings/findings.rs`): the same where an entry is in the inputs, and the Referrer replaces
     // it (`strict`): the path through the Repeater names the lifetime that the use site gives `T`.
     // Each fails to build on the code before the fix.
 
@@ -2755,7 +2759,7 @@ pub mod kinds {
         pub Rel,
     );
 
-    // F71 (`tests/findings.rs`): a type of a crate that the rule does not allow, in a where predicate
+    // F71 (`tests/findings/findings.rs`): a type of a crate that the rule does not allow, in a where predicate
     // that the context of an entry carries: it is no entry, and the copy writes it as it is (the
     // predicate does not hold without itself: `Vec<T>: Clone` needs `T: Clone`). Each fails to
     // build on the code before the fix, except the controls.
@@ -2912,5 +2916,18 @@ pub mod kinds {
         fn clone(&self) -> Self {
             unimplemented!()
         }
+    }
+
+    /// 9290 (the test macro's `defaults_check()`): the default `Defd<T>` is an entry for the
+    /// implementor, since the bound of `T` names `Self` and fixes `Output` through it (`&'h Self`).
+    /// The Referrer's use site leaves the default out (`inst(2)`), and the macro checks that the
+    /// arguments it completes are the defaults that rustc takes. The completed default names the
+    /// host (`<Host as Repeater<..>>::Type`), which needs the bound for the host to normalize, and
+    /// the check for any implementor needs the bound for `__X`: in one function they fix `Output`
+    /// twice (`&__X` and `&Host`, E0284), so the macro checks them in two. The second copy is for
+    /// an unsized host (`dyn Host`).
+    #[prop_leak(id = 9290, prelude = true)]
+    pub trait SelfFixedDefault<T: for<'h> ::core::ops::Fn(&'h u8) -> &'h Self, U = Defd<T>> {
+        fn get(&self, t: T, u: U);
     }
 }

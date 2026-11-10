@@ -126,11 +126,12 @@
 //! # Accepting the rejections (`TYPE_LEAK_PROP_ACCEPT`)
 //!
 //! The Leaker copies what conflicts as written and goes on: of a type that cannot be leaked, the
-//! path of its head (what is in its arguments is analyzed on its own, see `tests/flat_errors.rs`),
-//! and whole the trait bounds, the types in predicates, the references and the holders of a bare
-//! name that may be a const. `LeakerResult::allow(cause)` accepts the conflict by dropping its
-//! error, and `finish()` then gives the Referrer, which has the correction. This test did not compile those corrections. With `TYPE_LEAK_PROP_ACCEPT=1` it compiles
-//! them, by accepting the causes of the errors:
+//! path of its head (what is in its arguments is analyzed on its own, see
+//! `tests/errors/flat_errors.rs`), and whole the trait bounds, the types in predicates, the
+//! references and the holders of a bare name that may be a const. `LeakerResult::allow(cause)`
+//! accepts the conflict by dropping its error, and `finish()` then gives the Referrer, which has
+//! the correction. This test did not compile those corrections. With `TYPE_LEAK_PROP_ACCEPT=1` it
+//! compiles them, by accepting the causes of the errors:
 //!
 //! 1. The macro (`prop_leak_accept`) analyzes an item as always. If the Leaker rejects it, it
 //!    allows the `cause` of every error, which must drop every error, and takes the recovered
@@ -189,7 +190,7 @@
 //!
 //! `Rules` given to the Leaker and to `LeakerResult::allow()` are one rule, but the result judges an
 //! analysis made without it, so for a path rule it can leave other errors and other entries (see
-//! `tests/allow_stages.rs`). With `allow_stages` the macro of each item takes each rule of
+//! `tests/allow/allow_stages.rs`). With `allow_stages` the macro of each item takes each rule of
 //! `gen::rules()` in turn and makes two copies, and the test builds them, to see whether the
 //! difference is more than a number:
 //!
@@ -250,7 +251,7 @@
 //! The summary has, for each rule, the counts: items compared, items where the rule matters, copies
 //! built after the result and after the config, with globs and clean, and the failures by kind. The
 //! path rules can leave other errors after the result than in the config (see
-//! `tests/allow_stages.rs`); the summary counts the items where they do, and no more.
+//! `tests/allow/allow_stages.rs`); the summary counts the items where they do, and no more.
 //!
 //! # More of the API than the copies compare
 //!
@@ -377,7 +378,7 @@
 //!   `-name` turns it off, also one that is on by default (`-nested_self_entries`); `all` turns
 //!   every feature on, and the words are read in order (`all,-strict_anchors`). With one of `inferred_outlives`,
 //!   `impl_self_outlives`, or `all`, the test fails with the reproduction of that finding
-//!   (`tests/findings.rs` has most of them as a library-level test). `strict_anchors` (F18, about the
+//!   (`tests/findings/findings.rs` has most of them as a library-level test). `strict_anchors` (F18, about the
 //!   copies that replace optional entries) is fixed, and on by default (`-strict_anchors`: the
 //!   items that have it are not generated on purpose). `unsized_params`,
 //!   `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`,
@@ -411,8 +412,8 @@
 //!   each in a share of the items (`gen::Gen::cyclic`): they are on by default (the Leaker encodes
 //!   or rewrites them, records what they need, or rejects and counts what it cannot copy, and the
 //!   Referrer names the lifetime of an elided signature where `Self` adds lifetimes to it). The
-//!   other findings of `tests/findings.rs` (F22 to F24: the Leaker rejected what compiles, F29,
-//!   F31, F32) are not features: a rejection is counted as success, and the test cannot show a
+//!   other findings of `tests/findings/findings.rs` (F22 to F24: the Leaker rejected what compiles,
+//!   F29, F31, F32) are not features: a rejection is counted as success, and the test cannot show a
 //!   toolchain or a lint.
 //!   `allow_stages`, `relative_std` and `values` are no feature of the generator (`gen::Features` is in
 //!   the tables, and they are off by default, so the tables do not change):
@@ -1233,9 +1234,9 @@ fn attr_lines(case: &Case) -> Vec<(usize, usize)> {
 /// What the macro of an item counted for a rule with `TYPE_LEAK_PROP_FEATURES=allow_stages`
 /// (`__tl_stages_<rule>_<id>!`, see `rule_stage()` of `prop.rs`): the errors of the analysis without
 /// the rule, those that remain when the rule is given to the config (`before`), and when it is given
-/// to the result (`after`). The path rules cannot be exact (see `tests/allow_stages.rs`), and the
-/// difference is only counted. The cause and place rules (`values`, `default`) are: the config and
-/// the result give the same errors, or the run fails (their Referrers differ in the parts).
+/// to the result (`after`). The path rules cannot be exact (see `tests/allow/allow_stages.rs`), and
+/// the difference is only counted. The cause and place rules (`values`, `default`) are: the config
+/// and the result give the same errors, or the run fails (their Referrers differ in the parts).
 #[derive(Debug)]
 struct Stages {
     case: usize,

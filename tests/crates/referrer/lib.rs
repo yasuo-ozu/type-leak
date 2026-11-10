@@ -2,6 +2,10 @@
 //! the types relative to `type_leak_test_leaker::m`. This crate compiles only if `type-leak`
 //! rewrites every such type.
 
+// The copies keep the bounds of the Leaker's items where they are written (inline and in a where
+// clause).
+#![allow(clippy::multiple_bound_locations)]
+
 use type_leak_test_leaker::m::Inner;
 
 /// Concrete arguments, including a negative `i32`.
@@ -97,19 +101,10 @@ type_leak_test_leaker::s::ExprTypes!(impl ExprTypes for Concrete => 0);
 pub struct GenericExpr<const B: bool>(pub Inner);
 type_leak_test_leaker::s::ExprTypes!(impl<const B: bool> ExprTypes for GenericExpr<B> => 0);
 
-/// The types of external crates are optional entries: the Referrer leaves them as written, or
-/// replaces them with the Repeater's projections (the Referrer does not trust the names
-/// of the crates), with the relative types in them replaced either way.
-pub struct Trusting(pub Inner);
-type_leak_test_leaker::m::External!(impl<T> External<T> for Trusting => 0 {
-    fn receiver(self: ::std::boxed::Box<Self>) -> usize {
-        type_leak_test_leaker::m::External::<T>::receiver(::std::boxed::Box::new(self.0))
-    }
-});
-
-/// The same, replacing the optional entries as well.
-pub struct Strict(pub Inner);
-type_leak_test_leaker::m::External!(impl<T> External<T> for Strict => 0 {
+/// The types of external crates are optional entries, which the Referrer replaces with the
+/// Repeater's projections, with the relative types in them replaced too.
+pub struct WithExternal(pub Inner);
+type_leak_test_leaker::m::External!(impl<T> External<T> for WithExternal => 0 {
     fn receiver(self: ::std::boxed::Box<Self>) -> usize {
         type_leak_test_leaker::m::External::<T>::receiver(::std::boxed::Box::new(self.0))
     }
@@ -252,6 +247,17 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9225!(path = ::type_leak_test_leaker::kinds, inst(2));
     type_leak_test_leaker::__tl_prop_9226!(path = ::type_leak_test_leaker::kinds, inst(2));
     type_leak_test_leaker::__tl_prop_9227!(path = ::type_leak_test_leaker::kinds, inst(2));
+    // The default is an entry for the host, and a bound of the trait fixes `Output` through `Self`
+    // (the macro's `defaults_check()`).
+    type_leak_test_leaker::__tl_prop_9290!(path = ::type_leak_test_leaker::kinds, inst(2));
+    // The same for an unsized host: `dyn Host9290I`.
+    pub mod unsized_host_9290 {
+        type_leak_test_leaker::__tl_prop_9290!(
+            path = ::type_leak_test_leaker::kinds,
+            inst(2),
+            dyn_host
+        );
+    }
     // `Self: 'x` is no reason to keep the bound that is left out (F47).
     type_leak_test_leaker::__tl_prop_9200!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9201!(path = ::type_leak_test_leaker::kinds);

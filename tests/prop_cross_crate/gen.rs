@@ -4792,7 +4792,7 @@ impl Gen {
     /// use it (`U = Rel<T>`, `W = Rel2<T, U>`): `self_bound_adts`, F41. A field has the type of the
     /// default too (an entry for any type, F37), and, with `nested_self_entries`, one names `Self`
     /// in a relative type (`Rel2<Self, T>`, F42). The generics have no lifetime or const parameter,
-    /// and the item has no impl: the unit tests of `tests/findings.rs` cover them.
+    /// and the item has no impl: the unit tests of `tests/findings/findings.rs` cover them.
     fn gen_self_bound_adt(
         &mut self,
         kind: AdtKind,
@@ -6469,9 +6469,9 @@ fn clean_referrer(
 /// causes of its errors, and the line where each item is invoked.
 ///
 /// The copy keeps what conflicts as written: of a type that cannot be leaked, the path of its head
-/// (its arguments are analyzed on their own, see `tests/flat_errors.rs`), and whole the trait
-/// bounds, the types in predicates, the references and the holders of a bare name that may be a
-/// const. The paths in it are those the item has in the Leaker's crate (`R0`, `self::R1`,
+/// (its arguments are analyzed on their own, see `tests/errors/flat_errors.rs`), and whole the
+/// trait bounds, the types in predicates, the references and the holders of a bare name that may be
+/// a const. The paths in it are those the item has in the Leaker's crate (`R0`, `self::R1`,
 /// `super::R1`, `super::base::B1`, `crate::base::B1`, an import `I1` or `J1`), and it is up to the
 /// user of `allow()` that they resolve to the same items in the crate of the copy. This crate makes them: the module of the Leaker's crate that the item
 /// is in is declared again with the same `use`s and a glob import of the Leaker's module, in the same

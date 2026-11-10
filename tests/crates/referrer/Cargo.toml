@@ -5,8 +5,17 @@ edition = "2018"
 publish = false
 description = "Referrer crate for tests/cross_crate.rs"
 
+# A member of the workspace of type-leak, so that `cargo test` at the root runs tests/cross_crate.rs
+# beside the tests of type-leak. The lib has no tests and no docs to build.
 [lib]
 path = "lib.rs"
+test = false
+doctest = false
+doc = false
 
 [dependencies]
 type-leak-test-leaker = { path = "../leaker" }
+
+[dev-dependencies]
+type-leak = { path = "../../.." }
+syn = { version = "2.0", features = ["full"] }

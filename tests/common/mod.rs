@@ -66,6 +66,223 @@ pub fn types(referrer: &Referrer) -> impl Iterator<Item = &Type> {
     referrer.iter().map(|(_, ty, _)| ty)
 }
 
+/// The leaked types, as text, in the order of the Referrer.
+#[allow(dead_code)]
+pub fn type_texts(referrer: &Referrer) -> Vec<String> {
+    types(referrer).map(s).collect()
+}
+
+/// What `Self` means in the context of an entry, as text: `-` (nothing), `Self: Tr` (the implementor of
+/// a trait) or `Self = T` (a type).
+#[allow(dead_code)]
+pub fn self_text(context: &Context) -> String {
+    match context.self_ty.as_ref() {
+        None => "-".to_string(),
+        Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
+        Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
+        Some(other) => format!("{:?}", other),
+    }
+}
+
+/// What `Self` means in the `ix`-th entry ([`self_text()`]).
+#[allow(dead_code)]
+pub fn self_of(referrer: &Referrer, ix: usize) -> String {
+    self_text(entry(referrer, ix))
+}
+
+/// What `Self` means in each entry ([`self_text()`]).
+#[allow(dead_code)]
+pub fn selfs(referrer: &Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .map(|(_, _, context)| self_text(context))
+        .collect()
+}
+
+/// The tag of the format of a serialized Referrer, which it starts with (as text, without quotes).
+#[allow(dead_code)]
+pub fn format_tag() -> String {
+    format!("type-leak-format-{}", Referrer::FORMAT_VERSION)
+}
+
+/// The path of the Repeater of the tests that write an impl.
+#[allow(dead_code)]
+pub fn repeater() -> Path {
+    parse_quote!(crate::Repeater)
+}
+
+/// A type written as it is printed, to compare with an encoding.
+#[allow(dead_code)]
+pub fn t(ty: Type) -> String {
+    s(&ty)
+}
+
+/// The generic arguments of `texts`, parsed.
+#[allow(dead_code)]
+pub fn arguments(texts: &[&str]) -> Vec<GenericArgument> {
+    texts.iter().map(|text| parse_str(text).unwrap()).collect()
+}
+
+/// The paths of an error, as text.
+#[allow(dead_code)]
+pub fn path_texts(error: &ErrorItem) -> Vec<String> {
+    error.paths.iter().map(s).collect()
+}
+
+/// The parts that the Referrer carries, as it serializes them after the format tag: `KIND (CAUSE)
+/// CONTEXT [predicate] [in (TYPE) CONTEXT]`, one string for each.
+#[allow(dead_code)]
+pub fn parts_of(referrer: &Referrer) -> Vec<String> {
+    let mut tokens = template_quote::ToTokens::to_token_stream(referrer)
+        .into_iter()
+        .skip(1);
+    let list = match tokens.next() {
+        Some(TokenTree::Group(group)) if group.delimiter() == proc_macro2::Delimiter::Bracket => {
+            group.stream()
+        }
+        _ => return Vec::new(),
+    };
+    let (mut parts, mut current) = (Vec::new(), TokenStream::new());
+    for token in list {
+        match &token {
+            TokenTree::Punct(punct) if punct.as_char() == ',' => {
+                parts.push(std::mem::take(&mut current).to_string());
+            }
+            _ => current.extend([token]),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.to_string());
+    }
+    parts
+}
+
+/// The config of most tests: primitive types and the names of the standard prelude are allowed.
+#[allow(dead_code)]
+pub fn std_config() -> Rules {
+    Rules::new().primitive().prelude()
+}
+
+/// A Leaker with [`std_config()`].
+#[allow(dead_code)]
+pub fn std_leaker() -> Leaker<Rules> {
+    Leaker::with_rule(std_config())
+}
+
+/// A Leaker that allows the paths `allowed` (and what [`std_config()`] allows).
+#[allow(dead_code)]
+pub fn leaker_with(allowed: &[Path]) -> Leaker<impl Allow> {
+    let allowed = allowed.to_vec();
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(move |cause: &Cause, place: Place| {
+            allowed.iter().any(|a| starts_with(a.clone())(cause, place))
+        });
+    Leaker::with_rule(config)
+}
+
+/// Like [`leaker_with()`], with the paths as text.
+#[allow(dead_code)]
+pub fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
+    let allowed: Vec<Path> = allowed
+        .iter()
+        .map(|path| parse_str(path).unwrap())
+        .collect();
+    leaker_with(&allowed)
+}
+
+/// An entry as the pair of its type and its generics, as text.
+#[allow(dead_code)]
+pub fn e(ty: &str, generics: &str) -> (String, String) {
+    (ty.to_string(), generics.to_string())
+}
+
+/// The index of the entry whose type is `text` (as `s()` prints it).
+#[allow(dead_code)]
+pub fn entry_index(referrer: &Referrer, text: &str) -> usize {
+    types(referrer)
+        .position(|ty| s(ty) == text)
+        .unwrap_or_else(|| panic!("no entry `{}`", text))
+}
+
+/// An entry as the pair of its type and its generics (with the where clause), as text.
+#[allow(dead_code)]
+pub fn entry_with_generics(ty: Type, generics: Generics) -> (String, String) {
+    (s(&ty), s(&quote!(#generics #{&generics.where_clause})))
+}
+
+/// An identifier with the span of the call site.
+#[allow(dead_code)]
+pub fn ident(name: &str) -> Ident {
+    Ident::new(name, proc_macro2::Span::call_site())
+}
+
+/// Rewrites each leaked type to `P<index>` (the index has no suffix): the `replace` of a visitor.
+#[allow(dead_code)]
+pub fn placeholder_unsuffixed(_: Type, ix: EntryId, _: &Context) -> Type {
+    let ix = proc_macro2::Literal::usize_unsuffixed(ix.index());
+    parse_quote!(P<#ix>)
+}
+
+/// Rewrites each leaked type to `P<ix>` (the index has the suffix `usize`): the `replace` of a
+/// visitor.
+#[allow(dead_code)]
+pub fn placeholder(_: Type, ix: EntryId, _: &Context) -> Type {
+    parse_quote!(P<#ix>)
+}
+
+/// The causes of the errors, as text.
+#[allow(dead_code)]
+pub fn cause_texts(errors: &[ErrorItem]) -> Vec<String> {
+    errors.iter().map(|error| s(&error.cause)).collect()
+}
+
+/// The generics with their where clause, as text.
+#[allow(dead_code)]
+pub fn with_where(generics: &Generics) -> String {
+    format!("{} {}", s(generics), s(&generics.where_clause))
+}
+
+/// The config of the property test: [`std_config()`] and the paths of `::p` are allowed.
+#[allow(dead_code)]
+pub fn p_config() -> Rules<impl Allow + Clone> {
+    std_config().or_if(starts_with(parse_quote!(::p)))
+}
+
+/// A Leaker with [`p_config()`].
+#[allow(dead_code)]
+pub fn p_leaker() -> Leaker<impl Allow> {
+    Leaker::with_rule(p_config())
+}
+
+/// The Referrer of a new Leaker that `f` analyzes with. Panics if there is an error.
+#[allow(dead_code)]
+pub fn leak_with(f: impl FnOnce(&mut Leaker)) -> Referrer {
+    let mut leaker = Leaker::new();
+    f(&mut leaker);
+    leaker.result().finish().unwrap()
+}
+
+/// Runs `analyze` on `leaker` and returns its result.
+#[allow(dead_code)]
+pub fn run<A: Allow, R>(
+    mut leaker: Leaker<A>,
+    analyze: impl FnOnce(&mut Leaker<A>) -> R,
+) -> LeakerResult {
+    analyze(&mut leaker);
+    leaker.result()
+}
+
+/// The errors that `leaker` has after `analyze` ran on it.
+#[allow(dead_code)]
+pub fn errors_in<A: Allow, R>(
+    leaker: Leaker<A>,
+    analyze: impl FnOnce(&mut Leaker<A>) -> R,
+) -> Vec<ErrorItem> {
+    run(leaker, analyze).errors().to_vec()
+}
+
 /// The `EntryId` of the `n`-th entry, counted from 0 (`Referrer::iter()` gives it).
 #[allow(dead_code)]
 pub fn entry_id_at(referrer: &Referrer, n: usize) -> EntryId {
@@ -80,7 +297,7 @@ pub fn entry(referrer: &Referrer, ix: usize) -> &Context {
 
 /// The name of a generic parameter, as `substitute_args()` asks for it.
 #[allow(dead_code)]
-pub fn param_ident(param: &GenericParam) -> &Ident {
+fn param_ident(param: &GenericParam) -> &Ident {
     match param {
         GenericParam::Lifetime(param) => &param.lifetime.ident,
         GenericParam::Type(param) => &param.ident,
@@ -150,14 +367,14 @@ pub fn written_entry(ty: &Type) -> Option<EntryId> {
 ///
 /// With `host` (`Visitor::with_self()`), `Self` in the type of the entry is the host.
 #[allow(dead_code)]
-pub struct Replace<'r, F> {
+struct Replace<'r, F> {
     referrer: &'r Referrer,
     replace: F,
     host: Option<Type>,
 }
 
 impl<'r, F: FnMut(Type, EntryId, &Context) -> Type> Replace<'r, F> {
-    pub fn new(referrer: &'r Referrer, replace: F) -> Self {
+    fn new(referrer: &'r Referrer, replace: F) -> Self {
         Self {
             referrer,
             replace,
@@ -731,7 +948,7 @@ pub fn read_serialized_ids(tokens: TokenStream) -> syn::Result<SerializedIds> {
 
 fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
     let tag: LitStr = input.parse()?;
-    let expected = format!("type-leak-format-{}", Referrer::FORMAT_VERSION);
+    let expected = format_tag();
     if tag.value() != expected {
         return Err(Error::new(
             tag.span(),
@@ -827,6 +1044,89 @@ pub fn entry_id(referrer: &Referrer, ix: usize) -> ContextId {
     }
 }
 
+/// Analyzes `item` with the `intern_*` of its kind (a struct, an enum, a union, a trait or an
+/// impl). A `mod` stands for the items it holds, nested in a scope of no generics: each has its
+/// own `Self`. Panics for another item.
+#[allow(dead_code)]
+pub fn intern_item<A: Allow>(leaker: &mut Leaker<A>, item: &Item) -> ContextId {
+    match item {
+        Item::Struct(item) => leaker.intern_struct(item),
+        Item::Enum(item) => leaker.intern_enum(item),
+        Item::Union(item) => leaker.intern_union(item),
+        Item::Trait(item) => leaker.intern_trait(item),
+        Item::Impl(item) => leaker.intern_impl(item),
+        Item::Mod(item) => {
+            leaker
+                .enter_generics(&Generics::default(), |view| {
+                    for item in &item.content.as_ref().expect("a mod with items").1 {
+                        view.visit_item(item);
+                    }
+                })
+                .0
+        }
+        _ => panic!("unsupported item"),
+    }
+}
+
+/// The word that names the kind of a cause.
+#[allow(dead_code)]
+pub fn cause_kind(cause: &Cause) -> &'static str {
+    match cause {
+        Cause::Type(_) => "type",
+        Cause::Trait(_) => "trait",
+        Cause::Expr(_) => "expr",
+        Cause::Macro(_) => "macro",
+        Cause::Lifetime(_) => "lifetime",
+        Cause::Unknown(_) => "unknown",
+        Cause::Unreadable(_) => "unreadable",
+        other => panic!("{:?}", other),
+    }
+}
+
+/// A cause as `kind(tokens)`.
+#[allow(dead_code)]
+pub fn kinded(cause: &Cause) -> String {
+    format!("{}({})", cause_kind(cause), s(cause))
+}
+
+/// What an error says: the headline, the tokens, the notes and the help.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub message: String,
+    pub tokens: String,
+    pub notes: Vec<String>,
+    pub help: String,
+}
+
+#[allow(dead_code)]
+impl Shown {
+    pub fn new(message: &str, tokens: &str, notes: &[&str], help: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            tokens: tokens.to_string(),
+            notes: notes.iter().map(|note| note.to_string()).collect(),
+            help: help.to_string(),
+        }
+    }
+}
+
+/// What each of the errors says: the headline, the tokens, the notes and the help.
+#[allow(dead_code)]
+pub fn shown(err: &[ErrorItem]) -> Vec<Shown> {
+    err.iter()
+        .map(|item| Shown {
+            message: item.message.clone(),
+            tokens: s(&item.cause),
+            notes: item.notes.iter().map(|(_, note)| note.clone()).collect(),
+            help: item
+                .help_text()
+                .expect("every error has a help")
+                .to_string(),
+        })
+        .collect()
+}
+
 /// Interns the items `items` of a trait `Tr` with the generics `generics` (e.g. `fn f(&self) ->
 /// Rel<Self>;`). The errors are those of `Leaker::result()`.
 #[allow(dead_code)]
@@ -856,12 +1156,6 @@ pub fn visit_function<A: Allow>(view: &mut View<'_, '_, A>, sig: &Signature) {
     if let Some(where_clause) = &sig.generics.where_clause {
         view.visit_where_clause(where_clause);
     }
-}
-
-/// Enters the generics of the function `sig` and analyzes it there ([`visit_function()`]).
-#[allow(dead_code)]
-pub fn enter_function<A: Allow>(leaker: &mut Leaker<A>, sig: &Signature) -> (ContextId, ()) {
-    leaker.enter_generics(&sig.generics, |view| visit_function(view, sig))
 }
 
 /// Checks `ty` in a scope that declares the generics `generics` and nothing else (see
@@ -897,10 +1191,28 @@ pub fn analyze_trait<A: Allow>(item: &ItemTrait, config: A, check_values: bool) 
     leaker.result()
 }
 
+/// Analyzes the trait `item` with `config`.
+#[allow(dead_code)]
+pub fn analyze<A: Allow>(item: &ItemTrait, config: A) -> LeakerResult {
+    analyze_trait(item, config, false)
+}
+
+/// [`analyze()`] with `check_values`: the values are read too.
+#[allow(dead_code)]
+pub fn analyze_values<A: Allow>(item: &ItemTrait, config: A) -> LeakerResult {
+    analyze_trait(item, config, true)
+}
+
+/// The causes of the errors of the result, as text.
+#[allow(dead_code)]
+pub fn causes_of(result: &LeakerResult) -> Vec<String> {
+    cause_texts(result.errors())
+}
+
 /// The causes that a rule must allow to accept `error`: each of its paths, or its cause if it has
 /// no path.
 #[allow(dead_code)]
-pub fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
+fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
     if error.paths.is_empty() {
         vec![error.cause.clone()]
     } else {

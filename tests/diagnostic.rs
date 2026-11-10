@@ -552,7 +552,7 @@ mod spans {
     //! a span can tell a wrong one. Code parsed from a string has them if `proc-macro2` is built with
     //! the feature `span-locations`. A feature is shared by the whole build of a package, and this one
     //! makes the spans larger, which is enough for the deep recursion of other tests
-    //! (`tests/binder_output.rs`) to overflow the stack of a test thread. So the tests are a package of
+    //! (`tests/output/binder_output.rs`) to overflow the stack of a test thread. So the tests are a package of
     //! their own, built on its own as the other fixtures are.
 
     use std::process::Command;

@@ -250,7 +250,8 @@ pub mod m {
     /// projection (nothing infers `T: 'a` from `&'a <Rel2<T> as Deref>::Target` in the original
     /// either, and the same goes for a path starting with a type parameter, `&'a
     /// T::A<Rel2<U>>`), nor across the lifetime of a `for<..>` binder or `'static`, which are not
-    /// generics. See the module `ancestors` of `tests/outlives_bounds.rs` for the contexts of each.
+    /// generics. See the module `ancestors` of `tests/output/outlives_bounds.rs` for the contexts
+    /// of each.
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,

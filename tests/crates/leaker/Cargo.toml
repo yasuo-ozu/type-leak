@@ -3,7 +3,7 @@ name = "type-leak-test-leaker"
 version = "0.0.0"
 edition = "2018"
 publish = false
-description = "Leaker crate for tests/cross_crate.rs"
+description = "Leaker crate for tests/crates/referrer/tests/cross_crate.rs"
 
 [lib]
 path = "lib.rs"
@@ -12,3 +12,7 @@ path = "lib.rs"
 type-leak-test-macro = { path = "../macro" }
 # Named by the Leaker's types, but not a dependency of the Referrer's crate.
 type-leak-test-ext = { path = "../ext" }
+
+# Its own workspace: the root workspace excludes it, and in a worktree nested in the repository cargo would
+# otherwise reach the outer root.
+[workspace]
