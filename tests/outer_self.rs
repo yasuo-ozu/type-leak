@@ -75,7 +75,7 @@ fn a_bound_is_rewritten_for_the_self_of_the_scope_that_declares_it() {
     // `Self` is `W` where `Rel<T>` is written, but `T: ::p::Tr<Self>` meant `Self = S<T>`.
     let mut leaker = Leaker::new();
     let (outer, (inner, ())) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         })
     });
@@ -98,7 +98,7 @@ fn a_scope_which_no_entry_depends_on_does_not_record_self() {
     // No type uses `T`: nothing depends on the `Self` of the struct.
     let mut leaker = Leaker::new();
     let (outer, _) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel))
         })
     });
@@ -114,7 +114,7 @@ fn the_same_type_in_the_scope_itself_keeps_self() {
     let mut leaker = Leaker::new();
     let (outer, ()) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
         v.visit_type(&parse_quote!(Rel<T>));
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         });
     });
@@ -137,7 +137,7 @@ fn a_where_predicate_is_rewritten_too() {
     let by_param = {
         let mut leaker = Leaker::new();
         leaker.enter_type(&ident("S"), &bound(), true, |v| {
-            v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+            v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
                 v.visit_type(&parse_quote!(Rel<T>))
             })
         });
@@ -146,7 +146,7 @@ fn a_where_predicate_is_rewritten_too() {
     let by_predicate = {
         let mut leaker = Leaker::new();
         leaker.enter_type(&ident("S"), &predicate(), true, |v| {
-            v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+            v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
                 v.visit_type(&parse_quote!(Rel<T>))
             })
         });
@@ -157,7 +157,7 @@ fn a_where_predicate_is_rewritten_too() {
     let mut generics: Generics = parse_quote!(<T>);
     generics.where_clause = Some(parse_quote!(where Self: ::p::Tr<T>, Self: Sized));
     leaker.enter_type(&ident("S"), &generics, true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         })
     });
@@ -177,7 +177,7 @@ fn the_self_of_a_trait_has_no_name() {
     // The implementor of the trait cannot be written where `Self` is something else.
     let mut leaker = Leaker::new();
     leaker.enter_trait(&ident("Tr"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         })
     });
@@ -255,7 +255,7 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
     let mut leaker = Leaker::new();
     let mut checked = None;
     leaker.enter_trait(&ident("Tr"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             // `View::check()` gives the headline with the rest of the conflict.
             checked = Some(v.check(&parse_quote!(Rel<T>)));
             v.visit_type(&parse_quote!(Rel<T>));
@@ -328,8 +328,8 @@ fn an_associated_item_of_self_has_no_name() {
     // `<S<T>>::X` is ambiguous (E0223), so it is no use to write it for the type.
     let generics: Generics = parse_quote!(<T: ::p::Tr<Self::X>>);
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&generics, &parse_quote!(S<T>), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+    leaker.enter_impl(&generics, &parse_quote!(S<T>), None, true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         })
     });
@@ -350,8 +350,8 @@ fn an_associated_item_of_self_has_no_name() {
     // `<Self as ::p::Tr>::X` is written in full, and `S<T>` is `Self` there.
     let generics: Generics = parse_quote!(<T: ::p::Tr<<Self as ::p::Q>::X>>);
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&generics, &parse_quote!(S<T>), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+    leaker.enter_impl(&generics, &parse_quote!(S<T>), None, true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         })
     });
@@ -399,7 +399,7 @@ fn the_same_self_changes_nothing() {
     );
     let mut leaker = Leaker::new();
     leaker.enter_type(&ident("S"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(S<T>), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(S<T>), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         });
         v.visit_item(&parse_quote!(
@@ -431,6 +431,7 @@ fn a_bound_of_the_scope_itself_is_not_rewritten() {
         v.enter_impl(
             &parse_quote!(<U: ::p::Bar<Self>>),
             &parse_quote!(W<U>),
+            None,
             true,
             |v| v.visit_type(&parse_quote!(Rel<T, U>)),
         );
@@ -529,7 +530,7 @@ fn allow_self_false_is_not_an_obstacle() {
     // it.
     let mut leaker = Leaker::new();
     leaker.enter_type(&ident("S"), &bound(), false, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), false, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, false, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         });
         // Where `Self` is the struct, it is denied as it always was.
@@ -554,9 +555,10 @@ fn several_scopes_each_rewrite_their_bounds() {
         v.enter_impl(
             &parse_quote!(<U: ::p::Bar<Self>>),
             &parse_quote!(W<U>),
+            None,
             true,
             |v| {
-                v.enter_impl(&Generics::default(), &parse_quote!(V), true, |v| {
+                v.enter_impl(&Generics::default(), &parse_quote!(V), None, true, |v| {
                     v.visit_type(&parse_quote!(Rel<T, U>))
                 })
             },
@@ -586,7 +588,13 @@ fn a_default_in_a_nested_scope_is_rewritten_for_the_outer_self() {
     for generics in [bound(), predicate()] {
         let mut leaker = Leaker::new();
         let (outer, (inner, ())) = leaker.enter_type(&ident("S"), &generics, true, |v| {
-            v.enter_impl(&parse_quote!(<U = Rel<T>>), &parse_quote!(W), true, |_| ())
+            v.enter_impl(
+                &parse_quote!(<U = Rel<T>>),
+                &parse_quote!(W),
+                None,
+                true,
+                |_| (),
+            )
         });
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
@@ -603,6 +611,7 @@ fn a_default_in_a_nested_scope_is_rewritten_for_the_outer_self() {
         v.enter_impl(
             &parse_quote!(<U, V = Rel<T, U>>),
             &parse_quote!(W),
+            None,
             true,
             |_| (),
         )
@@ -627,6 +636,7 @@ fn a_default_has_no_self_so_the_same_self_is_rewritten_too() {
         v.enter_impl(
             &parse_quote!(<U = Rel<T>>),
             &parse_quote!(S<T>),
+            None,
             true,
             |_| (),
         );
@@ -653,7 +663,13 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
     let headline = "the bound of `T` mentions a `Self` which has no name here";
     let mut leaker = Leaker::new();
     leaker.enter_trait(&ident("Tr"), &bound(), true, |v| {
-        v.enter_impl(&parse_quote!(<U = Rel<T>>), &parse_quote!(W), true, |_| ())
+        v.enter_impl(
+            &parse_quote!(<U = Rel<T>>),
+            &parse_quote!(W),
+            None,
+            true,
+            |_| (),
+        )
     });
     // The error of the inner scope is in the list of the call, once.
     let result = leaker.result();
@@ -696,7 +712,7 @@ fn the_referrer_finds_the_entry_of_a_nested_scope() {
     // rewritten) are two entries, which the copy tells apart by the scopes it nests.
     let mut leaker = Leaker::new();
     let (outer, ()) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         });
         v.visit_type(&parse_quote!(Rel<T>));
@@ -744,7 +760,7 @@ fn the_referrer_needs_the_nesting_of_the_leaker() {
     // neither is it in an impl nested at the same `Self`.
     let mut leaker = Leaker::new();
     let (outer, ()) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         });
     });
@@ -790,9 +806,10 @@ fn the_referrer_nests_the_scopes_like_the_leaker() {
         v.enter_impl(
             &parse_quote!(<U: ::p::Bar<Self>>),
             &parse_quote!(::p::W<U>),
+            None,
             true,
             |v| {
-                v.enter_impl(&Generics::default(), &parse_quote!(V), true, |v| {
+                v.enter_impl(&Generics::default(), &parse_quote!(V), None, true, |v| {
                     v.visit_type(&parse_quote!(Rel<T, U>))
                 })
             },
@@ -933,10 +950,17 @@ fn the_referrer_finds_the_default_of_a_nested_scope() {
     // of its own as the generics of a method).
     let mut leaker = Leaker::new();
     let (outer, ()) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
-        v.enter_impl(&parse_quote!(<U = Rel<T>>), &parse_quote!(W), true, |_| ());
+        v.enter_impl(
+            &parse_quote!(<U = Rel<T>>),
+            &parse_quote!(W),
+            None,
+            true,
+            |_| (),
+        );
         v.enter_impl(
             &parse_quote!(<U = Rel2<T>>),
             &parse_quote!(S<T>),
+            None,
             true,
             |_| (),
         );
@@ -1014,7 +1038,7 @@ fn expand_knows_the_self_of_the_context() {
     let mut leaker = Leaker::new();
     let (outer, ()) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
         v.visit_type(&parse_quote!(Rel<T>));
-        v.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+        v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel2<T>))
         });
     });

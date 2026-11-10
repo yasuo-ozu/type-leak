@@ -455,8 +455,8 @@ impl Referrer {
 
     /// Returns the sorted names of the external crates that the `ix`-th entry names.
     ///
-    /// A crate is the first segment of an absolute path in the entry. `core` is not listed, and
-    /// `r#` is stripped.
+    /// A crate is the first segment of an absolute path in the entry. `core` is not listed, nor
+    /// are `crate`, `self`, `super` and `Self` (no crate), and `r#` is stripped.
     pub fn external_crates_require(&self, ix: usize) -> &[String] {
         &self.external_crates[ix]
     }
@@ -721,7 +721,9 @@ impl Referrer {
     ///   [`Visitor::with_nested_self()`].
     /// - In a module copy, an entry with a module matches only there
     ///   ([`Referrer::context_module()`]), one with none everywhere. A `mod` item is a module
-    ///   nested in that of `context`, found by name.
+    ///   nested in that of `context`, found by name. For a module, visit its items: a `mod` that
+    ///   no module of the context is named like is also taken as the module itself, but not one
+    ///   that is.
     ///
     /// Panics if `context` is not in [`contexts()`](Referrer::contexts).
     ///
@@ -772,6 +774,7 @@ impl Referrer {
             mod_path: Vec::new(),
             defaults: Defaults::Plain,
             module,
+            module_scope: in_module,
             place: Place::default(),
             signature: None,
         }
@@ -1133,6 +1136,8 @@ pub struct Visitor<F, G = fn(&NestedSelf, Type, usize) -> Type> {
     /// their parameters are looked up (see `Visitor::visit_type_param_mut()`).
     defaults: Defaults,
     module: ModulePos,
+    /// The context is a module: the visited items are its own until the visitor enters one.
+    module_scope: bool,
     /// Where the visited syntax is among the predicates of the item.
     place: Place,
     /// The signature being visited (not its body), for the parts that a signature made.
@@ -1155,6 +1160,7 @@ impl<F, G> Clone for Visitor<F, G> {
             mod_path: self.mod_path.clone(),
             defaults: self.defaults,
             module: self.module,
+            module_scope: self.module_scope,
             place: self.place,
             signature: self.signature.clone(),
         }
@@ -1252,6 +1258,7 @@ where
             mod_path: self.mod_path,
             defaults: self.defaults,
             module: self.module,
+            module_scope: self.module_scope,
             place: self.place,
             signature: self.signature,
         }
@@ -1680,12 +1687,22 @@ where
         self.visit_attrs(&mut i.attrs);
         if let Some((_, items)) = &mut i.content {
             let mut visitor = self.clone();
-            visitor.module = self.referrer.module_in(self.module, &i.ident);
-            visitor.mod_path.push(i.ident.clone());
-            // A module has no generics: it only makes its items nested. `Self` has no meaning in it.
-            visitor.item_depth += 1;
-            visitor.self_requirement = None;
-            visitor.nested = None;
+            let found = self.referrer.module_in(self.module, &i.ident);
+            // At the top of the module of the context, a `mod` that none of its modules is named
+            // like is the module itself: its items are those of the context, as in a `File`.
+            let itself = self.module_scope && self.item_depth == 1 && found == ModulePos::Elsewhere;
+            if itself {
+                // A `mod` in it is nested in the module, as for its items.
+                visitor.module_scope = false;
+            } else {
+                visitor.module = found;
+                visitor.mod_path.push(i.ident.clone());
+                // A module has no generics: it only makes its items nested. `Self` has no meaning
+                // in it.
+                visitor.item_depth += 1;
+                visitor.self_requirement = None;
+                visitor.nested = None;
+            }
             visitor.shadow_items(items.iter(), true);
             for item in items.iter_mut() {
                 visitor.visit_item_mut(item);
@@ -2220,12 +2237,17 @@ fn parse_module_info(
     Ok(info)
 }
 
-/// `r#name` if `name` is a keyword, so that it parses back as an identifier.
-fn crate_ident(name: &str) -> Ident {
+/// `name` as an identifier, `r#name` if it is a keyword, so that it parses back as an identifier.
+///
+/// It is `None` for what is no identifier, or cannot be a raw one (`crate`, `self`, `super`, `Self`,
+/// `_`): the Leaker lists none of them.
+fn crate_ident(name: &str) -> Option<Ident> {
     if parse_str::<Ident>(name).is_ok() {
-        Ident::new(name, Span::call_site())
+        Some(Ident::new(name, Span::call_site()))
+    } else if parse_str::<Ident>(&format!("r#{}", name)).is_ok() {
+        Some(Ident::new_raw(name, Span::call_site()))
     } else {
-        Ident::new_raw(name, Span::call_site())
+        None
     }
 }
 
@@ -2290,12 +2312,18 @@ impl ToTokens for Referrer {
             } else if let Some(module) = self.context_module(context) {
                 tokens.extend(quote!(mod #module ;));
             }
+            let crates = |ix: usize| -> Vec<Ident> {
+                self.external_crates[ix]
+                    .iter()
+                    .filter_map(|name| crate_ident(name))
+                    .collect()
+            };
             tokens.extend(quote! {
                 (
                     #(for ix in entries), {
                         #(if !self.musts[ix]) { ? }
-                        #(if !self.external_crates[ix].is_empty()) {
-                            @[#(for name in &self.external_crates[ix]), { #{crate_ident(name)} }]
+                        #(if !crates(ix).is_empty()) {
+                            @[#(for name in crates(ix)), { #name }]
                         }
                         #{&self.leak_types[ix]}
                     }
@@ -2303,5 +2331,46 @@ impl ToTokens for Referrer {
             });
             next = context.index() + 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_ident_is_total() {
+        for name in ["p", "fn", "async", "type", "try"] {
+            let ident = crate_ident(name).unwrap_or_else(|| panic!("no identifier for `{}`", name));
+            // It parses back to the same name.
+            let read = parse2::<Ident>(ident.to_token_stream()).unwrap();
+            assert_eq!(read.unraw().to_string(), name);
+        }
+        for name in [
+            "crate", "self", "super", "Self", "_", "", "a-b", "1a", "a b", "::p",
+        ] {
+            assert!(crate_ident(name).is_none(), "`{}`", name);
+        }
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_written_is_left_out_of_the_tokens() {
+        let mut leaker = crate::Leaker::new();
+        leaker.intern_struct(
+            &parse_quote!(
+                struct S {
+                    a: ::p::X,
+                }
+            ),
+            true,
+        );
+        let mut referrer = leaker.result().finish().unwrap();
+        assert_eq!(referrer.external_crates, [["p"]]);
+        referrer.external_crates[0] = vec!["crate".into(), "p".into(), "Self".into()];
+        let read: Referrer = parse2(referrer.to_token_stream()).unwrap();
+        assert_eq!(read.external_crates, [["p"]]);
+        referrer.external_crates[0] = vec!["self".into()];
+        let read: Referrer = parse2(referrer.to_token_stream()).unwrap();
+        assert_eq!(read.external_crates, [Vec::<String>::new()]);
     }
 }

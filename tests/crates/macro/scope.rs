@@ -11,7 +11,7 @@
 //! ```
 //!
 //! whose trait and self type are resolved by name, so only their arguments are leaked:
-//! `Leaker::enter_impl(&generics, &self_ty, allow_self, |view| { view.visit_path_arguments(..) .. })`.
+//! `Leaker::enter_impl(&generics, &self_ty, None, allow_self, |view| { view.visit_path_arguments(..) .. })`.
 //! If the Referrer has a required entry, it emits the marker type, the Repeater's implementation of
 //! each required entry (`ImplSelf::Marker(&marker)` for an entry where `Referrer::needs_self()` is
 //! false, and `ImplSelf::Param(&ident)` for one where it is true), a witness for each type argument,
@@ -45,7 +45,7 @@ use type_leak::*;
 /// Which scope the analysis enters.
 #[derive(Clone, Copy, PartialEq)]
 enum Scope {
-    /// `enter_impl(&generics, &self_ty, allow_self, ..)`
+    /// `enter_impl(&generics, &self_ty, None, allow_self, ..)`
     Impl,
     /// `enter_generics(&generics, ..)`, where `Self` has no meaning.
     Generics,
@@ -172,6 +172,7 @@ impl ScopeInput {
             Scope::Impl => leaker.enter_impl(
                 &self.item.generics,
                 &self.item.self_ty,
+                None,
                 self.allow_self,
                 visit,
             ),

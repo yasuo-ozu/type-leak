@@ -1044,18 +1044,31 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
     enter_function(&mut leaker, &item.sig);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     // As local generics it is checked in a method of a trait or of an impl of a trait (a method
-    // that the walk reaches alone may be one). A function nested in a scope or in a module, and a
-    // method of an inherent impl, have no signature to differ from, so the copy compiles with
-    // `'b` early-bound (F22).
+    // that the walk reaches alone, in `enter_impl()` given a trait). A function nested in a scope
+    // or in a module, and a method of an inherent impl (`enter_impl()` given none), have no
+    // signature to differ from, so the copy compiles with `'b` early-bound (F22).
+    let trait_: Path = parse_quote!(::p::Tr);
+    let sig = &item.sig;
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
-        let sig = &item.sig;
-        view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
-    });
+    leaker.enter_impl(
+        &Generics::default(),
+        &parse_quote!(::p::W),
+        Some(&trait_),
+        true,
+        |view| view.visit_impl_item_fn(&parse_quote!(#sig { loop {} })),
+    );
     let result = leaker.result();
     let err = result.errors();
     assert!(to_syn_error(err).to_string().contains("E0195"));
-    let sig = &item.sig;
+    let mut leaker = Leaker::new();
+    leaker.enter_impl(
+        &Generics::default(),
+        &parse_quote!(::p::W),
+        None,
+        true,
+        |view| view.visit_impl_item_fn(&parse_quote!(#sig { loop {} })),
+    );
+    assert!(leaker.result().errors().is_empty());
     let of_trait: ItemImpl = parse_quote! { impl ::p::Tr for ::p::W { #sig { loop {} } } };
     let mut leaker = Leaker::new();
     leaker.enter_generics(&Generics::default(), |view| {
@@ -1349,14 +1362,28 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     let mut leaker = Leaker::new();
     enter_function(&mut leaker, &item.sig);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
+    let trait_: Path = parse_quote!(::p::Tr);
+    let sig = &item.sig;
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
-        let sig = &item.sig;
-        view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
-    });
+    leaker.enter_impl(
+        &Generics::default(),
+        &parse_quote!(::p::W),
+        Some(&trait_),
+        true,
+        |view| view.visit_impl_item_fn(&parse_quote!(#sig { loop {} })),
+    );
     let result = leaker.result();
     let err = result.errors();
     assert!(to_syn_error(err).to_string().contains("E0195"));
+    let mut leaker = Leaker::new();
+    leaker.enter_impl(
+        &Generics::default(),
+        &parse_quote!(::p::W),
+        None,
+        true,
+        |view| view.visit_impl_item_fn(&parse_quote!(#sig { loop {} })),
+    );
+    assert!(leaker.result().errors().is_empty());
     let item: ItemMod = parse_quote! {
         mod m { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } }
     };

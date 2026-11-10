@@ -337,7 +337,7 @@ fn a_path_named_like_a_generic_is_replaced_in_the_arguments_of_an_impl() {
         .unwrap();
         let (_, trait_path, _) = item.trait_.clone().unwrap();
         let mut leaker = Leaker::from_config(config(), false, false);
-        let (context, ()) = leaker.enter_impl(&item.generics, &item.self_ty, false, |view| {
+        let (context, ()) = leaker.enter_impl(&item.generics, &item.self_ty, None, false, |view| {
             for seg in &trait_path.segments {
                 view.visit_path_arguments(&seg.arguments);
             }

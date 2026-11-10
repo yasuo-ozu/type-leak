@@ -1620,7 +1620,8 @@ fn family(error: &Rejection) -> Option<Family> {
         ));
     }
     // A relative path in a value (`crate::base::bf`, `RLEN`), which the Leaker reads with
-    // `check_values` and copies as written: the note says which value (`values`).
+    // `check_values` (a const default either way) and copies as written: the note says which
+    // value (`values`).
     if error.note.contains("which the copy writes as it is") {
         reasons.push((
             "a relative path in a value, which the copy writes as it is",

@@ -53,6 +53,9 @@ pub enum ImplSelf<'a> {
 #[non_exhaustive]
 pub struct RepeaterImpl {
     /// The generics that the impl declares, with its where clause.
+    ///
+    /// The lifetimes come first, then the types (the parameter for `Self` last among them), then the
+    /// consts: the order that rustc before 1.59 requires.
     pub generics: Generics,
     /// The type that the impl is for.
     pub self_ty: Type,
@@ -318,11 +321,18 @@ impl Referrer {
             // the impl needs `__S: Sized` (E0275: the type needs the impl, which needs the type).
             let sized = matches!(self.context_self(context), Some(SelfRequirement::Any))
                 && needs_sized(&declared, &ty, ident);
-            declared.params.push(match (bound, sized) {
+            let declaration = match (bound, sized) {
                 (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
                 (None, true) => parse_quote!(#ident),
                 (None, false) => parse_quote!(#ident: ?::core::marker::Sized),
-            });
+            };
+            // Before the first const parameter: rustc before 1.59 wants the types before the consts.
+            let at = declared
+                .params
+                .iter()
+                .position(|param| matches!(param, GenericParam::Const(_)))
+                .unwrap_or(declared.params.len());
+            declared.params.insert(at, declaration);
         }
         parenthesize_leading_qualified_path(&mut declared);
         Ok(RepeaterImpl {

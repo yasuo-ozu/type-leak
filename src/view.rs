@@ -19,10 +19,15 @@ mod forward;
 ///
 /// `View` also implements [`Visit`](syn::visit::Visit): `syn::visit::visit_item_struct(view,
 /// &item)` does what [`Leaker::intern_struct()`](crate::Leaker::intern_struct) does. The walk
-/// declares nothing, so walk the item the scope is for. `visit_signature` analyzes the signature in
-/// a scope of its own for its generics, and reports a method lifetime that the copy would leave
-/// unconstrained (E0195, [Method lifetimes](crate::Leaker#method-lifetimes)) and an elided output
-/// lifetime that it could not resolve (E0106, [Elided lifetimes](crate::Leaker#elided-lifetimes)).
+/// declares nothing, so walk the item the scope is for. For an impl, `enter_impl()` with
+/// `syn::visit::visit_item_impl(view, &item)` does what
+/// [`Leaker::intern_impl()`](crate::Leaker::intern_impl) does, except that it does not cut the
+/// entries in the self type if a bound of the impl names `Self` (`intern_impl()` rejects or copies
+/// them as written): use `intern_impl()` for such an impl. `visit_signature` analyzes the
+/// signature in a scope of its own for its generics, and reports a method lifetime that the copy
+/// would leave unconstrained (E0195, [Method lifetimes](crate::Leaker#method-lifetimes), not in an
+/// inherent impl) and an elided output lifetime that it could not resolve (E0106, [Elided
+/// lifetimes](crate::Leaker#elided-lifetimes)).
 /// `visit_path` at the root analyzes only the arguments of the path: to check the root too, use
 /// [`View::visit_type_param_bound()`].
 ///
@@ -108,10 +113,11 @@ impl<'v, P: Fn(&Path) -> bool> View<'v, P> {
         &mut self,
         generics: &Generics,
         self_ty: &Type,
+        trait_: Option<&Path>,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_impl(self, generics, self_ty, allow_self, f)
+        Scopes::enter_impl(self, generics, self_ty, trait_, allow_self, f)
     }
 
     /// Opens a scope for the parts of a trait:

@@ -375,9 +375,9 @@ fn ident(name: &str) -> Ident {
 ///   with `Visitor::with_nested_self()` (`Projector::project_nested()`).
 /// - `generics`: a struct, an enum or a union with no `Self`, in `enter_generics(..)`.
 /// - `trait`: a trait without a generic associated type, in `enter_trait(..)`.
-/// - `impl`: an impl in `enter_impl(..)`, where only the self type and the arguments of the trait
-///   are visited (the shape of a macro that resolves the trait by its name). The generics and the
-///   items of the impl are not analyzed, and not compared.
+/// - `impl`: an impl in `enter_impl(.., None, ..)`, where only the self type and the arguments of
+///   the trait are visited (the shape of a macro that resolves the trait by its name, so it gives
+///   none). The generics and the items of the impl are not analyzed, and not compared.
 fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
     analyze_with(item, args, None)
 }
@@ -460,7 +460,7 @@ fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
         }
         ("impl", Item::Impl(i)) => {
             leaker
-                .enter_impl(&i.generics, &i.self_ty, allow_self, |view| {
+                .enter_impl(&i.generics, &i.self_ty, None, allow_self, |view| {
                     view.visit_type(&i.self_ty);
                     if let Some((_, path, _)) = &i.trait_ {
                         for seg in &path.segments {
@@ -679,13 +679,18 @@ fn impl_text(text: &str, self_param: &Ident) -> String {
         .replace(['(', ')'], "")
 }
 
-/// Takes the last parameter off the generics. (They are collected again, so that no comma is left
-/// after the parameter before it.)
+/// Takes the parameter before the first const parameter (or the last one) off the generics: where
+/// `Referrer::repeater_impl()` declares the implementor. (They are collected again, so that no
+/// comma is left after the parameter before it.)
 fn implementor_param(generics: &mut Generics) -> Option<GenericParam> {
     let mut params: Vec<GenericParam> = generics.params.iter().cloned().collect();
-    let last = params.pop();
+    let at = params
+        .iter()
+        .position(|param| matches!(param, GenericParam::Const(_)))
+        .unwrap_or(params.len());
+    let taken = at.checked_sub(1).map(|at| params.remove(at));
     generics.params = params.into_iter().collect();
-    last
+    taken
 }
 
 /// The generics of a context without the lifetime bounds that the trait arguments of a Repeater
@@ -810,7 +815,7 @@ fn check_impl_pieces(
             }
             other => {
                 return Err(helpers_disagree(format!(
-                    "the impl of the entry {} does not end with the parameter `{}`: {}",
+                    "the impl of the entry {} does not declare the implementor as `{}`: {}",
                     ix,
                     self_param,
                     quote!(#other)

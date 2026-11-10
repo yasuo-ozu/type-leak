@@ -51,13 +51,22 @@ fn self_type(generics: &Generics) -> Type {
 
 /// Enters the scope of `$kind` (one of [`KINDS`]) with the generics `$generics` on `$on`, which is
 /// a `Leaker` or a `View`: the item is `S`, and the self type of the impl is that of
-/// [`self_type()`]. A module has no generics: it is entered as `m`.
+/// [`self_type()`], which is of the trait `::p::Tr` (its methods are compared with a trait's). A module has no generics: it is entered as `m`.
 macro_rules! enter {
     ($on:expr, $kind:expr, $generics:expr, $allow_self:expr, $f:expr) => {{
         let generics: &Generics = $generics;
         match $kind {
             "struct" | "enum" | "union" => $on.enter_type(&ident("S"), generics, $allow_self, $f),
-            "impl" => $on.enter_impl(generics, &self_type(generics), $allow_self, $f),
+            "impl" => {
+                let trait_: Path = parse_quote!(::p::Tr);
+                $on.enter_impl(
+                    generics,
+                    &self_type(generics),
+                    Some(&trait_),
+                    $allow_self,
+                    $f,
+                )
+            }
             "trait" => $on.enter_trait(&ident("S"), generics, $allow_self, $f),
             "mod" => $on.enter_mod("m", [], $f),
             kind => panic!("{}", kind),
@@ -246,7 +255,7 @@ fn nested_ids() -> String {
         let (m2, ()) = view.enter_mod("m2", [], |view| view.visit_type(&parse_quote!(Rel3)));
         // After the modules, the same generics are still the same context.
         let (d, ()) = view.enter_type(&s_ident, &generics, true, |_| ());
-        let (e, ()) = view.enter_impl(&generics, &parse_quote!(::p::Wrap<U>), true, |view| {
+        let (e, ()) = view.enter_impl(&generics, &parse_quote!(::p::Wrap<U>), None, true, |view| {
             view.visit_type(&parse_quote!(Rel6<Self, U>))
         });
         let (f, ()) = view.enter_trait(&ident("Tr"), &generics, false, |view| {

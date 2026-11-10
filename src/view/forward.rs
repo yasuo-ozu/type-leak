@@ -115,6 +115,7 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for View<'_, P> {
         visit_type_param_bound: TypeParamBound,
         visit_type_path: TypePath,
         visit_type_trait_object: TypeTraitObject,
+        visit_variant: Variant,
     }
 }
 

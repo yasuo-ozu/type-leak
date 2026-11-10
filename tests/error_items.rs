@@ -759,9 +759,13 @@ fn the_path_of_a_qualified_type_is_unreadable() {
     // `Tr<u8>::X` is the trait with the name that follows the `>`: a path that is no node, and not
     // a type (`syn` has the `qself` and the path apart).
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
-        view.visit_type(&parse_quote!(<Self as super::Tr<u8>>::X))
-    });
+    leaker.enter_impl(
+        &Generics::default(),
+        &parse_quote!(B),
+        None,
+        false,
+        |view| view.visit_type(&parse_quote!(<Self as super::Tr<u8>>::X)),
+    );
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);

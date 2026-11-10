@@ -609,9 +609,13 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
     // name it.
     let leak = |ty: Type| {
         expect_errors(Leaker::new(), |leaker| {
-            leaker.enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
-                view.visit_type(&ty)
-            })
+            leaker.enter_impl(
+                &Generics::default(),
+                &parse_quote!(B),
+                None,
+                false,
+                |view| view.visit_type(&ty),
+            )
         })
     };
     let err = leak(parse_quote!(<Self as super::Tr<u8>>::X));

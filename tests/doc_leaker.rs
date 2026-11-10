@@ -121,11 +121,17 @@ fn enter_impl_leaks_only_the_visited_trait_arguments() {
     let item: ItemImpl = parse_quote! { impl<T> ::path::MyTrait<Rel<T>> for MyType<T, Rel2> {} };
     let (_, trait_path, _) = item.trait_.as_ref().unwrap();
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&item.generics, &item.self_ty, true, |view| {
-        for segment in &trait_path.segments {
-            view.visit_path_arguments(&segment.arguments);
-        }
-    });
+    leaker.enter_impl(
+        &item.generics,
+        &item.self_ty,
+        Some(trait_path),
+        true,
+        |view| {
+            for segment in &trait_path.segments {
+                view.visit_path_arguments(&segment.arguments);
+            }
+        },
+    );
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1); // `Rel<T>`, not `Rel2`
 }
 

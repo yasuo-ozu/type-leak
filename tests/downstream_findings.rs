@@ -430,7 +430,7 @@ fn four_sibling_scopes_keep_the_kind_of_their_parameter() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::Arr<N>)),
         parse_quote! {
-            impl<const N: usize, __S: ?::core::marker::Sized> crate::Repeater<([(); N],), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized, const N: usize> crate::Repeater<([(); N],), 7u64, 0usize> for __S {
                 type Type = inner::Arr<N>;
             }
         }

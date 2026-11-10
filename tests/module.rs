@@ -524,16 +524,15 @@ fn referrer_tracks_the_modules_it_enters() {
         .visitor(root, rewrite)
         .visit_file_mut(&mut file);
     assert_eq!(quote!(#file).to_string(), quote!(#rewritten).to_string());
-    // With the context of the module `m::inner`, a `mod inner` is `m::inner::inner`, which has
-    // no entry (the `mod` item is never the module itself, as it was when it was the root): to
-    // rewrite a copy of `m::inner`, visit its items. (It was rewritten.)
+    // With the context of the module `m::inner`, `m::inner` has no module of its own, so a `mod
+    // inner` is the module itself: the same as its items.
     let inner = referrer.context_module(referrer.context(0)).unwrap();
     let mut item = unchanged.clone();
     referrer
         .clone()
         .visitor(inner, rewrite)
         .visit_item_mod_mut(&mut item);
-    assert_eq!(quote!(#item).to_string(), quote!(#unchanged).to_string());
+    assert_eq!(quote!(#item).to_string(), quote!(#rewritten).to_string());
     let mut item = unchanged.clone();
     visit_items(referrer.visitor(inner, rewrite), &mut item);
     assert_eq!(quote!(#item).to_string(), quote!(#rewritten).to_string());
@@ -628,7 +627,9 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
     .to_string();
     assert_eq!(copy(root), rewritten);
     assert_eq!(copy(other), unchanged);
-    // A copy of the items of the module with a nested module without an entry for it.
+    // A copy of the items of the module with modules that the Leaker did not see. A `mod` at the
+    // top is taken as the module itself (it is none of the modules of `root`), and the `mod`
+    // inside it is nested in the module, a module no entry depends on.
     let mut item: ItemMod = parse_quote!(
         mod m {
             pub struct A {
@@ -637,6 +638,11 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
             pub mod inner {
                 pub struct C {
                     y: Rel,
+                }
+                pub mod deeper {
+                    pub struct D {
+                        y: Rel,
+                    }
                 }
             }
         }
@@ -649,7 +655,12 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
             }
             pub mod inner {
                 pub struct C {
-                    y: Rel,
+                    y: P,
+                }
+                pub mod deeper {
+                    pub struct D {
+                        y: Rel,
+                    }
                 }
             }
         }
@@ -776,9 +787,10 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
     .to_string();
     assert_eq!(referrer.context_module(scope), None);
     assert_eq!(rewrite(&inner, scope), rewritten);
-    // With the id of the module, the `mod` item is nested in it, not the module itself.
+    // With the id of the module, which has no module named `inner`, the `mod` item is the module
+    // itself.
     let id = referrer.context_module(referrer.context(0)).unwrap();
-    assert_eq!(rewrite(&inner, id), quote!(#inner).to_string());
+    assert_eq!(rewrite(&inner, id), rewritten);
     // Several roots are told apart by their names, whereas a visitor that did not know its module
     // could not tell them (nothing was rewritten then).
     let other: ItemMod = parse_quote!(
@@ -892,9 +904,8 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
         rewrite(&m2, a),
         quote!(mod m2 { pub struct S { f: #{ident(&format!("P{}", index(a)))}, } }).to_string()
     );
-    // A `mod` item is nested in the module of the context, so the copy visited as a whole is
-    // `m1::m2`, which has no entry. (The root `mod` item was the module itself, and then it was
-    // rewritten.)
+    // The context has no module named like the copy, so the copy visited as a whole is the module
+    // itself, and is rewritten as its items are.
     let whole = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
@@ -903,13 +914,14 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
     };
-    assert_eq!(whole(&m2, b), quote!(#m2).to_string());
-    assert_eq!(whole(&m1, a), quote!(#m1).to_string());
-    assert_eq!(whole(&m2, a), quote!(#m2).to_string());
+    assert_eq!(whole(&m2, b), rewrite(&m2, b));
+    assert_eq!(whole(&m1, a), rewrite(&m1, a));
+    assert_eq!(whole(&m2, a), rewrite(&m2, a));
+    assert_ne!(whole(&m2, b), quote!(#m2).to_string());
 }
 
 #[test]
-fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
+fn the_context_is_the_module_and_a_mod_item_is_nested_in_it_unless_it_is_the_module() {
     let m: ItemMod = parse_quote!(
         mod m {
             pub struct A {
@@ -939,7 +951,6 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
         }
     )
     .to_string();
-    let unchanged = quote!(#m).to_string();
     let visitor = |module: ContextId| {
         referrer
             .clone()
@@ -964,9 +975,8 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
         quote!(mod m { #(#items)* }).to_string()
     };
     assert_eq!(by_file(root), rewritten);
-    // `mod m` as a whole is `m::m` in the module of the context: nothing is found in it, as no
-    // entry depends on it. The `mod` item is never the module itself. (It was rewritten when it
-    // was the root node.)
+    // `mod m` as a whole: no module of the context is named `m` (`inner` is), so it is the module
+    // itself, and it is rewritten as its items are (F55 in `tests/findings.rs`).
     let by_mod = |module: ContextId, as_file: bool| {
         let mut item = m.clone();
         let mut visitor = visitor(module);
@@ -984,10 +994,11 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
             quote!(#item).to_string()
         }
     };
-    assert_eq!(by_mod(root, false), unchanged);
-    assert_eq!(by_mod(root, true), unchanged);
+    assert_eq!(by_mod(root, false), rewritten);
+    assert_eq!(by_mod(root, true), rewritten);
     // With the context of the module `inner`, the items of `m` are looked up in it (`Rel` is the
-    // entry of `inner`), and the `inner` in it is a module in it, which is none.
+    // entry of `inner`), and the `inner` in it is none of the modules of `inner`: it is the
+    // module itself, so its `Rel` is the entry of `inner` too.
     assert_eq!(
         by_items(inner),
         quote!(
@@ -997,7 +1008,7 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
                 }
                 pub mod inner {
                     pub struct C {
-                        y: Rel,
+                        y: P1,
                     }
                 }
             }

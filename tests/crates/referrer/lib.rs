@@ -246,6 +246,13 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9142!(path = ::type_leak_test_leaker::kinds);
     // The names of the prelude of every edition in the values and the bounds (issue 3).
     type_leak_test_leaker::__tl_prop_9208!(path = ::type_leak_test_leaker::kinds);
+    // The bindings of a discriminant and of the default of a const parameter are local (F56). The
+    // relative macro and struct literal are rejected: they expand to nothing, as they could not be
+    // resolved here.
+    type_leak_test_leaker::__tl_prop_9215!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9216!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9217!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9218!(path = ::type_leak_test_leaker::kinds);
     // The scopes that share names: every entry has the generics of its own scope.
     type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);

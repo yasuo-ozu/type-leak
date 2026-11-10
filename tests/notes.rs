@@ -280,7 +280,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
     assert_eq!(shown(&error(&item)), expected);
     // An impl whose parts are visited by a scope: it does not know the trait.
     let outer = errors_of(leaker(), |leaker| {
-        leaker.enter_impl(&Generics::default(), &parse_quote!(S), true, |view| {
+        leaker.enter_impl(&Generics::default(), &parse_quote!(S), None, true, |view| {
             view.enter_generics(&Generics::default(), |view| {
                 view.visit_type(&parse_quote!(Rel<Self::A>))
             })

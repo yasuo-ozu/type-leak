@@ -167,16 +167,17 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     ///
     /// `check_values` makes it read the values of an item too: the values of consts and statics,
     /// the defaults and values of associated consts, and the bodies of functions and methods (enum
-    /// discriminants and array lengths are read either way). Without it a relative path in a value
-    /// breaks the copy and the Leaker does not tell. The types in a type position of a value (a
-    /// cast, a `let`, a closure parameter or output, the generic arguments of a path or method
-    /// call, the self type of a qualified path) are leaked like any type of the item. Another
-    /// relative path (a function, a constant, a struct literal, a variant, the trait of a qualified
-    /// path) is rejected unless it is absolute or starts with `$crate`, is allowed
-    /// ([`Allow::allow_path_if()`]), or starts with a generic or `Self` in scope or a name that the
-    /// value declares. A macro whose arguments are not expressions (`cfg!`, `stringify!` and
-    /// `matches!` excepted), a `macro_rules!`, a glob import and syntax that `syn` does not parse
-    /// are rejected.
+    /// discriminants, the defaults of const parameters and array lengths are read either way, the
+    /// first two as a value is, but their errors are no [`ErrorItem::in_value`]). Without it a
+    /// relative path in a value breaks the copy and the Leaker does not tell. The types in a type
+    /// position of a value (a cast, a `let`, a closure parameter or output, the generic arguments
+    /// of a path or method call, the self type of a qualified path) are leaked like any type of
+    /// the item. Another relative path (a function, a constant, a struct literal, a variant, the
+    /// trait of a qualified path) is rejected unless it is absolute or starts with `$crate`, is
+    /// allowed ([`Allow::allow_path_if()`]), or starts with a generic or `Self` in scope or a name
+    /// that the value declares. A macro whose arguments are not expressions (`cfg!`, `stringify!`
+    /// and `matches!` excepted), a `macro_rules!`, a glob import and syntax that `syn` does not
+    /// parse are rejected.
     ///
     /// `nested_self_entries` accepts a type that names the `Self` of a struct, an enum or a union
     /// nested in the analyzed syntax ([`View::visit_item()`], the items of
@@ -203,8 +204,8 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     }
 
     /// Returns a compile-time check that the primitive names copied as written (`u8` in `const N:
-    /// u8`, or by [`Allow::allow_primitive()`]) are not shadowed. Emit it in the Leaker's
-    /// crate. It is empty if none was copied.
+    /// u8`, or by [`Allow::allow_primitive()`]) are not shadowed, also those in a part that an error
+    /// makes copied as written. Emit it in the Leaker's crate. It is empty if none was copied.
     pub fn assertions(&self) -> TokenStream {
         if self.state.assumed_primitives.is_empty() {
             return TokenStream::new();
@@ -263,7 +264,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     pub fn intern_impl(&mut self, item: &ItemImpl, allow_self: bool) -> ContextId {
         // The scope checks the path of the trait, and the walk analyzes its arguments.
         let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
-        self.enter_impl_of(
+        self.enter_impl(
             &item.generics,
             &item.self_ty,
             trait_path,
@@ -365,14 +366,22 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
 
     /// Analyzes parts of an impl: runs `f` on a [`View`] inside an impl with `generics` for
     /// `self_ty`. Like [`enter_type()`](Leaker::enter_type), with `self_ty` as `Self`.
+    ///
+    /// `trait_` is the trait that the impl implements, and `None` is an inherent impl. The path is
+    /// checked here (a relative path is an error), not its arguments: `f` visits them. The methods
+    /// of an inherent impl are not compared with a trait's
+    /// ([Method lifetimes](Leaker#method-lifetimes)), and the help for `Self::A` names the trait.
+    /// A caller that resolves the trait by its name elsewhere passes the path and allows it
+    /// ([`Allow::allow_path_if()`](crate::Allow::allow_path_if)), or `None` if it visits no method.
     pub fn enter_impl<R>(
         &mut self,
         generics: &Generics,
         self_ty: &Type,
+        trait_: Option<&Path>,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_, P>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_impl(self, generics, self_ty, allow_self, f)
+        Scopes::enter_impl(self, generics, self_ty, trait_, allow_self, f)
     }
 
     /// Analyzes parts of a trait: runs `f` on a [`View`] inside the trait `ident` with `generics`.
@@ -911,6 +920,9 @@ fn find(component: &mut [usize], mut i: usize) -> usize {
 
 /// Returns the sorted names of the external crates (not `core`) that `ty` and `context` name as
 /// `::name`.
+///
+/// `::crate`, `::self`, `::super`, `::Self` and `::_` name no crate (rustc rejects them in the
+/// Leaker's crate), and cannot be written as a name in a serialized Referrer.
 fn external_crates(ty: &Type, context: &Context) -> Vec<String> {
     use proc_macro2::{Spacing, TokenTree};
     #[derive(Default)]
@@ -918,7 +930,10 @@ fn external_crates(ty: &Type, context: &Context) -> Vec<String> {
     impl Finder {
         fn add(&mut self, ident: &Ident) {
             let name = ident_name(ident);
-            if name != "core" {
+            if !matches!(
+                name.as_str(),
+                "core" | "crate" | "self" | "super" | "Self" | "_"
+            ) {
                 self.0.insert(name);
             }
         }

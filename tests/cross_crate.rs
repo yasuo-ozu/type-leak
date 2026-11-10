@@ -2365,3 +2365,68 @@ fn a_marker_is_for_the_entries_that_do_not_need_self_and_the_host_for_the_others
         type_name::<l::kinds::Rel>()
     );
 }
+
+/// F56, fixtures 9215 and 9216: the bindings in an enum discriminant (`let`, a `match` arm, a
+/// pattern, an item of the block) and in the default of a const parameter are local names, not
+/// relative paths. The Leaker rejected them, and the Referrer's crate had no copy of either (which
+/// fails to build this test). The copies write the expressions as they are and compute what the
+/// originals do.
+#[test]
+fn the_bindings_in_a_discriminant_and_in_the_default_of_a_const_parameter_are_local() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(
+        reported(9215, __tl_report_9215!()),
+        ok("enum", 0, 0, 0),
+        "{}",
+        __tl_report_9215!()
+    );
+    assert_eq!(
+        reported(9216, __tl_report_9216!()),
+        ok("struct", 0, 1, 1),
+        "{}",
+        __tl_report_9216!()
+    );
+    let original = [
+        l::DiscriminantBindings::Let as isize,
+        l::DiscriminantBindings::Arm as isize,
+        l::DiscriminantBindings::Pair as isize,
+        l::DiscriminantBindings::Typed as isize,
+        l::DiscriminantBindings::Item as isize,
+    ];
+    assert_eq!(original, [3, 6, 12, 7, 42]);
+    let copy = [
+        r::DiscriminantBindings::Let as isize,
+        r::DiscriminantBindings::Arm as isize,
+        r::DiscriminantBindings::Pair as isize,
+        r::DiscriminantBindings::Typed as isize,
+        r::DiscriminantBindings::Item as isize,
+    ];
+    assert_eq!(copy, original);
+
+    // The default of `N` is 4 in both: `DefaultBinding` is `DefaultBinding<4>`.
+    let original: l::DefaultBinding = l::DefaultBinding([1; 4]);
+    let copy: r::DefaultBinding = r::DefaultBinding([1; 4]);
+    assert_eq!(original.0.len(), 4);
+    assert_eq!(copy.0, original.0);
+}
+
+/// F56, fixtures 9217 and 9218: a macro and a struct literal that are relative paths, in a
+/// discriminant and in the default of a const parameter, are rejected. The Leaker did not report
+/// them, and the copy in the Referrer's crate could not resolve `rel_two!` and `RelPoint`. The
+/// Referrer's macro expands to nothing (`kinds`, like the other rejected items).
+#[test]
+fn a_relative_macro_and_struct_literal_in_a_discriminant_or_a_default_are_rejected() {
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9217, __tl_report_9217!()),
+        rejected("enum", "useabsolutepath:'rel_two!'")
+    );
+    assert_eq!(
+        reported(9218, __tl_report_9218!()),
+        rejected("struct", "useabsolutepath:'RelPoint'")
+    );
+}

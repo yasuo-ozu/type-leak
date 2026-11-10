@@ -1398,20 +1398,32 @@ fn by_hand(referrer: &Referrer, ix: usize, self_param: &Ident) -> (Generics, Typ
     };
     let self_ty = match referrer.context_self(context) {
         Some(SelfRequirement::Bound(path)) => {
-            declared
-                .params
-                .push(parse_quote!(#self_param: ?::core::marker::Sized + #path));
+            declare_before_consts(
+                &mut declared,
+                parse_quote!(#self_param: ?::core::marker::Sized + #path),
+            );
             marker
         }
         Some(SelfRequirement::Type(self_ty)) => self_ty.clone(),
         _ => {
-            declared
-                .params
-                .push(parse_quote!(#self_param: ?::core::marker::Sized));
+            declare_before_consts(
+                &mut declared,
+                parse_quote!(#self_param: ?::core::marker::Sized),
+            );
             marker
         }
     };
     (declared, self_ty, encoded, ty.clone())
+}
+
+/// Declares `param` after the lifetimes and types, before the consts (rustc before 1.59 wants it).
+fn declare_before_consts(generics: &mut Generics, param: GenericParam) {
+    let at = generics
+        .params
+        .iter()
+        .position(|param| matches!(param, GenericParam::Const(_)))
+        .unwrap_or(generics.params.len());
+    generics.params.insert(at, param);
 }
 
 /// `(<S>::A): Clone` as the first predicate is `<S>::A: Clone`.

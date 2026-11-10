@@ -595,6 +595,58 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     );
 }
 
+/// Asserts that `generics` are declared in the order that every rustc accepts: the lifetimes, then
+/// the types, then the consts (before 1.59 a type after a const is an error).
+fn assert_declared_in_order(generics: &Generics, what: &str) {
+    let rank = |param: &GenericParam| match param {
+        GenericParam::Lifetime(_) => 0,
+        GenericParam::Type(_) => 1,
+        GenericParam::Const(_) => 2,
+    };
+    let ranks: Vec<_> = generics.params.iter().map(rank).collect();
+    assert!(
+        ranks.windows(2).all(|w| w[0] <= w[1]),
+        "{}: {}",
+        what,
+        s(generics)
+    );
+}
+
+/// Every entry of every sample, in every mode, is declared in the order of every rustc (F53 in
+/// `tests/findings.rs`: the parameter for the implementor came after the const parameters).
+#[test]
+fn the_generics_of_every_impl_are_declared_in_the_order_of_every_rustc() {
+    let param: Ident = parse_quote!(__S);
+    let marker: Type = parse_quote!(crate::Marker);
+    let mut with_consts = 0;
+    for item in bucket_samples() {
+        let (referrer, _) = analyze(&item);
+        for ix in 0..referrer.iter().count() {
+            let encode = |value: &Expr, param: &ConstParam| slots().encode_const(value, &param.ty);
+            for target in [
+                ImplSelf::Param(&param),
+                ImplSelf::Marker(&marker),
+                ImplSelf::Bucket {
+                    id: 5,
+                    param: &param,
+                },
+            ] {
+                if let Ok(r) = referrer.repeater_impl(ix, target, encode) {
+                    let what = format!("{}: {} {:?}", s(&item), ix, target);
+                    assert_declared_in_order(&r.generics, &what);
+                    with_consts += r
+                        .generics
+                        .params
+                        .iter()
+                        .any(|param| matches!(param, GenericParam::Const(_)))
+                        as usize;
+                }
+            }
+        }
+    }
+    assert!(with_consts > 5, "{}", with_consts);
+}
+
 // ── entry_args ───────────────────────────────────────────────────────────────────────────────
 
 #[test]

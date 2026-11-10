@@ -61,6 +61,12 @@
 //! | `f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_error` | the paths of the error of a value path left out the relative types in its arguments: a path rule after the analysis dropped the error, and the copy wrote them as they were | fixed |
 //! | `f51_a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected` | `enter_mod` with `nested_self_entries` accepted `S<T: AsRef<Rel<Self>>>` beside an entry that uses `T`, which `intern_struct()` rejects: E0277 in the copy | fixed |
 //! | `f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate` | a part copied as written with `Self::A` in a predicate made no optional entry of the types in the bounds of its context a part too, so a strict Referrer replaced them (E0277) | fixed |
+//! | `f53_the_parameter_for_the_implementor_is_declared_before_the_const_parameters` | `repeater_impl()` pushed the parameter for the implementor after the const parameters (`impl<const N: usize, __S> ..`), which rustc before 1.59 rejects | fixed |
+//! | `f54_an_entry_headed_by_a_path_keyword_names_no_crate_and_serializes` | `::crate::X` (and `::self`, `::super`, `::Self`) was recorded as the crate `crate`, and serializing the Referrer panicked on `r#crate` | fixed |
+//! | `f55_visiting_the_mod_item_of_the_module_of_the_context_is_visiting_its_items` | `visit_item_mod_mut()` with the context of `intern_mod()` took the `mod` for a module nested in it and replaced nothing | fixed |
+//! | `f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value` | a relative macro or struct literal in an enum discriminant or the default of a const parameter was no error, and a `let` or closure binding in one was a false error: they are read by the walk of a value (`ValueWalk`), with or without `check_values` | fixed |
+//! | `f57_the_primitive_names_in_a_part_copied_as_written_are_asserted` | `Leaker::assertions()` left out the primitive names in a type, bound or value path that an error makes a part copied as written (`Rel<'_, u8>`, `&dyn RelTr<u8>`, `T: Into<u32>`) | fixed |
+//! | `f58_enter_impl_is_told_the_trait_of_the_impl` | `enter_impl()` could not say that the impl is inherent (E0195 for a method lifetime, entries lost) nor of which trait (a relative path was not checked, the help for `Self::A` had a placeholder) | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -7885,10 +7891,16 @@ fn f36_the_own_self_hides_the_one_around() {
     );
     let mut leaker = new_leaker();
     let (_, context) = leaker.enter_mod("m", names(&[]), |view| {
-        view.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
-            view.visit_type(&parse_quote!(Rel2<Self>));
-            view.visit_item(&nested);
-        })
+        view.enter_impl(
+            &Generics::default(),
+            &parse_quote!(::p::W),
+            None,
+            true,
+            |view| {
+                view.visit_type(&parse_quote!(Rel2<Self>));
+                view.visit_item(&nested);
+            },
+        )
         .0
     });
     let referrer = leaker.result().finish().unwrap();
@@ -12879,4 +12891,959 @@ fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
     let result = leaker.result();
     assert!(result.errors().is_empty());
     assert!(f52_entries(&result.into_referrer()).is_empty());
+}
+
+// ── F53 ──────────────────────────────────────────────────────────────────────
+
+/// The generics of the Repeater impl of the entry `entry` of `referrer`, and its type, as text.
+fn f53_declared(referrer: &Referrer, entry: &str, target: ImplSelf<'_>) -> (String, String) {
+    let ix = referrer.iter().position(|ty| string(ty) == entry).unwrap();
+    let r = referrer.repeater_impl(ix, target, array_const).unwrap();
+    (f53_text(&r.generics), string(&r.self_ty))
+}
+
+/// `generics` with their where clause, as text.
+fn f53_text(generics: &Generics) -> String {
+    format!("{} {}", string(generics), string(&generics.where_clause))
+}
+
+/// F53 (fixed): the parameter for the implementor was declared after the const parameters.
+///
+/// Trigger: an entry of an item with a const generic, `trait Tr<'a, T: 'a, const N: usize> { fn
+/// f(&self, x: &'a Wrap<T, N>); }`, and `repeater_impl()` for `ImplSelf::Param` (or `Bucket`, for an
+/// entry that needs `Self`). The impl was `impl<'a, T, const N: usize, __S: ?Sized> Repeater<..> for
+/// __S`, which rustc before 1.59 rejects ("type parameters must be declared prior to const
+/// parameters"): the Referrer's crate failed to build there, though the library supports rustc
+/// 1.56. The generics of a context were already in the order of every rustc (lifetimes, types,
+/// consts); `__S` was pushed last.
+///
+/// Fix: `repeater_impl()` declares the parameter after the lifetimes and the types, before the first
+/// const parameter. No other place adds a generic to generated generics. No cross-crate fixture:
+/// rustc 1.59 and later accept both orders. `tests/helpers.rs` checks every entry of the samples.
+#[test]
+fn f53_the_parameter_for_the_implementor_is_declared_before_the_const_parameters() {
+    let param: Ident = parse_quote!(__S);
+    let bucket = ImplSelf::Bucket {
+        id: 3,
+        param: &param,
+    };
+    let analyze = |item: Item| {
+        analyze_in(new_leaker(), &item)
+            .unwrap_or_else(|e| panic!("{}", joined_messages(&e)))
+            .1
+    };
+    let declared = |generics: Generics| f53_text(&generics);
+    // A trait: an entry for any type, and one for the implementor (`Self::Out` is bound by it).
+    let referrer = analyze(parse_quote! {
+        trait Tr<'a, T: 'a, const N: usize> {
+            type Out;
+            fn f(&self, x: &'a Wrap<T, N>) -> Rel<Self::Out, N>;
+        }
+    });
+    let any = "& 'a Wrap < T , N >";
+    let implementor = "Rel < Self :: Out , N >";
+    let (generics, self_ty) = f53_declared(&referrer, any, ImplSelf::Param(&param));
+    assert_eq!(
+        generics,
+        declared(parse_quote!(<'a, T, __S: ?::core::marker::Sized, const N: usize>))
+    );
+    assert_eq!(self_ty, "__S");
+    // A bucket is a primitive type, and declares nothing.
+    let (generics, self_ty) = f53_declared(&referrer, any, bucket);
+    assert_eq!(generics, declared(parse_quote!(<'a, T, const N: usize>)));
+    assert_ne!(self_ty, "__S");
+    for target in [ImplSelf::Param(&param), bucket] {
+        let (generics, self_ty) = f53_declared(&referrer, implementor, target);
+        assert_eq!(
+            generics,
+            declared(parse_quote!(<
+                'a,
+                T,
+                __S: ?::core::marker::Sized + Tr<'a, T, N>,
+                const N: usize
+            >))
+        );
+        assert_eq!(self_ty, "__S");
+    }
+    // A struct: an entry for any type, and one for the type, which declares no parameter.
+    let referrer = analyze(parse_quote! {
+        struct S<'a, T: 'a, const N: usize> { a: &'a Wrap<T, N>, b: Rel<Self, N> }
+    });
+    let (generics, _) = f53_declared(&referrer, any, ImplSelf::Param(&param));
+    assert_eq!(
+        generics,
+        declared(parse_quote!(<'a, T, __S: ?::core::marker::Sized, const N: usize>))
+    );
+    let (generics, _) = f53_declared(&referrer, any, bucket);
+    assert_eq!(generics, declared(parse_quote!(<'a, T, const N: usize>)));
+    let (generics, self_ty) = f53_declared(&referrer, "Rel < Self , N >", ImplSelf::Param(&param));
+    assert_eq!(generics, declared(parse_quote!(<'a, T, const N: usize>)));
+    assert_eq!(self_ty, "S < 'a , T , N >");
+    // A nested struct whose bound names its own `Self`: the impl is for any type that holds it.
+    let referrer = analyze(parse_quote! {
+        mod m { pub struct S<T: AsRef<Self>, const N: usize>(T, Wrap<T, N>); }
+    });
+    for target in [ImplSelf::Param(&param), bucket] {
+        let (generics, self_ty) = f53_declared(&referrer, "Wrap < T , N >", target);
+        assert_eq!(
+            generics,
+            declared(parse_quote!(<T: AsRef<__S>, __S: ?::core::marker::Sized, const N: usize>))
+        );
+        assert_eq!(self_ty, "__S");
+    }
+}
+
+// ── F54 ──────────────────────────────────────────────────────────────────────
+
+/// F54 (fixed): serializing a Referrer panicked for an entry headed by `::crate`, `::self`,
+/// `::super` or `::Self`.
+///
+/// Trigger: `struct S { a: ::crate::X }`. The Leaker accepts it (the path is absolute, and which
+/// crate it is is not its business) and recorded the optional entry with the crate `crate`
+/// (`external_crates_require()`); writing the name as `r#crate` for the tokens panics, since
+/// `crate`, `self`, `super`, `Self` and `_` cannot be raw identifiers. rustc rejects the item in
+/// the Leaker's crate anyway, but the library must not panic.
+///
+/// Fix: `::crate`, `::self`, `::super`, `::Self` and `::_` name no crate and are not recorded, in a
+/// path or in the tokens of a macro; and `crate_ident()` returns `None` for a name that cannot be
+/// written, so the entry lists the others.
+#[test]
+fn f54_an_entry_headed_by_a_path_keyword_names_no_crate_and_serializes() {
+    for head in ["crate", "self", "super", "Self"] {
+        let head: Ident = Ident::new(head, proc_macro2::Span::call_site());
+        let items: Vec<(ItemStruct, &str)> = vec![
+            (parse_quote!(struct S { a: ::#head::X }), "a path"),
+            // A real crate next to it is still listed.
+            (
+                parse_quote!(struct S { a: ::#head::X<::p::Y> }),
+                "a path with a crate",
+            ),
+            // The tokens of a macro, in which paths are not parsed.
+            (
+                parse_quote!(
+                    struct S {
+                        a: ::q::m!(::#head::X, ::p::Y),
+                    }
+                ),
+                "a macro",
+            ),
+        ];
+        for (item, what) in items {
+            let what = format!("`{}` ({})", string(&item), what);
+            let mut leaker = new_leaker();
+            leaker.intern_struct(&item, true);
+            let result = leaker.result();
+            let tokens = template_quote::ToTokens::to_token_stream(&result);
+            let referrer = result.into_referrer();
+            let crates: Vec<Vec<String>> = (0..referrer.iter().count())
+                .map(|ix| referrer.external_crates_require(ix).to_vec())
+                .collect();
+            assert!(!crates.is_empty(), "{}", what);
+            for names in &crates {
+                assert!(
+                    names.iter().all(|name| ["p", "q"].contains(&name.as_str())),
+                    "{}: {:?}",
+                    what,
+                    crates
+                );
+            }
+            // The tokens parse back to the same Referrer, both as a Referrer and as a result.
+            assert_eq!(
+                parse2::<Referrer>(tokens.clone()).unwrap(),
+                referrer,
+                "{}",
+                what
+            );
+            let read = parse2::<LeakerResult>(tokens).unwrap();
+            assert_eq!(read.into_referrer(), referrer, "{}", what);
+        }
+    }
+}
+
+// ── F55 ──────────────────────────────────────────────────────────────────────
+
+/// F55 (fixed): visiting the `mod` item itself with the context of `intern_mod()` replaced nothing.
+///
+/// Trigger: `let ctx = leaker.intern_mod(&m)`, then `referrer.visitor(ctx, ..).visit_item_mod_mut(&mut
+/// m.clone())`. Visiting the items of `m` (a `File`, or each item) replaces the entries. But
+/// `visit_item_mod_mut()` took `m` for a module nested in the module of the context (`module_in()`),
+/// found none by that name, and so looked up the entries of no module: every entry stayed as written,
+/// silently.
+///
+/// Fix: at the top of a module context (nothing entered yet), a `mod` that none of the modules of
+/// the context is named like is the module itself, so visiting it is visiting its items. The `mod`
+/// in it are nested in the module as before (not again the module itself). A module of the context
+/// that is named like the `mod` keeps the nested meaning (`mod m { mod m { .. } }`: it is ambiguous,
+/// and the docs of `Referrer::visitor()` say to visit the items of a module). A module the Leaker
+/// did not see, directly among the items, is taken as the module itself too: nothing tells it from
+/// the module that is visited.
+#[test]
+fn f55_visiting_the_mod_item_of_the_module_of_the_context_is_visiting_its_items() {
+    let rewrite = |referrer: &Referrer, context: ContextId, item: &ItemMod, how: &str| -> String {
+        let mut visitor = referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>));
+        let mut item = item.clone();
+        match how {
+            "mod" => visitor.visit_item_mod_mut(&mut item),
+            "item" => {
+                let mut whole = Item::Mod(item);
+                visitor.visit_item_mut(&mut whole);
+                item = match whole {
+                    Item::Mod(item) => item,
+                    _ => unreachable!(),
+                };
+            }
+            "file" => {
+                let mut file = File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![Item::Mod(item)],
+                };
+                visitor.visit_file_mut(&mut file);
+                item = match file.items.remove(0) {
+                    Item::Mod(item) => item,
+                    _ => unreachable!(),
+                };
+            }
+            "items" => {
+                for item in &mut item.content.as_mut().unwrap().1 {
+                    visitor.visit_item_mut(item);
+                }
+            }
+            _ => unreachable!(),
+        }
+        string(&item)
+    };
+    let analyze = |m: &ItemMod| {
+        let mut leaker = new_leaker();
+        let context = leaker.intern_mod(m);
+        (context, leaker.result().finish().unwrap())
+    };
+    // Entries at the root of the module and in a nested module (the same type, so two entries).
+    let m: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                a: Rel,
+            }
+            pub mod inner {
+                pub struct C {
+                    c: Rel,
+                    d: Rel2,
+                }
+            }
+        }
+    );
+    let (context, referrer) = analyze(&m);
+    assert_eq!(referrer.iter().count(), 3);
+    let by_items = rewrite(&referrer, context, &m, "items");
+    // Every entry is replaced, each one with its own index.
+    assert!(!by_items.contains("Rel"), "{}", by_items);
+    for ix in 0..3 {
+        assert_eq!(
+            by_items.matches(&format!("P < {}usize >", ix)).count(),
+            1,
+            "{}",
+            by_items
+        );
+    }
+    for how in ["mod", "item", "file"] {
+        assert_eq!(rewrite(&referrer, context, &m, how), by_items, "{}", how);
+    }
+    // `mod m { mod m { .. } }`: the inner module has the name of the outer one. Visiting the items
+    // of the outer one, the inner `mod m` is its nested module, whose entries are replaced.
+    let m: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                a: Rel,
+            }
+            pub mod m {
+                pub struct C {
+                    c: Rel,
+                }
+            }
+        }
+    );
+    let (context, referrer) = analyze(&m);
+    assert_eq!(referrer.iter().count(), 2);
+    let by_items = rewrite(&referrer, context, &m, "items");
+    assert!(!by_items.contains("Rel"), "{}", by_items);
+    assert!(by_items.contains("P < 0usize >") && by_items.contains("P < 1usize >"));
+    // Visiting the outer `mod m` itself, the module of the context has a module of that name: it
+    // is that one (ambiguous, so it keeps the nested meaning). Its items have the entry of the
+    // nested module, and the inner `mod m` is a module no entry depends on.
+    let nested_ix = (0..referrer.iter().count())
+        .find(|&ix| {
+            let module = referrer.context_module(referrer.context(ix)).unwrap();
+            referrer.module_path(module).map(<[Ident]>::len) == Some(1)
+        })
+        .unwrap();
+    let expected = format!(
+        "mod m {{ pub struct A {{ a : P < {}usize > , }} pub mod m {{ pub struct C {{ c : Rel , }} }} }}",
+        nested_ix
+    );
+    for how in ["mod", "item", "file"] {
+        assert_eq!(rewrite(&referrer, context, &m, how), expected, "{}", how);
+        assert_ne!(rewrite(&referrer, context, &m, how), by_items, "{}", how);
+    }
+    // A `mod` in the module that is visited as a whole is nested in it, as among its items: the
+    // module the Leaker did not see has no entry.
+    let m: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                a: Rel,
+            }
+        }
+    );
+    let (context, referrer) = analyze(&m);
+    let copy: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                a: Rel,
+            }
+            pub mod other {
+                pub mod deeper {
+                    pub struct D {
+                        d: Rel,
+                    }
+                }
+            }
+        }
+    );
+    for how in ["mod", "items"] {
+        let text = rewrite(&referrer, context, &copy, how);
+        assert!(text.contains("a : P < 0usize >"), "{}: {}", how, text);
+        assert!(text.contains("d : Rel"), "{}: {}", how, text);
+    }
+}
+
+// ── F56 ──────────────────────────────────────────────────────────────────────
+
+/// What the Leaker finds in `source`, a struct or an enum, analyzed with `allow_primitive()`: for
+/// each error its cause, `in_value` and `in_default`, and then the entries. `check_values` is on
+/// and off, which must not matter (an enum discriminant and the default of a const parameter are
+/// read either way).
+fn f56_read(source: &str, allow_self: bool) -> (Vec<(String, bool, bool)>, Vec<String>) {
+    let item: Item = parse_str(source).unwrap();
+    let mut found = Vec::new();
+    for check_values in [false, true] {
+        let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), check_values, false);
+        match &item {
+            Item::Enum(item) => leaker.intern_enum(item, allow_self),
+            Item::Struct(item) => leaker.intern_struct(item, allow_self),
+            _ => unreachable!(),
+        };
+        let result = leaker.result();
+        assert!(
+            result
+                .errors()
+                .iter()
+                .all(|error| error.reason == Reason::RelativePath),
+            "{}",
+            source
+        );
+        let errors = (result.errors().iter())
+            .map(|error| (string(&error.cause), error.in_value, error.in_default))
+            .collect();
+        let entries = result.into_referrer().iter().map(string).collect();
+        found.push((errors, entries));
+    }
+    let read = found.pop().unwrap();
+    assert_eq!(found.pop().unwrap(), read, "{}", source);
+    read
+}
+
+/// F56 (fixed): a relative macro or struct literal in an enum discriminant or in the default of a
+/// const parameter was no error, and a binding of such an expression was one.
+///
+/// Trigger: `enum E { B = two!() }`, `struct S<const N: usize = { Rel { a: 1 }.a }>(..)` (no error,
+/// whereas the copy in the Referrer's crate resolves `two!` and `Rel` there), and `enum E { B = {
+/// let x: Rel = 1; x } }`, `struct S<const N: usize = { let x = 1; x }>(..)` (the error `x`, a
+/// local binding read as a relative path). An array length (`[u8; two!()]`) and `B = REL` were
+/// errors, and a binding in an array length was no error.
+///
+/// Cause: the two expressions are read at the depth of the item, not of a type, where the visitor
+/// only knew the path of a value (`visit_expr_path()`), and no scope: a macro was recorded as a
+/// cause only in a type (`visit_path_of()`), a struct literal has no node of its own for it, and a
+/// binding was tracked only by the walk that `check_values` makes of a value (`ValueWalk`).
+///
+/// Fix: both are read by that walk, with or without `check_values` (`read_expr()`), so they have
+/// its rules: a binding, an item, a generic or `Self` is local, a relative macro, struct literal,
+/// function or constant is an error (`RelativePath`, the path as the cause), and a type in a type
+/// position is leaked as before. The error is not `in_value` (a value that `check_values` reads:
+/// `allow_values()` leaves it), and `in_default` for a const parameter. What else changes: the
+/// cause of a qualified path with a relative trait (`<::p::S as Rel>::N`) is the trait (`Rel`, as
+/// in a value that `check_values` reads), not the whole path, and its self type is an entry; a
+/// macro with arguments that are not expressions is `Unreadable` also if its path is absolute.
+///
+/// The cross-crate fixtures are 9215 and 9216 (the bindings are accepted, and the copy compiles in
+/// a crate that has none of the Leaker's names), 9217 and 9218 (the relative macro and struct
+/// literal are rejected: the copy did not compile), checked in `tests/cross_crate.rs`.
+#[test]
+fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value() {
+    // The source, the causes of the errors, the entries.
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        // The macro and the struct literal are errors.
+        ("enum E { B = two!() }", &["two !"], &[]),
+        ("enum E { B = 1 + two!() }", &["two !"], &[]),
+        ("enum E { A = 1, B = { two!() } }", &["two !"], &[]),
+        (
+            "struct S<const N: usize = { two!() }>([u8; N]);",
+            &["two !"],
+            &[],
+        ),
+        ("enum E { B = Rel { a: 1 }.a }", &["Rel"], &[]),
+        (
+            "struct S<const N: usize = { Rel { a: 1 }.a }>([u8; N]);",
+            &["Rel"],
+            &[],
+        ),
+        // A binding is local: a `let`, a closure parameter, a `match` arm, an item of the block.
+        // The types in their type positions are leaked.
+        ("enum E { B = { let x: Rel = 1; x } }", &[], &["Rel"]),
+        ("enum E { B = (|x: u8| x)(1) as isize }", &[], &[]),
+        ("enum E { B = match 2 { y => y } }", &[], &[]),
+        ("enum E { B = { let (a, b) = (1, 2); a + b } }", &[], &[]),
+        ("enum E { B = { const K: u8 = 1; K as isize } }", &[], &[]),
+        (
+            "struct S<const N: usize = { let x = 1; x }>([u8; N]);",
+            &[],
+            &[],
+        ),
+        (
+            "struct S<const N: usize = { (|x: usize| x)(1) }>([u8; N]);",
+            &[],
+            &[],
+        ),
+        // Controls: what was right stays.
+        ("enum E { B = REL }", &["REL"], &[]),
+        ("enum E { B = ::m::two!() }", &[], &[]),
+        ("struct S([u8; two!()]);", &["two !"], &[]),
+        (
+            "struct S([u8; { let x = 1; x }]);",
+            &[],
+            &["[u8 ; { let x = 1 ; x }]"],
+        ),
+        ("enum E { B = 1 as Rel }", &[], &["Rel"]),
+        ("enum E { B = <Rel as ::p::Tr>::N }", &[], &["Rel"]),
+        (
+            "enum E { B = rel_fn::<Rel2>() }",
+            &["rel_fn :: < Rel2 >"],
+            &[],
+        ),
+        ("enum E { B = ::p::f::<Rel2>() }", &[], &["Rel2"]),
+        (
+            "enum E { B = match 1 { Rel::A => 1, _ => 2 } }",
+            &["Rel :: A"],
+            &[],
+        ),
+        // The trait of a qualified path is the cause, and its self type an entry.
+        (
+            "enum E { B = <::p::S as Rel>::N }",
+            &["Rel"],
+            &[":: p :: S"],
+        ),
+    ];
+    for (source, causes, entries) in cases {
+        let (errors, found) = f56_read(source, true);
+        let found_causes: Vec<&str> = errors.iter().map(|(cause, _, _)| cause.as_str()).collect();
+        assert_eq!(&found_causes, causes, "{}", source);
+        assert_eq!(&found, entries, "{}", source);
+        // The default of a parameter is a default, and neither is a value of `check_values`.
+        let in_default = source.contains("const N");
+        assert!(
+            errors
+                .iter()
+                .all(|&(_, value, default)| !value && default == in_default),
+            "{}",
+            source
+        );
+    }
+
+    // The error is the one of a relative path: its headline and note.
+    let item: ItemEnum = parse_quote!(
+        enum E {
+            B = two!(),
+        }
+    );
+    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), false, false);
+    leaker.intern_enum(&item, true);
+    let err = assert_rejected(
+        &item,
+        leaker.result().finish(),
+        &["use absolute path: 'two !'"],
+    );
+    assert_eq!(
+        all_notes(&err),
+        ["it is in the discriminant of `B`, which the copy writes as it is"]
+    );
+    let item: ItemStruct = parse_quote!(
+        struct S<const N: usize = { Rel { a: 1 }.a }>([u8; N]);
+    );
+    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), false, false);
+    leaker.intern_struct(&item, true);
+    let err = assert_rejected(
+        &item,
+        leaker.result().finish(),
+        &["use absolute path: 'Rel'"],
+    );
+    assert_eq!(
+        all_notes(&err),
+        ["it is in the default of `N`, which the copy writes as it is"]
+    );
+
+    // `allow_values()` accepts what `check_values` reads, which this is not. `allow_default()`
+    // accepts the default of a parameter, not a discriminant.
+    let analyze = |source: &str| {
+        let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), true, false);
+        match parse_str::<Item>(source).unwrap() {
+            Item::Enum(item) => leaker.intern_enum(&item, true),
+            Item::Struct(item) => leaker.intern_struct(&item, true),
+            _ => unreachable!(),
+        };
+        leaker.result()
+    };
+    let (discriminant, default) = (
+        "enum E { B = two!() }",
+        "struct S<const N: usize = { two!() }>([u8; N]);",
+    );
+    // The errors that remain after `allow_values()` and after `allow_default()`.
+    for (source, values, defaults) in [(discriminant, 1, 1), (default, 1, 0)] {
+        let mut result = analyze(source);
+        result.allow_values();
+        assert_eq!(result.errors().len(), values, "{}", source);
+        let mut result = analyze(source);
+        result.allow_default();
+        assert_eq!(result.errors().len(), defaults, "{}", source);
+    }
+
+    // `Self` is read as in a value of `check_values`, but where the analysis denies it
+    // (`allow_self = false`) it is rejected, as it is in the default of a const parameter.
+    let item = "enum E { B = Self::K }";
+    assert_eq!(f56_read(item, true), (vec![], vec![]));
+    let (errors, entries) = f56_read(item, false);
+    assert_eq!(errors, [("Self :: K".to_string(), false, false)]);
+    assert!(entries.is_empty());
+}
+
+// ── F57 ──────────────────────────────────────────────────────────────────────
+
+/// The primitive names that `tokens` (`Leaker::assertions()`) checks, in order.
+fn f57_names(tokens: proc_macro2::TokenStream) -> Vec<String> {
+    let mut names = Vec::new();
+    for token in tokens {
+        match token {
+            proc_macro2::TokenTree::Group(group) => names.extend(f57_names(group.stream())),
+            proc_macro2::TokenTree::Ident(ident) => {
+                let ident = ident.to_string();
+                let name = ident.strip_prefix("__type_leak_assert_");
+                names.extend(
+                    name.and_then(|name| name.strip_suffix("_is_primitive"))
+                        .map(str::to_string),
+                );
+            }
+            _ => (),
+        }
+    }
+    names
+}
+
+/// Analyzes a struct, an enum or a trait.
+fn f57_intern<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    leaker: &mut Leaker<P, E>,
+    item: &Item,
+) {
+    match item {
+        Item::Struct(item) => leaker.intern_struct(item, true),
+        Item::Enum(item) => leaker.intern_enum(item, true),
+        Item::Trait(item) => leaker.intern_trait(item, true),
+        _ => unreachable!(),
+    };
+}
+
+/// The primitive names that the assertions of `source` check with `allow_primitive()`, which must
+/// be those with `allow(|_| true)` besides (it drops every error), and the same again: the text of
+/// the assertions does not change.
+fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
+    let item: Item = parse_str(source).unwrap();
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), check_values, false);
+        f57_intern(&mut leaker, &item);
+        texts.push(leaker.assertions().to_string());
+        let config = Allow::new().allow_primitive().allow(|_| true);
+        let mut leaker = Leaker::from_config(config, check_values, false);
+        f57_intern(&mut leaker, &item);
+        texts.push(leaker.assertions().to_string());
+    }
+    assert_eq!(texts[0], texts[1], "{}", source);
+    assert_eq!(texts[0], texts[2], "{}", source);
+    assert_eq!(texts[1], texts[3], "{}", source);
+    f57_names(texts[0].parse().unwrap())
+}
+
+/// F57 (fixed): `Leaker::assertions()` left out the primitive names in a part that an error makes
+/// copied as written.
+///
+/// Trigger: `struct A { a: Rel<'_, u8> }`, `struct A { a: &dyn RelTr<u8> }` and `struct A<T:
+/// Into<u32>> { a: T }`, with `allow_primitive()` (and `allow(|_| true)`, which drops the errors):
+/// the assertions were empty. With `Allow::new()` `u8` is a relative path, so there is nothing to
+/// assume. The copy writes `u8` as it is, which would be another type if the Leaker's crate shadowed
+/// `u8`, and the assertion is for that.
+///
+/// Cause: a type that conflicts is copied as written whole, and its parts were dropped, with the
+/// `Effect::Primitive` that the visit of each recorded; a bound or the path of a value that
+/// conflicts (`Into<u32>`, `rel_fn::<u8>`) is not visited at all. The Leaker kept the primitive
+/// names of a type that is not leaked (`Cannot and need not be leaked`) and of the parts of one
+/// that is leaked in parts only.
+///
+/// Fix: a part has the primitive names that it is copied with (`Part::primitives` in
+/// `src/analysis.rs`): those of the effects of the type's components and of the types leaked whole
+/// that it holds (`PendingType::primitives`), and, for a bound or the path of a value, those of
+/// its syntax (`PrimitiveNames`). A type that is replaced by its entry still asserts nothing: its
+/// components are gone, and a type is a part only where the Referrer leaves it as written.
+#[test]
+fn f57_the_primitive_names_in_a_part_copied_as_written_are_asserted() {
+    let cases: &[(&str, &[&str])] = &[
+        // The three of the trigger.
+        ("struct A { a: Rel<'_, u8> }", &["u8"]),
+        ("struct A { a: &dyn RelTr<u8> }", &["u8"]),
+        ("struct A<T: Into<u32>> { a: T }", &["u32"]),
+        // In order of appearance, at any depth of the part.
+        (
+            "struct A { a: Rel<'_, ::core::option::Option<(u8, u16)>> }",
+            &["u8", "u16"],
+        ),
+        (
+            "struct A<T: Into<(u32, u16)> + From<u8>> { a: T }",
+            &["u32", "u16", "u8"],
+        ),
+        // A path in a where predicate.
+        ("struct A<T> where T: Into<u32> { a: T }", &["u32"]),
+        // Only the part: the entry beside it, and the types it holds, assert nothing.
+        ("struct A { a: Rel<'_, u8>, b: Rel2<u16> }", &["u8"]),
+        ("struct A { a: Rel<u8>, b: Wrap<Rel2<u16>> }", &[]),
+        ("struct A { a: [u8; size_of::<u16>()] }", &[]),
+        // The same without an error: copied, so assumed.
+        ("struct A { a: ::core::option::Option<u8> }", &["u8"]),
+    ];
+    for (source, names) in cases {
+        assert_eq!(&f57_assertions(source, false), names, "{}", source);
+    }
+    // Nothing is assumed where `u8` is a relative path, which the error tells.
+    let item: ItemStruct = parse_quote!(
+        struct A {
+            a: Rel<'_, u8>,
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true);
+    assert!(f57_names(leaker.assertions()).is_empty());
+
+    // The path of a value that is a part, with `check_values` or not (a discriminant, the default
+    // of a const parameter).
+    let value_cases: &[(&str, bool, &[&str])] = &[
+        (
+            "trait Tr { fn f(&self) { rel_fn::<u8>(); } }",
+            true,
+            &["u8"],
+        ),
+        (
+            "trait Tr { const C: usize = rel_fn::<u16>(); }",
+            true,
+            &["usize", "u16"],
+        ),
+        ("enum E { B = rel_fn::<u8>() }", false, &["u8"]),
+        ("enum E { B = rel_fn::<u8>() }", true, &["u8"]),
+        (
+            "struct S<const N: usize = { rel_fn::<u32>() }>([u8; N]);",
+            false,
+            &["usize", "u32", "u8"],
+        ),
+        ("trait Tr { fn f(&self) { rel_fn::<Rel>(); } }", true, &[]),
+    ];
+    for (source, check_values, names) in value_cases {
+        assert_eq!(&f57_assertions(source, *check_values), names, "{}", source);
+    }
+
+    // An entry that is cut and copied as written instead keeps its names: the type is a part
+    // through `cut_conflicts()` (the self type of an impl whose bound names `Self`), and through
+    // `correct_unmeant_self()` (`Self` where it has no meaning).
+    let item: ItemImpl = parse_quote!(
+        impl<T: Clone> Tr for Rel<u8, T>
+        where
+            Self: ::core::marker::Sized,
+            T: AsRef<Self>,
+        {
+        }
+    );
+    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), false, false);
+    leaker.intern_impl(&item, true);
+    let assertions = f57_names(leaker.assertions());
+    let errors = leaker.result().errors().to_vec();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("is in the self type of the impl")));
+    assert_eq!(assertions, ["u8"]);
+    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), false, false);
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Rel<u8, Self>))
+    });
+    assert_eq!(f57_names(leaker.assertions()), ["u8"]);
+    // Control: the same type without `Self` is an entry, and asserts nothing.
+    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), false, false);
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Rel<u8>))
+    });
+    assert!(f57_names(leaker.assertions()).is_empty());
+}
+
+// ── F58 ──────────────────────────────────────────────────────────────────────
+
+/// What `intern_impl()` and the scope are compared by: the serialized result (the Referrer and
+/// each error with its notes and help), and the headlines and helps of the errors, for a failure
+/// that can be read.
+fn f58_snapshot(result: LeakerResult) -> (String, Vec<String>, Vec<String>) {
+    let errors = result.errors();
+    let messages = errors.iter().map(|e| e.message.clone()).collect();
+    (string(&result), messages, all_helps(errors))
+}
+
+/// `item` analyzed by `intern_impl()`.
+fn f58_interned(item: &ItemImpl, allow_self: bool) -> (String, Vec<String>, Vec<String>) {
+    let mut leaker = new_leaker();
+    leaker.intern_impl(item, allow_self);
+    f58_snapshot(leaker.result())
+}
+
+/// `item` analyzed by `enter_impl()` with the trait of the impl, and the walk of the whole impl
+/// that `View` documents (`syn::visit::visit_item_impl()`).
+fn f58_entered(item: &ItemImpl, allow_self: bool) -> (String, Vec<String>, Vec<String>) {
+    let trait_ = item.trait_.as_ref().map(|(_, path, _)| path);
+    let mut leaker = new_leaker();
+    leaker.enter_impl(&item.generics, &item.self_ty, trait_, allow_self, |view| {
+        syn::visit::visit_item_impl(view, item)
+    });
+    f58_snapshot(leaker.result())
+}
+
+/// F58 (fixed): `enter_impl()` could not say whether the impl is inherent or of which trait.
+///
+/// Trigger: `impl S { fn f<'a>(&self, x: Wrap<'a>) -> &'a u8 { .. } }` in `enter_impl(&generics,
+/// &self_ty, allow_self, ..)` with the walk of the impl in the closure: the error E0195 (a method
+/// lifetime that the copy would leave unconstrained, `Reason::UnconstrainedLifetime`), and no entry
+/// for `Wrap<'a>`, while `intern_impl()` accepts the impl with the entries `S` and `Wrap<'a>` (and
+/// `u8`, unless primitive types are allowed). `impl RelTr for S {}` had no error (`intern_impl()`: `RelativePath`, the trait is a
+/// relative path), and the help for `Self::A` in a trait impl said "write `<Self as SomeTrait>::A`"
+/// with a placeholder instead of the trait.
+///
+/// Cause: only `intern_impl()` passed the trait to the scope (`Scopes::enter_impl_of()`), and only
+/// the walk that it makes (`walk_item_impl()`, private) set `inherent_impl`, which the check of the
+/// signature of a method reads: it compares a method with the signature of a trait unless the impl
+/// is inherent. The scope of `enter_impl()` knew neither.
+///
+/// Fix: `enter_impl(generics, self_ty, trait_: Option<&Path>, allow_self, f)`. `None` is an
+/// inherent impl, whose methods are not compared (F22); `Some(path)` is the trait, which the scope
+/// checks as `intern_impl()` does, and which the help for `Self::A` names. So the scope with the
+/// walk `syn::visit::visit_item_impl(view, &item)` gives what `intern_impl()` gives (the Referrer,
+/// the errors with their notes and helps, and the context), but for the limitation of the next
+/// test. A caller that resolves the trait by its name elsewhere (`coinduction`) gives `None` for a
+/// trait impl: the scope does not check the path, and does not compare the methods it visits.
+#[test]
+fn f58_enter_impl_is_told_the_trait_of_the_impl() {
+    // The inherent impl: no error, two entries (`u8` is allowed).
+    let item: ItemImpl = parse_quote!(
+        impl S {
+            fn f<'a>(&self, x: Wrap<'a>) -> &'a u8 {
+                todo!()
+            }
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.enter_impl(&item.generics, &item.self_ty, None, true, |view| {
+        syn::visit::visit_item_impl(view, &item)
+    });
+    let result = leaker.result();
+    assert!(result.errors().is_empty(), "{}", string(&result));
+    let entries: Vec<String> = result.into_referrer().iter().map(string).collect();
+    assert_eq!(entries, ["S", "Wrap < 'a >"]);
+    // The same method in an impl of a trait is compared with the trait's signature: E0195.
+    let item: ItemImpl = parse_quote!(
+        impl ::p::Tr for S {
+            fn f<'a>(&self, x: Wrap<'a>) -> &'a u8 {
+                todo!()
+            }
+        }
+    );
+    let mut leaker = new_leaker();
+    let trait_ = item.trait_.as_ref().map(|(_, path, _)| path);
+    leaker.enter_impl(&item.generics, &item.self_ty, trait_, true, |view| {
+        syn::visit::visit_item_impl(view, &item)
+    });
+    let reasons: Vec<Reason> = leaker.result().errors().iter().map(|e| e.reason).collect();
+    assert_eq!(reasons, [Reason::UnconstrainedLifetime]);
+    // The path of the trait is checked on entering the scope.
+    let item: ItemImpl = parse_quote!(impl RelTr for S {});
+    let (_, trait_, _) = item.trait_.as_ref().unwrap();
+    let mut leaker = new_leaker();
+    leaker.enter_impl(&item.generics, &item.self_ty, Some(trait_), true, |_| ());
+    let result = leaker.result();
+    assert_eq!(
+        joined_messages(result.errors()),
+        "use absolute path: 'RelTr'"
+    );
+    // The help for `Self::A` names the trait.
+    let item: ItemImpl = parse_quote!(
+        impl ::p::Tr for S {
+            type A = u8;
+            fn f(&self) -> Wrap<Self::A> {
+                todo!()
+            }
+        }
+    );
+    let mut leaker = new_leaker();
+    let trait_ = item.trait_.as_ref().map(|(_, path, _)| path);
+    leaker.enter_impl(&item.generics, &item.self_ty, trait_, true, |view| {
+        syn::visit::visit_item_impl(view, &item)
+    });
+    let result = leaker.result();
+    let helps = all_helps(result.errors());
+    assert_eq!(helps.len(), 1, "{}", string(&result));
+    assert_eq!(helps[0], "replace `Self::A` with `<Self as ::p::Tr>::A`");
+}
+
+/// The scope with the trait of the impl and the walk of the impl gives what `intern_impl()` gives,
+/// for an impl that is inherent or of a trait (absolute or relative, with or without arguments),
+/// with a method lifetime or a `Self::A`, with `allow_self` true and false (F58).
+#[test]
+fn f58_the_scope_of_an_impl_gives_what_intern_impl_gives() {
+    let impls: Vec<ItemImpl> = vec![
+        // Inherent.
+        parse_quote!(impl S {}),
+        parse_quote!(
+            impl<T> S<T>
+            where
+                T: Clone,
+            {
+                fn g(&self) -> Wrap<T> {
+                    todo!()
+                }
+            }
+        ),
+        parse_quote!(impl S { fn f<'a>(&self, x: Wrap<'a>) -> &'a u8 { todo!() } }),
+        parse_quote!(
+            impl<'b> S<'b> {
+                fn f<'a>(&self, x: &'a Rel<'b>) -> Rel2<'a> {
+                    todo!()
+                }
+            }
+        ),
+        parse_quote!(impl S { const C: Rel = todo!(); }),
+        parse_quote!(impl ::p::S { fn f(&self, x: Wrap<Self>) {} }),
+        parse_quote!(
+            impl<T> S<T> {
+                fn f(&self) -> Wrap<<Self as ::p::Tr>::A> {
+                    todo!()
+                }
+            }
+        ),
+        // A trait with an absolute path.
+        parse_quote!(impl ::p::Tr for S {}),
+        parse_quote!(
+            impl<T> ::p::Tr<Rel<T>, Rel2> for S<T> {}
+        ),
+        parse_quote!(
+            impl<T> ::p::Tr<T, Rel<T>> for ::p::S<T> where T: ::p::Bound<Rel2> {}
+        ),
+        parse_quote!(impl ::p::Tr for S { fn f<'a>(&self, x: Wrap<'a>) -> &'a u8 { todo!() } }),
+        parse_quote!(impl ::p::Tr for S { type A = Rel; fn f(&self) -> Wrap<Self::A> { todo!() } }),
+        parse_quote!(
+            impl<T> ::p::Tr<T> for S<T> {
+                type A = u8;
+                fn f(&self) -> Wrap<Self::A> {
+                    todo!()
+                }
+            }
+        ),
+        parse_quote!(impl ::p::Tr for ::p::S { fn f(&self, x: Rel<Self>) { todo!() } }),
+        // A trait with a relative path.
+        parse_quote!(impl RelTr for S {}),
+        parse_quote!(
+            impl<T> RelTr<Rel<T>> for S<T> {}
+        ),
+        parse_quote!(impl m::RelTr<Rel> for S { fn f(&self) -> Wrap<Self::A> { todo!() } }),
+        parse_quote!(impl RelTr for ::p::S { fn f<'a>(&self, x: Wrap<'a>) -> &'a u8 { todo!() } }),
+        // A bound that names `Self`, where the self type has no entry.
+        parse_quote!(
+            impl<T> ::p::Tr<T> for u8 where T: AsRef<Self> {}
+        ),
+        parse_quote!(
+            impl<T: ::p::Bound<Rel<Self>>> ::p::Tr<T> for u8 {}
+        ),
+    ];
+    let mut errors = 0;
+    for item in &impls {
+        for allow_self in [true, false] {
+            let interned = f58_interned(item, allow_self);
+            let entered = f58_entered(item, allow_self);
+            assert_eq!(
+                interned,
+                entered,
+                "`{}`, allow_self = {}",
+                string(item),
+                allow_self
+            );
+            errors += interned.1.len();
+        }
+    }
+    // The impls with an error are compared with it, not only the clean ones.
+    assert!(errors >= 8, "{}", errors);
+}
+
+/// F58 (limitation): the walk of the whole impl in the scope does not cut the entries of the self
+/// type of an impl whose bound names `Self`.
+///
+/// `impl<T> ::p::S<Rel<T>> where T: AsRef<Self> {}`: `intern_impl()` reports that `Rel<T>` is in the
+/// self type of the impl and a bound of its generics names `Self` (`Reason::SelfInImplSelfType`:
+/// the copy would write `Self` as a path through the Repeater that stands for itself, E0391), and
+/// copies an optional entry in the self type (`impl<T> ::p::S<T> where T: AsRef<Self> {}`) as
+/// written. It walks the self type apart and cuts those entries when it ends
+/// (`AnalyzeVisitor::cut_self_cycles()`, in the private `walk_item_impl()`).
+/// `syn::visit::visit_item_impl(view, &item)` visits the self type like any other type, so it does
+/// not: it leaves `Rel<T>` an entry and reports the bound only, and `::p::S<T>` is an optional
+/// entry. For an impl whose bound may name `Self`, use `intern_impl()` (or `View::visit_item()` in
+/// a scope).
+#[test]
+fn f58_the_walk_in_the_scope_does_not_cut_the_self_type_of_the_impl() {
+    let reasons =
+        |errors: &[ErrorItem]| -> Vec<Reason> { errors.iter().map(|e| e.reason).collect() };
+    let analyze = |item: &ItemImpl, interned: bool| -> LeakerResult {
+        let mut leaker = new_leaker();
+        if interned {
+            leaker.intern_impl(item, true);
+        } else {
+            leaker.enter_impl(&item.generics, &item.self_ty, None, true, |view| {
+                syn::visit::visit_item_impl(view, item)
+            });
+        }
+        leaker.result()
+    };
+    let item: ItemImpl = parse_quote!(
+        impl<T> ::p::S<Rel<T>> where T: AsRef<Self> {}
+    );
+    assert_eq!(
+        reasons(analyze(&item, true).errors()),
+        [Reason::SelfInImplSelfType, Reason::UnprovableBound]
+    );
+    assert_eq!(
+        reasons(analyze(&item, false).errors()),
+        [Reason::UnprovableBound]
+    );
+    let item: ItemImpl = parse_quote!(
+        impl<T> ::p::S<T> where T: AsRef<Self> {}
+    );
+    let optional =
+        |interned: bool| -> Vec<String> { f52_entries(&analyze(&item, interned).into_referrer()) };
+    assert!(optional(true).is_empty());
+    assert_eq!(optional(false), ["?:: p :: S < T >"]);
 }

@@ -2212,4 +2212,49 @@ pub mod kinds {
             it.len() + it.rev().count()
         }
     }
+
+    // F56 (`tests/findings.rs`): an enum discriminant and the default of a const parameter are read
+    // like a value, with or without `check_values`. Each fails to build on the code before the fix.
+
+    /// F56, 9215: the discriminants bind names (`x`, `y`, `a`, `b`, `z`, `K`): they are local, not
+    /// relative paths. The Leaker rejected them (`use absolute path: 'x'`), so the Referrer's crate
+    /// lacked `DiscriminantBindings`. The copy writes them as they are, in a crate that has none of
+    /// the Leaker's names.
+    #[prop_leak(id = 9215, allow_self = true, scope = "mod")]
+    pub enum DiscriminantBindings {
+        Let = { let x = 3; x },
+        Arm = match 5 { y => y + 1 },
+        Pair = { let (a, b) = (1, 2); a * 10 + b },
+        Typed = { let z: u8 = 7; z as isize },
+        Item = { const K: isize = 40; K + 2 },
+    }
+
+    /// F56, 9216: the default of the const parameter binds a name (`n`). It was rejected as well.
+    #[prop_leak(id = 9216, allow_self = true, scope = "mod")]
+    pub struct DefaultBinding<const N: usize = { let n = 2; n * 2 }>(pub [u8; N]);
+
+    /// A macro of this crate, which the Referrer's crate does not have.
+    macro_rules! rel_two {
+        () => {
+            2
+        };
+    }
+
+    /// F56, 9217: a discriminant that calls a macro of this crate (`rel_two!`) by a relative path.
+    /// The Leaker did not report it, and the copy in the Referrer's crate could not resolve the
+    /// macro. It is rejected now: the Referrer's macro expands to nothing.
+    #[prop_leak(id = 9217, allow_self = true, scope = "mod")]
+    pub enum RelativeMacroDiscriminant {
+        Two = rel_two!(),
+    }
+
+    /// A struct of this crate, which the Referrer's crate does not have.
+    pub struct RelPoint {
+        pub a: usize,
+    }
+
+    /// F56, 9218: the default of a const parameter that writes a struct of this crate as a literal
+    /// (`RelPoint { a: 1 }`). Not reported before, and the copy could not resolve `RelPoint`.
+    #[prop_leak(id = 9218, allow_self = true, scope = "mod")]
+    pub struct LiteralDefault<const N: usize = { RelPoint { a: 1 }.a }>(pub [u8; N]);
 }

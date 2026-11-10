@@ -1,5 +1,7 @@
 //! The check of the values of an item, for [`check_values`](crate::Leaker::from_config): the
 //! default of an associated const, the value of a const or a static, and the body of a function.
+//! An enum discriminant and the default of a const parameter are read the same way, whether
+//! values are read or not.
 //!
 //! The copy writes a value as it is, since an expression cannot go through the Repeater. So the
 //! check rejects every path of the value that depends on where it is written, with the error of a
@@ -58,6 +60,16 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         let outer = self.reading(default);
         ValueWalk::new(self, what).visit_expr(expr);
         self.reading_done(outer);
+    }
+
+    /// Reads the expression `expr` as a value, whether values are read or not: an enum discriminant
+    /// or the default of a const parameter, which the copy writes as it is. `what` says where it
+    /// is, as the notes do. `in_value` is not set for what it finds: that is for the values that
+    /// `check_values` reads.
+    pub(super) fn read_expr(&mut self, what: String, expr: &Expr) {
+        let mut walk = ValueWalk::new(self, what);
+        walk.deny_self = true;
+        walk.visit_expr(expr);
     }
 
     /// Checks the body `block` of the function `sig`, if values are read. `default`: it is the
@@ -123,6 +135,10 @@ struct ValueWalk<'a, P> {
     reads: usize,
     /// While such a type is read: the name it has that the value declares.
     declared_name: Option<String>,
+    /// A path that starts with `Self` is rejected if the analysis denies `Self` (`allow_self` is
+    /// `false`), as in the default of a const parameter. A value that `check_values` reads has no
+    /// such rule.
+    deny_self: bool,
 }
 
 impl<'a, P: Fn(&Path) -> bool> ValueWalk<'a, P> {
@@ -134,6 +150,7 @@ impl<'a, P: Fn(&Path) -> bool> ValueWalk<'a, P> {
             barrier: 0,
             reads: 0,
             declared_name: None,
+            deny_self: false,
         }
     }
 
@@ -199,7 +216,7 @@ impl<'a, P: Fn(&Path) -> bool> ValueWalk<'a, P> {
         }
         if self_segment(path).is_some() {
             self.visitor.check_self_has_meaning(Cause::expr_path(path));
-            return true;
+            return !self.deny_self || self.visitor.allow_self;
         }
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
             return true;
@@ -272,7 +289,11 @@ impl<'a, P: Fn(&Path) -> bool> ValueWalk<'a, P> {
         // It is copied as written with its arguments, so the relative paths in them are written too.
         let paths = match cause.as_path() {
             Some(path) => {
-                let mut paths = vec![without_arguments(path)];
+                // A path that starts with `Self` is no relative path (no rule is asked about it).
+                let mut paths = Vec::new();
+                if self.visitor.is_relative_path(path) {
+                    paths.push(without_arguments(path));
+                }
                 ArgumentPaths {
                     walk: self,
                     found: &mut paths,

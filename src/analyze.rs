@@ -3,8 +3,8 @@
 use crate::analysis::{
     ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
     has_ambiguous, has_error, has_optional, names_self, part_names_self, primitive_effects,
-    scope_error, shift_seen, unshift_seen, CheckResult, Effect, Part, PendingType, Place,
-    SelfMention, SignatureFacts, SignatureMark,
+    primitive_names, scope_error, shift_seen, unshift_seen, CheckResult, Effect, Part, PendingType,
+    Place, SelfMention, SignatureFacts, SignatureMark,
 };
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
@@ -460,6 +460,9 @@ pub(crate) struct DeclaredSelf {
     allow_self: bool,
     /// `Self` is a type that the copy writes (the self type of an impl), not the item itself.
     written: bool,
+    /// The scope is that of an inherent impl: no trait declares the signatures of its methods
+    /// (see [`AnalyzeVisitor::with_signature()`]).
+    inherent: bool,
     /// The generic associated types of the trait, if the scope is that of a trait whose items the
     /// Leaker sees (see [`Gat`]).
     gats: Vec<Gat>,
@@ -574,28 +577,19 @@ pub(crate) trait Scopes {
             requirement: SelfRequirement::of_item(ident, generics),
             allow_self,
             written: false,
+            inherent: false,
             gats: Vec::new(),
         };
         self.enter_declaring(generics, declares, None, f)
     }
 
+    /// An impl of the trait `trait_` (which must not depend on the context), or an inherent impl
+    /// if it is `None`.
     fn enter_impl<R>(
         &mut self,
         generics: &Generics,
         self_ty: &Type,
-        allow_self: bool,
-        f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
-    ) -> (ContextId, R) {
-        self.enter_impl_of(generics, self_ty, None, allow_self, f)
-    }
-
-    /// Like `enter_impl()` for an impl of the trait `trait_path`, which must not depend on the
-    /// context.
-    fn enter_impl_of<R>(
-        &mut self,
-        generics: &Generics,
-        self_ty: &Type,
-        trait_path: Option<&Path>,
+        trait_: Option<&Path>,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
@@ -603,9 +597,10 @@ pub(crate) trait Scopes {
             requirement: SelfRequirement::Type(self_ty.clone()),
             allow_self,
             written: true,
+            inherent: trait_.is_none(),
             gats: Vec::new(),
         };
-        self.enter_declaring(generics, declares, trait_path, f)
+        self.enter_declaring(generics, declares, trait_, f)
     }
 
     fn enter_trait<R>(
@@ -631,6 +626,7 @@ pub(crate) trait Scopes {
             requirement: SelfRequirement::of_trait(ident, generics),
             allow_self,
             written: false,
+            inherent: false,
             gats,
         };
         self.enter_declaring(generics, declares, None, f)
@@ -1496,6 +1492,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     self.self_written = declared.written;
                     self.self_nested = false;
                     self.self_trait = trait_path.as_deref().map(|path| self.impl_trait(path));
+                    self.inherent_impl = declared.inherent;
                     self.allow_self = declared.allow_self;
                 }
                 let gats = declares
@@ -2548,7 +2545,8 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                         for needed in &needs {
                             if let Some(conflict) = self.self_env_cycle(ty, needed) {
                                 // The type is left without an entry, and copied as written.
-                                let mut conflict = self.with_part(conflict, ty, Some(context));
+                                let mut conflict =
+                                    self.with_part(conflict, ty, Some(context), &effects);
                                 conflict.seen = self.self_errors.len();
                                 conflict.place = self.place();
                                 conflict.paths = self.paths_since(inner.must_start);
@@ -2583,7 +2581,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     .env_cycle(ty, &context)
                     .or_else(|| self.nested_self_cycle(ty, &context, &inner));
                 if let Some(conflict) = cycle {
-                    let mut conflict = self.with_part(conflict, ty, Some(context));
+                    let mut conflict = self.with_part(conflict, ty, Some(context), &effects);
                     conflict.paths = self.paths_since(inner.must_start);
                     let conflict = self.nested_in_type(conflict, ty, entry);
                     return self.push_error(conflict);
@@ -2593,20 +2591,21 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                     is_must_intern: true,
                     in_graph: true,
                     ambiguous: entry.ambiguous && context.is_empty(),
+                    primitives: primitive_names(&effects),
                     ..PendingType::new(ty, context, Vec::new())
                 }
             }
             Some(Err(conflict)) => {
-                // The errors of the parts are real as well, if the cause of the type is one of them.
-                if bare {
-                    self.frame.effects.extend(error_effects(effects));
-                }
                 // The type is copied as written: the Referrer leaves it so. One whose context
                 // cannot be written has none, and is found where the Referrer cannot write it.
                 let context = self.context_of(ty, &inner).ok();
-                let mut conflict = self.with_part(conflict, ty, context);
+                let mut conflict = self.with_part(conflict, ty, context, &effects);
                 if let Some(part) = conflict.part.as_mut() {
                     part.mark = mark;
+                }
+                // The errors of the parts are real as well, if the cause of the type is one of them.
+                if bare {
+                    self.frame.effects.extend(error_effects(effects));
                 }
                 let conflict = self.nested_in_type(conflict, ty, entry);
                 return self.push_error(conflict);
@@ -2655,7 +2654,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 let leaked_whole = has_must && is_whole_reference(ty);
                 if leaked_whole {
                     if let Some(conflict) = self.env_cycle(ty, &context) {
-                        let mut conflict = self.with_part(conflict, ty, Some(context));
+                        let mut conflict = self.with_part(conflict, ty, Some(context), &effects);
                         conflict.paths = self.paths_since(inner.must_start);
                         let conflict = self.nested_in_type(conflict, ty, entry);
                         return self.push_error(conflict);
@@ -2713,12 +2712,14 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     }
 
     /// Gives `conflict`, about `ty` in `context` (`None`: it cannot be written), the part that the
-    /// Referrer leaves as written: the whole type (see [`Part`]).
+    /// Referrer leaves as written: the whole type (see [`Part`]). `effects` are those of the
+    /// components of `ty`, whose primitive names the copy writes.
     fn with_part(
         &self,
         mut conflict: CheckResult,
         ty: &Type,
         context: Option<Context>,
+        effects: &[Effect],
     ) -> CheckResult {
         conflict.part = Some(Part {
             cause: Cause::Type(ty.clone()),
@@ -2726,6 +2727,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             in_predicate: self.env_depth > 0,
             within: None,
             mark: None,
+            primitives: primitive_names(effects),
         });
         conflict
     }
@@ -2750,12 +2752,18 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             Some(module) => context.with_module(Some(module.id)),
             None => context,
         });
+        let mut names = PrimitiveNames {
+            visitor: self,
+            found: Vec::new(),
+        };
+        names.visit_path(path);
         Part {
             cause,
             context,
             in_predicate: self.env_depth > 0,
             within: None,
             mark: None,
+            primitives: names.found,
         }
     }
 
@@ -4485,16 +4493,8 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         if free && !starts_with_generic {
             // An allowed primitive name is copied as it is. It may be shadowed (`type u16 = i32;`),
             // so it is recorded for `Leaker::assertions()`.
-            if i.leading_colon.is_none() {
-                if let Some(seg) = i
-                    .segments
-                    .first()
-                    .filter(|seg| is_primitive_name(&seg.ident))
-                {
-                    self.frame
-                        .effects
-                        .push(Effect::Primitive(seg.ident.clone()));
-                }
+            if let Some(ident) = primitive_head(i) {
+                self.frame.effects.push(Effect::Primitive(ident.clone()));
             }
             // An external crate path is resolved by name, which the Referrer may not share.
             if in_type && self.allowed.is_soft_path(i) {
@@ -5023,8 +5023,20 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
         }
         if let Some(expr) = &i.default {
             let outer = std::mem::replace(&mut self.in_param_default, true);
-            self.visit_expr(expr);
+            self.read_expr(format!("the default of `{}`", i.ident), expr);
             self.in_param_default = outer;
+        }
+    }
+
+    fn visit_variant(&mut self, i: &Variant) {
+        // As `syn::visit::visit_variant()`, with the discriminant read as a value.
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_ident(&i.ident);
+        self.visit_fields(&i.fields);
+        if let Some((_, expr)) = &i.discriminant {
+            self.read_expr(format!("the discriminant of `{}`", i.ident), expr);
         }
     }
 
@@ -5180,6 +5192,35 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
             self.relative_path(Cause::path_expr(i), Cause::path_expr(i), part, paths);
             self.nest_last(|visitor| visitor.visit_expr_path(i));
         }
+    }
+}
+
+/// The primitive name that `path` starts with (`u8` in `u8::MAX`).
+fn primitive_head(path: &Path) -> Option<&Ident> {
+    path.segments
+        .first()
+        .map(|seg| &seg.ident)
+        .filter(|ident| path.leading_colon.is_none() && is_primitive_name(ident))
+}
+
+/// Collects the primitive names in the syntax it visits that the copy writes as they are, each
+/// once: those that `AnalyzeVisitor::visit_path_of()` records in a type, for the syntax that is a
+/// part copied as written without the visit of its types (a bound, the path of a value).
+struct PrimitiveNames<'a, P> {
+    visitor: &'a AnalyzeVisitor<P>,
+    found: Vec<Ident>,
+}
+
+impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for PrimitiveNames<'_, P> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        if self.visitor.is_free_path(i) && !self.visitor.starts_with_generic(i) {
+            if let Some(ident) = primitive_head(i) {
+                if !self.found.contains(ident) {
+                    self.found.push(ident.clone());
+                }
+            }
+        }
+        syn::visit::visit_path(self, i)
     }
 }
 

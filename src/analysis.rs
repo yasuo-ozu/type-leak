@@ -137,6 +137,8 @@ pub(crate) struct Part {
     pub(crate) within: Option<(Type, Context)>,
     /// The signature that made it a part, if one did.
     pub(crate) mark: Option<SignatureMark>,
+    /// The primitive names in it, which the copy writes as they are ([`Leaker::assertions()`]).
+    pub(crate) primitives: Vec<Ident>,
 }
 
 /// A part that the Referrer leaves as written, with its contexts interned. Serialized as `KIND (
@@ -255,6 +257,9 @@ pub(crate) struct PendingType {
     pub(crate) in_predicate: bool,
     /// The relative paths the type depends on, if it is an entry ([`CheckResult::paths`]).
     pub(crate) paths: Vec<Path>,
+    /// The primitive names in a type that is leaked whole, which `components` does not hold: they
+    /// are assumed if the type is copied as written instead ([`Part::primitives`]).
+    pub(crate) primitives: Vec<Ident>,
     pub(crate) components: Vec<Effect>,
 }
 
@@ -274,18 +279,22 @@ impl PendingType {
             unmeant_self: false,
             in_predicate: false,
             paths: Vec::new(),
+            primitives: Vec::new(),
             components,
         }
     }
 
     /// The part that the Referrer leaves as written if the type is copied so instead of leaked.
     pub(crate) fn part(&self) -> Part {
+        let mut primitives = self.primitives.clone();
+        primitives.extend(primitive_names(&self.components));
         Part {
             cause: Cause::Type(self.ty.clone()),
             context: Some(self.context.clone()),
             in_predicate: self.in_predicate,
             within: None,
             mark: None,
+            primitives,
         }
     }
 }
@@ -355,6 +364,7 @@ impl Analysis {
                 Effect::Error(error) => {
                     // The contexts are interned as an entry's is.
                     if let Some(part) = &error.part {
+                        self.primitives.extend(part.primitives.iter().cloned());
                         let item = PartItem {
                             part: part.cause.clone(),
                             context: part
@@ -637,6 +647,38 @@ pub(crate) fn error_effects(effects: Vec<Effect>) -> Vec<Effect> {
         }
     }
     found
+}
+
+/// The primitive names in `effects`, each once, also in the parts and in the types leaked whole:
+/// the names that a copy of the syntax as written holds ([`Part::primitives`]).
+pub(crate) fn primitive_names(effects: &[Effect]) -> Vec<Ident> {
+    let mut found = Vec::new();
+    collect_primitive_names(effects, &mut found);
+    found
+}
+
+fn collect_primitive_names(effects: &[Effect], found: &mut Vec<Ident>) {
+    let mut add = |names: &[Ident]| {
+        for ident in names {
+            if !found.contains(ident) {
+                found.push(ident.clone());
+            }
+        }
+    };
+    for effect in effects {
+        match effect {
+            Effect::Primitive(ident) => add(std::slice::from_ref(ident)),
+            Effect::Type(pending) => {
+                add(&pending.primitives);
+                add(&primitive_names(&pending.components));
+            }
+            Effect::Error(error) => {
+                if let Some(part) = &error.part {
+                    add(&part.primitives);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn primitive_effects(effects: Vec<Effect>) -> Vec<Effect> {

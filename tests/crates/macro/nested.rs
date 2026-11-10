@@ -123,7 +123,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let mut leaker = Leaker::from_config(config, false, false);
     let (context, ()) =
         leaker.enter_trait(&nested.trait_ident, &nested.trait_generics, true, |view| {
-            view.enter_impl(&nested.impl_generics, &nested.self_ty, true, |view| {
+            view.enter_impl(&nested.impl_generics, &nested.self_ty, None, true, |view| {
                 for (_, ty) in &nested.types {
                     view.visit_type(ty);
                 }

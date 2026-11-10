@@ -399,24 +399,25 @@ fn a_nested_function_or_type_alias_keeps_the_self_around() {
     // E0401 there, so the one around is its only meaning. Only a struct, an enum, a union, a trait
     // and an impl have a `Self` of their own, and the Referrer must agree.
     let mut leaker = Leaker::new();
-    let (context, ()) = leaker.enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
-        for item in [
-            parse_quote!(
-                fn f(x: Rel<Self>) {}
-            ),
-            parse_quote!(
-                type A = Rel2<Self>;
-            ),
-            parse_quote!(
-                struct V {
-                    a: Rel3<Self>,
-                }
-            ),
-        ] {
-            let item: Item = item;
-            v.visit_item(&item);
-        }
-    });
+    let (context, ()) =
+        leaker.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
+            for item in [
+                parse_quote!(
+                    fn f(x: Rel<Self>) {}
+                ),
+                parse_quote!(
+                    type A = Rel2<Self>;
+                ),
+                parse_quote!(
+                    struct V {
+                        a: Rel3<Self>,
+                    }
+                ),
+            ] {
+                let item: Item = item;
+                v.visit_item(&item);
+            }
+        });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 3);
     assert_eq!(self_of_entry(&referrer, "Rel < Self >"), "Self = W");
