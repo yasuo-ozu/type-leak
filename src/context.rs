@@ -1237,10 +1237,6 @@ impl Contexts {
         self.modules.get(&id)
     }
 
-    pub(crate) fn find(&self, context: &Context) -> Option<ContextId> {
-        self.ids.get(context).copied()
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.list.len()
     }

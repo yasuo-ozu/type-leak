@@ -1818,8 +1818,7 @@ fn f13_leaker() -> Leaker<impl Allow> {
 /// bounds without `Self`).
 ///
 /// What is not rejected: an optional entry (the absolute path of a crate that the Leaker does not
-/// allow): it is copied as written, so a strict Referrer (`deny_ambiguous_crate_name()`) does
-/// not replace it either. A bound of an outer scope that names its own `Self` is not the impl's
+/// allow): it is copied as written, so a Referrer that trusts nothing does not replace it either. A bound of an outer scope that names its own `Self` is not the impl's
 /// (`the_same_self_changes_nothing` in `outer_self.rs`). The controls are accepted: a self type
 /// that is not leaked (an allowed path), and bounds that do not name `Self`.
 ///
@@ -2062,7 +2061,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
     for item in copied.iter().chain(&controls) {
         let mut leaker = f13_leaker();
         let context = leaker.intern_impl(item, true);
-        let mut result = leaker.result();
+        let result = leaker.result();
         let referrer = result
             .clone()
             .finish()
@@ -2072,9 +2071,9 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
             "{}",
             string(item)
         );
-        // A strict Referrer replaces the optional entries too, but not those in the self type.
+        // A Referrer that trusts nothing replaces the optional entries, but not those in the self
+        // type.
         let mut copy = Item::Impl(item.clone());
-        result = result.deny_ambiguous_crate_name();
         result
             .finish()
             .unwrap()
@@ -2098,14 +2097,13 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
     );
     let mut leaker = f13_leaker();
     let context = leaker.intern_impl(&item, true);
-    let mut result = leaker.result();
+    let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     assert_eq!(
         referrer.iter().map(|t| string(&t)).collect::<Vec<_>>(),
         [":: ext :: S < T >"]
     );
     let mut copy = Item::Impl(item);
-    result = result.deny_ambiguous_crate_name();
     result
         .finish()
         .unwrap()
@@ -2157,8 +2155,9 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
     }
 }
 
-/// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a strict Referrer
-/// or not, and whether the Leaker accepts `item`.
+/// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a Referrer that
+/// trusts nothing (`strict`) or one that trusts every optional entry, and whether the Leaker accepts
+/// `item`.
 fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
     let config = Rules::new()
         .primitive()
@@ -2167,8 +2166,8 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<
     let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_impl(item, true);
     let mut result = leaker.result();
-    if strict {
-        result = result.deny_ambiguous_crate_name();
+    if !strict {
+        result = result.allow(Rules::new().external_crates());
     }
     let referrer = result.finish()?;
     let mut copy = Item::Impl(item.clone());
@@ -2208,7 +2207,7 @@ type Rejected<'a> = Option<(&'a str, &'a str)>;
 /// "Bounds that name leaked types" in the `Leaker` docs); the impl needs the same rule, with the
 /// generics of the impl instead of those of the context. The assertion: if the Leaker accepts the
 /// impl, its copy does not have a replacement in a bound or where predicate of the impl and
-/// `Self::A` in a predicate. An optional entry counts if the Referrer is strict (it replaces it).
+/// `Self::A` in a predicate. An optional entry counts if the Referrer replaces it (`strict`).
 ///
 /// The controls are accepted, as they compile: a bound that names no leaked type, and a leaked
 /// bound with `Self::A1` outside the predicates.
@@ -2216,7 +2215,8 @@ type Rejected<'a> = Option<(&'a str, &'a str)>;
 /// Fixed by the rule of F2 for `Self::A` (see "Bounds that name leaked types" in the `Leaker` docs
 /// and `tests/bound_cycles.rs`): in an impl, the bounds of the impl count too, not only those of
 /// the generics in the context of `Self::A`, as rustc selects the impl of the trait. The optional
-/// entries that they name are copied as written for a strict Referrer.
+/// entries that they name are copied as written for a Referrer that replaces the optional entries
+/// (`strict`).
 #[test]
 fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
     let items: Vec<(ItemImpl, bool, Rejected)> = vec![
@@ -2304,7 +2304,7 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
             ),
             false,
         ),
-        // An optional entry is left as written by a Referrer that is not strict.
+        // An optional entry is left as written by a Referrer that trusts it (not `strict`).
         (
             parse_quote!(
                 impl<T> ::p::Tr<T> for u8
@@ -2971,9 +2971,9 @@ fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
 /// of the context of.
 ///
 /// Trigger: `struct S<'a, T: 'a> where T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8 { .. }`, where
-/// `::ext` is a crate that the Leaker does not allow, and a strict Referrer
-/// (`deny_ambiguous_crate_name()`, the Referrer's choice, for a Referrer whose dependencies
-/// may differ from the Leaker's) replaces the optional entries. `&'a ::ext::W<T, ::ext::B0>` is an
+/// `::ext` is a crate that the Leaker does not allow, and a Referrer that trusts nothing (`strict`:
+/// the default, for a Referrer whose dependencies may differ from the Leaker's) replaces the
+/// optional entries. `&'a ::ext::W<T, ::ext::B0>` is an
 /// optional entry (it holds `::ext::B0`, another optional type, so it is not left alone as
 /// `T: Fn(&'a ::ext::W<T>)` is), and its context has `'a`, `T` and the where predicate that names
 /// `'a`, which is the predicate that names the entry. The copy has
@@ -3068,8 +3068,8 @@ fn f17_optional_entry_in_own_context() {
 /// the copy did not have it where the original did.
 ///
 /// `Rules::or_if()` docs: an absolute path of a crate that the Leaker does not allow is an
-/// optional entry, which a Referrer leaves as written by default and replaces if it is strict
-/// (`deny_ambiguous_crate_name()`). Trigger:
+/// optional entry, which a Referrer replaces unless `LeakerResult::allow()` trusts it (`strict`
+/// replaces it). Trigger:
 /// `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the trait, `'x` is
 /// late-bound (the argument holds it, and no bound names it). The Leaker counted the optional type
 /// as an anchor, as the default Referrer keeps it. The strict copy was
@@ -3122,8 +3122,8 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
         let mut leaker = Leaker::from_config(config, Options::new());
         let context = leaker.intern_trait(&item, true);
         let mut result = leaker.result();
-        if strict {
-            result = result.deny_ambiguous_crate_name();
+        if !strict {
+            result = result.allow(Rules::new().external_crates());
         }
         let referrer = result.finish().unwrap();
         let mut copy = item.clone();
@@ -3281,7 +3281,7 @@ fn f18_the_optional_entries_that_hold_a_method_lifetime_are_copied_as_written() 
         let what = string(item);
         let mut leaker = new_leaker();
         let context = intern(&mut leaker, item);
-        let result = leaker.result().deny_ambiguous_crate_name();
+        let result = leaker.result();
         let referrer = result
             .finish()
             .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)));
@@ -7596,8 +7596,8 @@ fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, V
     nested_copy_as(nest, item, declared, false)
 }
 
-/// Like `nested_copy()`, for a Referrer that replaces the optional entries too if `strict`
-/// (`deny_ambiguous_crate_name()`).
+/// Like `nested_copy()`, for a Referrer that replaces the optional entries too if `strict` (else it
+/// trusts them all).
 fn nested_copy_as(
     nest: Nest,
     item: &Item,
@@ -7657,8 +7657,8 @@ fn nested_copy_recovering<A: Allow>(
         }
     };
     let mut result = leaker.result();
-    if strict {
-        result = result.deny_ambiguous_crate_name();
+    if !strict {
+        result = result.allow(Rules::new().external_crates());
     }
     let referrer = if recover {
         result.into_referrer()
@@ -8858,8 +8858,7 @@ fn f38_entries(referrer: &Referrer) -> Vec<String> {
 /// F38 (fixed): an absolute type that names the own `Self` of a struct, an enum or a union nested in
 /// a scope (`View::visit_item()`, the items of `intern_mod()`) was recorded as an optional entry
 /// (`SelfRequirement::Type`, `must` is `false`), and the copy of a Referrer that replaces the
-/// optional entries (`deny_ambiguous_crate_name()`, a strict one) was not the copy of one
-/// that does not.
+/// optional entries (a strict one) was not the copy of one that trusts them.
 ///
 /// The type is `::std::boxed::Box<Self>`, `::p::Rel2<Self, T>`: it resolves the same in the copy
 /// (`::std` and `::p` are crates, which only the choice of the Referrer makes optional), and its
@@ -10174,13 +10173,17 @@ fn f40_a_type_in_a_default_body_is_carried_in_the_generics_of_the_method() {
     };
     let mut leaker = values_leaker();
     let context = leaker.intern_impl(&item, true);
-    let referrer = leaker.result().finish().unwrap();
+    // A Referrer that trusts the optional entries (`::p::S<T>`) copies them as written.
+    let result = leaker.result().allow(Rules::new().external_crates());
+    let referrer = result.finish().unwrap();
+    // The contexts are numbered in the order they are met, and the first is that of the self type
+    // `::p::S<T>`, which is the context of `inner::Wrap<T>` too.
     let required: Vec<String> = referrer.required().map(|(_, ty)| string(ty)).collect();
     assert_eq!(
         required,
         [
-            "inner :: Local",
             "inner :: Wrap < T >",
+            "inner :: Local",
             "inner :: Wrap < Self >"
         ]
     );
@@ -10190,9 +10193,9 @@ fn f40_a_type_in_a_default_body_is_carried_in_the_generics_of_the_method() {
         .visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::default::Default> ::p::Tr<T> for ::p::S<T> {
-            const N: usize = ::core::mem::size_of::<P<0usize>>();
+            const N: usize = ::core::mem::size_of::<P<1usize>>();
             fn f(&self) -> usize {
-                let w: P<1usize> = ::core::unimplemented!();
+                let w: P<0usize> = ::core::unimplemented!();
                 ::core::mem::size_of::<P<2usize>>()
             }
         }
@@ -10306,9 +10309,11 @@ fn f40_every_type_position_of_a_value_is_replaced() {
     }
 }
 
-/// F40, the optional entries: an absolute type of another crate that holds the relative one. A
-/// Referrer that trusts the names of the crates replaces the relative type only; a strict one
-/// replaces the whole type. Both as for a type of a signature.
+/// F40, the optional entries: an absolute type of another crate. One that holds a relative type is
+/// one required entry, which both a Referrer that trusts the names of the crates and a strict one
+/// replace as a whole (it was an optional entry beside the relative type). One that holds none is
+/// an optional entry: a trusting Referrer leaves it as it is, and a strict one replaces it. Both as
+/// for a type of a signature.
 #[test]
 fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
     let source =
@@ -10321,27 +10326,37 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
             .enumerate()
             .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "?" }, string(ty)))
             .collect::<Vec<_>>(),
-        ["inner :: Local", "?:: p :: Wrap < inner :: Local >"]
+        [":: p :: Wrap < inner :: Local >"]
     );
-    assert_eq!(referrer.external_crates_require(1), ["p"]);
-    let trusting = f40_copy(&referrer, context, &item);
+    assert_eq!(referrer.external_crates_require(0), ["p"]);
     let expected: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self) {
-                let _: ::p::Wrap<P<0usize>> = ::core::unimplemented!();
+                let _: P<0usize> = ::core::unimplemented!();
             }
         }
     );
+    let trusting = result.clone().allow(Rules::new().external_crates());
+    let trusting = f40_copy(&trusting.finish().unwrap(), context, &item);
     assert_eq!(trusting, string(&expected));
-    let strict = result.deny_ambiguous_crate_name();
-    let strict = strict.finish().unwrap();
-    let expected: ItemTrait = parse_quote!(
-        trait Tr {
-            fn f(&self) {
-                let _: P<1usize> = ::core::unimplemented!();
-            }
-        }
+    let strict = result.finish().unwrap();
+    assert_eq!(f40_copy(&strict, context, &item), string(&expected));
+    // One with no relative type in it is an optional entry.
+    let source = "trait Tr { fn f(&self) { let _: ::p::Wrap<()> = ::core::unimplemented!(); } }";
+    let (item, result, context) = f40_result(source);
+    let referrer = result.clone().finish().unwrap();
+    assert_eq!(
+        referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "?" }, string(ty)))
+            .collect::<Vec<_>>(),
+        ["?:: p :: Wrap < () >"]
     );
+    let trusting = result.clone().allow(Rules::new().external_crates());
+    let trusting = f40_copy(&trusting.finish().unwrap(), context, &item);
+    assert_eq!(trusting, string(&item));
+    let strict = result.finish().unwrap();
     assert_eq!(f40_copy(&strict, context, &item), string(&expected));
 }
 
@@ -10363,7 +10378,10 @@ fn f40_the_values_of_a_module() {
     };
     let mut leaker = values_leaker();
     let module = leaker.intern_mod(&item);
-    let referrer = leaker.result().finish().unwrap();
+    // `::p::W<..>` holds `inner::Local`, so it is a required entry, replaced whatever the Referrer
+    // trusts.
+    let result = leaker.result().allow(Rules::new().external_crates());
+    let referrer = result.finish().unwrap();
     assert_eq!(
         referrer
             .iter()
@@ -10371,9 +10389,9 @@ fn f40_the_values_of_a_module() {
             .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "?" }, string(ty)))
             .collect::<Vec<_>>(),
         [
+            ":: p :: W < inner :: Local >",
             "inner :: Local",
-            "inner :: Other",
-            "?:: p :: W < inner :: Local >"
+            "inner :: Other"
         ]
     );
     // The entries are those of the module, which the copy is in.
@@ -10386,12 +10404,12 @@ fn f40_the_values_of_a_module() {
         .visit_file_mut(&mut file);
     let expected: File = parse_quote! {
         pub struct Declared(pub u8);
-        pub const SIZE: usize = ::core::mem::size_of::<Declared>() + ::core::mem::size_of::<P<0usize>>();
-        pub static OTHER: usize = ::core::mem::size_of::<P<1usize>>();
+        pub const SIZE: usize = ::core::mem::size_of::<Declared>() + ::core::mem::size_of::<P<1usize>>();
+        pub static OTHER: usize = ::core::mem::size_of::<P<2usize>>();
         pub fn f() -> usize {
-            let x: P<0usize> = ::core::unimplemented!();
+            let x: P<1usize> = ::core::unimplemented!();
             let y: Declared = ::core::unimplemented!();
-            ::core::mem::size_of::<::p::W<P<0usize>>>()
+            ::core::mem::size_of::<P<0usize>>()
         }
     };
     assert_eq!(string(&file), string(&expected));
@@ -11558,14 +11576,15 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
 }
 
 /// F43: a trait object in a path that gives it a lifetime. The part is `::p::W<'a, T, dyn RelTr>`;
-/// `dyn RelTr` is an entry beside it, in `::p::Bare<dyn RelTr>`, with another lifetime, and a
-/// strict Referrer replaces that path too, as an optional entry.
+/// `dyn RelTr` is an entry beside it, in `::core::marker::PhantomData<dyn RelTr>`, with another
+/// lifetime. (In `::p::Bare<dyn RelTr>` it would be in one required entry with it, and no entry of
+/// its own.)
 #[test]
 fn f43_the_entry_inside_the_part_is_not_replaced() {
     let nested: Item = parse_quote!(
         impl<'a> ::p::W for X {
             fn f(&self, x: ::p::W<'a, T, dyn RelTr>) {}
-            fn g(&self, y: ::p::Bare<dyn RelTr>) {}
+            fn g(&self, y: ::core::marker::PhantomData<dyn RelTr>) {}
         }
     );
     let (result, context) = f43_analyze(std_config(), false, &[], &nested);
@@ -11577,20 +11596,16 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
         ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable whole"]
     );
     let (object, x) = (entry(&referrer, "dyn RelTr"), entry(&referrer, "X"));
-    let bare = entry(&referrer, ":: p :: Bare < dyn RelTr >");
-    assert!(referrer.must(object) && !referrer.must(bare));
-    for (strict, g) in [
-        (false, format!(":: p :: Bare < P < {}usize > >", object)),
-        (true, format!("P < {}usize >", bare)),
-    ] {
+    assert!(referrer.must(object));
+    for strict in [false, true] {
         let mut result = result.clone();
-        if strict {
-            result = result.deny_ambiguous_crate_name();
+        if !strict {
+            result = result.allow(Rules::new().external_crates());
         }
         let referrer = result.into_referrer();
         let expected = format!(
-            "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : {}) {{ }} }} }} }}",
-            x, g
+            "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : :: core :: marker :: PhantomData < P < {}usize > >) {{ }} }} }} }}",
+            x, object
         );
         assert_eq!(
             f43_copy(&referrer, context, &[], &nested, false),
@@ -11621,7 +11636,8 @@ fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_written_as_they_a
         .iter()
         .all(|error| error.reason == Reason::RelativePath));
     assert_eq!(result.errors().len(), 2);
-    let referrer = result.into_referrer();
+    // A Referrer that trusts the optional entries (`::p::Host`) copies them as written.
+    let referrer = result.allow(Rules::new().external_crates()).into_referrer();
     assert_eq!(
         parts_of(&referrer),
         ["trait (RelTrait < T , Other >) unwritable whole predicate"]

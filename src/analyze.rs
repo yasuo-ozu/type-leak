@@ -3784,7 +3784,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// Makes the optional entries that hold `lifetime` no optional entries, if only they keep it
-    /// constrained in the copy: a strict Referrer would leave it in a projection only (E0195, F18).
+    /// constrained in the copy: a Referrer that replaces them would leave it in a projection only
+    /// (E0195, F18).
     /// `used` has the occurrences as written; the types leaked whole hold none in the copy.
     fn keep_optional_anchors(
         &mut self,

@@ -8,7 +8,7 @@
 
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer};
+use type_leak::{array_const, ContextId, ImplSelf, Leaker, Options, Referrer, Rules};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -17,6 +17,14 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 /// The leaked types of a trait with the generics each uses (and the where clause).
 fn leaked(item: ItemTrait) -> Vec<(String, String)> {
     let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    entries(&referrer)
+}
+
+/// Like `leaked()`, for a Leaker that allows the paths of external crates, so that none is an entry.
+fn leaked_allowing_crates(item: ItemTrait) -> Vec<(String, String)> {
+    let mut leaker = Leaker::from_config(Rules::new().external_crates(), Options::new());
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     entries(&referrer)
@@ -335,21 +343,28 @@ fn the_gats_of_a_trait_in_a_module_are_read() {
 /// without `T: 'a`, and the bound that is written (`type A<'a, T: 'a>`) is the one of the entry.
 #[test]
 fn the_value_of_an_associated_type_is_analyzed_like_the_original() {
-    // Not written: nothing is guessed for `Rel2<T>` and the path.
+    // Not written: nothing is guessed for `Rel2<T>` and the path. The path of an external crate
+    // is an entry with `Rel2<T>` in it; where the crate is allowed, it is not.
+    assert_eq!(
+        leaked_allowing_crates(
+            parse_quote! { trait Tr { type A<'a, T> = ::p::Ref<'a, Rel2<T>>; } }
+        ),
+        [e("Rel2 < T >", "< T >")]
+    );
     assert_eq!(
         leaked(parse_quote! { trait Tr { type A<'a, T> = ::p::Ref<'a, Rel2<T>>; } }),
-        [
-            e("Rel2 < T >", "< T >"),
-            e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T >"),
-        ]
+        [e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T >")]
     );
     // Written, as the `Leaker` docs say to: both have it.
     assert_eq!(
+        leaked_allowing_crates(
+            parse_quote! { trait Tr { type A<'a, T: 'a> = ::p::Ref<'a, Rel2<T>>; } }
+        ),
+        [e("Rel2 < T >", "< 'a , T : 'a >")]
+    );
+    assert_eq!(
         leaked(parse_quote! { trait Tr { type A<'a, T: 'a> = ::p::Ref<'a, Rel2<T>>; } }),
-        [
-            e("Rel2 < T >", "< 'a , T : 'a >"),
-            e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T : 'a >"),
-        ]
+        [e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T : 'a >")]
     );
     // A relative path is leaked as a whole.
     assert_eq!(

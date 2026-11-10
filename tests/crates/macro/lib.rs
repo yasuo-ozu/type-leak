@@ -652,8 +652,8 @@ struct Header {
 /// rewritten.
 ///
 /// `show NAME [SelfTy] { items }` does not emit the copies, but `pub const NAME: &str`, which holds
-/// their tokens, so that a test can tell what a Referrer wrote (e.g. a strict one from a trusting
-/// one).
+/// their tokens, so that a test can tell what a Referrer wrote (e.g. one that trusts no crate from
+/// one that trusts them all).
 struct CopyInput {
     header: Header,
     /// The name of the const of `show`.
@@ -697,11 +697,12 @@ impl Parse for Input {
         let id = braced_parse(input)?;
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
-        // `strict` makes the Referrer replace the optional entries as well (it does not trust the
-        // names of the crates, see `LeakerResult::deny_ambiguous_crate_name()`).
+        // `strict` is a Referrer that trusts no name of a crate: it replaces the optional entries as
+        // well. Else it trusts them all (`LeakerResult::allow()`).
         if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
             input.parse::<Ident>()?;
-            result = result.deny_ambiguous_crate_name();
+        } else {
+            result = result.allow(Rules::new().external_crates());
         }
         let header = Header {
             item_trait,

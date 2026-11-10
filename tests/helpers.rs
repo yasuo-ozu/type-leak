@@ -152,11 +152,11 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
         );
     }
     assert!(referrer.required().next().is_some());
-    // Not affected by how the Referrer treats the optional entries.
-    let strict = result.deny_ambiguous_crate_name();
-    let strict = strict.finish().unwrap();
+    // Not affected by trusting the optional entries.
+    let trusting = result.allow(Rules::new().external_crates());
+    let trusting = trusting.finish().unwrap();
     assert_eq!(
-        strict.required().map(|(ix, _)| ix).collect::<Vec<_>>(),
+        trusting.required().map(|(ix, _)| ix).collect::<Vec<_>>(),
         [0, 1]
     );
     // The serialized Referrer has them too.

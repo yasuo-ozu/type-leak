@@ -222,8 +222,8 @@ impl Referrer {
     /// `target` says what the impl is for ([`ImplSelf`]); `const_fn` is as in
     /// [`Referrer::entry_args()`], but gets the parameter itself (`N`) as `value`. Write the impl
     /// in [`RepeaterImpl::module`] if it is `Some`, and one for every entry ([`Referrer::iter()`]):
-    /// optional entries need one if some Referrer is strict
-    /// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)).
+    /// optional entries need one if some Referrer does not trust them
+    /// ([`LeakerResult::allow()`](crate::LeakerResult::allow)).
     ///
     /// Fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry
     /// [needs `Self`](Referrer::needs_self), and with the error of `const_fn`.

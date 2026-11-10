@@ -250,8 +250,8 @@ fn rules_are_clone_and_debug_where_their_rule_is() {
     let rules = Rules::new().primitive().defaults();
     assert_eq!(
         format!("{:?}", rules.clone()),
-        "Rules { primitive: true, prelude: false, std_crates: false, crate_paths: false, \
-         values: false, defaults: true, custom: () }"
+        "Rules { primitive: true, prelude: false, std_crates: false, external_crates: false, \
+         crate_paths: false, values: false, defaults: true, custom: () }"
     );
     // A function is `Debug` and `Clone`; a closure that captures is `Clone` if its captures are.
     let _ = format!("{:?}", Rules::new().or(()));
@@ -910,10 +910,16 @@ fn the_built_in_rules_take_relative_paths_by_their_head() {
         (parse_quote!(crate::m::T), [false, false, false, true]),
         (parse_quote!(self::m::T), [false, false, false, false]),
         (parse_quote!(super::T), [false, false, false, false]),
-        // A leading `::` is another crate, never one of these.
+        // A leading `::` is another crate, never one of these, except that `std_crates()` takes the
+        // crates `std`, `core` and `alloc` also so.
         (parse_quote!(::u8), [false; 4]),
-        (parse_quote!(::std::vec::Vec), [false; 4]),
-        (parse_quote!(::core::primitive::u8), [false; 4]),
+        (parse_quote!(::std::vec::Vec), [false, false, true, false]),
+        (parse_quote!(::alloc::vec::Vec), [false, false, true, false]),
+        (
+            parse_quote!(::core::primitive::u8),
+            [false, false, true, false],
+        ),
+        (parse_quote!(::stdx::Vec), [false; 4]),
         (parse_quote!(::crate::T), [false; 4]),
     ];
     let place = Place::default();
@@ -968,6 +974,69 @@ fn the_built_in_rules_take_relative_paths_by_their_head() {
     ] {
         assert!(!all.allow(&cause, place), "{}", cause.to_token_stream());
     }
+}
+
+/// `external_crates()` allows the paths with a leading `::` (any crate, of any kind of cause that
+/// carries a path), and no relative path.
+#[test]
+fn external_crates_allows_the_absolute_paths_only() {
+    let place = Place::default();
+    let rules = Rules::new().external_crates();
+    for (path, expected) in [
+        (parse_quote!(::foo::X), true),
+        (parse_quote!(::foo), true),
+        (parse_quote!(::std::vec::Vec), true),
+        (parse_quote!(::core::primitive::u8), true),
+        (parse_quote!(::u8), true),
+        (parse_quote!(foo::X), false),
+        (parse_quote!(u8), false),
+        (parse_quote!(std::vec::Vec), false),
+        (parse_quote!(crate::X), false),
+        (parse_quote!(self::X), false),
+    ] {
+        let path: Path = path;
+        let causes = [
+            Cause::Type(Type::Path(TypePath {
+                qself: None,
+                path: path.clone(),
+            })),
+            Cause::Trait(path.clone()),
+            Cause::Macro(path.clone()),
+            Cause::Unknown(path.clone()),
+            Cause::Expr(Expr::Path(ExprPath {
+                attrs: Vec::new(),
+                qself: None,
+                path: path.clone(),
+            })),
+        ];
+        for cause in &causes {
+            assert_eq!(
+                rules.allow(cause, place),
+                expected,
+                "{}",
+                cause.to_token_stream()
+            );
+        }
+        // With generic arguments the cause is not a bare path: its paths are asked.
+        let mut with_arguments = path.clone();
+        if let Some(last) = with_arguments.segments.last_mut() {
+            last.arguments = PathArguments::AngleBracketed(parse_quote!(<u8>));
+        }
+        assert!(!rules.allow(&Cause::Trait(with_arguments), place));
+    }
+    // A cause that is no path is not allowed, and nothing else is allowed by it.
+    for cause in [
+        Cause::Type(parse_quote!(&u8)),
+        Cause::Lifetime(parse_quote!('a)),
+        Cause::Unreadable(quote!(::foo::X)),
+    ] {
+        assert!(!rules.allow(&cause, place), "{}", cause.to_token_stream());
+    }
+    // It chains with the other rules like the flags do.
+    let both = Rules::new().external_crates().primitive();
+    assert!(both.allow(&Cause::Trait(parse_quote!(u8)), place));
+    assert!(both.allow(&Cause::Trait(parse_quote!(::foo::X)), place));
+    assert!(!both.allow(&Cause::Trait(parse_quote!(Rel)), place));
 }
 
 #[test]

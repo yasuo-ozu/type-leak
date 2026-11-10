@@ -154,12 +154,23 @@ fn dyn_lifetime_bounds_are_visited() {
             fn f<'a>(&self) -> ::std::boxed::Box<dyn RelTr + 'a>;
         }
     });
-    assert_eq!(entries(&referrer), [e("dyn RelTr + 'a", "< 'a >")]);
-    // The `Box` is an optional entry, with the lifetime among its generics.
+    // The `Box` is a required entry as a whole, with the lifetime among its generics.
     assert_eq!(
-        optional_entries(&referrer),
+        entries(&referrer),
         [e(":: std :: boxed :: Box < dyn RelTr + 'a >", "< 'a >")]
     );
+    assert!(optional_entries(&referrer).is_empty());
+    // If the Leaker allows the `Box`, only the trait object is leaked.
+    let referrer = leak_trait_with(
+        config().or_if(starts_with(parse_quote!(::std::boxed::Box))),
+        &parse_quote! {
+            trait Tr {
+                fn f<'a>(&self) -> ::std::boxed::Box<dyn RelTr + 'a>;
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(entries(&referrer), [e("dyn RelTr + 'a", "< 'a >")]);
     let mut leaker = Leaker::new();
     let generics = Generics::default();
     // `'_` is impossible.
@@ -307,11 +318,19 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     )
     .unwrap();
     assert_eq!(entries(&referrer), [e("& 'a dyn RelTr", "< 'a >")]);
-    // The default of a `Box` is `'static`, so the trait object is interned alone.
-    let referrer = leak_trait(parse_quote! {
+    // The default of a `Box` is `'static`, so the trait object is interned alone, if the `Box` is
+    // allowed. If it is not, the `Box` is interned as a whole.
+    let item: ItemTrait = parse_quote! {
         trait Tr { fn f(&self) -> ::std::boxed::Box<dyn RelTr>; }
-    });
+    };
+    let allowed = config().or_if(starts_with(parse_quote!(::std::boxed::Box)));
+    let referrer = leak_trait_with(allowed, &item).unwrap();
     assert_eq!(entries(&referrer), [e("dyn RelTr", "")]);
+    let referrer = leak_trait(item);
+    assert_eq!(
+        entries(&referrer),
+        [e(":: std :: boxed :: Box < dyn RelTr >", "")]
+    );
     // `check()` agrees.
     let result = check_in(
         &mut Leaker::new(),

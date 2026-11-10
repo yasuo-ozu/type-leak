@@ -760,9 +760,9 @@ generics, trait of the generics: `RelTr` leaves the lifetime `'b` of the method 
 mod, trait of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 trait, trait, mod: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 mod: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
-mod, no generics: ok (2)
+mod, no generics: ok (1)
 generics, mod: ok (1)
-mod, mod, no generics: ok (2)
+mod, mod, no generics: ok (1)
 mod, generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 "#;
 

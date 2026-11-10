@@ -115,7 +115,7 @@ fn test_reduce_roots_root_covers_descendant() {
     let item: ItemStruct = parse_quote! {
         struct S { a: (RelType, ::std::string::String) }
     };
-    let mut leaker = Leaker::new();
+    let mut leaker = quiet();
     leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
@@ -146,7 +146,7 @@ fn test_reduce_roots_deep_nesting() {
     let item: ItemStruct = parse_quote! {
         struct S { a: (::std::vec::Vec<(RelInner,)>, ::std::string::String) }
     };
-    let mut leaker = Leaker::new();
+    let mut leaker = quiet();
     leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelInner);
@@ -174,8 +174,14 @@ fn test_reduce_roots_type_in_both_positions() {
     );
 }
 
+/// A Leaker that writes the paths of external crates as they are, so that the tests of the cut
+/// among the required types see no optional entries (`test_reduce_roots_one_cut` tests both).
+fn quiet() -> Leaker<Rules> {
+    Leaker::from_config(Rules::new().external_crates(), Options::new())
+}
+
 fn leaked_of(item: ItemStruct) -> Vec<String> {
-    let mut leaker = Leaker::new();
+    let mut leaker = quiet();
     leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     finish_as_strings(leaker).into_iter().collect()
@@ -295,42 +301,41 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     // The wrappers are not leaked, but a copy of them is rewritten around the inner entry.
     let item: ItemStruct = parse_quote! {
         struct S {
-            a: ::std::vec::Vec<(Rel,)>,
-            b: (Rel, ::std::string::String),
+            a: ::core::option::Option<(Rel,)>,
+            b: (Rel, ::core::primitive::bool),
             c: &'static Rel,
+            d: ::std::string::String,
         }
     };
     let mut leaker = Leaker::new();
     let context = leaker.intern_struct(&item, true);
     let result = leaker.result();
-    let referrer = result.clone().finish().unwrap();
+    let referrer = result
+        .clone()
+        .allow(Rules::new().external_crates())
+        .finish()
+        .unwrap();
     // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry). The
-    // two types of external crates are optional entries (old: none), after the required ones: the
-    // `Vec` (one cut covers it, whatever else is in it) and the `String`.
+    // type of an external crate is an optional entry (old: none), after the required ones.
     assert_eq!(
         (0..referrer.iter().count())
             .map(|ix| referrer.must(ix))
             .collect::<Vec<_>>(),
-        [true, true, false, false]
+        [true, true, false]
     );
     let strings: Vec<String> = referrer.iter().map(|t| quote!(#t).to_string()).collect();
     assert_eq!(
         strings,
-        [
-            "& 'static Rel",
-            "Rel",
-            ":: std :: string :: String",
-            ":: std :: vec :: Vec < (Rel ,) >"
-        ]
+        ["& 'static Rel", "Rel", ":: std :: string :: String"]
     );
     let mut copy: ItemStruct = parse_quote! {
         struct S {
-            a: ::std::vec::Vec<(Rel,)>,
-            b: (Rel, ::std::string::String),
+            a: ::core::option::Option<(Rel,)>,
+            b: (Rel, ::core::primitive::bool),
+            d: ::std::string::String,
         }
     };
     let rel_ix = strings.iter().position(|ty| ty == "Rel").unwrap();
-    let vec_ix = strings.iter().position(|ty| ty.contains("Vec")).unwrap();
     let string_ix = strings.iter().position(|ty| ty.contains("String")).unwrap();
     let mut replaced = copy.clone();
     syn::visit_mut::VisitMut::visit_item_struct_mut(
@@ -339,17 +344,16 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     );
     let expected: ItemStruct = syn::parse2(quote! {
         struct S {
-            a: ::std::vec::Vec<(P<#rel_ix>,)>,
-            b: (P<#rel_ix>, ::std::string::String),
+            a: ::core::option::Option<(P<#rel_ix>,)>,
+            b: (P<#rel_ix>, ::core::primitive::bool),
+            d: ::std::string::String,
         }
     })
     .unwrap();
     assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
-    // The Referrer which does not trust the names of the crates replaces them as well: the `Vec`
-    // as a whole, and the `String`, with `Rel` inside the tuple.
-    let strict = result.deny_ambiguous_crate_name();
+    // The Referrer which does not trust the names of the crates replaces the `String` as well.
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut strict
+        &mut result
             .finish()
             .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
@@ -357,8 +361,9 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     );
     let expected: ItemStruct = syn::parse2(quote! {
         struct S {
-            a: P<#vec_ix>,
-            b: (P<#rel_ix>, P<#string_ix>),
+            a: ::core::option::Option<(P<#rel_ix>,)>,
+            b: (P<#rel_ix>, ::core::primitive::bool),
+            d: P<#string_ix>,
         }
     })
     .unwrap();
@@ -367,6 +372,22 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
 
 /// The required leaked types of a trait, with the generics each uses.
 fn leaked_trait(item: &ItemTrait) -> Vec<(String, String)> {
+    let mut leaker = quiet();
+    leaker.intern_trait(item, true);
+    let referrer = leaker.result().finish().unwrap();
+    referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .enumerate()
+        .filter(|(ix, _)| referrer.must(*ix))
+        .map(|(_, (ty, generics))| (ty_string(ty.clone()), quote!(#generics).to_string()))
+        .collect()
+}
+
+/// The required leaked types of a trait, with the generics each uses, from a Leaker that leaks the
+/// types of external crates (`leaked_trait()` has none).
+fn required_trait(item: &ItemTrait) -> Vec<(String, String)> {
     let mut leaker = Leaker::new();
     leaker.intern_trait(item, true);
     let referrer = leaker.result().finish().unwrap();
@@ -414,9 +435,10 @@ fn error_of(item: &ItemTrait) -> String {
     to_syn_error(result.errors()).to_string()
 }
 
-/// Rewrites a trait with each leaked type replaced by `P<index>`, like the Referrer's copy.
+/// Rewrites a trait with each leaked type replaced by `P<index>`, like the Referrer's copy. The
+/// types of other crates stay as written.
 fn rewritten(item: &ItemTrait) -> String {
-    let mut leaker = Leaker::new();
+    let mut leaker = quiet();
     let context = leaker.intern_trait(item, true);
     let referrer = leaker.result().finish().unwrap();
     let mut copy = item.clone();
@@ -1732,7 +1754,7 @@ fn test_reduce_roots_bare_identifier_argument() {
     .is_empty());
     // `check()` agrees: the path must be interned as a whole.
     let result = check_in(
-        &mut Leaker::new(),
+        &mut quiet(),
         &parse_quote!(::p::W<SIZE>),
         &Generics::default(),
     );
@@ -2063,7 +2085,7 @@ fn test_reduce_roots_types_in_expressions() {
     .is_empty());
     // `check()` agrees: the array must be interned as a whole.
     let result = check_in(
-        &mut Leaker::new(),
+        &mut quiet(),
         &parse_quote!([::core::primitive::u8; ::core::mem::size_of::<Big>()]),
         &Generics::default(),
     );
@@ -2190,7 +2212,8 @@ fn test_reduce_roots_large_item() {
 }
 
 /// A random type: `Ra`, `Rb` and `Rc` are red, as is every `Rg<..>`, and so is a reference to a
-/// type with a red component (which is interned as a whole).
+/// type with a red component (which is interned as a whole). If the Leaker leaks the types of
+/// external crates, so are `Vec<..>` and `W<..>`.
 ///
 /// The red leaves are written as `m::Ra`, not as a bare identifier: as an argument of a path, it
 /// may be a const, so the path would be interned as a whole instead (which makes it red as well).
@@ -2258,12 +2281,13 @@ impl Model {
         }
     }
 
-    fn is_red(&self) -> bool {
+    fn is_red(&self, external: bool) -> bool {
         match self {
             Model::Leaf(name) => matches!(*name, "Ra" | "Rb" | "Rc"),
             Model::Rg(_) => true,
+            Model::Vec(_) | Model::W(..) => external,
             // The copy of a reference needs its referent to outlive the lifetime.
-            Model::Ref(a) => a.has_red(),
+            Model::Ref(a) => a.has_red(external),
             _ => false,
         }
     }
@@ -2277,20 +2301,20 @@ impl Model {
         }
     }
 
-    fn has_red(&self) -> bool {
+    fn has_red(&self, external: bool) -> bool {
         match self {
-            Model::Ref(a) => a.has_red(),
-            _ => self.is_red() || self.children().iter().any(|c| c.has_red()),
+            Model::Ref(a) => a.has_red(external),
+            _ => self.is_red(external) || self.children().iter().any(|c| c.has_red(external)),
         }
     }
 
     /// Adds the node of the type (if it contains a red type), and those of its components.
-    fn add(&self, parent: Option<usize>, graph: &mut ModelGraph) {
-        if !self.has_red() {
+    fn add(&self, parent: Option<usize>, graph: &mut ModelGraph, external: bool) {
+        if !self.has_red(external) {
             return;
         }
         let name = ty_string(self.ty());
-        let ix = graph.node(&name, self.is_red());
+        let ix = graph.node(&name, self.is_red(external));
         match parent {
             Some(parent) => {
                 if !graph.children[parent].contains(&ix) {
@@ -2304,7 +2328,7 @@ impl Model {
             }
         }
         for child in self.children() {
-            child.add(Some(ix), graph);
+            child.add(Some(ix), graph, external);
         }
     }
 }
@@ -2361,9 +2385,19 @@ impl ModelGraph {
 
 #[test]
 fn test_reduce_roots_is_the_minimum_cut_closest_to_the_sink() {
-    // Compared with a search of all the sets of nodes: the Leaker leaks a smallest set which cuts
-    // every path from a root to a red node, and among them the one whose source side is largest
-    // (the closest to the sink).
+    is_the_minimum_cut_closest_to_the_sink(false);
+}
+
+#[test]
+fn test_reduce_roots_is_the_minimum_cut_with_the_types_of_external_crates() {
+    is_the_minimum_cut_closest_to_the_sink(true);
+}
+
+/// Compared with a search of all the sets of nodes: the Leaker leaks a smallest set which cuts
+/// every path from a root to a red node, and among them the one whose source side is largest (the
+/// closest to the sink). `external`: the types of external crates are leaked too (one cut covers
+/// the required entries and the optional ones).
+fn is_the_minimum_cut_closest_to_the_sink(external: bool) {
     let mut rng = 12345u64;
     let mut checked = 0;
     for _ in 0..400 {
@@ -2372,7 +2406,7 @@ fn test_reduce_roots_is_the_minimum_cut_closest_to_the_sink() {
             .collect();
         let mut graph = ModelGraph::default();
         for field in &fields {
-            field.add(None, &mut graph);
+            field.add(None, &mut graph, external);
         }
         let n = graph.names.len();
         if n > 14 {
@@ -2408,7 +2442,14 @@ fn test_reduce_roots_is_the_minimum_cut_closest_to_the_sink() {
         });
         let item: ItemStruct =
             syn::parse2(quote! { struct S<'a, T> { #(#fields_tokens),* } }).unwrap();
-        let mut got = leaked_of(item.clone());
+        let mut got = if external {
+            let mut leaker = Leaker::new();
+            leaker.intern_struct(&item, true);
+            let referrer = leaker.result().finish().unwrap();
+            referrer.iter().map(|ty| ty_string(ty.clone())).collect()
+        } else {
+            leaked_of(item.clone())
+        };
         got.sort();
         assert_eq!(got, expected, "{}", quote!(#item));
         checked += 1;
@@ -2416,8 +2457,151 @@ fn test_reduce_roots_is_the_minimum_cut_closest_to_the_sink() {
     assert!(checked > 100, "{}", checked);
 }
 
-/// The optional entries (the types of external crates, see `Referrer::must()`) are a minimum cut
-/// of their own, and the required entries are cut for free in it.
+/// The entries of a trait in order: the required ones, then the optional ones with a `?`.
+fn all_entries(item: &ItemTrait) -> Vec<String> {
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(item, true);
+    let referrer = leaker.result().finish().unwrap();
+    referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| {
+            let mark = if referrer.must(ix) { "" } else { "? " };
+            format!("{}{}", mark, ty_string(ty.clone()))
+        })
+        .collect()
+}
+
+/// One cut chooses the required entries and the optional ones, and an entry that has a required
+/// type in it is required.
+#[test]
+fn test_reduce_roots_one_cut() {
+    // The type of an external crate with a required type in it is one required entry (it was the
+    // entry `Rel` and the optional entry `::ext::W<..>`).
+    let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> ::ext::W<Rel>; } };
+    assert_eq!(all_entries(&item), [":: ext :: W < Rel >"]);
+    // The Referrer replaces it whatever it trusts: only the type of the crate alone is trusted.
+    let mut leaker = Leaker::new();
+    let context = leaker.intern_trait(&item, true);
+    let referrer = leaker
+        .result()
+        .allow(Rules::new().external_crates())
+        .finish()
+        .unwrap();
+    assert!(referrer.must(0));
+    let mut copy = item.clone();
+    syn::visit_mut::VisitMut::visit_item_trait_mut(
+        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut copy,
+    );
+    assert_eq!(
+        quote!(#copy).to_string(),
+        printed(parse_quote! { trait Tr { fn f(&self) -> P<0usize>; } })
+    );
+    // What kind an entry has does not depend on the other types: the type of the crate is
+    // required also if `Rel` is an entry of its own.
+    let item: ItemTrait = parse_quote! {
+        trait Tr { fn f(&self) -> ::ext::W<Rel>; fn g(&self) -> Rel; }
+    };
+    assert_eq!(all_entries(&item), [":: ext :: W < Rel >", "Rel"]);
+    // Two types side by side keep their kinds: `Rel` is required and `::ext::X` optional.
+    let item: ItemTrait = parse_quote! { trait Tr { fn f(&self, a: ::ext::X, b: Rel); } };
+    assert_eq!(all_entries(&item), ["Rel", "? :: ext :: X"]);
+    // One type that holds both is a single required entry: the tuple is cheaper than its parts.
+    let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> (::ext::X, Rel); } };
+    assert_eq!(all_entries(&item), ["(:: ext :: X , Rel)"]);
+    // An optional entry in an optional one is not an entry (the Referrer trusts both or neither).
+    let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> ::ext::W<::ext2::X>; } };
+    assert_eq!(all_entries(&item), ["? :: ext :: W < :: ext2 :: X >"]);
+    let item: ItemTrait = parse_quote! {
+        trait Tr { fn f(&self) -> ::core::option::Option<::ext::W<::ext2::X>>; }
+    };
+    assert_eq!(all_entries(&item), ["? :: ext :: W < :: ext2 :: X >"]);
+    // Unless it is an entry on its own, too.
+    let item: ItemTrait = parse_quote! {
+        trait Tr { fn f(&self) -> ::ext::W<::ext2::X>; fn g(&self) -> ::ext2::X; }
+    };
+    assert_eq!(
+        all_entries(&item),
+        ["? :: ext :: W < :: ext2 :: X >", "? :: ext2 :: X"]
+    );
+    // A type that is leaked whole holds the optional types in it, and is required.
+    let item: ItemTrait = parse_quote! {
+        trait Tr { fn f(&self) -> Local<::ext::W<::ext2::X>>; }
+    };
+    assert_eq!(
+        all_entries(&item),
+        ["Local < :: ext :: W < :: ext2 :: X > >"]
+    );
+    // The listing has the required entries first, each part by the order in which the contexts
+    // first appear, then the tokens.
+    let item: ItemTrait = parse_quote! {
+        trait Tr<T> {
+            fn f(&self, a: ::ext::W<Rel2<T>>, b: ::ext::X, c: Rel);
+            fn g<U>(&self, u: ::ext::V<U>) -> Rel3<U>;
+        }
+    };
+    assert_eq!(
+        all_entries(&item),
+        [
+            ":: ext :: W < Rel2 < T > >",
+            "Rel",
+            "Rel3 < U >",
+            "? :: ext :: X",
+            "? :: ext :: V < U >"
+        ]
+    );
+}
+
+/// A type that cannot be an entry (the copy would make a cycle) is never chosen, whatever it costs
+/// to leak its parts, also if one of the kinds of entry would be fine.
+#[test]
+fn test_reduce_roots_a_forbidden_type_has_its_components_as_entries() {
+    let entries = |config: Rules, item: ItemStruct| -> Vec<String> {
+        let mut leaker = Leaker::from_config(config, Options::new());
+        leaker.enter_mod("m", [item.ident.clone()], |view| {
+            view.visit_item(&Item::Struct(item.clone()))
+        });
+        let referrer = leaker.result().finish().unwrap();
+        referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| {
+                let mark = if referrer.must(ix) { "" } else { "? " };
+                format!("{}{}", mark, ty_string(ty.clone()))
+            })
+            .collect()
+    };
+    // `Self` of a nested struct is the copy's own type, which no entry can name, so a type that
+    // names it is no entry: not as a required one, whose parts would be two, and not as an optional
+    // one.
+    let item: ItemStruct = parse_quote! {
+        struct S { a: ::p::Pair<Self, (RelA,), (RelB,)>, b: (::p::A, Self, ::p::B) }
+    };
+    assert_eq!(
+        entries(Rules::new(), item),
+        ["RelA", "RelB", "? :: p :: A", "? :: p :: B"]
+    );
+    // The type of an external crate whose context has a bound that names a leaked type cannot be
+    // a required entry (F24): it has `Rel2<u8>` in it, so it is no optional one either, and its
+    // parts are the entries.
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(::p::Tr)));
+    let item: ItemImpl = parse_quote! {
+        impl<T: Fn(Rel2<u8>), U> ::p::Tr<U> for ::p::W2<T, Rel<U>> where Self: Clone {}
+    };
+    let mut leaker = Leaker::from_config(config, Options::new());
+    leaker.intern_impl(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    let types: Vec<String> = referrer.iter().map(|ty| ty_string(ty.clone())).collect();
+    assert_eq!(types, ["Rel2 < u8 >", "Rel < U >"]);
+    assert!((0..types.len()).all(|ix| referrer.must(ix)));
+}
+
+/// The optional entries (the types of external crates, see `Referrer::must()`) are chosen by the
+/// same cut as the required ones: an entry that covers a required type is required.
 #[test]
 fn test_reduce_roots_optional_entries() {
     let optional = |item: ItemTrait| -> Vec<String> {
@@ -2427,7 +2611,10 @@ fn test_reduce_roots_optional_entries() {
             .collect()
     };
     let required = |item: ItemTrait| -> Vec<String> {
-        leaked_trait(&item).into_iter().map(|(ty, _)| ty).collect()
+        required_trait(&item)
+            .into_iter()
+            .map(|(ty, _)| ty)
+            .collect()
     };
     // One entry covers a type which is used twice with everything in it, as a cut of the graph.
     let item: ItemTrait = parse_quote! {
@@ -2444,15 +2631,15 @@ fn test_reduce_roots_optional_entries() {
     // The inner types are preferred on a tie, as for the required ones.
     let item: ItemTrait = parse_quote! {
         trait Tr {
-            fn f(&self) -> ((Rel,), ::a::A);
-            fn g(&self) -> (::a::A, (Rel,), ::b::B);
+            fn f(&self) -> ::core::option::Option<(::a::A,)>;
+            fn g(&self) -> ::core::option::Option<(::b::B,)>;
         }
     };
     assert_eq!(optional(item.clone()), [":: a :: A", ":: b :: B"]);
-    assert_eq!(required(item), ["Rel"]);
-    // The required entries do not depend on the optional ones: the type of an external crate
-    // which has a required type in it (`Rel`, and the tuple, which one cut covers) is optional
-    // as a whole, and the required types in it are entries of their own.
+    assert!(required(item).is_empty());
+    // The type of an external crate that has a required type in it (`Rel`, and the tuple, which
+    // one cut covers) is a required entry as a whole, as is the tuple. The optional `::b::X` in
+    // `::a::W<..>` is covered by it, and is an entry for the root `::b::X` only.
     let item: ItemTrait = parse_quote! {
         trait Tr {
             fn f(&self) -> ::core::option::Option<(Rel, ::a::A, ::b::B)>;
@@ -2462,14 +2649,13 @@ fn test_reduce_roots_optional_entries() {
         }
     };
     assert_eq!(
-        optional(item.clone()),
+        required(item.clone()),
         [
             "(Rel , :: a :: A , :: b :: B)",
             ":: a :: W < (Rel ,) , :: b :: X >",
-            ":: b :: X",
         ]
     );
-    assert_eq!(required(item), ["Rel"]);
+    assert_eq!(optional(item), [":: b :: X"]);
     // A required entry which is cut covers the optional types in it: they are not entries.
     let item: ItemTrait = parse_quote! {
         trait Tr {

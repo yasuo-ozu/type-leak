@@ -35,9 +35,9 @@
 //!   number that no other exported trait of the crate has. It is written into both the impls and
 //!   the macro of A, so both sides agree.
 //! - The Repeater impls are written for all the entries (`Referrer::iter()`), not only for the
-//!   required ones (`Referrer::required()`), because a Referrer in crate B may be strict
-//!   (`LeakerResult::deny_ambiguous_crate_name()`), which replaces the optional entries too.
-//!   The impls of the optional entries cost nothing if no one needs them.
+//!   required ones (`Referrer::required()`), because a Referrer in crate B replaces the optional
+//!   entries too unless `LeakerResult::allow()` trusts them. The impls of the optional entries
+//!   cost nothing if no one needs them.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;

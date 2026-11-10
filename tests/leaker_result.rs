@@ -282,8 +282,8 @@ fn into_parts_returns_the_referrer_and_the_errors_that_remain() {
     assert_eq!(again, referrer);
 }
 
-/// `allow()` and `deny_ambiguous_crate_name()` take and return the result, so they chain; a rule is
-/// applied at once, so it may count (through a `Cell`).
+/// `allow()` takes and returns the result, so it chains; a rule is applied at once, so it may count
+/// (through a `Cell`).
 #[test]
 fn the_rules_chain_and_a_rule_may_count() {
     let result = with_errors();
@@ -301,16 +301,19 @@ fn the_rules_chain_and_a_rule_may_count() {
             }
             false
         })
-        .allow(Rules::new().std_crates())
-        .deny_ambiguous_crate_name();
+        .allow(Rules::new().std_crates());
     // The rule is asked about the cause of each error, and then about the paths of those it did not
     // accept: the counting rule saw at least one question for each error.
     assert!(asked.get() >= result.errors().len());
     assert!(seen.borrow().iter().any(|path| path == "Rel"), "{:?}", seen);
-    // Chained: the same errors as one call after the other, and a strict Referrer.
-    let one_by_one = result.clone().allow(Rules::new().std_crates());
+    // Chained: the same errors as one call after the other. The rules chained trust nothing, so the
+    // Referrer replaces the optional entry `::foo::X`; the one that trusts all does not (`==`
+    // ignores the trust).
+    let one_by_one = result
+        .clone()
+        .allow(Rules::new().std_crates())
+        .allow(Rules::new().external_crates());
     assert_eq!(describe_all(&chained), describe_all(&one_by_one));
-    // Only the strict Referrer replaces the optional entry `::foo::X` (`==` ignores strictness).
     let expand = |result: LeakerResult| {
         let referrer = result.into_referrer();
         let ix = referrer
@@ -324,8 +327,8 @@ fn the_rules_chain_and_a_rule_may_count() {
         );
         (ix, text(&ty))
     };
-    let (ix, strict) = expand(chained);
-    assert_eq!(strict, format!("P < {}usize >", ix));
+    let (ix, replaced) = expand(chained);
+    assert_eq!(replaced, format!("P < {}usize >", ix));
     let one_by_one = expand(one_by_one).1;
     assert_eq!(one_by_one, ":: foo :: X");
 }

@@ -72,9 +72,10 @@ pub(crate) struct Args {
     /// How the item is analyzed: `""` by the `intern_*` method of its kind, or by a scope (see
     /// [`analyze()`]): `"mod"`, `"generics"`, `"trait"` or `"impl"`.
     scope: String,
-    /// The Referrer replaces the optional entries too (`deny_ambiguous_crate_name()`), so it
-    /// needs the Repeater's impl of every entry. A trusting Referrer needs those of the required
-    /// entries only, and that is all this macro emits then, as a downstream crate does. Not said:
+    /// The Referrer trusts no optional entry (`LeakerResult::allow()` does not), so it replaces
+    /// them and needs the Repeater's impl of every entry. A trusting Referrer needs those of the
+    /// required entries only, and that is all this macro emits then, as a downstream crate does.
+    /// Not said:
     /// the impls of all the entries, for any Referrer; the Referrer's invocation says which it is
     /// (`strict`), and the two must agree if it is said.
     strict: Option<bool>,
@@ -2591,8 +2592,8 @@ fn count_copy(
     let positions = collect_positions(original, None, args);
     let dummy: Path = parse_quote!(::__dummy);
     let mut counted = result.clone();
-    if args.strict == Some(true) {
-        counted = counted.deny_ambiguous_crate_name();
+    if args.strict != Some(true) {
+        counted = counted.allow(Rules::new().external_crates());
     }
     let counted = counted.into_referrer();
     let report = match rewrite(&counted, context, original, args, &dummy, false) {
@@ -3029,15 +3030,15 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         };
     }
     let errors = result.errors().to_vec();
-    // `strict` makes the Referrer replace the optional entries as well.
+    // `strict` is a Referrer that replaces the optional entries too; else it trusts them all.
     if args.strict.is_some_and(|said| said != strict) {
         return Err(Error::new(
             Span::call_site(),
             "test macro: the item is invoked with another `strict` than the one it was analyzed for",
         ));
     }
-    if strict {
-        result = result.deny_ambiguous_crate_name();
+    if !strict {
+        result = result.allow(Rules::new().external_crates());
     }
     let referrer = result.into_referrer();
     let rewritten = rewrite(&referrer, context, &item, &args, &path, dyn_host)?;

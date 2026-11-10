@@ -300,6 +300,12 @@ pub mod m {
             &self,
             x: &'a ::std::vec::Vec<T::A<Rel2<U>>>,
         ) -> usize;
+        /// The same with a path of `::core`, which is no entry: only `Rel2<U>` is, with no bound
+        /// from the reference, as the projection is a unit.
+        fn gat_nested_core<'a, T: ::type_leak_test_outlives::Gat, U>(
+            &self,
+            x: &'a ::core::option::Option<T::A<Rel2<U>>>,
+        ) -> usize;
     }
 
     /// `Self: 'a` for a type leaked alone, like `T: 'a`: the reference implies it (`by_ref`, the
@@ -830,10 +836,10 @@ pub mod m {
             fn fn_pointer_binder<F: for<'x> ::core::ops::Fn(for<'y> fn(&'x u8, &'y u8), Hr<'x>) -> &'x u8>(&self, f: F) -> usize;
         }
     }
-    // An anchor in a path of `::core` stays where it is written, so only `Hr<'x>` is leaked (the
-    // optional entry is the `Box` of an external crate around the trait object).
+    // An anchor in a path of `::core` stays where it is written, so only `Hr<'x>` is leaked (and
+    // the `Box` of an external crate around the trait object, which holds it: it is required).
     check_leak! {
-        { Hr<'x>, ? ::std::boxed::Box<dyn for<'x> ::core::ops::Fn(::core::option::Option<(u8, &'x u8)>, Hr<'x>) -> &'x u8> }
+        { ::std::boxed::Box<dyn for<'x> ::core::ops::Fn(::core::option::Option<(u8, &'x u8)>, Hr<'x>) -> &'x u8>, Hr<'x> }
         { }
         trait CoreAnchored {
             fn bound<F: for<'x> ::core::ops::Fn(::core::option::Option<&'x u8>, Hr<'x>) -> &'x u8>(&self, f: F) -> usize;
@@ -845,13 +851,11 @@ pub mod m {
     // The only anchor is in the type of an external crate, which the Referrer may replace as a
     // whole, so it is no anchor (old: `Hr<'x>` alone, see `AnchoredInside`, where `::std` is
     // allowed): the function pointer or the trait object is leaked as a whole, and a bound is an
-    // error. The optional entries are the types of `::std` which do not use `'x` themselves, or
-    // which hold the binder.
+    // error. The type of `::std` which holds the trait object is leaked whole too, with it in it.
     check_leak! {
         {
-            for<'x> fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>, Hr<'x>) -> &'x u8,
-            dyn for<'x> ::core::ops::Fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>, Hr<'x>) -> &'x u8,
-            ? ::std::boxed::Box<dyn for<'x> ::core::ops::Fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>, Hr<'x>) -> &'x u8>
+            ::std::boxed::Box<dyn for<'x> ::core::ops::Fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>, Hr<'x>) -> &'x u8>,
+            for<'x> fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>, Hr<'x>) -> &'x u8
         }
         { }
         trait ExternalAnchor {
@@ -1419,6 +1423,12 @@ pub mod m {
         ) -> usize {
             13
         }
+        fn gat_nested_core<'a, T: ::type_leak_test_outlives::Gat, U>(
+            &self,
+            _x: &'a ::core::option::Option<T::A<Rel2<U>>>,
+        ) -> usize {
+            14
+        }
     }
 
     impl SelfAround for Inner {
@@ -1885,6 +1895,21 @@ pub mod user {
     crate::m::Locals!(strict impl Locals for StrictWrapper => 0);
     crate::m::LocalBinders!(strict impl LocalBinders for StrictWrapper => 0);
 
+    /// The `::std::vec::Vec<..>` of `Around` has `Rel2<..>` in it, so it is an entry, replaced
+    /// whether the Referrer trusts the crate or not, and a copy as the field of a struct writes the
+    /// bound as the strict one does (`strict_copies`).
+    pub mod trusting_copies {
+        use crate::m::Rel2;
+
+        crate::m::Around!(copy [super::Wrapper] {
+            pub struct GatNested<'a, T: ::type_leak_test_outlives::Gat, U>(
+                pub &'a ::std::vec::Vec<T::A<Rel2<U>>>,
+            )
+            where
+                T::A<Rel2<U>>: 'a;
+        });
+    }
+
     /// The copies as the fields of structs, with the `::std::vec::Vec<..>` replaced by its entry,
     /// which has the bounds that the struct writes (`T: 'a`, as `Ref<'a, X>` requires it, E0309
     /// otherwise).
@@ -1902,6 +1927,9 @@ pub mod user {
             )
             where
                 T::A<Rel2<U>>: 'a;
+            pub struct GatNestedCore<'a, T: ::type_leak_test_outlives::Gat, U>(
+                pub &'a ::core::option::Option<T::A<Rel2<U>>>,
+            );
         });
         pub struct StrictWrapper;
     }
@@ -1950,8 +1978,10 @@ pub mod user {
         pub struct GatCell<'a, T: ::type_leak_test_outlives::Gat, U>(
             pub ::core::cell::Ref<'a, T::A<Rel2<U>>>,
         );
-        pub struct GatNested<'a, T: ::type_leak_test_outlives::Gat, U>(
-            pub &'a ::std::vec::Vec<T::A<Rel2<U>>>,
+        // A path of `::core` is no entry, so the copy infers the bound from the field (the `Vec`
+        // of an external crate is, see `trusting_copies`).
+        pub struct GatNestedCore<'a, T: ::type_leak_test_outlives::Gat, U>(
+            pub &'a ::core::option::Option<T::A<Rel2<U>>>,
         );
         // The original is well-formed with a `U` which does not outlive `'a` (`Rel2<U>` is not
         // required to, as the projection is `()`), and so is the copy, unless it requires

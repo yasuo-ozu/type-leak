@@ -190,7 +190,8 @@ pub struct Features {
     /// written, and so does a where predicate: they are the limitation F5 and the test macro's
     /// witness (no receiver).
     pub implied_outlives: bool,
-    /// A strict Referrer (`deny_ambiguous_crate_name()`) replaces the optional entries too.
+    /// A strict Referrer (one that trusts no crate, as `LeakerResult::allow()` does) replaces the
+    /// optional entries too.
     /// An optional entry in a where predicate that names a lifetime (`T: Fn(&'a ::ext::W<T,
     /// ::ext::B0>)`) has the predicate in its context, so it is replaced by a path that needs
     /// itself (E0277, F17): `not_optional` of the Leaker misses the type that holds another

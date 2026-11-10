@@ -1342,20 +1342,29 @@ fn a_trait_object_of_an_external_crate_with_a_lifetime_bound_is_leaked_alone() {
     ] {
         let input: Type = parse_str(input).unwrap();
         let item: ItemTrait = parse_quote! {
-            trait Tr { fn f(&self, f: for<'x> fn(#input, Parser<'x>) -> &'x u8); }
+            trait Tr { fn f(&self, f: for<'x> fn(#input) -> &'x u8); }
         };
         assert_eq!(
             leaked_by(leaker_allowing_nothing(), item.clone()),
-            [
-                e("Parser < 'x >", "< 'x >"),
-                e(
-                    &format!(
-                        "? {}",
-                        s(&parse_str::<Type>(&input_without_ref(&input)).unwrap())
-                    ),
-                    "< 'x >"
+            [e(
+                &format!(
+                    "? {}",
+                    s(&parse_str::<Type>(&input_without_ref(&input)).unwrap())
                 ),
-            ],
+                "< 'x >"
+            )],
+            "{}",
+            s(&item)
+        );
+        // With a type to leak beside it, one entry covers both: the function pointer, as a whole.
+        let item: ItemTrait = parse_quote! {
+            trait Tr { fn f(&self, f: for<'x> fn(#input, Parser<'x>) -> &'x u8); }
+        };
+        let pointer: Type = parse_quote!(for<'x> fn(#input, Parser<'x>) -> &'x u8);
+        let pointer = s(&pointer);
+        assert_eq!(
+            leaked_by(leaker_allowing_nothing(), item.clone()),
+            [e(&pointer, "")],
             "{}",
             s(&item)
         );
@@ -1480,8 +1489,8 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
             ""
         )]
     );
-    // With a cause in it (`Parser`), the required entries are not affected: `Parser` is leaked as
-    // usual, and the function pointer, which contains it, is the optional entry.
+    // With a cause in it (`Parser`), the function pointer which contains it is the only entry, and
+    // it is required (`Parser` was an entry of its own, and the function pointer an optional one).
     assert_eq!(
         leaked_by(
             leaker_allowing_nothing(),
@@ -1489,13 +1498,10 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
                 trait Tr { fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8, (Parser,)>) -> &'x u8); }
             }
         ),
-        [
-            e("Parser", ""),
-            e(
-                "? for < 'x > fn (:: other :: Wrap < & 'x u8 , (Parser ,) >) -> & 'x u8",
-                ""
-            )
-        ]
+        [e(
+            "for < 'x > fn (:: other :: Wrap < & 'x u8 , (Parser ,) >) -> & 'x u8",
+            ""
+        )]
     );
     // One which does not use the lifetime of the output is an optional entry as usual.
     let item: ItemTrait = parse_quote! {
@@ -1507,14 +1513,23 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
     );
     // And one which another input anchors, with `'x` among its generics.
     let item: ItemTrait = parse_quote! {
+        trait Tr { fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8) -> &'x u8); }
+    };
+    assert_eq!(
+        leaked_by(leaker_allowing_nothing(), item),
+        [e("? :: other :: Wrap < & 'x u8 >", "< 'x >")]
+    );
+    // With `Parser<'x>` beside it, the function pointer is one entry (it was `Parser<'x>` and the
+    // optional `Wrap<&'x u8>`).
+    let item: ItemTrait = parse_quote! {
         trait Tr { fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8); }
     };
     assert_eq!(
         leaked_by(leaker_allowing_nothing(), item),
-        [
-            e("Parser < 'x >", "< 'x >"),
-            e("? :: other :: Wrap < & 'x u8 >", "< 'x >")
-        ]
+        [e(
+            "for < 'x > fn (:: other :: Wrap < & 'x u8 > , & 'x u8 , Parser < 'x >) -> & 'x u8",
+            ""
+        )]
     );
 }
 
@@ -1545,12 +1560,12 @@ fn the_anchor_of_an_external_crate_type_is_checked_by_check() {
 
 #[test]
 fn the_copy_keeps_what_anchors_with_external_crate_types() {
-    // The Referrer which leaves the optional entries keeps the type of the external crate where it
+    // The Referrer which trusts the optional entries keeps the type of the external crate where it
     // is written (it is as anchored as the Leaker's was), and the one which replaces it has the
-    // function pointer replaced as a whole.
+    // type replaced, with `&'x u8` anchoring `'x` in both.
     let item: ItemTrait = parse_quote! {
         trait Tr {
-            fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8);
+            fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8) -> &'x u8);
         }
     };
     let mut leaker = leaker_allowing_nothing();
@@ -1560,23 +1575,18 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     syn::visit_mut::VisitMut::visit_item_trait_mut(
         &mut result
             .clone()
+            .allow(Rules::new().external_crates())
             .finish()
             .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut kept,
     );
-    let expected: ItemTrait = parse_quote! {
-        trait Tr {
-            fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, P<0usize>) -> &'x u8);
-        }
-    };
-    assert_eq!(s(&kept), s(&expected));
+    assert_eq!(s(&kept), s(&item));
     // The Referrer which replaces them: the type is replaced (with its entry), and `&'x u8`
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
-    let strict = result.deny_ambiguous_crate_name();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut strict
+        &mut result
             .finish()
             .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
@@ -1584,10 +1594,38 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     );
     let expected: ItemTrait = parse_quote! {
         trait Tr {
-            fn f(&self, f: for<'x> fn(P<1usize>, &'x u8, P<0usize>) -> &'x u8);
+            fn f(&self, f: for<'x> fn(P<0usize>, &'x u8) -> &'x u8);
         }
     };
     assert_eq!(s(&replaced), s(&expected));
+    // With a type to leak beside it, one entry covers all: the function pointer, replaced as a
+    // whole by both (it was `Parser<'x>` and the optional `Wrap<&'x u8>`).
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8);
+        }
+    };
+    let mut leaker = leaker_allowing_nothing();
+    let context = leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    for allow in [true, false] {
+        let mut copy = item.clone();
+        let mut result = result.clone();
+        if allow {
+            result = result.allow(Rules::new().external_crates());
+        }
+        syn::visit_mut::VisitMut::visit_item_trait_mut(
+            &mut result
+                .finish()
+                .unwrap()
+                .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut copy,
+        );
+        let expected: ItemTrait = parse_quote! {
+            trait Tr { fn f(&self, f: P<0usize>); }
+        };
+        assert_eq!(s(&copy), s(&expected));
+    }
     // The one whose function pointer is leaked as a whole is replaced by it in both.
     let item: ItemTrait = parse_quote! {
         trait Tr {
@@ -1600,8 +1638,8 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     for allow in [true, false] {
         let mut copy = item.clone();
         let mut result = result.clone();
-        if !allow {
-            result = result.deny_ambiguous_crate_name();
+        if allow {
+            result = result.allow(Rules::new().external_crates());
         }
         syn::visit_mut::VisitMut::visit_item_trait_mut(
             &mut result

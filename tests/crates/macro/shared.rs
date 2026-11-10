@@ -150,7 +150,9 @@ impl Parse for Apply {
     fn parse(input: ParseStream) -> Result<Self> {
         let content;
         braced!(content in input);
-        let referrer = content.parse()?;
+        // A Referrer that trusts every crate: it copies the optional entries as written.
+        let result: LeakerResult = content.parse()?;
+        let referrer = result.allow(Rules::new().external_crates()).into_referrer();
         let content;
         braced!(content in input);
         let contexts = content

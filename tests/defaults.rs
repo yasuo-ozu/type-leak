@@ -3,7 +3,7 @@
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, Referrer};
+use type_leak::{ContextId, Leaker, Referrer, Rules};
 
 fn referrer(tr: &ItemTrait) -> Referrer {
     {
@@ -258,7 +258,8 @@ fn test_defaults_of_several_calls_are_shared() {
     leaker.intern_trait(&bad, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().allow(Rules::new().external_crates());
+    let referrer = referrer.into_referrer();
     // The types use no generics, so they are in one context, whichever call found them, and the
     // generics of the calls (without the defaults) are two other contexts. The default of `U`,
     // the type of an external crate, is an optional entry (after the required ones), which uses
@@ -282,7 +283,7 @@ fn test_defaults_of_several_calls_are_shared() {
     assert_eq!(referrer.context(2), top_plain);
     assert_eq!(referrer.context_generics(top_plain).params.len(), 1);
     assert_eq!(referrer.context_generics(top_tr).params.len(), 2);
-    // The default is copied (the optional entry is left as it is), as in any call.
+    // The default is copied (the trusted optional entry is left as it is), as in any call.
     let completed = referrer
         .complete_args(
             top_tr,
@@ -296,8 +297,7 @@ fn test_defaults_of_several_calls_are_shared() {
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
     // A Referrer which does not trust the names of the crates replaces the default by the entry.
-    let strict = result.deny_ambiguous_crate_name();
-    let strict = strict.into_referrer();
+    let strict = result.into_referrer();
     let mut replaced = Vec::new();
     let completed = strict
         .complete_args(

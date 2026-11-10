@@ -85,6 +85,9 @@ type CompositionGraph =
     LinkedAdjEdgeGraph<HashMap<NodeKey, NodeRepr<u32>>, Vec<((), EdgeRepr<NodeKey, u32>)>>;
 
 /// The types found by the analysis, and their composition.
+///
+/// A type is a node if it may be a required entry or an optional one (or both). A type that may
+/// be neither is not in it: its components hang on its parent.
 #[derive(Default)]
 pub(crate) struct TypeGraph {
     /// An edge goes from a type to each internable type it is composed of.
@@ -92,12 +95,19 @@ pub(crate) struct TypeGraph {
     nodes: HashSet<NodeKey>,
     /// The types that appear as roots, not as components of another type.
     pub(crate) roots: HashSet<NodeKey>,
-    /// The types that must be interned: they depend on the context, or the Referrer may replace
-    /// them.
+    /// The types that depend on the context: each must be an entry or inside one.
     pub(crate) must_intern: HashSet<NodeKey>,
-    /// The types that cannot be entries, because the copy would be cyclic (see
+    /// The types that the Referrer may replace (their own path names an external crate): the same.
+    pub(crate) optional: HashSet<NodeKey>,
+    /// The types that may be a required entry: a part of them is a cause.
+    pub(crate) required_candidates: HashSet<NodeKey>,
+    /// The types that may be an optional entry: they or a part of them is optional.
+    pub(crate) optional_candidates: HashSet<NodeKey>,
+    /// The types that cannot be required entries, because the copy would be cyclic (see
     /// `AnalyzeVisitor::env_cycle()`): their components are entries instead.
-    pub(crate) forbidden: HashSet<NodeKey>,
+    pub(crate) no_required: HashSet<NodeKey>,
+    /// The same for the optional entries.
+    pub(crate) no_optional: HashSet<NodeKey>,
 }
 
 impl TypeGraph {
@@ -108,7 +118,6 @@ impl TypeGraph {
         context: ContextId,
         ty: &Type,
         parent: Option<&NodeKey>,
-        is_must_intern: bool,
     ) -> NodeKey {
         let key = NodeKey {
             context,
@@ -123,15 +132,7 @@ impl TypeGraph {
                 self.roots.insert(key.clone());
             }
         }
-        if is_must_intern {
-            self.must_intern.insert(key.clone());
-        }
         key
-    }
-
-    /// Makes `key` a type that cannot be an entry.
-    pub(crate) fn forbid(&mut self, key: &NodeKey) {
-        self.forbidden.insert(key.clone());
     }
 
     fn add_edge(&mut self, from: NodeKey, to: NodeKey) {
@@ -170,7 +171,11 @@ impl TypeGraph {
         }
         self.roots.extend(other.roots);
         self.must_intern.extend(other.must_intern);
-        self.forbidden.extend(other.forbidden);
+        self.optional.extend(other.optional);
+        self.required_candidates.extend(other.required_candidates);
+        self.optional_candidates.extend(other.optional_candidates);
+        self.no_required.extend(other.no_required);
+        self.no_optional.extend(other.no_optional);
     }
 }
 

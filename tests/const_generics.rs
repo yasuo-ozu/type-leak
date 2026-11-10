@@ -7,13 +7,15 @@ use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, Referrer};
+use type_leak::{ContextId, Leaker, Options, Referrer, Rules};
 
-/// Leaks the types of `item`, and returns the top-level context of the trait.
+/// Leaks the types of `item`, and returns the top-level context of the trait. The Referrer trusts
+/// the optional entries: it copies them as written.
 fn leak(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = Leaker::new();
     let context = leaker.intern_trait(item, true);
-    (leaker.result().finish().unwrap(), context)
+    let result = leaker.result().allow(Rules::new().external_crates());
+    (result.finish().unwrap(), context)
 }
 
 /// Returns the leaked types with their local generics (with the where clause), by index.
@@ -332,19 +334,32 @@ fn test_binder_in_type() {
         }
     };
     let (referrer, context) = leak(&item);
-    // The `Box` of an external crate is an optional entry (a type with the lifetime of the binder
-    // inside it, which does not use the binder itself), and `Rel<L>` is the required one.
+    // The `Box` of an external crate holds `Rel<L>`, so it is the one entry, and required (`Rel<L>`
+    // was the required entry, and the `Box` an optional one).
     assert_eq!(
         entries(&referrer),
-        [
-            entry(parse_quote!(Rel<L>), parse_quote!(<L>)),
-            entry(
-                parse_quote!(::std::boxed::Box<dyn for<'b> ::p::F<&'b Rel<L>>>),
-                parse_quote!(<L>)
-            ),
-        ]
+        [entry(
+            parse_quote!(::std::boxed::Box<dyn for<'b> ::p::F<&'b Rel<L>>>),
+            parse_quote!(<L>)
+        )]
     );
-    assert!(referrer.must(0) && !referrer.must(1));
+    assert!(referrer.must(0));
+    assert_eq!(
+        rewrite(referrer, context, item.clone()),
+        expected(parse_quote! {
+            trait MyTrait {
+                fn f<L>(&self, x: P<0usize>);
+            }
+        })
+    );
+    // Where the Leaker allows the crates, `Rel<L>` is the entry, with `L` only.
+    let mut leaker = Leaker::from_config(Rules::new().external_crates(), Options::new());
+    let context = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        entries(&referrer),
+        [entry(parse_quote!(Rel<L>), parse_quote!(<L>))]
+    );
     assert_eq!(
         rewrite(referrer, context, item),
         expected(parse_quote! {

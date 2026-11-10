@@ -5,7 +5,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer, UseSite};
+use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer, Rules, UseSite};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -478,11 +478,13 @@ fn test_outermost_generics_as_leakers() {
     );
 }
 
-/// The Referrer of the trait, and its top-level context: the scope of its copies.
+/// The Referrer of the trait, and its top-level context: the scope of its copies. The Referrer
+/// trusts the optional entries (the types of other crates stay as written).
 fn referrer_of(tr: ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = type_leak::Leaker::new();
     let context = leaker.intern_trait(&tr, true);
-    (leaker.result().finish().unwrap(), context)
+    let result = leaker.result().allow(Rules::new().external_crates());
+    (result.finish().unwrap(), context)
 }
 
 #[test]

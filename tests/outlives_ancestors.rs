@@ -25,8 +25,10 @@ fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
+/// The paths of external crates (`::std::vec::Vec`) are allowed: they are no entries, so the entry
+/// of a type is the one in them, whatever the Referrer trusts.
 fn leaker() -> Leaker<impl Allow> {
-    let config = Rules::new().primitive().prelude();
+    let config = Rules::new().primitive().prelude().external_crates();
     Leaker::from_config(config, Options::new())
 }
 
@@ -34,11 +36,20 @@ fn referrer_of(item: &ItemTrait) -> Referrer {
     referrer_in(item).0
 }
 
+/// The Referrer of a Leaker that does not allow the external crates: their paths are optional
+/// entries.
+fn referrer_with_optional_entries(item: &ItemTrait) -> Referrer {
+    let mut leaker = Leaker::from_config(Rules::new().primitive().prelude(), Options::new());
+    leaker.intern_trait(item, true);
+    leaker.result().finish().unwrap()
+}
+
 /// The Referrer, with the top-level context of the trait: the scope of its copies.
 fn referrer_in(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = leaker();
     let context = leaker.intern_trait(item, true);
-    (leaker.result().finish().unwrap(), context)
+    let result = leaker.result().allow(Rules::new().external_crates());
+    (result.finish().unwrap(), context)
 }
 
 /// The generics (and the where clause) of each leaked type, by its tokens.
@@ -955,7 +966,10 @@ mod projection_paths {
         // definition may imply (`T: 'a` and `U: 'a` are not assumed: they are written when they
         // are needed).
         assert_eq!(
-            contexts_of(&referrer_of(&tr), ":: p :: Wrap < 'a , T :: A < U > >"),
+            contexts_of(
+                &referrer_with_optional_entries(&tr),
+                ":: p :: Wrap < 'a , T :: A < U > >"
+            ),
             ["< 'a , T : :: p :: Gat , U >"],
             "an absolute path is an optional entry"
         );
@@ -963,7 +977,10 @@ mod projection_paths {
             trait Tr { fn f<'a, T: ::p::Gat + 'a, U: 'a>(&self, x: ::p::Wrap<'a, T::A<U>>); }
         };
         assert_eq!(
-            contexts_of(&referrer_of(&tr), ":: p :: Wrap < 'a , T :: A < U > >"),
+            contexts_of(
+                &referrer_with_optional_entries(&tr),
+                ":: p :: Wrap < 'a , T :: A < U > >"
+            ),
             ["< 'a , T : 'a + :: p :: Gat , U : 'a >"],
             "the bounds which are written"
         );

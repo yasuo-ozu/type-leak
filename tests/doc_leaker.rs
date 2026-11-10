@@ -186,9 +186,9 @@ fn allow_a_cause_copies_that_part_as_written() {
     assert_eq!(result.finish().unwrap().required().count(), 1);
 }
 
-/// `deny_ambiguous_crate_name()` makes the Referrer replace an optional entry.
+/// The Referrer replaces an optional entry, unless `allow()` trusts it.
 #[test]
-fn deny_ambiguous_crate_name_replaces_optional_entries() {
+fn allow_trusts_optional_entries() {
     let mut leaker = Leaker::new();
     let context = leaker.intern_struct(&parse_quote! { struct S { a: ::foo::X } }, true);
     let result = leaker.result();
@@ -197,12 +197,13 @@ fn deny_ambiguous_crate_name_replaces_optional_entries() {
     let referrer = result.clone().finish().unwrap();
     assert_eq!(
         referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
-        ty
+        replaced
     );
-    let referrer = result.deny_ambiguous_crate_name().finish().unwrap();
+    let result = result.allow(Rules::new().external_crates());
+    let referrer = result.finish().unwrap();
     assert_eq!(
         referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
-        replaced
+        ty
     );
 }
 

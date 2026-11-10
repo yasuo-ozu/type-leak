@@ -1,7 +1,9 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
+use crate::allow::{Allow, Place as AllowPlace};
 use crate::analysis::{PartItem, SignatureFacts, SignatureMark};
 use crate::context::{Context, ContextId, Enclosing, Gat, ModuleInfo, Scope, SelfRequirement};
+use crate::crates::absolute_paths;
 use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
 use crate::encode::{check_root_args, complete_generics_args, param_as_arg, EncodeError};
 use crate::error::Cause;
@@ -31,9 +33,10 @@ use template_quote::{quote, ToTokens};
 ///
 /// A's macro passes the `Referrer` and the top-level [`ContextId`] to B's as tokens ([`ToTokens`],
 /// [`Parse`]); both crates must use the same version of `type-leak`. Emit an impl for every entry,
-/// not only the [`required()`](Referrer::required) ones: B may be strict
-/// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)), which `==`
-/// ignores: it is not serialized. `examples/two-macros` is a complete pair.
+/// not only the [`required()`](Referrer::required) ones: B replaces an optional entry unless it
+/// trusts it ([`LeakerResult::allow()`](crate::LeakerResult::allow)), and the trust is not
+/// serialized (`==` ignores it), so a parsed Referrer trusts none. `examples/two-macros` is a
+/// complete pair.
 ///
 /// A method that takes an entry index `ix` panics if it is out of range ([`iter()`](Referrer::iter)
 /// has the valid ones).
@@ -67,8 +70,10 @@ pub struct Referrer {
     pub(crate) contexts: Vec<ContextId>,
     pub(crate) musts: Vec<bool>,
     pub(crate) external_crates: Vec<Vec<String>>,
-    /// Not serialized, so not compared.
-    pub(crate) allow_ambiguous_crate_name: Unserialized<bool>,
+    /// By entry: a rule of [`LeakerResult::allow()`](crate::LeakerResult::allow) allowed every
+    /// absolute path of the entry, so the copy may keep an optional entry as written. Not
+    /// serialized, so not compared: a parsed Referrer trusts none.
+    pub(crate) trusted: Unserialized<Vec<bool>>,
     pub(crate) context_map: BTreeMap<ContextId, Context>,
     /// Each is also a context of `context_map`.
     pub(crate) modules: BTreeMap<ContextId, ModuleInfo>,
@@ -188,7 +193,7 @@ impl Referrer {
             contexts: Vec::new(),
             musts: Vec::new(),
             external_crates: Vec::new(),
-            allow_ambiguous_crate_name: Unserialized(true),
+            trusted: Unserialized(Vec::new()),
             context_map,
             modules,
             map: HashMap::new(),
@@ -210,6 +215,7 @@ impl Referrer {
             referrer.contexts.push(context);
             referrer.musts.push(must);
             referrer.external_crates.push(crates);
+            referrer.trusted.0.push(false);
         }
         referrer
     }
@@ -266,7 +272,21 @@ impl Referrer {
             }
         }
         let ix = best?.1;
-        Some(ix).filter(|&ix| !self.allow_ambiguous_crate_name.0 || self.musts[ix])
+        Some(ix).filter(|&ix| self.musts[ix] || !self.trusted.0[ix])
+    }
+
+    /// Trusts each optional entry for which `rule` allows every absolute path that it depends on
+    /// ([`absolute_paths()`]), asked bare, at no place. A trust stays.
+    pub(crate) fn trust<A: Allow + ?Sized>(&mut self, rule: &A) {
+        for ix in 0..self.leak_types.len() {
+            if self.musts[ix] || self.trusted.0[ix] {
+                continue;
+            }
+            let paths = absolute_paths(&self.leak_types[ix], self.entry_context(ix));
+            self.trusted.0[ix] = paths
+                .iter()
+                .all(|cause| rule.allow(cause, AllowPlace::default()));
+        }
     }
 
     /// Returns `true` if `ty` has the context `context` at `at`, in `scopes`, as an entry of that
@@ -487,10 +507,13 @@ impl Referrer {
 
     /// Returns `true` if the `ix`-th entry is required, and `false` if it is optional.
     ///
-    /// An entry is optional if only its own path is an absolute path that names an external crate:
-    /// a non-strict Referrer copies it as written, a strict one replaces it
-    /// ([`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name)).
-    /// Required entries have the smaller indices.
+    /// An entry is optional if only its own path is an absolute path that names an external crate
+    /// (`::foo::X`) and the Leaker's rule does not allow it, and no type that depends on the
+    /// context is in it: `::foo::W<Rel>` is required, as `Rel` is. A Referrer replaces an optional
+    /// entry through the Repeater, like a required entry, unless it trusts it: the rule given to
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) allows every absolute path of the
+    /// entry (it is then copied as written). The trust is not serialized. Required entries have the
+    /// smaller indices.
     ///
     /// ```
     /// # use type_leak::*;
@@ -508,7 +531,7 @@ impl Referrer {
     /// Returns the required entries ([`Referrer::must()`]) with their indices.
     ///
     /// Every Referrer replaces them, so each needs a Repeater impl; an optional entry needs one
-    /// only for a strict Referrer.
+    /// only if some Referrer does not trust it.
     pub fn required(&self) -> impl Iterator<Item = (usize, &Type)> {
         self.leak_types
             .iter()
@@ -1295,8 +1318,8 @@ where
     ///
     /// A type copied as written keeps its `Self`, in a nested struct, enum or union the copy's own
     /// type. So an absolute type that names it (`::p::Rel2<Self, T>`, `Box<Self>`) is no entry
-    /// there, not even an optional one for a strict Referrer: replaced, it would hold the Leaker's
-    /// type, and `Box<Self>` would not be recursive.
+    /// there, not even an optional one: replaced, it would hold the Leaker's type, and `Box<Self>`
+    /// would not be recursive.
     pub fn with_nested_self<N: FnMut(&NestedSelf, Type, usize) -> Type>(
         self,
         nested_fn: N,
@@ -1888,9 +1911,9 @@ impl Referrer {
 /// format tag ([`Referrer::FORMAT_VERSION`]) is missing or differs, or if the contexts are
 /// inconsistent (a module or context used but not declared, a cycle of module parents).
 ///
-/// The Referrer is lenient. A macro that wants it strict parses a
-/// [`LeakerResult`](crate::LeakerResult) instead (the same tokens parse as one) and calls
-/// [`deny_ambiguous_crate_name()`](crate::LeakerResult::deny_ambiguous_crate_name).
+/// The Referrer trusts no optional entry ([`Referrer::must()`]), so it replaces all. A macro that
+/// trusts crates parses a [`LeakerResult`](crate::LeakerResult) instead (the same tokens parse as
+/// one) and calls [`allow()`](crate::LeakerResult::allow) with a rule that allows their paths.
 impl Parse for Referrer {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         let span = input.span();

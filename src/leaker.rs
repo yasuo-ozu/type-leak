@@ -3,13 +3,15 @@
 use crate::allow::{filter, Allow};
 use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
 use crate::analyze::{declared_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
-use crate::context::{Context, ContextId, Contexts, Gat, SelfRequirement};
+#[cfg(doc)]
+use crate::context::SelfRequirement;
+use crate::context::{Context, ContextId, Contexts, Gat};
+use crate::crates::external_crates;
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::util::ident_name;
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -20,7 +22,6 @@ use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::result::Result;
 use syn::parse::{Parse, ParseStream};
-use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 
@@ -65,8 +66,10 @@ use template_quote::{quote, ToTokens};
 ///
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path
 ///   (`Self: Sized` needs [`Rules::prelude()`](crate::Rules::prelude)).
-/// - An absolute path of another crate is copied as written, which assumes that both crates
-///   resolve it alike ([`LeakerResult::deny_ambiguous_crate_name()`]).
+/// - An absolute path of another crate (`::foo::X`) is an optional entry: the Referrer replaces it
+///   through the Repeater unless [`LeakerResult::allow()`] trusts it (the crate is the same on both
+///   sides), or the Leaker's rule allows it and it makes no entry. With a type that depends on the
+///   context in it (`::foo::W<Rel>`) it is required, and always replaced.
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
 /// - Values and bodies are not analyzed unless [`Options::check_values()`] is on.
 ///
@@ -120,15 +123,11 @@ pub struct Leaker<A = ()> {
     /// What the Leaker leaves as written instead of leaking it, and the errors it does not
     /// record.
     allow: A,
-    /// The types that depend on the context (the required entries).
+    /// The types that depend on the context, or that the Referrer may replace.
     types: TypeGraph,
-    /// The types the Referrer may replace (the optional entries).
-    optional_types: TypeGraph,
     /// The result of [`Leaker::reduce_roots()`]: required, then optional. `None` if outdated.
     reachable_types: Option<(Vec<NodeKey>, Vec<NodeKey>)>,
     contexts: Contexts,
-    /// Numbered on their own, so that optional entries do not change the ids of required ones.
-    optional_contexts: Contexts,
     /// The top-level contexts of the scopes (also of those with errors), which the [`Referrer`]
     /// keeps without an entry too.
     top_levels: BTreeSet<ContextId>,
@@ -220,10 +219,8 @@ impl<A: Allow> Leaker<A> {
         Self {
             allow,
             types: TypeGraph::default(),
-            optional_types: TypeGraph::default(),
             reachable_types: None,
             contexts: Contexts::default(),
-            optional_contexts: Contexts::default(),
             top_levels: BTreeSet::new(),
             assumed_primitives: Vec::new(),
             options,
@@ -490,46 +487,23 @@ impl<A: Allow> Leaker<A> {
     /// Chooses the fewest entries from which every leaked type can be built;
     /// [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime or bare-identifier argument
     /// (`Wrap<SIZE>`), a type with a type in an expression (`[u8; size_of::<Big>()]`) and a trait
-    /// object are entries as a whole.
+    /// object are entries as a whole. One choice covers the required types and the optional ones
+    /// ([`Referrer::must()`]): an entry with a required type in it is required.
     pub fn reduce_roots(&mut self) {
-        if self.reachable_types.is_some() {
-            return;
+        if self.reachable_types.is_none() {
+            self.reachable_types = Some(reduce(&self.types));
         }
-        let required = reduce(&self.types, &HashSet::new());
-        // The required entries are cut for free in the graph of the optional ones.
-        let blocked: HashSet<NodeKey> = required
-            .iter()
-            .filter_map(|key| {
-                let context = self
-                    .optional_contexts
-                    .find(self.contexts.get(key.context))?;
-                Some(NodeKey {
-                    context,
-                    ty: key.ty.clone(),
-                })
-            })
-            .collect();
-        let mut optional: Vec<NodeKey> = reduce(&self.optional_types, &blocked)
-            .into_iter()
-            .map(|key| NodeKey {
-                context: self
-                    .contexts
-                    .intern(self.optional_contexts.get(key.context).clone()),
-                ty: key.ty,
-            })
-            .collect();
-        optional.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
-        self.reachable_types = Some((required, optional));
     }
 }
 
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
 ///
-/// [`allow()`](LeakerResult::allow) drops the errors that an [`Allow`] accepts. It takes and
-/// returns the result, so it chains. It only drops errors and leaves the entries as they are (you
-/// promise that the part compiles as written): to remove entries, give the [`Allow`] to
-/// [`Leaker::from_config()`]. A rule here only approximates the one of the Leaker (more errors may
-/// remain, and a copy may fail to build): give rules to the Leaker when you can.
+/// [`allow()`](LeakerResult::allow) takes and returns the result, so it chains. It drops the errors
+/// that an [`Allow`] accepts (you promise that the part compiles as written), and trusts the
+/// optional entries whose absolute paths it allows (see [`Referrer::must()`]). It leaves the
+/// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::from_config()`]. A rule
+/// here only approximates the one of the Leaker (more errors may remain, and a copy may fail to
+/// build): give rules to the Leaker when you can.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -556,29 +530,27 @@ impl LeakerResult {
     /// by its [`paths`](ErrorItem::paths) if it has any, else by its cause. The other errors stay,
     /// in order.
     ///
+    /// It also trusts each optional entry ([`Referrer::must()`]) for which `rule` allows every
+    /// absolute path that the entry names, in its type, in the bounds of its context and in its
+    /// `Self` requirement (the `::core` and `$crate` paths are always fine). A Referrer copies a
+    /// trusted entry as written, and replaces the others through the Repeater. You promise that
+    /// the crates mean the same in the Referrer's crate; the trust is not serialized, and stays
+    /// when `allow()` is called again. A path is asked bare, at no [`Place`](crate::Place), as the
+    /// cause of its kind (see [`Allow`]); [`Rules::external_crates()`](crate::Rules::external_crates)
+    /// allows all.
+    ///
     /// You promise that the part can be written as it is in the copy. The cause may be smaller
     /// than the part that is copied: in `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`,
     /// and the array is copied whole. Allowing a [`Reason::UnprovableBound`] does not make the copy
     /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
-    /// ignored). An absolute path is never an error, so a rule for `::serde` changes nothing here.
+    /// ignored). An absolute path is never an error, so a rule for `::serde` changes no error.
     ///
     /// See [`Allow`] for what the rule is asked. A closure needs `&Cause` and
     /// [`Place`](crate::Place) annotated when it is not written in the call
     /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none.
     pub fn allow(mut self, rule: impl Allow) -> Self {
         filter(&rule, &mut self.errors);
-        self
-    }
-
-    /// Makes the Referrer strict: optional entries (absolute paths of other crates) are replaced as
-    /// a whole through the Repeater too, instead of being left as written.
-    ///
-    /// Crates are matched by name only: use it if the Referrer's crate may have other dependencies
-    /// than the Leaker's. The types inside an optional entry are replaced either way. Not
-    /// serialized: the Leaker's side writes the impls of all entries ([`Referrer::iter()`]), and
-    /// the macro that receives the result chooses.
-    pub fn deny_ambiguous_crate_name(mut self) -> Self {
-        self.referrer.allow_ambiguous_crate_name.0 = false;
+        self.referrer.trust(&rule);
         self
     }
 
@@ -699,8 +671,6 @@ impl<A: Allow> Leaker<A> {
         drop_optional(&mut effects, &not_optional.into_iter().collect());
         let mut analysis = Analysis::default();
         analysis.apply(&mut self.contexts, &effects, None);
-        // Optional entries never fail the call: a type that cannot be leaked is copied as written.
-        analysis.apply_optional(&mut self.optional_contexts, &effects, None);
         for ident in analysis.primitives {
             if !self.assumed_primitives.contains(&ident) {
                 self.assumed_primitives.push(ident);
@@ -711,11 +681,10 @@ impl<A: Allow> Leaker<A> {
                 self.parts.push(part);
             }
         }
-        if !(analysis.types.is_empty() && analysis.optional.is_empty()) {
+        if !analysis.types.is_empty() {
             self.reachable_types = None;
         }
         self.types.merge(analysis.types);
-        self.optional_types.merge(analysis.optional);
         // Shares the context of an entry that uses exactly these generics.
         // `Self` is part of the top-level context only if an entry names it, or has a bound
         // rewritten for it (see `Context::of()`).
@@ -732,10 +701,17 @@ impl<A: Allow> Leaker<A> {
     }
 }
 
-/// Min vertex cut from the roots to the must-intern types, by max flow (Edmonds-Karp, node-split).
-/// Ties go to the cut closest to the sink, so inner types win.
-fn reduce(types: &TypeGraph, blocked: &HashSet<NodeKey>) -> Vec<NodeKey> {
-    let mut keys: Vec<&NodeKey> = types.keys().filter(|key| !blocked.contains(*key)).collect();
+/// Min vertex cut from the roots to the red types, by max flow (Edmonds-Karp, node-split). Ties go
+/// to the cut closest to the sink, so inner types win. Returns the required entries and the
+/// optional ones, each sorted.
+///
+/// A type is red if it is `must_intern`, or `optional` and may be an entry. The kind of an entry is
+/// what it covers: required if it is or holds a `must_intern` type, else optional. A type is cut
+/// only as a kind it may be: a candidate of the kind, not in `no_required` or `no_optional` (an
+/// optional type is a candidate of both). An optional type that may not be an entry is not red, and
+/// its parts are.
+fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
+    let mut keys: Vec<&NodeKey> = types.keys().collect();
     keys.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
     let index: HashMap<&NodeKey, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
     let n = keys.len();
@@ -749,28 +725,44 @@ fn reduce(types: &TypeGraph, blocked: &HashSet<NodeKey>) -> Vec<NodeKey> {
     let flags = |set: &HashSet<NodeKey>| -> Vec<bool> {
         keys.iter().map(|key| set.contains(*key)).collect()
     };
-    let (red, root) = (flags(&types.must_intern), flags(&types.roots));
-    // A type that must be an entry cannot be forbidden to be one.
-    let forbidden: Vec<bool> = flags(&types.forbidden)
-        .into_iter()
-        .enumerate()
-        .map(|(i, forbidden)| forbidden && !red[i] && !needs_parent(keys[i]))
-        .collect();
+    let (must, soft, root) = (
+        flags(&types.must_intern),
+        flags(&types.optional),
+        flags(&types.roots),
+    );
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, children) in children.iter().enumerate() {
         for &child in children {
             parents[child].push(i);
         }
     }
+    // An entry that covers a required type is a required entry.
+    let mut required = must.clone();
+    spread(&mut required, &parents);
+    // An optional type is an entry anyway, so it is a candidate of either kind.
+    let may: Vec<bool> = (0..n)
+        .map(|i| match required[i] {
+            true => {
+                (soft[i] || types.required_candidates.contains(keys[i]))
+                    && !types.no_required.contains(keys[i])
+            }
+            false => {
+                types.optional_candidates.contains(keys[i]) && !types.no_optional.contains(keys[i])
+            }
+        })
+        .collect();
+    // An optional type that cannot be an entry is no entry, and its parts are.
+    let red: Vec<bool> = (0..n).map(|i| must[i] || (soft[i] && may[i])).collect();
+    // A type that must be an entry cannot be forbidden to be one.
+    let forbidden: Vec<bool> = (0..n)
+        .map(|i| !may[i] && !red[i] && !needs_parent(keys[i]))
+        .collect();
     let mut has_red = red.clone();
     spread(&mut has_red, &parents);
 
     // A root that must be interned is in every minimum cut, so it is cut without a flow.
     let cut: Vec<bool> = (0..n).map(|i| red[i] && root[i]).collect();
-    let mut kept: Vec<NodeKey> = (0..n)
-        .filter(|&i| cut[i])
-        .map(|i| keys[i].clone())
-        .collect();
+    let mut kept: Vec<usize> = (0..n).filter(|&i| cut[i]).collect();
 
     // The edges of the network. A parent that its components cannot replace goes to the sink.
     let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -829,19 +821,22 @@ fn reduce(types: &TypeGraph, blocked: &HashSet<NodeKey>) -> Vec<NodeKey> {
         }
         let reaches_sink = sink_side(2 * m + 2, &edges, source, sink);
         // The cut closest to the sink: `v_in` cannot reach it, `v_out` can.
-        kept.extend(
-            members
-                .iter()
-                .filter(|&&i| {
-                    let v_in = 2 * local[i];
-                    reaches_sink[v_in + 1] && !reaches_sink[v_in]
-                })
-                .map(|&i| keys[i].clone()),
-        );
+        kept.extend(members.iter().copied().filter(|&i| {
+            let v_in = 2 * local[i];
+            reaches_sink[v_in + 1] && !reaches_sink[v_in]
+        }));
     }
 
-    kept.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
-    kept
+    let entries = |kind: bool| {
+        let mut found: Vec<NodeKey> = kept
+            .iter()
+            .filter(|&&i| required[i] == kind)
+            .map(|&i| keys[i].clone())
+            .collect();
+        found.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+        found
+    };
+    (entries(true), entries(false))
 }
 
 /// Marks every node reachable from a marked one.
@@ -902,71 +897,4 @@ fn find(component: &mut [usize], mut i: usize) -> usize {
         i = component[i];
     }
     i
-}
-
-/// Returns the sorted names of the external crates (not `core`) that `ty` and `context` name as
-/// `::name`.
-///
-/// `::crate`, `::self`, `::super`, `::Self` and `::_` name no crate (rustc rejects them in the
-/// Leaker's crate), and cannot be written as a name in a serialized Referrer.
-fn external_crates(ty: &Type, context: &Context) -> Vec<String> {
-    use proc_macro2::{Spacing, TokenTree};
-    #[derive(Default)]
-    struct Finder(BTreeSet<String>);
-    impl Finder {
-        fn add(&mut self, ident: &Ident) {
-            let name = ident_name(ident);
-            if !matches!(
-                name.as_str(),
-                "core" | "crate" | "self" | "super" | "Self" | "_"
-            ) {
-                self.0.insert(name);
-            }
-        }
-        /// Scans macro tokens for a leading `::` followed by a name.
-        fn scan(&mut self, tokens: TokenStream) {
-            let mut prev: Option<TokenTree> = None;
-            let mut iter = tokens.into_iter().peekable();
-            while let Some(tt) = iter.next() {
-                match &tt {
-                    TokenTree::Group(group) => self.scan(group.stream()),
-                    TokenTree::Punct(p) if p.as_char() == ':' && p.spacing() == Spacing::Joint => {
-                        let after_name = matches!(&prev, Some(TokenTree::Ident(_)))
-                            || matches!(&prev, Some(TokenTree::Punct(p)) if p.as_char() == '>');
-                        let second =
-                            matches!(iter.peek(), Some(TokenTree::Punct(p)) if p.as_char() == ':');
-                        if !after_name && second {
-                            iter.next();
-                            if let Some(TokenTree::Ident(ident)) = iter.peek() {
-                                self.add(ident);
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-                prev = Some(tt);
-            }
-        }
-    }
-    impl<'ast> Visit<'ast> for Finder {
-        fn visit_path(&mut self, i: &'ast Path) {
-            if let (Some(_), Some(seg)) = (&i.leading_colon, i.segments.first()) {
-                self.add(&seg.ident);
-            }
-            syn::visit::visit_path(self, i)
-        }
-        fn visit_macro(&mut self, i: &'ast Macro) {
-            self.scan(i.tokens.clone());
-            syn::visit::visit_macro(self, i)
-        }
-    }
-    let mut finder = Finder::default();
-    finder.visit_type(ty);
-    finder.visit_generics(context.generics());
-    match context.self_ty() {
-        Some(SelfRequirement::Bound(path)) => finder.visit_path(path),
-        Some(SelfRequirement::Type(ty)) => finder.visit_type(ty),
-        _ => (),
-    }
-    finder.0.into_iter().collect()
 }

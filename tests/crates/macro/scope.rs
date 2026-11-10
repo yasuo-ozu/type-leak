@@ -419,8 +419,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         path,
         strict,
     } = parse2(input)?;
-    if strict {
-        result = result.deny_ambiguous_crate_name();
+    if !strict {
+        result = result.allow(Rules::new().external_crates());
     }
     let referrer = result.into_referrer();
     let krate = path

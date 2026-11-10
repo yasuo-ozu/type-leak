@@ -505,9 +505,8 @@ pub mod s {
             ::core::cell::Ref<'a, dyn RelTr>,
             ::core::cell::Ref<'a, (dyn RelTr)>,
             dyn RelTr + 'a,
-            dyn RelTr,
             RelImpl,
-            ? ::std::boxed::Box<dyn RelTr>
+            ::std::boxed::Box<dyn RelTr>
         }
         { }
         trait PathDynLeaks<'a> {
@@ -741,8 +740,8 @@ pub mod x {
         module = crate::x,
     )]
     pub trait ExtDep {
-        /// An external type with a relative one in it: `RelX` is a required entry, and the whole
-        /// type an optional one.
+        /// An external type with a relative one in it: one required entry, which every Referrer
+        /// replaces whole.
         fn wrapped(&self) -> ::type_leak_test_ext::Ext<(RelX,)>;
         /// An external type without any relative one: an optional entry only.
         fn plain(&self, x: ::type_leak_test_ext::Ext<u8>) -> u8;
@@ -1870,7 +1869,12 @@ pub mod kinds {
     /// its entry is still replaced in the copy. (The traits differ: the Visitor finds a leaked type
     /// by its tokens, and would replace a `dyn ElidedTr` in `f` by the entry of `g`, with another
     /// lifetime.)
-    #[prop_leak_accept(id = 9185, allow_self = true, prelude = true)]
+    #[prop_leak_accept(
+        id = 9185,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
+    )]
     pub trait ElidedAndPlain {
         fn f(&self, x: ::type_leak_test_leaker::kinds::Elided<'_, dyn ElidedTr>);
         fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn PlainTr>);
@@ -1892,7 +1896,12 @@ pub mod kinds {
     /// `f` would take the entry of `g`, a trait object with another lifetime (E0308 in the impl of
     /// the host).
     pub trait SharedTr {}
-    #[prop_leak_accept(id = 9187, allow_self = true, prelude = true)]
+    #[prop_leak_accept(
+        id = 9187,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
+    )]
     pub trait ElidedAndBare {
         fn f(&self, x: ::type_leak_test_leaker::kinds::Elided<'_, dyn SharedTr>);
         fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
@@ -1903,7 +1912,12 @@ pub mod kinds {
     /// `f` is copied as written, and `Rel` beside it is an entry like any other, so the Referrer's
     /// crate, which does not name `Rel`, replaces it (E0412 if it were copied as written).
     pub struct ElidedPair<'e, T: ?Sized + 'e, U>(pub PhantomData<(&'e T, U)>);
-    #[prop_leak_accept(id = 9189, allow_self = true, prelude = true)]
+    #[prop_leak_accept(
+        id = 9189,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
+    )]
     pub trait ElidedWithSibling {
         fn f(&self, x: ::type_leak_test_leaker::kinds::ElidedPair<'_, dyn SharedTr, Rel>);
         fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
@@ -2049,7 +2063,12 @@ pub mod kinds {
     /// uses `T` is a conflict (`DeniedSelfInBounds`), copied as written, `dyn SharedTr + 'a`
     /// included. No entry names `Self`: the top-level context of the trait has to record it for
     /// the Visitor to find the part (F44). `g` has the entry `dyn SharedTr`, `+ 'static`.
-    #[prop_leak_accept(id = 9195, allow_self = false, prelude = true)]
+    #[prop_leak_accept(
+        id = 9195,
+        allow_self = false,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
+    )]
     pub trait DeniedSelfObject<'a> {
         fn f<T: PartialEq<Self>>(
             &self,
@@ -2084,7 +2103,12 @@ pub mod kinds {
     /// The where predicate of the trait names `Self` (`SelfInTraitPredicate`): the type in it is
     /// copied as written, and the impl of the host must satisfy the predicate with the
     /// original types (F44).
-    #[prop_leak_accept(id = 9196, allow_self = true, prelude = true)]
+    #[prop_leak_accept(
+        id = 9196,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
+    )]
     pub trait PredicateObject<'a>
     where
         ::type_leak_test_leaker::kinds::ObjOf<'a, Self, dyn SharedTr>:
@@ -2095,7 +2119,12 @@ pub mod kinds {
 
     /// The same for the self type of an impl, whose bound names `Self` (`SelfInImplSelfType`, and
     /// the `Self` of the bound, `UnprovableBound`): both are copied as written (F44).
-    #[prop_leak_accept(id = 9197, allow_self = true, prelude = true)]
+    #[prop_leak_accept(
+        id = 9197,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
+    )]
     impl<'a, T: ::core::convert::AsRef<Option<Self>>>
         ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>
     {
@@ -2111,7 +2140,8 @@ pub mod kinds {
         allow_self = true,
         prelude = true,
         scope = "mod",
-        no_nested_self = true
+        no_nested_self = true,
+        allow = "::type_leak_test_leaker::kinds::Bare"
     )]
     pub struct NestedSelfObject<'a, T: ::core::convert::AsRef<Self>> {
         pub obj: ::type_leak_test_leaker::kinds::ObjOf<'a, (Self, T), dyn SharedTr>,

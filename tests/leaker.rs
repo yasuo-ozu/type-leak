@@ -772,14 +772,22 @@ fn test_self_ty_cannot_be_interned() {
     );
 
     // The components are leaked instead if the type can be decomposed.
-    for ty in [quote!(::k::W<(Rel,), Self>), quote!((Rel, Self))] {
-        let sig = quote!(
-            fn f(&self) -> #ty;
-        );
-        assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
-        // `Self` does not depend on the context by itself, so `Rel` is enough.
-        assert_eq!(leak(sig, true).unwrap(), set(&["Rel"]), "{}", ty);
-    }
+    let sig = quote!(
+        fn f(&self) -> (Rel, Self);
+    );
+    assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
+    // `Self` does not depend on the context by itself, so `Rel` is enough.
+    assert_eq!(leak(sig, true).unwrap(), set(&["Rel"]));
+    // The type of an external crate, if `Self` can be leaked, is one required entry with `Rel` in
+    // it (it was the entry `Rel` and an optional one).
+    let sig = quote!(
+        fn f(&self) -> ::k::W<(Rel,), Self>;
+    );
+    assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
+    assert_eq!(
+        leak(sig, true).unwrap(),
+        set(&[":: k :: W < (Rel ,) , Self >"])
+    );
 
     // `Rel` as an argument may be a const, so the path is interned as a whole if it can be (with
     // `Self` allowed), and otherwise it is an error: `Rel` is not leaked as a type (see
@@ -805,7 +813,7 @@ fn test_self_ty_cannot_be_interned() {
             &mut leaker,
             &Generics::default(),
             quote!(
-                fn f(&self) -> ::k::W<(Rel,), Self>;
+                fn f(&self) -> ::k::W<(), Self>;
             ),
             allow_self,
         );
@@ -817,7 +825,7 @@ fn test_self_ty_cannot_be_interned() {
             .map(|(_, t)| quote!(#t).to_string())
             .collect::<Vec<_>>()
     };
-    assert_eq!(optional(true), [":: k :: W < (Rel ,) , Self >"]);
+    assert_eq!(optional(true), [":: k :: W < () , Self >"]);
     assert!(optional(false).is_empty());
 
     // `Self` alone is never leaked.

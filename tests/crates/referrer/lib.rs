@@ -93,10 +93,11 @@ type_leak_test_leaker::m::External!(strict impl<T> External<T> for Strict => 0 {
     }
 });
 
-// What the two Referrers write for the same items, as text: the trusting one names the crate (its
-// relative types are replaced), the strict one replaces the whole type of it. This crate has no
-// dependency on that crate (`type_leak_test_ext`), so it cannot compile either copy: the strict one
-// is compiled in `tests/crates/trusting`, which has the feature `strict` for it.
+// What the two Referrers write for the same items, as text: the trusting one names the crate (for
+// `Ext<u8>`, which has nothing relative in it), the strict one replaces the whole type of it. The
+// type with a relative one in it is replaced whole by both. This crate has no dependency on that
+// crate (`type_leak_test_ext`), so it cannot compile either copy: the strict one is compiled in
+// `tests/crates/trusting`, which has the feature `strict` for it.
 type_leak_test_leaker::x::ExtDep!(show TRUSTING_COPY [Wrapper] {
     pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
 });

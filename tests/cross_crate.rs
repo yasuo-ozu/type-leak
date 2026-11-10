@@ -1574,12 +1574,12 @@ fn accepted_conflicts_are_copied_as_written() {
             allowed("trait", 0, 2, 2),
         ),
         // (b) the parameter of `f` has an elided lifetime in the generics of a path, and `g`'s
-        // `dyn PlainTr` is an entry (and the optional one of the path around it). Only `g`'s
+        // `dyn PlainTr` is an entry (the path around it is allowed by the Leaker). Only `g`'s
         // parameter is compared (`f`'s has an elided lifetime, which a witness cannot name).
         (
             9185,
             reported(9185, __tl_report_9185!()),
-            allowed("trait", 2, 2, 1),
+            allowed("trait", 1, 2, 1),
         ),
         // (c) `Wrap<Self>`, where `Self` has no meaning, is copied as written; `Rel` is the entry.
         (
@@ -1593,7 +1593,7 @@ fn accepted_conflicts_are_copied_as_written() {
         (
             9187,
             reported(9187, __tl_report_9187!()),
-            allowed("trait", 2, 2, 1),
+            allowed("trait", 1, 2, 1),
         ),
         // (e) `Wrap<Y>` is an entry in `a1`, and in the bound of `ai` it is in the part that is
         // copied as written (`impl Into<Wrap<Y>>`): the same tokens and context.
@@ -1607,7 +1607,7 @@ fn accepted_conflicts_are_copied_as_written() {
         (
             9189,
             reported(9189, __tl_report_9189!()),
-            allowed("trait", 3, 2, 1),
+            allowed("trait", 2, 2, 1),
         ),
     ];
     for (id, got, expected) in table {
@@ -1771,30 +1771,30 @@ fn errors_the_referrers_macro_allows_are_copied_as_written() {
 // A strict Referrer, in a crate without the dependency of an optional entry.
 // ---------------------------------------------------------------------------------------------
 
-/// The type of a crate which the Referrer's crate has no dependency on is an optional entry. The
-/// trusting Referrer leaves it as written (and replaces what is relative in it), and the strict one
-/// replaces the whole type: the text of the two copies of the same items differs in that. Only the
-/// strict one can be compiled where the crate is not a dependency (this crate has none on it):
-/// `tests/trusting.rs` builds both in a crate that has none, and runs the tests of the strict one.
+/// The type of a crate which the Referrer's crate has no dependency on is an optional entry, if it
+/// has no relative type in it. The trusting Referrer leaves it as written, and the strict one
+/// replaces the whole type: the text of the two copies of the same items differs in that. The type
+/// with a relative type in it is one required entry, which both replace. Only the strict one can be
+/// compiled where the crate is not a dependency (this crate has none on it): `tests/trusting.rs`
+/// builds both in a crate that has none, and runs the tests of the strict one.
 #[test]
 fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not() {
     use type_leak_test_referrer::{STRICT_COPY, TRUSTING_COPY};
     let (trusting, strict) = (squash(TRUSTING_COPY), squash(STRICT_COPY));
 
-    // Trusting: the type of the other crate stays, with the relative type in it (`RelX`, the
-    // required entry 0) replaced; the plain `Ext<u8>` is not touched.
-    assert!(trusting.contains("x:::type_leak_test_ext::Ext<(<Wrapperas$crate::Repeater<(),"));
-    assert!(trusting.contains("0usize>>::Type,)>"));
-    assert!(trusting.contains("y:::type_leak_test_ext::Ext<u8>"));
-    assert_eq!(trusting.matches("type_leak_test_ext").count(), 2);
+    // Trusting: `Ext<(RelX,)>` is the required entry 0, replaced as a whole; the plain `Ext<u8>` is
+    // an optional one, which it leaves.
+    assert!(trusting.contains("x:<Wrapperas$crate::Repeater<(),"));
+    assert!(trusting.contains("0usize>>::Type,y:::type_leak_test_ext::Ext<u8>"));
+    assert_eq!(trusting.matches("type_leak_test_ext").count(), 1);
     assert_eq!(trusting.matches("Repeater<").count(), 1);
 
-    // Strict: both types of the other crate are replaced as a whole, each by its own entry (1 and
-    // 2, after the required `RelX`), and the crate is not named at all.
+    // Strict: both types of the other crate are replaced as a whole, each by its own entry (0 and
+    // 1), and the crate is not named at all.
     assert!(!strict.contains("type_leak_test_ext"));
     assert!(strict.contains("x:<Wrapperas$crate::Repeater<(),"));
-    assert!(strict.contains("1usize>>::Type,y:<Wrapperas$crate::Repeater<(),"));
-    assert!(strict.ends_with("2usize>>::Type){}"));
+    assert!(strict.contains("0usize>>::Type,y:<Wrapperas$crate::Repeater<(),"));
+    assert!(strict.ends_with("1usize>>::Type){}"));
     assert_eq!(strict.matches("Repeater<").count(), 2);
     assert_ne!(trusting, strict);
 }
@@ -2049,22 +2049,22 @@ fn parts_that_name_self_are_left_as_written() {
         (
             9195,
             reported(9195, __tl_report_9195!()),
-            allowed("trait", 2, 2, 2),
+            allowed("trait", 1, 2, 2),
         ),
         (
             9196,
             reported(9196, __tl_report_9196!()),
-            allowed("trait", 2, 1, 1),
+            allowed("trait", 1, 1, 1),
         ),
         (
             9197,
             reported(9197, __tl_report_9197!()),
-            allowed("impl-inherent", 2, 2, 2),
+            allowed("impl-inherent", 1, 2, 2),
         ),
         (
             9198,
             reported(9198, __tl_report_9198!()),
-            allowed("struct", 2, 2, 2),
+            allowed("struct", 1, 2, 2),
         ),
     ];
     for (id, got, expected) in table {
@@ -2131,7 +2131,7 @@ fn a_part_with_no_context_is_left_as_written() {
 
     assert_eq!(
         __nested_report_9199!(),
-        "9199|entries=2|errors=UnnameableSelf"
+        "9199|entries=1|errors=UnnameableSelf"
     );
     assert_eq!(
         squash(r::NESTED_9199_TYPES),

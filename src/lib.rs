@@ -10,6 +10,7 @@ mod allow;
 mod analysis;
 mod analyze;
 mod context;
+mod crates;
 mod elided;
 mod encode;
 mod error;

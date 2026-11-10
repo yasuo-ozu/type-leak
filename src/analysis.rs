@@ -1,5 +1,5 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
-//! visiting it, which the [`Analysis`] turns into the graphs of the entries.
+//! visiting it, which the [`Analysis`] turns into the graph of the entries.
 
 use crate::allow::Place;
 use crate::analyze::{input_type, unconstrained_in_output, Elision};
@@ -245,18 +245,19 @@ pub(crate) struct PendingType {
     /// The address of the type in the visited syntax, which `ty` is a copy of.
     pub(crate) origin: usize,
     pub(crate) is_must_intern: bool,
-    /// A candidate for the graph of the required entries: it or a part is a cause.
+    /// It may be a required entry: it or a part is a cause.
     pub(crate) in_graph: bool,
     /// An optional entry if the Referrer replaces it: its own path names an external crate.
     pub(crate) optional: bool,
+    /// It may be an optional entry: it or a part is `optional`.
     pub(crate) has_optional: bool,
     pub(crate) context: Context,
     /// A bare identifier argument that may be a const. Its parent is leaked whole if possible; if
     /// it cannot be because of a hard cause (see `Impossibles`), it is a conflict.
     pub(crate) ambiguous: bool,
-    /// It cannot be an entry, but its components can: the copy would be cyclic. Like
-    /// `no_optional_entry` for the optional entries.
+    /// It cannot be a required entry, but its components can: the copy would be cyclic.
     pub(crate) no_entry: bool,
+    /// Like `no_entry` for an optional entry.
     pub(crate) no_optional_entry: bool,
     /// The type names a `Self` without meaning, or a bound of its context does
     /// ([`correct_unmeant_self()`]).
@@ -358,14 +359,14 @@ pub(crate) enum Effect {
 #[derive(Default)]
 pub(crate) struct Analysis {
     pub(crate) types: TypeGraph,
-    /// In the contexts of `Leaker::optional_contexts`.
-    pub(crate) optional: TypeGraph,
     pub(crate) primitives: Vec<Ident>,
     /// The parts that the Referrer leaves as written, in order and distinct.
     pub(crate) parts: Vec<PartItem>,
 }
 
 impl Analysis {
+    /// Adds the types among `effects` that may be entries to the graph, and records the parts and
+    /// primitive names. A type that may be none is not added; its components hang on `parent`.
     pub(crate) fn apply(
         &mut self,
         contexts: &mut Contexts,
@@ -374,17 +375,31 @@ impl Analysis {
     ) {
         for effect in effects {
             match effect {
-                Effect::Type(pending) if !pending.in_graph => {
-                    // Never leaked: not added, but the assumptions of its components stay.
+                Effect::Type(pending) if !(pending.in_graph || pending.has_optional) => {
+                    // Never an entry: not added, but the assumptions of its components stay.
                     self.apply(contexts, &pending.components, parent);
                 }
                 Effect::Type(pending) => {
                     let context = contexts.intern(pending.context.clone());
-                    let key = self
-                        .types
-                        .add(context, &pending.ty, parent, pending.is_must_intern);
-                    if pending.no_entry {
-                        self.types.forbid(&key);
+                    let key = self.types.add(context, &pending.ty, parent);
+                    let types = &mut self.types;
+                    if pending.is_must_intern {
+                        types.must_intern.insert(key.clone());
+                    }
+                    if pending.optional {
+                        types.optional.insert(key.clone());
+                    }
+                    if pending.in_graph {
+                        types.required_candidates.insert(key.clone());
+                        if pending.no_entry {
+                            types.no_required.insert(key.clone());
+                        }
+                    }
+                    if pending.has_optional {
+                        types.optional_candidates.insert(key.clone());
+                        if pending.no_optional_entry {
+                            types.no_optional.insert(key.clone());
+                        }
                     }
                     self.apply(contexts, &pending.components, Some(&key));
                 }
@@ -414,31 +429,6 @@ impl Analysis {
                     }
                 }
                 Effect::Primitive(ident) => self.primitives.push(ident.clone()),
-            }
-        }
-    }
-
-    /// Like [`Analysis::apply()`] for the optional entries, which have contexts of their own. Types
-    /// leaked whole by their own cause are required, so they and their parts are not here.
-    pub(crate) fn apply_optional(
-        &mut self,
-        contexts: &mut Contexts,
-        effects: &[Effect],
-        parent: Option<&NodeKey>,
-    ) {
-        for effect in effects {
-            if let Effect::Type(pending) = effect {
-                if !pending.has_optional {
-                    continue;
-                }
-                let context = contexts.intern(pending.context.clone());
-                let key = self
-                    .optional
-                    .add(context, &pending.ty, parent, pending.optional);
-                if pending.no_optional_entry {
-                    self.optional.forbid(&key);
-                }
-                self.apply_optional(contexts, &pending.components, Some(&key));
             }
         }
     }
@@ -590,13 +580,14 @@ fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
     }
 }
 
-/// Returns `true` if a type that may become an entry, or a part copied as written, names `Self` or
-/// has bounds rewritten for the `Self` that `declared` is, so the Referrer needs to know what `Self`
-/// is to find it.
+/// Returns `true` if a type that may become an entry (of either kind), or a part copied as written,
+/// names `Self` or has bounds rewritten for the `Self` that `declared` is, so the Referrer needs to
+/// know what `Self` is to find it.
 pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool {
     effects.iter().any(|effect| match effect {
         Effect::Type(pending) => {
-            (pending.in_graph && depends_on_self(&pending.context, declared))
+            ((pending.in_graph || pending.has_optional)
+                && depends_on_self(&pending.context, declared))
                 || names_self(&pending.components, declared)
         }
         Effect::Error(error) => part_names_self(error, declared),
