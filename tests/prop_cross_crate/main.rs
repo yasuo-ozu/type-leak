@@ -448,7 +448,11 @@
 //!   constants and statics, the defaults of associated constants and of const parameters, with
 //!   the types of the Leaker's crate in a `let`, a turbofish and a cast, which the Leaker leaks with
 //!   `check_values` and the witnesses check (`Args::bodies`), and in a share of them a relative
-//!   path of a value (`crate::base::bf()`, `RLEN`), which it rejects (the tag `value_path`).
+//!   path of a value (`crate::base::bf()`, `RLEN`), which it rejects (the tag `value_path`). An item
+//!   whose text writes one, the root of a `use`, or a name of the prelude where its attribute says
+//!   `prelude = false`, is a forced shape (`forced:value_path`) unless it is analyzed by `enter_impl`,
+//!   which reads no body: it is left out of the floors, and fails the run if the Leaker accepts it or
+//!   rejects it for another value.
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
@@ -2786,6 +2790,7 @@ const SHAPE_TAGS: &[(&str, &str)] = &[
     (gen::TAG_QUALIFIED_PATH, "<T>::X path"),
     (gen::TAG_MACRO_CALL, "macro call"),
     (gen::TAG_WIDE_CONST, "wide const type"),
+    (gen::FORCED_VALUE_PATH, "relative path in a value"),
 ];
 
 /// A shape that the generator writes so that the Leaker must reject the item, under the settings
@@ -2802,17 +2807,22 @@ struct Forced {
     /// Only read when the Leaker reads the bodies of what it analyzes: not through `enter_trait`,
     /// nor in a module.
     in_body: bool,
+    /// Only a run with `values` writes the shape, and the summary leaves its line out of a run
+    /// without (`unreadable_value` is one too, but its line was always printed, with no item).
+    values: bool,
 }
 
 /// An error that a rejection must have: its `Reason`, and, where they tell the shape from the item's
-/// other errors, the kind of its cause, a text that its tokens hold (without whitespace), whether the
-/// item is analyzed with `allow_self`, and a tag of the item. Where the Leaker has another reason
-/// that takes the place of the shape's own, it is another `Expect` with its condition.
+/// other errors, the kind of its cause, a text that its tokens (without whitespace) or its note
+/// hold, whether the item is analyzed with `allow_self`, and a tag of the item. Where the Leaker has
+/// another reason that takes the place of the shape's own, it is another `Expect` with its
+/// condition.
 #[derive(Clone, Copy)]
 struct Expect {
     reason: &'static str,
     cause: Option<&'static str>,
     tokens: Option<&'static str>,
+    note: Option<&'static str>,
     allow_self: Option<bool>,
     tag: Option<&'static str>,
 }
@@ -2823,6 +2833,7 @@ impl Expect {
             reason,
             cause: None,
             tokens: None,
+            note: None,
             allow_self: None,
             tag: None,
         }
@@ -2838,6 +2849,13 @@ impl Expect {
     const fn tokens(self, tokens: &'static str) -> Expect {
         Expect {
             tokens: Some(tokens),
+            ..self
+        }
+    }
+
+    const fn note(self, note: &'static str) -> Expect {
+        Expect {
+            note: Some(note),
             ..self
         }
     }
@@ -2866,6 +2884,7 @@ impl Expect {
                     .replace(char::is_whitespace, "")
                     .contains(tokens)
             })
+            && self.note.map_or(true, |note| error.note.contains(note))
             && self.allow_self.map_or(true, |a| a == item.allow_self)
             && self.tag.map_or(true, |tag| item.tags.contains(tag))
     }
@@ -2877,6 +2896,9 @@ impl Expect {
         }
         if let Some(tokens) = self.tokens {
             write!(text, " whose tokens hold `{}`", tokens).unwrap();
+        }
+        if let Some(note) = self.note {
+            write!(text, " whose note holds `{}`", note).unwrap();
         }
         if let Some(allow_self) = self.allow_self {
             write!(text, " (item with allow_self {})", allow_self).unwrap();
@@ -2891,8 +2913,12 @@ impl Expect {
 /// The forced shapes. The classification of `SHAPE_TAGS` (measured over the seeds 1 to 16, 60 cases;
 /// accepted/rejected of the items with the tag): forced, with no accepted item of the tag,
 /// `nested_self_in_bounds` (0/319), `self_without_meaning` (0/211), `self_in_default` (0/56) and
-/// `unreadable_value` (with `values`); forced in part, where the tag of the shape is also on items
-/// that are accepted and the shape is the tag `gen::FORCED_*` that the text gives:
+/// `unreadable_value` (with `values`) and `forced:value_path` (with `values`, 0/1420: the shape is
+/// the tag that the text of the item gives, `gen::forced_value_path()`, so it is on no item that
+/// the Leaker accepts; the plain tag `value_path`, with the discriminants, `Vec::new()` where the
+/// prelude is allowed, `enter_impl` and the impls of an item with such a body, is on 186 accepted
+/// and 1596 rejected); forced in part, where the tag of the shape is also on items that are
+/// accepted and the shape is the tag `gen::FORCED_*` that the text gives:
 /// `self_in_trait_predicate` (741/565: a bound `T: AsRef<Self>` has it too), `impl_header_self`
 /// (71/177: a self type that no leaked type of names the generic), `macro_path` (22/207: an impl
 /// takes the tag of its type, `enter_impl` does not read signatures), `elided_arg` (44/314: a type of
@@ -2907,18 +2933,21 @@ const FORCED: &[Forced] = &[
         shape: gen::TAG_NESTED_SELF_BOUNDS,
         expect: &[Expect::reason("NestedSelfInBounds")],
         in_body: false,
+        values: false,
     },
     Forced {
         tag: gen::TAG_SELF_NO_MEANING,
         shape: gen::TAG_SELF_NO_MEANING,
         expect: &[Expect::reason("SelfWithoutMeaning")],
         in_body: false,
+        values: false,
     },
     Forced {
         tag: gen::TAG_SELF_IN_DEFAULT,
         shape: gen::TAG_SELF_IN_DEFAULT,
         expect: &[Expect::reason("SelfInDefault")],
         in_body: false,
+        values: false,
     },
     // With a bound of the generics that names a leaked type, the predicate is a cycle first.
     Forced {
@@ -2931,6 +2960,7 @@ const FORCED: &[Forced] = &[
                 .tag(gen::TAG_BOUND_CYCLE),
         ],
         in_body: false,
+        values: false,
     },
     // Without `allow_self` the `Self` of the bound cannot be leaked at all.
     Forced {
@@ -2941,30 +2971,53 @@ const FORCED: &[Forced] = &[
             Expect::reason("DeniedSelfInBounds").allow_self(false),
         ],
         in_body: false,
+        values: false,
     },
     Forced {
         tag: gen::TAG_UNREADABLE,
         shape: gen::TAG_UNREADABLE,
         expect: &[Expect::reason("Unreadable")],
         in_body: true,
+        values: false,
     },
     Forced {
         tag: gen::FORCED_MACRO_PATH,
         shape: gen::TAG_MACRO_PATH,
         expect: &[Expect::reason("RelativePath").cause("Macro")],
         in_body: false,
+        values: false,
     },
     Forced {
         tag: gen::FORCED_ELIDED_ARG,
         shape: gen::TAG_ELIDED_ARG,
         expect: &[Expect::reason("RelativePath").cause("Type").tokens("<'_>")],
         in_body: false,
+        values: false,
     },
     Forced {
         tag: gen::FORCED_RELATIVE_DISCRIMINANT,
         shape: gen::TAG_DISCRIMINANT,
         expect: &[Expect::reason("RelativePath").cause("Expr")],
         in_body: false,
+        values: false,
+    },
+    // A relative path, the root of a `use`, or a name of the prelude where the Leaker does not allow
+    // it, in a body or a constant: it reads them with `check_values` (`values = true`), whatever the
+    // scope but `enter_impl`, and a module as a whole. The note tells a value from the default of a
+    // const parameter and a discriminant, which have the same reason and cause.
+    Forced {
+        tag: gen::FORCED_VALUE_PATH,
+        shape: gen::FORCED_VALUE_PATH,
+        expect: &[
+            Expect::reason("RelativePath")
+                .cause("Expr")
+                .note("body of `"),
+            Expect::reason("RelativePath")
+                .cause("Expr")
+                .note("value of `"),
+        ],
+        in_body: false,
+        values: true,
     },
 ];
 
@@ -3372,8 +3425,8 @@ impl Stats {
 /// with `strict_anchors` off, the shape of wave 3A that the Leaker rejects in some settings, the
 /// pooled rates are the same (trait impl 69.3, assoc_const 73.5) and the lowest are 63.0 and 67.6.
 ///
-/// A floor of this table would fail the opt-in run of `values` (its bodies have relative paths that
-/// the Leaker rejects: the trait is accepted 64.3% at the lowest, 67.7% pooled), so that run has
+/// Eight floors of this table are above what the opt-in run of `values` is measured to reach (struct,
+/// enum, union, `enter_generics`, const_param, param_default, unsized_param, module), so that run has
 /// `VALUES_FLOORS`, which are the lower of the two, measured the same way.
 /// A construct is checked when a run has three times the `MIN_SAMPLES` of it.
 /// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them.
@@ -3405,42 +3458,45 @@ const FLOORS: &[(&str, f64)] = &[
 ];
 
 /// The floors of the run with `values` (`TYPE_LEAK_PROP_FEATURES=values`), 10 points below the lowest
-/// over the seeds 1 to 16 at 60 cases, rounded down, where that is lower than `FLOORS`; the items
-/// that have a forced shape are left out as in `FLOORS` (8.0% of the items analyzed, with the
-/// glob imports and the `macro_rules!` of `unreadable_value`). The bodies, constants and defaults
-/// have relative paths that the Leaker rejects (`value_path`) and a relative `use`, which are no
-/// forced shape. The lowest accepted share / pooled: struct 90.4/92.5, enum 88.2/92.8, union
-/// 86.1/93.4, trait 64.3/67.7, inherent impl 75.5/80.8, trait impl 59.0/65.3, module 53.3/67.2,
-/// `enter_mod` 87.2/90.7, `enter_generics` 83.7/91.1, `enter_trait` 62.1/72.5, gat 40.9/49.3,
-/// const_param 66.4/69.2, impl_trait_arg 52.5/58.0, param_default 73.7/76.8, binder 64.2/70.6,
-/// dyn_object 72.7/74.7, fn_pointer 72.2/73.4, assoc_const 56.6/61.4, lifetime_param 75.4/77.9,
-/// unsized_param 68.7/73.1, where_clause 72.2/74.6. The module stays at 49, the floor it had (59.3
-/// at the lowest then; modules have no forced shape, and the pooled rate is the same, 67.6 and
-/// 67.2: 85 items a seed). The run with `relative_std` is above `FLOORS` everywhere (the lowest:
+/// over the seeds 1 to 16 at 60 cases, rounded down, or the floor of `FLOORS` if that is lower. The
+/// items that have a forced shape are left out as in `FLOORS`: 13.7% of the items analyzed (11.7% to
+/// 15.2% in a seed), 6.8% of them for `forced:value_path`, a relative path, the root of a `use` or a
+/// name of the prelude that the Leaker does not allow, in a body or a constant (all rejected, as the
+/// run checks), and the rest for the other shapes, with the glob imports and the `macro_rules!` of
+/// `unreadable_value`. Measured on 2026-11-03, the lowest accepted share / pooled (and the fewest
+/// items of a seed): struct 90.6/92.5 (305), enum 88.0/93.0 (152), union 87.3/93.5 (66), trait
+/// 73.7/76.8 (267), inherent impl 86.3/89.4 (86), trait impl 67.3/73.8 (55), module 63.6/78.3 (68),
+/// `enter_mod` 90.8/93.4 (125), `enter_generics` 85.4/91.0 (29), `enter_trait` 68.4/79.2 (23),
+/// `enter_impl` 100/100 (29), gat 50.0/59.8 (36), const_param 73.8/77.0 (381), impl_trait_arg
+/// 63.1/67.6 (121), param_default 76.9/79.1 (225), binder 75.6/80.1 (230), dyn_object 81.3/83.9
+/// (462), fn_pointer 82.3/84.1 (403), assoc_const 67.2/72.1 (162), lifetime_param 82.8/84.2 (534),
+/// unsized_param 76.0/81.0 (232), where_clause 79.5/81.2 (552). With the value paths counted, the
+/// lowest were trait 64.5, inherent impl 76.1, trait impl 57.8, module 54.4 (its floor was 49), gat
+/// 42.0 and assoc_const 56.8. The run with `relative_std` is above `FLOORS` everywhere (the lowest:
 /// trait 73.7, gat 50.0, assoc_const 68.1, impl_trait_arg 58.4), and needs none of its own.
 const VALUES_FLOORS: &[(&str, f64)] = &[
     ("struct", 80.0),
-    ("enum", 78.0),
-    ("union", 76.0),
-    ("trait", 54.0),
-    ("impl-inherent", 65.0),
-    ("impl-trait", 49.0),
-    ("mod", 49.0),
-    ("enter_mod", 77.0),
-    ("enter_generics", 73.0),
-    ("enter_trait", 52.0),
+    ("enum", 77.0),
+    ("union", 77.0),
+    ("trait", 63.0),
+    ("impl-inherent", 70.0),
+    ("impl-trait", 48.0),
+    ("mod", 53.0),
+    ("enter_mod", 79.0),
+    ("enter_generics", 75.0),
+    ("enter_trait", 50.0),
     ("enter_impl", 90.0),
-    ("gat", 30.0),
-    ("const_param", 56.0),
-    ("impl_trait_arg", 42.0),
-    ("param_default", 63.0),
-    ("binder", 54.0),
-    ("dyn_object", 62.0),
-    ("fn_pointer", 62.0),
-    ("assoc_const", 46.0),
-    ("lifetime_param", 65.0),
-    ("unsized_param", 58.0),
-    ("where_clause", 62.0),
+    ("gat", 37.0),
+    ("const_param", 63.0),
+    ("impl_trait_arg", 51.0),
+    ("param_default", 66.0),
+    ("binder", 65.0),
+    ("dyn_object", 69.0),
+    ("fn_pointer", 67.0),
+    ("assoc_const", 53.0),
+    ("lifetime_param", 71.0),
+    ("unsized_param", 65.0),
+    ("where_clause", 67.0),
 ];
 
 /// The fewest analyzed items of a kind for its floor to count (a short run has too few of the
@@ -3989,7 +4045,7 @@ fn summarize(
         stats.forced_seen()
     )
     .unwrap();
-    for shape in FORCED {
+    for shape in FORCED.iter().filter(|shape| flags.values || !shape.values) {
         let count = stats.forced.get(shape.tag).copied().unwrap_or_default();
         writeln!(
             s,
@@ -4930,7 +4986,10 @@ mod checks {
         for (kind, floor) in &plain.by_kind {
             assert!(values.by_kind[kind] <= *floor, "{}", kind);
         }
-        assert!(values.by_kind["trait"] < plain.by_kind["trait"]);
+        // Lower where the run with `values` reaches less. The traits and the impls reach as much now
+        // that their value paths are forced and left out.
+        assert!(values.by_kind["struct"] < plain.by_kind["struct"]);
+        assert!(values.by_kind["param_default"] < plain.by_kind["param_default"]);
         // The same names, and the command line still overrides them.
         let names = |table: &'static [(&'static str, f64)]| {
             table.iter().map(|(k, _)| *k).collect::<Vec<&'static str>>()
@@ -6121,30 +6180,305 @@ mod checks {
         .is_empty());
     }
 
+    /// A path of a value is a forced shape where the attribute of the item makes the Leaker read it
+    /// and no rule of the analysis allows it: a relative path or the root of a `use` always, a name of
+    /// the prelude where the attribute says `prelude = false`; not an absolute path, not through
+    /// `enter_impl` (`scope = "impl"`), not without `values = true`, and no other forced shape.
+    #[test]
+    fn a_path_in_a_value_is_forced_where_the_leaker_must_reject_it() {
+        let forced = gen::forced_in;
+        let item = |settings: &str, body: &str| {
+            format!(
+                "#[@ATTR@(id = 1, allow_self = true, {}, krate = \"k\")]\npub trait Tr1_1 {{\nfn m(&self) {{ {} loop {{}} }}\n}}\n",
+                settings, body
+            )
+        };
+        let reads = "prelude = true, scope = \"\", values = true, bodies = true";
+        let value = [gen::FORCED_VALUE_PATH];
+        // A relative path in a `usize`, in each form that the generator writes.
+        for path in [
+            "crate::base::BLEN",
+            "crate::base::bf()",
+            "super::base::BLEN",
+            "super::super::base::bf()",
+            "RLEN",
+            "self::RLEN",
+            "ILEN",
+            "crate::base::bg::<*const R1<u8>>()",
+            "super::base::bg::<*const [R1; 3]>()",
+        ] {
+            let body = format!("let _d: usize = {} + 1;", path);
+            assert_eq!(forced(&item(reads, &body)), value, "{}", path);
+            let constant = format!(
+                "const K0: usize = ::core::mem::size_of::<*const R1<u8>>() + {};",
+                path
+            );
+            assert_eq!(forced(&constant), value, "{}", constant);
+        }
+        // The absolute path of the Leaker's crate is written as it is.
+        for path in [
+            "::k::base::BLEN",
+            "::k::base::bf()",
+            "::k::base::bg::<*const R1<u8>>()",
+        ] {
+            let body = format!("let _d: usize = {} + 1;", path);
+            assert!(forced(&item(reads, &body)).is_empty(), "{}", path);
+            let constant = format!(
+                "pub const KV0: usize = ::core::mem::size_of::<*const R1>() + {};",
+                path
+            );
+            assert!(forced(&constant).is_empty(), "{}", constant);
+        }
+        // The head of the path names the form.
+        assert_eq!(
+            gen::value_paths_in("let _d: usize = super::base::bf() + 1; let _e = 1;"),
+            [gen::ValuePath::Relative("super".to_string())]
+        );
+        assert_eq!(
+            gen::value_paths_in(
+                "pub const KV0: usize = ::core::mem::size_of::<*const R1>() + RLEN;"
+            ),
+            [gen::ValuePath::Relative("RLEN".to_string())]
+        );
+        assert!(
+            gen::value_paths_in("let _b = ::core::mem::size_of::<*const R1>(); let _c = 1u8;")
+                .is_empty()
+        );
+        // A name of the prelude is relative where the Leaker does not allow the prelude.
+        let vec = "let _e = Vec::<*const R1>::new();";
+        assert_eq!(
+            forced(&item(
+                &reads.replace("prelude = true", "prelude = false"),
+                vec
+            )),
+            value
+        );
+        assert!(forced(&item(reads, vec)).is_empty());
+        assert!(forced(&format!("pub fn f() {{ {} loop {{}} }}", vec)).is_empty());
+        // The root of a `use` is a relative path in a body.
+        assert_eq!(
+            forced(&item(reads, "use super::base::bf as local_bf;")),
+            value
+        );
+        assert!(forced(&item(reads, "use ::core::mem::size_of;")).is_empty());
+        // Not read: through `enter_impl`, and without `values = true`.
+        let relative = "let _d: usize = RLEN + 1;";
+        assert!(forced(&item(
+            &reads.replace("scope = \"\"", "scope = \"impl\""),
+            relative
+        ))
+        .is_empty());
+        assert!(forced(&item("prelude = true, scope = \"\"", relative)).is_empty());
+        // The part of a module has no attribute: the module's reads it.
+        assert_eq!(
+            forced("pub fn f0() -> usize { let _d: usize = crate::base::BLEN + 1; loop {} }"),
+            value
+        );
+        assert!(
+            forced("pub fn f0() -> usize { let _d: usize = ::k::base::BLEN + 1; loop {} }")
+                .is_empty()
+        );
+        // The other shapes of a value are not this one: a discriminant, a macro, an absolute macro.
+        assert_eq!(
+            forced("pub enum E1_1 { V0 = (RLEN as isize) + 0, V1 = (::core::mem::size_of::<*const R1>() as isize) + 100 }"),
+            [gen::FORCED_RELATIVE_DISCRIMINANT]
+        );
+        assert_eq!(
+            forced(&item(reads, "let _m = two!() + 1;")),
+            [gen::FORCED_MACRO_PATH]
+        );
+        assert!(forced(&item(
+            reads,
+            "let _m = ::k::two!() + 1; let _a = 1u8 as RA;"
+        ))
+        .is_empty());
+    }
+
+    /// The item with a forced path of a value that the Leaker accepts fails the run, and so does one
+    /// that it rejects for another reason, even for a relative path in another value (the default of a
+    /// const parameter, a discriminant) or a `RelativePath` of another cause; one rejected for the
+    /// path in the body or the constant passes. Nothing is forced through `enter_impl`.
+    #[test]
+    fn an_accepted_item_with_a_forced_value_path_fails_and_a_rejected_one_passes() {
+        let relative = |kind: &str, note: &str| Rejection {
+            reason: "RelativePath".to_string(),
+            kind: kind.to_string(),
+            tokens: "crate :: base :: BLEN".to_string(),
+            note: format!("it is in {}, which the copy writes as it is", note),
+            ..Default::default()
+        };
+        for (kind, scope) in [
+            ("trait", ""),
+            ("trait", "mod"),
+            ("trait", "trait"),
+            ("impl-trait", ""),
+            ("impl-inherent", ""),
+            ("mod", ""),
+        ] {
+            let item = item_with(kind, scope, true, &[gen::FORCED_VALUE_PATH]);
+            let problems = forced_problems(&item, &report_with(true, Vec::new()));
+            assert_eq!(problems.len(), 1, "{} {}", kind, scope);
+            assert_eq!(problems[0].0, FORCED_ACCEPTED);
+            assert!(problems[0].1.contains("forced:value_path"));
+            assert!(problems[0].1.contains("whose note holds `body of `"));
+            for note in [
+                "the body of `m`",
+                "the default body of `m`",
+                "the value of `KV0`",
+                "the default value of `K0`",
+            ] {
+                let right = report_with(false, vec![relative("Expr", note)]);
+                assert!(forced_problems(&item, &right).is_empty(), "{}", note);
+            }
+            for wrong in [
+                // The same reason and cause, for another value: the default of a const parameter, the
+                // discriminant of an enum.
+                relative("Expr", "the default of `N`"),
+                relative("Expr", "the discriminant of `V0`"),
+                // A path of a type, or a macro, is not a path of a value.
+                relative("Type", "the body of `m`"),
+                relative("Macro", "the body of `m`"),
+                error_of("Unreadable", "Unreadable", "use :: core :: mem :: * ;"),
+                error_of("UnprovableBound", "Type", "R1 < T >"),
+            ] {
+                let report = report_with(false, vec![wrong]);
+                let problems = forced_problems(&item, &report);
+                assert_eq!(problems.len(), 1);
+                assert_eq!(problems[0].0, FORCED_OTHER);
+            }
+            // One error of the shape among others is enough.
+            let report = report_with(
+                false,
+                vec![
+                    relative("Expr", "the default of `N`"),
+                    error_of("UnprovableBound", "Type", "R1 < T >"),
+                    relative("Expr", "the body of `m`"),
+                ],
+            );
+            assert!(forced_problems(&item, &report).is_empty());
+        }
+        let through_impl = item_with("impl-trait", "impl", true, &[gen::FORCED_VALUE_PATH]);
+        assert!(forced_of(&through_impl).is_empty());
+        assert!(forced_problems(&through_impl, &report_with(true, Vec::new())).is_empty());
+        // An item whose plain tag `value_path` is the discriminant's, or the stale tag of an impl, has
+        // no forced shape: the Leaker may accept it.
+        let plain = item_with("impl-trait", "", true, &[gen::TAG_VALUE_PATH]);
+        assert!(forced_problems(&plain, &report_with(true, Vec::new())).is_empty());
+    }
+
+    /// The forced paths of values are in the summary of a run with `values` only: a run without it
+    /// prints the lines it always printed.
+    #[test]
+    fn the_summary_counts_the_forced_value_paths_with_values_only() {
+        assert!(FORCED
+            .iter()
+            .any(|shape| shape.tag == gen::FORCED_VALUE_PATH && shape.values));
+        assert_eq!(forced_class(gen::FORCED_VALUE_PATH), "forced");
+        let mut case = generate_with(1, 0, 8, Features::parse(""), Flags::default());
+        let mut item = case.items.remove(0);
+        item.kind = "trait";
+        item.scope = "";
+        item.tags.insert(gen::FORCED_VALUE_PATH.to_string());
+        let id = item.id;
+        case.items = vec![item];
+        let selected = [(0, &case)];
+        let mut reports = BTreeMap::new();
+        reports.insert(
+            (0, id),
+            Report {
+                kind: "trait".to_string(),
+                accepted: false,
+                rejections: vec![Rejection {
+                    reason: "RelativePath".to_string(),
+                    kind: "Expr".to_string(),
+                    note: "it is in the body of `m`, which the copy writes as it is".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let stats = Stats::collect(&selected, &reports);
+        let run = Run {
+            seed: 1,
+            cases: 1,
+            items: 8,
+            features: String::new(),
+            accept: false,
+            stages: false,
+            only: None,
+        };
+        let without = summarize(
+            &stats,
+            &defaults(),
+            &run,
+            Features::default(),
+            Flags::default(),
+        );
+        let with = summarize(
+            &stats,
+            &defaults(),
+            &run,
+            Features::default(),
+            Flags {
+                values: true,
+                ..Flags::default()
+            },
+        );
+        // The shape is counted whatever the flags, as the other shapes are; its line of the forced
+        // shapes is printed with `values` only.
+        assert!(without.contains("shape relative path in a value"));
+        assert!(without.contains("1 analyzed,    0 accepted,    1 rejected; forced"));
+        assert!(!without.contains("forced shape relative path in a value"));
+        assert!(without.contains("forced shape unreadable value"));
+        assert!(with.contains("forced shape relative path in a value"));
+        assert!(with.contains(
+            "1 items,    1 rejected for its reason,    0 rejected for another,    0 accepted"
+        ));
+    }
+
     /// The generated items have the forced tags only where their own text gives them, and an impl
     /// takes none from its type or its trait.
     #[test]
     fn the_forced_tags_of_the_generated_items_are_read_from_their_text() {
-        let mut checked = 0;
-        for seed in 0..20 {
-            let case = generate_with(seed, 0, 8, Features::parse(""), Flags::default());
-            for item in &case.items {
-                let from_text: BTreeSet<String> = gen::forced_in(&item.source)
-                    .into_iter()
-                    .map(String::from)
-                    .collect();
-                let has: BTreeSet<String> = item
-                    .tags
-                    .iter()
-                    .filter(|tag| tag.starts_with(gen::TAG_FORCED))
-                    .cloned()
-                    .collect();
-                // A module has the tags of its items, which its own text has too.
-                assert_eq!(has, from_text, "{}", item.source);
-                checked += usize::from(!has.is_empty());
+        let (mut checked, mut paths) = (0, 0);
+        for flags in [
+            Flags::default(),
+            Flags {
+                values: true,
+                ..Flags::default()
+            },
+        ] {
+            for seed in 0..20 {
+                let case = generate_with(seed, 0, 8, Features::parse(""), flags);
+                for item in &case.items {
+                    let from_text: BTreeSet<String> = gen::forced_in(&item.source)
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                    let has: BTreeSet<String> = item
+                        .tags
+                        .iter()
+                        .filter(|tag| tag.starts_with(gen::TAG_FORCED))
+                        .cloned()
+                        .collect();
+                    // A module has the tags of its items, which its own text has too.
+                    assert_eq!(has, from_text, "{}", item.source);
+                    checked += usize::from(!has.is_empty());
+                    paths += usize::from(has.contains(gen::FORCED_VALUE_PATH));
+                    // Without `values` no value is generated, and an item of `enter_impl` is not read.
+                    assert!(
+                        flags.values || !has.contains(gen::FORCED_VALUE_PATH),
+                        "{}",
+                        item.source
+                    );
+                    if item.scope == "impl" {
+                        assert!(!has.contains(gen::FORCED_VALUE_PATH), "{}", item.source);
+                    }
+                }
             }
         }
         assert!(checked > 5, "{} items have a forced tag", checked);
+        assert!(paths > 5, "{} items have a forced path of a value", paths);
     }
 
     /// The classification of `SHAPE_TAGS` into forced, forced in part and not forced.

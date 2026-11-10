@@ -669,7 +669,8 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
 /// `value_path`: a body, a constant or a default has a relative path of a value (`crate::base::bf()`,
-/// `RLEN`), which `Options::check_values()` rejects (`values`).
+/// `RLEN`), which `Options::check_values()` rejects (`values`); a discriminant too. It explains the
+/// rejection (`family()`), but is no forced shape: `forced:value_path` is, from the text.
 pub const TAG_VALUE_PATH: &str = "value_path";
 /// `relative_std`: a path of `std`, `core` or `alloc` is written without the leading `::` in the item.
 /// The Leaker leaks it unless it allows them (the rule `std` of `allow_stages` does not), so in a
@@ -738,12 +739,19 @@ pub const TAG_WIDE_CONST: &str = "wide_const";
 ///   another crate is written as it is).
 /// - `forced:relative_discriminant`: a discriminant that is a constant of the module or of its
 ///   parent (`RLEN`, `super::base::BLEN`), not one of the Leaker's crate by an absolute path.
+/// - `forced:value_path`: with `values`, a body or a constant writes a path of a value that the
+///   Leaker's rules do not allow: a relative one (`RLEN`, `crate::base::bf()`), the root of a `use`
+///   (`use super::base::bf as local_bf;`), or a name of the prelude where the attribute says
+///   `prelude = false` (`Vec::<*const R1>::new()`). Read from the text and its attribute
+///   (`value_paths_in()`): not where the attribute says `scope = "impl"`, which reads no body. The
+///   tag `value_path` is also on a discriminant, and on the impls of an item with such a body.
 pub const TAG_FORCED: &str = "forced:";
 pub const FORCED_SELF_IN_TRAIT_PRED: &str = "forced:self_in_trait_predicate";
 pub const FORCED_IMPL_HEADER_SELF: &str = "forced:impl_header_self";
 pub const FORCED_MACRO_PATH: &str = "forced:macro_path";
 pub const FORCED_ELIDED_ARG: &str = "forced:elided_arg";
 pub const FORCED_RELATIVE_DISCRIMINANT: &str = "forced:relative_discriminant";
+pub const FORCED_VALUE_PATH: &str = "forced:value_path";
 /// The shapes that the items accepted by `LeakerResult::allow()` fail on (`TYPE_LEAK_PROP_ACCEPT`;
 /// `accept_families()` in `main.rs` lists the failures). They explain no rejection:
 ///
@@ -6478,6 +6486,9 @@ impl Gen {
             for _ in 0..2 {
                 if self.chance(60) {
                     let item = self.gen_value_item();
+                    // The constant is no item of `gen_one()`, whose text `note_text()` reads.
+                    self.tags
+                        .extend(forced_in(&item).into_iter().map(String::from));
                     text += &self.relativize_std(&item);
                 }
             }
@@ -7288,7 +7299,31 @@ pub fn forced_in(text: &str) -> Vec<&'static str> {
     if relative_discriminant(text) {
         out.push(FORCED_RELATIVE_DISCRIMINANT);
     }
+    if forced_value_path(text) {
+        out.push(FORCED_VALUE_PATH);
+    }
     out
+}
+
+/// Whether a body or a constant of `text` writes a path of a value that the Leaker must reject
+/// under the settings in the attribute of the item (its first line, if it has one; the part of a
+/// module has none, and the attribute of the module is read when the module is):
+///
+/// - the Leaker reads the values (`values = true`), and not through `enter_impl` (`scope = "impl"`),
+///   which analyzes the self type and the trait's arguments only;
+/// - no rule of the analysis allows what is written: not `crate::..`, `super::..`, `self::..` and the
+///   constants of the module (the rules allow `::std`, the Leaker's crate by `::`, the primitive
+///   types, and the names of the prelude where the attribute says `prelude = true`).
+fn forced_value_path(text: &str) -> bool {
+    let attribute = text.lines().next().filter(|line| line.starts_with("#["));
+    let says = |setting: &str| attribute.map_or(false, |line| line.contains(setting));
+    if attribute.is_some() && (!says("values = true") || says("scope = \"impl\"")) {
+        return false;
+    }
+    value_paths_in(text).iter().any(|path| match path {
+        ValuePath::Prelude => says("prelude = false"),
+        ValuePath::Relative(_) | ValuePath::UseRoot => true,
+    })
 }
 
 /// The arguments of `ty` if it is a path with no leading `::` applied to arguments, the last segment
@@ -7412,6 +7447,59 @@ fn relative_discriminant(text: &str) -> bool {
         let form = &text[open + "= (".len()..at];
         form == "RLEN" || (form.ends_with("base::BLEN") && !form.starts_with("::"))
     })
+}
+
+/// A path of a value that the text of an item writes and the copy writes as it is
+/// (`Gen::value_usize()`, `Gen::value_statements()`), read from the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValuePath {
+    /// A relative path in an expression of type `usize` (`crate::base::BLEN`, `super::base::bf()`,
+    /// `RLEN`, `self::RLEN`, `ILEN`), with its first segment (`crate`, `super`, `self`, `RLEN`, ..).
+    Relative(String),
+    /// `Vec::<*const T>::new()`: a path of the prelude, relative where the Leaker does not allow
+    /// the prelude.
+    Prelude,
+    /// `use super::base::bf as local_bf;`: the root of a `use` in a body.
+    UseRoot,
+}
+
+/// The paths of values that `text` writes by a relative path or a name of the prelude, not the
+/// absolute ones (`::krate::base::BLEN`). Only the values of `Gen::value_statements()` and
+/// `Gen::value_const()`: not the discriminants (`relative_discriminant()`).
+pub fn value_paths_in(text: &str) -> Vec<ValuePath> {
+    // Where the `usize` expression of a body (`let _d: usize = P + 1;`) and of a constant
+    // (`size_of::<*const T>() + P`) starts.
+    let mut starts: Vec<&str> = Vec::new();
+    for (at, found) in text.match_indices("let _d: usize = ") {
+        starts.push(&text[at + found.len()..]);
+    }
+    for (at, found) in text.match_indices("size_of::<*const ") {
+        let rest = &text[at + found.len()..];
+        if let Some(call) = rest.find(">()") {
+            if let Some(path) = rest[call + ">()".len()..].strip_prefix(" + ") {
+                starts.push(path);
+            }
+        }
+    }
+    let mut out: Vec<ValuePath> = starts
+        .into_iter()
+        .filter(|start| !start.starts_with("::"))
+        .map(|start| {
+            let end = start
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                .unwrap_or(start.len());
+            // The first segment names the form (`crate`, `super`, `self`, `RLEN`).
+            let head = start[..end].split("::").next().unwrap_or_default();
+            ValuePath::Relative(head.to_string())
+        })
+        .collect();
+    if text.contains("let _e = Vec::<*const ") {
+        out.push(ValuePath::Prelude);
+    }
+    if text.contains(" as local_bf;") {
+        out.push(ValuePath::UseRoot);
+    }
+    out
 }
 
 /// Whether the text of a bound is one that every type of the use site's choice has (`FRIENDLY` in
