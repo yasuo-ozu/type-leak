@@ -12191,11 +12191,8 @@ fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value
         ("enum E { B = REL }", &["REL"], &[]),
         ("enum E { B = ::m::two!() }", &[], &[]),
         ("struct S([u8; two!()]);", &["two !"], &[]),
-        (
-            "struct S([u8; { let x = 1; x }]);",
-            &[],
-            &["[u8 ; { let x = 1 ; x }]"],
-        ),
+        // A binding in an array length is local too (F110): the array names nothing relative.
+        ("struct S([u8; { let x = 1; x }]);", &[], &[]),
         ("enum E { B = 1 as Rel }", &[], &["Rel"]),
         ("enum E { B = <Rel as ::p::Tr>::N }", &[], &["Rel"]),
         // The path is written as it is, and the type in its arguments is leaked, as it is of an
@@ -17969,11 +17966,12 @@ fn f94_with_self_checks_only_the_entries_of_the_visited_self() {
 /// Fix: in a type (`type_depth > 0`) the visitor reads the value or the body as it reads the rest
 /// of the length. Outside a type `check_values` keeps its meaning (the second part of the test).
 ///
-/// Limits: a name that the block declares is a relative path there, as for the `let` (`{ const X:
-/// usize = 3; let _y = X; 3 }` leaks the array whole); a closure, an assignment or a macro in a
-/// nested body is an impossible expression of the type, as in a `let`, so with a relative path
-/// it is an error. Cross-crate fixture 9264 (and 9250 for the default of a type parameter): the
-/// Referrer's crate did not build before the fix.
+/// Limits: a closure, an assignment or a macro in a nested body is an impossible expression of the
+/// type, as in a `let`, so with a relative path it is an error. Cross-crate fixture 9264 (and 9250
+/// for the default of a type parameter): the Referrer's crate did not build before the fix.
+///
+/// F110 changed the rows of the names that the block declares and of the closures: those names
+/// were relative paths (the array whole, or with a closure the error `RelativePath`), and are local.
 #[test]
 fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
     let found = |check_values: bool, array: &Type| {
@@ -18042,7 +18040,7 @@ fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
             }),
         ),
         (
-            "inherent impl (control: `Z` made it whole)",
+            "inherent impl",
             parse_quote!({
                 struct Z;
                 impl Z {
@@ -18074,18 +18072,16 @@ fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
                 3
             }),
         ),
-        (
-            "names that the block declares",
-            parse_quote!({
-                const X: usize = 3;
-                const Y: usize = X;
-                3
-            }),
-        ),
     ];
     let absolute: Vec<Block> = vec![
         parse_quote!({
             const X: usize = ::core::mem::size_of::<u8>();
+            3
+        }),
+        // The names that the block declares (F110).
+        parse_quote!({
+            const X: usize = 3;
+            const Y: usize = X;
             3
         }),
         parse_quote!({
@@ -18136,12 +18132,17 @@ fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
                 check_values
             );
         }
-        // A closure in a nested body cannot be copied by the entry, as in a `let`.
+        // A closure cannot be copied by the entry, but these name nothing relative: the parameter
+        // `a` and the local `c` are the block's own (F110), so `Rel<T>` alone is the entry.
         for block in &closures {
             let array: Type = parse_quote!([Rel<T>; #block]);
-            let (errors, _) = found(check_values, &array);
-            assert_eq!(errors.len(), 1, "{}", string(block));
-            assert_eq!(errors[0].0, Reason::RelativePath, "{}", string(block));
+            assert_eq!(
+                found(check_values, &array),
+                (vec![], vec!["Rel<T>".to_string()]),
+                "{}, check_values {}",
+                string(block),
+                check_values
+            );
         }
     }
 
@@ -18630,5 +18631,1095 @@ fn f100_the_error_for_an_entry_that_needs_self_names_its_context() {
             "{}",
             what
         );
+    }
+}
+
+// ── F102 ─────────────────────────────────────────────────────────────────────
+
+/// F102 (fixed): the `Self` of an item nested in the default of a type parameter was taken for the
+/// `Self` of the scope.
+///
+/// Trigger: `struct S<T = [u8; { struct Z<U>(U, Rel<Self>); 3 }]>(T)` was rejected with
+/// `SelfInDefault` (the same for a trait, and for `enter_type()`), and
+/// `enter_generics(<T = [u8; { struct Z(Option<Box<Self>>); 3 }]>)` with `SelfWithoutMeaning`.
+/// As a field, `struct S([u8; { struct Z<U>(U, Rel<Self>); 3 }])`, there is no error, but the
+/// context of the entry had `Self = S` for nothing: the copy needs a host.
+///
+/// Cause: entering the nested item did not leave the default, so `Self` meant what the default
+/// says (nothing, or the scope's), and the mention of `Self` in the item reached the frame of the
+/// type that owns the block, where the check of the default and the context read it.
+///
+/// Fix: a nested item clears the default and the mention of `Self` while it is visited. It cannot
+/// name the `Self` of the scope (E0401).
+#[test]
+fn f102_the_self_of_an_item_in_the_default_of_a_parameter_is_its_own() {
+    let blocks: Vec<(&str, Expr)> = vec![
+        (
+            "struct with an entry",
+            parse_quote!({
+                struct Z<U>(U, Rel<Self>);
+                3
+            }),
+        ),
+        (
+            "struct with a box",
+            parse_quote!({
+                struct Z(Option<Box<Self>>);
+                3
+            }),
+        ),
+        (
+            "enum",
+            parse_quote!({
+                enum Z {
+                    A(Rel<Self>),
+                }
+                3
+            }),
+        ),
+        (
+            "union",
+            parse_quote!({
+                union Z {
+                    a: std::mem::ManuallyDrop<Rel<Self>>,
+                }
+                3
+            }),
+        ),
+        (
+            "trait",
+            parse_quote!({
+                trait Tr {
+                    fn f(x: Rel<Self>);
+                }
+                3
+            }),
+        ),
+        (
+            "impl",
+            parse_quote!({
+                impl<U> Z<U> {
+                    fn f(x: Rel<Self>) {}
+                }
+                3
+            }),
+        ),
+    ];
+    // The reasons and messages of the errors, and the entries with whether their context has `Self`.
+    type Found = (Vec<(Reason, String)>, Vec<(String, bool)>);
+    let found = |item: &Item| -> Found {
+        let mut leaker = new_leaker();
+        intern(&mut leaker, item);
+        let result = leaker.result();
+        let errors = (result.errors().iter())
+            .map(|error| (error.reason, error.message.clone()))
+            .collect();
+        let referrer = result
+            .finish()
+            .unwrap_or_else(|e| panic!("{}: {}", string(item), joined_messages(&e)));
+        let entries = (referrer.iter())
+            .map(|(_, ty, context)| (string(ty), context.self_ty.is_some()))
+            .collect();
+        (errors, entries)
+    };
+    for (name, block) in &blocks {
+        let ty: Type = parse_quote!([u8; #block]);
+        let field = found(&parse_quote!(struct S(#ty);));
+        assert!(field.0.is_empty(), "{} as a field: {:?}", name, field.0);
+        assert!(
+            field.1.iter().all(|(_, has_self)| !has_self),
+            "{} as a field: {:?}",
+            name,
+            field.1
+        );
+        for (place, item) in [
+            ("struct", parse_quote!(struct S<T = #ty>(T);)),
+            (
+                "second parameter",
+                parse_quote!(struct S<U, T = #ty>(U, T);),
+            ),
+            ("enum", parse_quote!(enum E<T = #ty> { A(T) })),
+            ("union", parse_quote!(union Un<T = #ty> { a: T })),
+            ("trait", parse_quote!(trait Tr<T = #ty> {})),
+        ] {
+            let default = found(&item);
+            assert_eq!(default, field, "{} in the default of a {}", name, place);
+        }
+        // A scope entered with the generics, and a nested type: no error either.
+        let generics: Generics = parse_quote!(<T = #ty>);
+        let mut leaker = new_leaker();
+        leaker.enter_generics(&generics, |_| ());
+        let messages = joined_messages(leaker.result().errors());
+        assert_eq!(messages, "", "{} in enter_generics", name);
+        let mut leaker = new_leaker();
+        leaker.enter_type(&parse_quote!(S), &generics, |_| ());
+        let messages = joined_messages(leaker.result().errors());
+        assert_eq!(messages, "", "{} in enter_type", name);
+    }
+    // The block alone, in a scope with no `Self`: no error.
+    let mut leaker = new_leaker();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(
+            [u8; {
+                struct Z(Option<Box<Self>>);
+                3
+            }]
+        ))
+    });
+    assert_eq!(joined_messages(leaker.result().errors()), "");
+    // A `Self` outside the item, in the default of a scope with no `Self`, is still an error.
+    let mut leaker = new_leaker();
+    leaker.enter_generics(&parse_quote!(<T = Option<Self>>), |_| ());
+    let errors = leaker.result().errors().to_vec();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].reason, Reason::SelfWithoutMeaning);
+    // And in the default of a struct, beside a block with an item.
+    let mut leaker = new_leaker();
+    leaker.intern_struct(&parse_quote!(
+        struct S<
+            T = (
+                Rel<Self>,
+                [u8; {
+                    struct Z(Self);
+                    3
+                }],
+            ),
+        >(T);
+    ));
+    let errors = leaker.result().errors().to_vec();
+    assert_eq!(errors.len(), 1, "{:?}", errors);
+    assert_eq!(errors[0].reason, Reason::SelfInDefault);
+}
+
+// ── F103 ─────────────────────────────────────────────────────────────────────
+
+/// F103 (fixed): the default of a const parameter was not read when the type of the parameter is
+/// relative.
+///
+/// Trigger: `struct S<const N: Idx = { rel::X }> { a: [u8; N] }` reported `Idx` only. With a rule
+/// that allows `Idx` given to the Leaker, `rel::X` was reported; given to the result after the
+/// analysis (`allow()`), `finish()` was `Ok` and the copy wrote `{ rel::X }` unchecked.
+///
+/// Cause: `visit_const_param()` returned after the error for the type.
+///
+/// Fix: the default is read after the error too, as the analysis goes on after any error.
+#[test]
+fn f103_the_default_of_a_const_parameter_is_read_when_its_type_is_relative() {
+    let item: ItemStruct = parse_quote!(
+        struct S<const N: Idx = { rel::X }> {
+            a: [u8; N],
+        }
+    );
+    let allow_idx = || {
+        Rules::new()
+            .primitive()
+            .prelude()
+            .or_if(starts_with(parse_quote!(Idx)))
+    };
+    // Both are reported, in this order.
+    let mut leaker = new_leaker();
+    leaker.intern_struct(&item);
+    let result = leaker.result();
+    assert_eq!(
+        joined_messages(result.errors()),
+        "use absolute path: 'Idx'\nuse absolute path: 'rel::X'"
+    );
+    // The rule given after the analysis leaves the second, as the one given to the Leaker does.
+    let unchecked = "the default is accepted unchecked";
+    let after = (result.allow(allow_idx()).finish()).expect_err(unchecked);
+    let mut leaker = Leaker::with_rule(allow_idx());
+    leaker.intern_struct(&item);
+    let before = leaker.result().finish().expect_err(unchecked);
+    assert_eq!(joined_messages(&after), "use absolute path: 'rel::X'");
+    assert_eq!(after.to_vec(), before.to_vec());
+}
+
+// ── F104 ─────────────────────────────────────────────────────────────────────
+
+/// F104 (fixed): the `Self` of an item that a value declares was checked against the scope.
+///
+/// Trigger: with `Leaker::check_values`, `enter_generics(<>, |view| view.visit_item(..))` of
+/// `fn f() { struct L; impl L { fn g() -> Self { L } } }` gave `SelfWithoutMeaning`, and
+/// `const C: usize = { trait Q { fn q(&self) -> usize { Self::X } const X: usize; } 0 };` gave it
+/// twice (the `Self` of the body, and the one of the receiver). Under `intern_struct()` and the like
+/// the scope has a `Self`, so there was no error, and none in an array length.
+///
+/// Cause: the walk of a value took the `Self` of a struct, enum, union, trait or impl in a block for
+/// the one of the scope, where it has none.
+///
+/// Fix: inside such an item the walk does not check `Self`: it is the item's own, and the copy
+/// writes it as it is.
+#[test]
+fn f104_the_self_of_an_item_that_a_value_declares_is_its_own() {
+    let analyze = |item: &Item| -> Vec<(Reason, String)> {
+        let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
+        leaker.check_values = true;
+        leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+        let result = leaker.result();
+        (result.errors().iter())
+            .map(|error| (error.reason, error.message.clone()))
+            .collect()
+    };
+    for (name, item) in [
+        (
+            "an impl in a function",
+            parse_quote!(
+                fn f() {
+                    struct L;
+                    impl L {
+                        fn g() -> Self {
+                            L
+                        }
+                    }
+                }
+            ),
+        ),
+        (
+            "a trait in a constant",
+            parse_quote!(
+                const C: usize = {
+                    trait Q {
+                        fn q(&self) -> usize {
+                            Self::X
+                        }
+                        const X: usize;
+                    }
+                    0
+                };
+            ),
+        ),
+        (
+            "a struct with a method in a static",
+            parse_quote!(
+                static S: usize = {
+                    struct L(usize);
+                    impl L {
+                        fn get(&self) -> usize {
+                            let _s: Self = L(self.0);
+                            Self::N
+                        }
+                        const N: usize = 1;
+                    }
+                    0
+                };
+            ),
+        ),
+        (
+            "an enum and a union",
+            parse_quote!(
+                fn f() -> usize {
+                    enum E {
+                        A,
+                    }
+                    impl E {
+                        fn a() -> Self {
+                            Self::A
+                        }
+                    }
+                    union U {
+                        a: u8,
+                    }
+                    impl U {
+                        fn new() -> Self {
+                            Self { a: 0 }
+                        }
+                    }
+                    0
+                }
+            ),
+        ),
+    ] {
+        assert_eq!(analyze(&item), vec![], "{}", name);
+    }
+    // A `Self` of the value itself, where the scope has none, is an error: before the item, after
+    // it, and in an item that has no `Self` of its own.
+    for (name, item) in [
+        (
+            "alone",
+            parse_quote!(
+                const X: usize = Self::N;
+            ),
+        ),
+        (
+            "after the item",
+            parse_quote!(
+                fn f() -> usize {
+                    struct L;
+                    impl L {
+                        fn g() -> Self {
+                            L
+                        }
+                    }
+                    Self::N
+                }
+            ),
+        ),
+        (
+            "before the item",
+            parse_quote!(
+                fn f() -> usize {
+                    let _n = Self::N;
+                    struct L;
+                    0
+                }
+            ),
+        ),
+        (
+            "in a function beside the item",
+            parse_quote!(
+                fn f() {
+                    struct L;
+                    fn g() -> usize {
+                        Self::N
+                    }
+                }
+            ),
+        ),
+    ] {
+        let errors = analyze(&item);
+        assert!(
+            !errors.is_empty()
+                && errors
+                    .iter()
+                    .all(|(reason, _)| *reason == Reason::SelfWithoutMeaning),
+            "{}: {:?}",
+            name,
+            errors
+        );
+    }
+}
+
+// ── F105 ─────────────────────────────────────────────────────────────────────
+
+/// F105 (fixed): `::alloc::vec![..]` and a relative `std::vec![..]` were read as macros of the
+/// user.
+///
+/// Trigger: with `Leaker::check_values` and `Rules::std_crates()`, `::alloc::vec!["{x}"]` and
+/// `std::vec!["{x}"]` gave a false `RelativePath` for `x`: the string was read as a format string,
+/// which a macro of the user may have, whereas `::std::vec!["{x}"]` gave none.
+///
+/// Cause: the walk knew a macro of the standard library by a bare name, or by `::core::` and
+/// `::std::`.
+///
+/// Fix: `::alloc::` is one too, and so is a relative path to `std`, `core` or `alloc` that the
+/// rule allowed and the value does not declare. This changes only how the literal is read: a
+/// relative path that the rule does not allow is still rejected, and its literal read as the
+/// string of a macro of the user.
+#[test]
+fn f105_a_macro_of_alloc_or_a_relative_std_macro_is_one_of_the_library() {
+    fn messages<A: Allow>(rule: A, item: &Item) -> Vec<String> {
+        let mut leaker = Leaker::with_rule(rule);
+        leaker.check_values = true;
+        leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+        let result = leaker.result();
+        (result.errors().iter())
+            .map(|error| error.message.clone())
+            .collect()
+    }
+    let std_crates = || Rules::new().std_crates();
+    for path in [
+        "::std::vec",
+        "::alloc::vec",
+        "::core::format_args",
+        "std::vec",
+        "alloc::vec",
+        "core::format_args",
+    ] {
+        let source = format!(
+            "fn f() {{ let _ = {}![\"{{x}}\"]; let _ = {}![\"{{y}} {{}}\", 1]; }}",
+            path, path
+        );
+        let item: Item = parse_str(&source).unwrap();
+        if path.ends_with("format_args") {
+            // It formats: `x` and `y` are captured, so they are paths.
+            let found = messages(std_crates(), &item);
+            assert_eq!(
+                found,
+                ["use absolute path: 'x'", "use absolute path: 'y'"],
+                "{}",
+                path
+            );
+        } else {
+            assert_eq!(
+                messages(std_crates(), &item),
+                Vec::<String>::new(),
+                "{}",
+                path
+            );
+        }
+    }
+    // A relative path that the rule does not allow is rejected, and its string is read as a
+    // format string.
+    let item: Item = parse_quote!(
+        fn f() {
+            let _ = std::vec!["{x}"];
+        }
+    );
+    assert_eq!(
+        messages(Rules::new(), &item),
+        ["use absolute path: 'std::vec!'", "use absolute path: 'x'"]
+    );
+    // A `std` that the value declares is the user's own.
+    let item: Item = parse_quote!(
+        fn f() {
+            mod std {
+                pub struct Z;
+            }
+            let _ = std::vec!["{x}"];
+        }
+    );
+    assert_eq!(
+        messages(std_crates(), &item)
+            .iter()
+            .filter(|message| message.ends_with("'x'"))
+            .count(),
+        1
+    );
+}
+
+// ── F106 ─────────────────────────────────────────────────────────────────────
+
+/// F106 (fixed): a qualified struct literal or pattern was reported as a path of its own.
+///
+/// Trigger: with `Leaker::check_values`, `<T as Tr2>::Out { a: 1 }` was reported as the expression
+/// `Tr2::Out`, whereas `<T as Tr2>::OUT` is the trait `Tr2`: a rule that asks for the kind of the
+/// cause, and the paths of the error, differed. The same for the patterns
+/// `<T as Tr2>::Out { a }` and `<T as Tr2>::Out(a)`.
+///
+/// Cause: the walk of a value took the path of a struct literal or pattern, with the trait inside
+/// it, as one path, whereas it splits the path of a qualified expression.
+///
+/// Fix: a struct literal, a struct pattern and a tuple struct pattern go through the same check as
+/// an expression path, then their fields are read.
+#[test]
+fn f106_a_qualified_struct_literal_or_pattern_is_checked_like_a_qualified_path() {
+    let causes = |body: &str| -> (Vec<Cause>, Vec<Vec<Cause>>) {
+        let source = format!("fn f<T: ::p::Tr0, U>(x: U) {{ {} }}", body);
+        let item: Item = parse_str(&source).unwrap();
+        let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
+        leaker.check_values = true;
+        leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
+        let result = leaker.result();
+        let errors = result.errors();
+        (
+            errors.iter().map(|error| error.cause.clone()).collect(),
+            errors.iter().map(|error| error.paths.clone()).collect(),
+        )
+    };
+    let path = causes("let _v = <T as Tr2>::OUT;");
+    assert_eq!(path.0, [Cause::Trait(parse_quote!(Tr2))]);
+    assert_eq!(path.1, [vec![Cause::Trait(parse_quote!(Tr2))]]);
+    for (what, body) in [
+        ("a struct literal", "let _v = <T as Tr2>::Out { a: 1 };"),
+        (
+            "a struct literal with a base",
+            "let _v = <T as Tr2>::Out { a: 1, ..<T as Tr2>::OUT };",
+        ),
+        ("a struct pattern", "let <T as Tr2>::Out { a, .. } = x;"),
+        ("a tuple struct pattern", "let <T as Tr2>::Out(a, ..) = x;"),
+    ] {
+        let found = causes(body);
+        // The base of the literal is the same trait: the error is once per place.
+        assert_eq!(found.0.first(), path.0.first(), "{}", what);
+        assert_eq!(found.1.first(), path.1.first(), "{}", what);
+        assert!(
+            found
+                .0
+                .iter()
+                .all(|cause| *cause == Cause::Trait(parse_quote!(Tr2))),
+            "{}: {:?}",
+            what,
+            found.0
+        );
+    }
+    // An unqualified one is a path of an expression, as before.
+    let found = causes("let _v = Out { a: 1 };");
+    assert_eq!(found.0, [Cause::Expr(parse_quote!(Out))]);
+    // The fields are read: a relative path in one is reported.
+    let found = causes("let _v = <T as ::p::Tr2>::Out { a: rel::X };");
+    assert_eq!(found.0, [Cause::Expr(parse_quote!(rel::X))]);
+    // And the qualified self type is leaked, as in a path.
+    for body in [
+        "let _v = <Rel as ::p::Tr2>::OUT;",
+        "let _v = <Rel as ::p::Tr2>::Out { a: 1 };",
+        "let <Rel as ::p::Tr2>::Out { a, .. } = x;",
+        "let <Rel as ::p::Tr2>::Out(a, ..) = x;",
+    ] {
+        let source = format!("fn f<U>(x: U) {{ {} }}", body);
+        let item: Item = parse_str(&source).unwrap();
+        let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
+        leaker.check_values = true;
+        leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
+        let referrer = leaker.result().finish().unwrap();
+        let entries: Vec<String> = referrer.iter().map(|(_, ty, _)| string(ty)).collect();
+        assert_eq!(entries, ["Rel"], "{}", body);
+    }
+}
+
+// ── F107 ─────────────────────────────────────────────────────────────────────
+
+/// F107 (fixed): the Visitor did not replace an entry that names a generic associated type through
+/// the trait with its arguments written (`<Self as Tr<B, A>>::G<'x>`) when the parameters of the
+/// trait were not declared in the order the context writes them (types by name, consts last).
+///
+/// Trigger: `trait Tr<B, A> { type G<'b> where B: 'b; fn m<'x>(&self, a: Rel<<Self as Tr<B,
+/// A>>::G<'x>>); }`. The copy left `a: Rel<..>` as written. The same trait declared `Tr<A, B>` with
+/// `where A: 'b` was replaced. Also `Tr<Item, Error>`, and a const parameter before a type.
+///
+/// Cause: the arguments written in the path were paired with the parameters of the scope by
+/// position. The Leaker's scope has them as declared, but the Visitor's outermost scope is built
+/// from the context, whose generics are in the writing order: the bound `B: 'b` became `A: 'x`.
+///
+/// Fix: the scope of a context keeps the parameters as declared, which the context has, and pairs
+/// the arguments with those.
+#[test]
+fn f107_the_trait_arguments_of_a_gat_projection_are_paired_with_the_declared_parameters() {
+    for (name, generics, outlives, args) in [
+        ("types in order", "A, B", "A", "A, B"),
+        ("types out of order", "B, A", "B", "B, A"),
+        ("names", "Item, Error", "Item", "Item, Error"),
+        ("names out of order", "Item, Error", "Error", "Item, Error"),
+        ("a const before a type", "const N: usize, T", "T", "N, T"),
+        (
+            "a const between types",
+            "A, const N: usize, B",
+            "B",
+            "A, N, B",
+        ),
+    ] {
+        let item: ItemTrait = parse_str(&format!(
+            "pub trait Tr<{}> {{ \
+                 type G<'b> where {}: 'b; \
+                 fn m<'x>(&self, a: Rel<<Self as Tr<{}>>::G<'x>>); \
+             }}",
+            generics, outlives, args
+        ))
+        .unwrap();
+        let mut leaker = Leaker::new();
+        let context = leaker.intern_trait(&item);
+        let referrer = leaker.result().finish().unwrap();
+        assert_eq!(referrer.iter().count(), 1, "{}", name);
+        let text = rewrite(&referrer, context, Item::Trait(item));
+        assert!(text.contains("a : P < 0usize >"), "{}: {}", name, text);
+    }
+}
+
+// ── F108 ─────────────────────────────────────────────────────────────────────
+
+/// F108 (fixed): `Self::LEN` in the tokens of a macro became `Vec<u8>::LEN` for the host `Vec<u8>`,
+/// which is not an expression (`<Vec<u8>>::LEN` is, and is what the same path gets outside a
+/// macro). A host like `dyn A + B` broke every `Self::..` in tokens the same way.
+///
+/// Trigger: `substitute_args()` on `{ m!(Self::LEN) }`, and `Visitor::with_self()` on a copy that
+/// keeps a macro as written.
+///
+/// Cause: the tokens of a macro are not parsed, so `Self` was replaced by the tokens of the host
+/// wherever it stood.
+///
+/// Fix: a `Self` that a `::` follows is replaced by `<host>`, unless the host is a path with no
+/// arguments (`Host`, `a::Host`), which stays as it was (`m!(Host::LEN)`).
+#[test]
+fn f108_self_with_a_path_after_it_in_macro_tokens_is_written_in_angle_brackets() {
+    for (host, written, expected) in [
+        // The trigger.
+        ("Vec<u8>", "{ m!(Self::LEN) }", "{ m!(<Vec<u8>>::LEN) }"),
+        ("Vec<u8>", "{ Self::LEN }", "{ <Vec<u8>>::LEN }"),
+        ("dyn A + B", "{ m!(Self::LEN) }", "{ m!(<dyn A + B>::LEN) }"),
+        // In groups, and more than one.
+        (
+            "Vec<u8>",
+            "{ m!([Self::A; 2], (Self::B, Self::C::D)) }",
+            "{ m!([<Vec<u8>>::A; 2], (<Vec<u8>>::B, <Vec<u8>>::C::D)) }",
+        ),
+        // A host that is a qualified path, a reference, a tuple.
+        (
+            "<T as Tr>::X",
+            "{ m!(Self::LEN) }",
+            "{ m!(<<T as Tr>::X>::LEN) }",
+        ),
+        ("&'a Host", "{ m!(Self::LEN) }", "{ m!(<&'a Host>::LEN) }"),
+        ("(A, B)", "{ m!(Self::LEN) }", "{ m!(<(A, B)>::LEN) }"),
+        // A host that is a path with no arguments stays as it was.
+        ("Host", "{ m!(Self::LEN) }", "{ m!(Host::LEN) }"),
+        ("a::Host", "{ m!(Self::LEN) }", "{ m!(a::Host::LEN) }"),
+        ("::a::Host", "{ m!(Self::A::B) }", "{ m!(::a::Host::A::B) }"),
+        // `Self` that no `::` follows is replaced as it was: a bound (`Self: ::p::Tr`, where the
+        // `::` is the start of a path), a cast, a type.
+        (
+            "Vec<u8>",
+            "{ m!(Self, Self: ::p::Tr, Self as Tr, Self<T>) }",
+            "{ m!(Vec<u8>, Vec<u8>: ::p::Tr, Vec<u8> as Tr, Vec<u8><T>) }",
+        ),
+    ] {
+        let host: Type = parse_str(host).unwrap();
+        let mut args = f59_args(&[written]);
+        substitute_args(args.iter_mut(), |name: &Ident| {
+            (name == "Self").then(|| GenericArgument::Type(host.clone()))
+        })
+        .unwrap();
+        // Without spaces: the spacing of the tokens that were written differs from the parsed ones.
+        assert_eq!(
+            string(&args[0]).replace(' ', ""),
+            string(&f59_args(&[expected])[0]).replace(' ', ""),
+            "substitute_args, {}: {}",
+            string(&host),
+            written
+        );
+    }
+
+    // `Visitor::with_self()` does the same in a macro that the copy keeps as written (a bound of a
+    // generic whose type names `Self` is an error of the Leaker, `UnprovableBound`).
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T: ::p::Tr<::p::m!(Self::LEN, [Self::A; 2])>> {
+            fn f(&self, t: T);
+        }
+    );
+    let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
+    let context = leaker.intern_trait(&tr);
+    let result = leaker.result();
+    assert_eq!(
+        result.errors().len(),
+        1,
+        "{}",
+        joined_messages(result.errors())
+    );
+    assert_eq!(result.errors()[0].reason, Reason::UnprovableBound);
+    let referrer = result.recovered();
+    assert_eq!(referrer.iter().count(), 0);
+    for (host, expected) in [
+        (
+            "Vec<u8>",
+            quote!(::p::m!(<Vec<u8>>::LEN, [<Vec<u8>>::A; 2])),
+        ),
+        (
+            "dyn A + B",
+            quote!(::p::m!(<dyn A + B>::LEN, [<dyn A + B>::A; 2])),
+        ),
+        ("Host", quote!(::p::m!(Host::LEN, [Host::A; 2]))),
+    ] {
+        let mut copy = tr.clone();
+        common::visitor(&referrer, context, replaced)
+            .with_self(parse_str(host).unwrap())
+            .visit_item_trait_mut(&mut copy);
+        let expected: ItemTrait = parse_quote!(
+            trait Tr<T: ::p::Tr<#expected>> {
+                fn f(&self, t: T);
+            }
+        );
+        assert_eq!(
+            string(&copy).replace(' ', ""),
+            string(&expected).replace(' ', ""),
+            "with_self, {}",
+            host
+        );
+    }
+}
+
+// ── F109 ─────────────────────────────────────────────────────────────────────
+
+/// F109 (fixed): `complete_args()` took the one bound of `T` for the trait of `T::Out` when a where
+/// predicate with its own binder (`where for<'a> T: Other<'a>`) was the second bound, and ignored
+/// the same bound written with the binder on the bound (`where T: for<'a> Other<'a>`), which is
+/// not a single bound.
+///
+/// Trigger: `trait Tr<T: ::p::Iter, U = T::Out> where for<'a> T: ::p::Other<'a>`, completed for
+/// `::std::vec::IntoIter<u8>`: the default was `<IntoIter<u8> as ::p::Iter>::Out`, which rustc
+/// refuses as the wrong trait (E0576). The only effect was the message of rustc, as the copy
+/// does not compile either way.
+///
+/// Cause: `single_bound()` read only the predicates without a binder.
+///
+/// Fix: a trait bound in a predicate with a binder ends the search, as a bound with a binder does:
+/// `AmbiguousAssociatedType`, or `<V>::Out` for an argument that is one identifier.
+#[test]
+fn f109_a_where_predicate_with_a_binder_is_not_a_single_bound() {
+    let into_iter = ["::std::vec::IntoIter<u8>"];
+    for (generics, binder) in [
+        (
+            "<T: ::p::Iter, U = T::Out> where for<'a> T: ::p::Other<'a>",
+            "on the predicate",
+        ),
+        (
+            "<T: ::p::Iter, U = T::Out> where T: for<'a> ::p::Other<'a>",
+            "on the bound",
+        ),
+        (
+            "<T, U = T::Out> where for<'a> T: ::p::Other<'a>",
+            "on the predicate, alone",
+        ),
+    ] {
+        let item: ItemTrait = parse_str(&format!("trait Tr {} {{}}", generics)).unwrap();
+        match common::complete_generics(&item.generics, &f59_args(&into_iter)) {
+            Err(EncodeError::AmbiguousAssociatedType(found)) => assert_eq!(
+                string(&*found),
+                ty(parse_quote!(<::std::vec::IntoIter<u8>>::Out)),
+                "{}",
+                binder
+            ),
+            other => panic!("{}: {:?}", binder, other),
+        }
+        let completed = common::complete_generics(&item.generics, &f59_args(&["I"])).unwrap();
+        assert_eq!(
+            string(&completed[1]),
+            ty(parse_quote!(<I>::Out)),
+            "{}",
+            binder
+        );
+    }
+}
+
+// ── F110 ─────────────────────────────────────────────────────────────────────
+
+/// F110 (fixed): a name that a block in a type declares (a `let` binding, a parameter of a closure
+/// or of a nested function, an item of the block) was taken for a relative path.
+///
+/// Trigger: `struct S<T>([Rel<T>; { let c = |a: u8| a; 3 }])` was the error `RelativePath` at `a`,
+/// "it cannot be leaked as a whole because of `| a : u8 | a`", which sends the user to a wrong fix,
+/// and `{ fn f() -> usize { let c = || 1; c() } 3 }` the same at `c` (since F101 reads the body of
+/// a nested function). Without a closure there was no error, but the local made the whole array the
+/// entry (`{ let x = 3; let _y = x; 3 }`), where `Rel<T>` alone does. Announce issue 11.
+///
+/// The same for a match arm, `if let`, `while let`, `for`, the receiver of a method, a label
+/// (`'outer`, a lifetime that no scope declares), a trait of the block that an impl there names,
+/// and a block in a const argument of a bound (`T: ::p::Tr<{ let x = 3; x }>`, an error even
+/// without a closure, as it is read outside a type).
+///
+/// Cause: the visitor took every name in an expression of a type for a path that depends on where
+/// the copy is written; a closure, which the Repeater's impl cannot copy, made that an error.
+///
+/// Fix: the walk of an expression in a type keeps the names that its blocks declare, as the walk of
+/// a value does: a `let` binds from the next statement, the parameters of a closure or a nested
+/// function (and its receiver), a match arm, `if let`, `while let` and `for` bind in their bodies,
+/// and the items and labels of a block are declared in the whole block (not a `use`, an `extern
+/// crate` or a `macro_rules!`, which the walk does not read). A path that starts with such a name
+/// (a binding: the name alone; a macro: never) is neither a relative path nor a cause. A nested
+/// item does not see the bindings around it, a module none of the names. Cross-crate fixture 9271:
+/// the item was rejected before the fix.
+#[test]
+fn f110_a_name_that_a_block_in_a_type_declares_is_no_relative_path() {
+    let found = |check_values: bool, block: &Block| {
+        let item: Item = parse_quote!(struct S<T>([Rel<T>; #block]););
+        let rule = Rules::new()
+            .crate_paths()
+            .external_crates()
+            .primitive()
+            .prelude();
+        let mut leaker = Leaker::with_rule(rule);
+        leaker.check_values = check_values;
+        let context = intern(&mut leaker, &item);
+        let result = leaker.result();
+        let errors: Vec<(Reason, String)> = (result.errors().iter())
+            .map(|error| (error.reason, string(&error.cause)))
+            .collect();
+        let referrer = result.recovered();
+        let copy = string(&copied(&referrer, context, item)).replace(' ', "");
+        (errors, entries_text(&referrer, false), copy)
+    };
+    // The locals: `Rel<T>` alone is the entry, and the copy writes the length as it is.
+    let local: Vec<(&str, Block)> = vec![
+        (
+            "a parameter of a closure",
+            parse_quote!({
+                let c = |a: u8| a;
+                3
+            }),
+        ),
+        (
+            "a local of a nested function",
+            parse_quote!({
+                fn f() -> usize {
+                    let c = || 1;
+                    c()
+                }
+                3
+            }),
+        ),
+        (
+            "a `let` binding",
+            parse_quote!({
+                let x = 3;
+                let _y = x;
+                3
+            }),
+        ),
+        (
+            "no local (control)",
+            parse_quote!({
+                let _c = || 1;
+                3
+            }),
+        ),
+        (
+            "a parameter of a nested function",
+            parse_quote!({
+                fn f(a: usize) -> usize {
+                    let c = |b: usize| a + b;
+                    c(1)
+                }
+                f(2)
+            }),
+        ),
+        (
+            "an item of the block, before it",
+            parse_quote!({
+                let _c = || X;
+                const X: usize = 3;
+                X
+            }),
+        ),
+        (
+            "a struct of the block and its impl",
+            parse_quote!({
+                struct Z(usize);
+                impl Z {
+                    const A: usize = 3;
+                }
+                let _c = || Z(1);
+                let _z: Z = Z(2);
+                Z::A
+            }),
+        ),
+        (
+            "a trait of the block and its impl",
+            parse_quote!({
+                trait Tr {
+                    const A: usize;
+                }
+                struct Z;
+                impl Tr for Z {
+                    const A: usize = 3;
+                }
+                let _c = || 1;
+                <Z as Tr>::A
+            }),
+        ),
+        (
+            "the receiver of a method",
+            parse_quote!({
+                struct Z(usize);
+                impl Z {
+                    fn get(&self) -> usize {
+                        self.0
+                    }
+                }
+                let _c = || 1;
+                3
+            }),
+        ),
+        (
+            "a module of the block and its items",
+            parse_quote!({
+                mod m {
+                    pub const N: usize = 3;
+                    pub const M: usize = N;
+                }
+                let _c = || 1;
+                m::M
+            }),
+        ),
+        (
+            "a label",
+            parse_quote!({
+                let _c = || 1;
+                'outer: loop {
+                    break 'outer 3;
+                }
+            }),
+        ),
+        (
+            "a match arm",
+            parse_quote!({
+                let _c = || 1;
+                match 3 {
+                    n if n > 0 => n,
+                    _ => 0,
+                }
+            }),
+        ),
+        (
+            "`if let`",
+            parse_quote!({
+                let _c = || 1;
+                if let Some(v) = Some(3) {
+                    v
+                } else {
+                    3
+                }
+            }),
+        ),
+        (
+            "`while let`",
+            parse_quote!({
+                let _c = || 1;
+                let mut n = 0;
+                while let Some(v) = Some(n).filter(|m| *m < 3) {
+                    n = v + 1;
+                }
+                n
+            }),
+        ),
+        (
+            "`for`",
+            parse_quote!({
+                let _c = || 1;
+                let mut n = 0;
+                for i in 0..3 {
+                    n += i;
+                }
+                n
+            }),
+        ),
+    ];
+    // The relative paths: still an error with a closure, the whole array the entry without one.
+    let relative: Vec<(&str, Block, &str)> = vec![
+        (
+            "a relative path in a closure",
+            parse_quote!({
+                let c = |a: u8| rel::N;
+                3
+            }),
+            "rel :: N",
+        ),
+        (
+            "a relative function in a closure, with its parameter",
+            parse_quote!({
+                let c = |a: u8| g(a);
+                3
+            }),
+            "g",
+        ),
+        (
+            "a name used before its `let`",
+            parse_quote!({
+                let _c = || 1;
+                let _y = x;
+                let x = 3;
+                3
+            }),
+            "x",
+        ),
+        (
+            "a parameter of a closure after it",
+            parse_quote!({
+                let _c = |a: u8| a;
+                let _d = a;
+                3
+            }),
+            "a",
+        ),
+        (
+            "a binding of a match arm after it",
+            parse_quote!({
+                let _c = || 1;
+                match 3 {
+                    n => n,
+                };
+                n
+            }),
+            "n",
+        ),
+        (
+            "a binding around a nested function",
+            parse_quote!({
+                let x = 3;
+                fn f() -> usize {
+                    let _c = || 1;
+                    x
+                }
+                3
+            }),
+            "x",
+        ),
+        (
+            "a name that a `use` brings in",
+            parse_quote!({
+                use rel::N;
+                let _c = || 1;
+                N
+            }),
+            "N",
+        ),
+    ];
+    let without_closure: Block = parse_quote!({
+        let _y = x;
+        let x = 3;
+        3
+    });
+    for check_values in [false, true] {
+        for (name, block) in &local {
+            let item: Item = parse_quote!(struct S<T>([P<0usize>; #block]););
+            assert_eq!(
+                found(check_values, block),
+                (
+                    vec![],
+                    vec!["Rel<T>".to_string()],
+                    string(&item).replace(' ', "")
+                ),
+                "{}, check_values {}",
+                name,
+                check_values
+            );
+        }
+        for (name, block, cause) in &relative {
+            let (errors, entries, _) = found(check_values, block);
+            assert_eq!(
+                (errors, entries),
+                (
+                    vec![(Reason::RelativePath, cause.to_string())],
+                    vec!["Rel<T>".to_string()]
+                ),
+                "{}, check_values {}",
+                name,
+                check_values
+            );
+        }
+        let array: Type = parse_quote!([Rel<T>; #without_closure]);
+        let (errors, entries, copy) = found(check_values, &without_closure);
+        assert_eq!(
+            (errors, entries, copy),
+            (
+                vec![],
+                vec![string(&array).replace(' ', "")],
+                "structS<T>(P<0usize>);".to_string()
+            ),
+            "a name used before its `let`, without a closure, check_values {}",
+            check_values
+        );
+        // A const argument of a bound is read outside a type, where a relative path is an error
+        // with or without a closure: the locals there are local too.
+        for (item, cause) in [
+            (
+                "struct S<T: ::p::Tr<{ let c = |a: usize| a; 3 }>>(Rel<T>);",
+                None,
+            ),
+            (
+                "struct S<T>(Rel<T>) where T: ::p::Tr<{ let x = 3; x }>;",
+                None,
+            ),
+            (
+                "struct S<T>(Rel<T>) where T: ::p::Tr<{ let x = 3; y }>;",
+                Some("y"),
+            ),
+        ] {
+            let item: Item = parse_str(item).unwrap();
+            let rule = Rules::new().external_crates().primitive().prelude();
+            let mut leaker = Leaker::with_rule(rule);
+            leaker.check_values = check_values;
+            intern(&mut leaker, &item);
+            let result = leaker.result();
+            let errors: Vec<(Reason, String)> = (result.errors().iter())
+                .map(|error| (error.reason, string(&error.cause)))
+                .collect();
+            let expected: Vec<(Reason, String)> = (cause.into_iter())
+                .map(|cause| (Reason::RelativePath, cause.to_string()))
+                .collect();
+            assert_eq!(
+                (errors, entries_text(&result.recovered(), false)),
+                (expected, vec!["Rel<T>".to_string()]),
+                "{}, check_values {}",
+                string(&item),
+                check_values
+            );
+        }
     }
 }

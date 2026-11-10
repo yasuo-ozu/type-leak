@@ -587,14 +587,15 @@ fn a_path_in_a_closure_in_an_array_length_is_a_value() {
         allowing(),
         parse_quote!(
             [u8; {
-                let c = |a: u8| a;
+                let c = |a: u8| g(a);
                 3
             }]
         ),
     );
+    // `a` is the closure's own name, `g` a relative function.
     assert_eq!(items.len(), 1);
-    assert_item(&items[0], Reason::RelativePath, "expr", "a");
-    assert!(matches!(&items[0].cause, Cause::Expr(Expr::Path(path)) if path.path.is_ident("a")));
+    assert_item(&items[0], Reason::RelativePath, "expr", "g");
+    assert!(matches!(&items[0].cause, Cause::Expr(Expr::Path(path)) if path.path.is_ident("g")));
 }
 
 #[test]
@@ -675,14 +676,15 @@ fn a_relative_type_in_an_absolute_holder_that_cannot_be_leaked_is_a_type() {
 
 #[test]
 fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
-    // `u8` and `a` depend on the context, and the array type cannot be leaked whole because of the
-    // closure. The error is reported at the first, `u8`; the other is a note.
+    // `u8` and `g` depend on the context (`a` is the closure's own name), and the array type cannot
+    // be leaked whole because of the closure. The error is reported at the first, `u8`; the other is
+    // a note.
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f(
                 &self,
                 x: [u8; {
-                    let c = |a: u8| a;
+                    let c = |a: u8| g(a);
                     3
                 }],
             );
@@ -695,22 +697,22 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "type", "u8");
     assert_eq!(
-        note_at(&items[0], "a"),
-        Some("`a` also depends on the type context")
+        note_at(&items[0], "g"),
+        Some("`g` also depends on the type context")
     );
-    // Where `u8` is allowed, `a` is the first. A closure cannot be written in the impl of the
+    // Where `u8` is allowed, `g` is the first. A closure cannot be written in the impl of the
     // Repeater, so it is an error naming the closure, and the array type is no entry.
     let mut leaker = allowing();
     leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
-    assert_item(&items[0], Reason::RelativePath, "expr", "a");
-    assert_eq!(note_at(&items[0], "a"), None);
-    assert_eq!(items[0].message, "use absolute path: 'a'");
+    assert_item(&items[0], Reason::RelativePath, "expr", "g");
+    assert_eq!(note_at(&items[0], "g"), None);
+    assert_eq!(items[0].message, "use absolute path: 'g'");
     assert_eq!(
         note_texts(&items[0]),
-        ["it cannot be leaked as a whole because of `| a : u8 | a`"]
+        ["it cannot be leaked as a whole because of `| a : u8 | g (a)`"]
     );
     // Without the closure the array type is an entry.
     let item: ItemTrait = parse_quote!(
@@ -719,7 +721,7 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
                 &self,
                 x: [u8; {
                     let c = 3;
-                    c
+                    g(c)
                 }],
             );
         }

@@ -1110,21 +1110,45 @@ pub(crate) struct ReplaceSelf<'a> {
 }
 
 impl<'a> ReplaceSelf<'a> {
+    /// Replaces each `Self`. One that a `::` follows is `<host>`, as an expression needs, unless
+    /// the host is a path with no arguments.
     pub(crate) fn replace_tokens(&self, tokens: TokenStream) -> TokenStream {
-        use proc_macro2::{Group, TokenTree};
-        tokens
-            .into_iter()
-            .map(|tt| match tt {
-                TokenTree::Ident(ident) if ident == "Self" => self.self_ty.to_token_stream(),
+        use proc_macro2::{Group, Spacing, TokenTree};
+        let plain_host = matches!(
+            self.self_ty,
+            Type::Path(TypePath { qself: None, path })
+                if path.segments.iter().all(|seg| seg.arguments.is_none())
+        );
+        let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+        let mut written = TokenStream::new();
+        for (ix, tt) in tokens.iter().enumerate() {
+            match tt {
+                TokenTree::Ident(ident) if ident == "Self" => {
+                    let path_follows = match (tokens.get(ix + 1), tokens.get(ix + 2)) {
+                        (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b))) => {
+                            a.as_char() == ':'
+                                && a.spacing() == Spacing::Joint
+                                && b.as_char() == ':'
+                        }
+                        _ => false,
+                    };
+                    let self_ty = self.self_ty;
+                    written.extend(if path_follows && !plain_host {
+                        quote!(<#self_ty>)
+                    } else {
+                        self_ty.to_token_stream()
+                    });
+                }
                 TokenTree::Group(group) => {
                     let mut new =
                         Group::new(group.delimiter(), self.replace_tokens(group.stream()));
                     new.set_span(group.span());
-                    TokenTree::Group(new).into()
+                    written.extend(Some(TokenTree::Group(new)));
                 }
-                tt => tt.into(),
-            })
-            .collect()
+                tt => written.extend(Some(tt.clone())),
+            }
+        }
+        written
     }
 
     pub(crate) fn fold_type_with(&self, folder: &mut impl syn::fold::Fold, ty: Type) -> Type {

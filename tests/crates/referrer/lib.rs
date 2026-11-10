@@ -276,8 +276,15 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9250!(path = ::type_leak_test_leaker::kinds);
     // The same in the length of an array in a field, without `check_values` (F101).
     type_leak_test_leaker::__tl_prop_9264!(path = ::type_leak_test_leaker::kinds);
+    // The names that a block in an array length declares are local (F110).
+    type_leak_test_leaker::__tl_prop_9271!(path = ::type_leak_test_leaker::kinds);
+    // The `Self` of an item in the default of a type parameter is the item's own (F102).
+    type_leak_test_leaker::__tl_prop_9265!(path = ::type_leak_test_leaker::kinds);
     // The argument of a generic associated type replaces its parameter in its where clause (F89).
     type_leak_test_leaker::__tl_prop_9251!(path = ::type_leak_test_leaker::kinds);
+    // The trait arguments in the path of a generic associated type are paired with the parameters
+    // as declared (F107).
+    type_leak_test_leaker::__tl_prop_9270!(path = ::type_leak_test_leaker::kinds);
     // The bindings of a discriminant and of the default of a const parameter are local (F56). The
     // relative macro and struct literal are rejected: they expand to nothing, as they could not be
     // resolved here.

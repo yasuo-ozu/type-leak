@@ -656,9 +656,18 @@ fn every_item_kind_is_leaked_across_crates() {
         (9250, __tl_report_9250!(), ok("struct", 1, 2, 2)),
         // F101: the same in the length of an array in a field, without `check_values`.
         (9264, __tl_report_9264!(), ok("struct", 1, 1, 1)),
+        // F110: the parameter of a closure and the local of a function in the length of an array
+        // are local, not relative paths: `Rel` is the entry (the Leaker rejected the item).
+        (9271, __tl_report_9271!(), ok("struct", 1, 2, 2)),
+        // F102: the `Self` of a struct in a block in the default of a type parameter is its own: the
+        // Leaker rejected the default (`SelfInDefault`).
+        (9265, __tl_report_9265!(), ok("struct", 1, 2, 2)),
         // F89: the argument of a generic associated type replaces its parameter in the relations of its
         // where clause, also when it is no path (`&'x u8`) and a generic of the method has the name.
         (9251, __tl_report_9251!(), ok("trait", 1, 2, 2)),
+        // F107: the trait arguments in the path of a generic associated type are paired with the
+        // parameters as declared (`B` before `A`).
+        (9270, __tl_report_9270!(), ok("trait", 1, 1, 1)),
         // F68: the self type of an impl is a type of the Leaker's crate by an absolute path, a bound
         // of a generic names an optional type and another `Self`, and a predicate is on an entry
         // that uses the generic: the self type is no entry, and every copy writes it as it is.

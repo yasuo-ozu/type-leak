@@ -2428,6 +2428,43 @@ pub mod kinds {
         }],
     );
 
+    // F110 (`tests/findings.rs`): a name that a block in an array length declares is local. It
+    // fails to build on the code before the fix.
+
+    /// F110: the blocks of the lengths declare a closure with the parameter `a`, and a function
+    /// with the local `c`. The Leaker took `a` and `c` for relative paths, which the closure kept
+    /// from being leaked whole (`use absolute path: 'a'`), so the Referrer's crate lacked
+    /// `ClosureLocals`. `Rel` is the entry, and the copy writes the lengths as they are.
+    #[prop_leak(id = 9271)]
+    pub struct ClosureLocals(
+        pub  [Rel; {
+            let _c = |a: u8| a;
+            3
+        }],
+        pub  [Rel; {
+            fn _f() -> usize {
+                let c = || 1;
+                c()
+            }
+            3
+        }],
+    );
+
+    // F102 (`tests/findings.rs`): the `Self` of an item in the default of a type parameter is its
+    // own. It fails to build on the code before the fix.
+
+    /// F102: the block in the default of `T` declares a struct that names its own `Self` beside a
+    /// relative type. The Leaker took that `Self` for the one of `SelfInDefault` and rejected the
+    /// default (`SelfInDefault`); the array is the entry, with no `Self`.
+    #[prop_leak(id = 9265, prelude = true)]
+    pub struct SelfInDefault<
+        T = [u8; {
+                #[allow(dead_code)]
+                struct Z(Rel, Option<Box<Self>>);
+                3
+            }],
+    >(pub T);
+
     // F89 (`tests/findings.rs`): the arguments of a generic associated type replace its parameters
     // in the outlives relations of its where clause. It fails to build on the code before the fix.
 
@@ -2444,6 +2481,23 @@ pub mod kinds {
             U::Target: 'b;
 
         fn f<'x, U: ::core::ops::Deref>(&self, u: U, a: Wrap<&'x Self::G<'x, &'x u8>>);
+    }
+
+    // F107 (`tests/findings.rs`): the arguments of the trait in a generic associated type's path are
+    // paired with the parameters as declared. It fails to build on the code before the fix.
+
+    /// F107: `G` needs `B: 'b`, and `B` is declared before `A`, whereas the context of the entry
+    /// writes `<'x, A, B: 'x>`. The copy paired the arguments `<B, A>` of the path with `A, B`, did
+    /// not find the entry, and left `Wrap<..>` as written: the Referrer's crate did not build.
+    #[prop_leak(id = 9270, prelude = true)]
+    pub trait GatDeclaredOrder<B, A> {
+        type G<'b>
+        where
+            B: 'b;
+
+        fn f<'x>(&self, a: Wrap<<Self as GatDeclaredOrder<B, A>>::G<'x>>)
+        where
+            B: 'x;
     }
 
     // F56 (`tests/findings.rs`): an enum discriminant and the default of a const parameter are read

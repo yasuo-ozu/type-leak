@@ -236,31 +236,32 @@ fn a_conflict_that_is_not_accepted_stays_beside_one_that_is() {
 fn the_cause_of_an_array_with_a_closure_is_the_type_in_it() {
     let item: ItemImpl = parse_quote!(
         impl ::p::S {
-            fn f(_: [u8; { let c = |a: u8| a; 3 }]) {}
+            fn f(_: [u8; { let c = |a: u8| h(a); 3 }]) {}
             fn g(_: ::p::V<u8>) {}
         }
     );
-    // `u8` is the cause, `a` a note: allowing `u8` copies the array whole and `a` is not reached.
+    // `u8` is the cause, `h` a note: allowing `u8` copies the array whole and `h` is not reached.
+    // (`a` is the closure's own name.)
     let result = analyzed(&item);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].cause, Cause::Type(parse_quote!(u8)));
     assert_eq!(
         result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
-        Some("it cannot be leaked as a whole because of `| a : u8 | a`")
+        Some("it cannot be leaked as a whole because of `| a : u8 | h (a)`")
     );
     let causes = [Cause::Type(parse_quote!(u8))];
     let accepted = allowing(result.clone(), &causes);
     assert!(accepted.errors().is_empty());
     let referrer = accepted.finish().unwrap();
-    // `::p::V<u8>` is an entry, as it is without the array, and nothing is for `a`; so is the self
+    // `::p::V<u8>` is an entry, as it is without the array, and nothing is for `h`; so is the self
     // type.
     let found: Vec<&Type> = common::types(&referrer).collect();
     assert_eq!(found, [&parse_quote!(::p::V<u8>), &parse_quote!(::p::S)]);
     let only_g: ItemImpl = parse_quote!(impl ::p::S { fn g(_: ::p::V<u8>) {} });
     assert_eq!(entries(&item), entries(&only_g));
-    // `a` alone accepts nothing: it is not the cause of the error.
-    let a = Cause::Expr(parse_quote!(a));
-    assert_eq!(allowing(result, &[a]).errors().len(), 1);
+    // `h` alone accepts nothing: it is not the cause of the error.
+    let h = Cause::Expr(parse_quote!(h));
+    assert_eq!(allowing(result, &[h]).errors().len(), 1);
 }
 
 // ── scopes ───────────────────────────────────────────────────────────────────────────────────

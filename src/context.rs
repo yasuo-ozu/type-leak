@@ -23,6 +23,9 @@ use template_quote::{quote, ToTokens};
 #[derive(Clone, Debug)]
 pub(crate) struct Scope {
     params: Vec<GenericParam>,
+    /// The parameters in the order they were declared, if `params` are in another (those of a
+    /// context are by kind and name).
+    declared_params: Option<Vec<GenericParam>>,
     predicates: Vec<WherePredicate>,
     is_binder: bool,
     /// What `Self` meant where the generics were declared, which their bounds and where predicates
@@ -44,6 +47,7 @@ impl Scope {
                 .cloned()
                 .map(without_default)
                 .collect(),
+            declared_params: None,
             predicates: generics
                 .where_clause
                 .iter()
@@ -57,12 +61,19 @@ impl Scope {
 
     /// The generics and what `Self` means in the scope of `context`.
     pub(crate) fn of_context(context: &Context) -> Self {
-        Self::new(&context.generics, context.self_ty.clone()).with_gats(context.gats.clone())
+        let mut scope =
+            Self::new(&context.generics, context.self_ty.clone()).with_gats(context.gats.clone());
+        scope.declared_params = context
+            .declared
+            .as_ref()
+            .map(|declared| declared.params.iter().cloned().collect());
+        scope
     }
 
     pub(crate) fn binder(lifetimes: &BoundLifetimes) -> Self {
         Self {
             params: lifetimes.lifetimes.iter().cloned().collect(),
+            declared_params: None,
             predicates: Vec::new(),
             is_binder: true,
             self_ty: None,
@@ -127,6 +138,11 @@ impl Scope {
 
     pub(crate) fn params(&self) -> impl Iterator<Item = &GenericParam> {
         self.params.iter()
+    }
+
+    /// The parameters in the order they were declared.
+    fn declared_params(&self) -> &[GenericParam] {
+        self.declared_params.as_deref().unwrap_or(&self.params)
     }
 
     pub(crate) fn predicates(&self) -> impl Iterator<Item = &WherePredicate> {
@@ -588,12 +604,12 @@ fn gat_requirements(
         .find(|scope| scope.self_ty() == self_req && scope.gat(&name).is_some());
     match scope.and_then(|scope| Some((scope, scope.gat(&name)?))) {
         Some((scope, gat)) => {
-            let trait_params: Vec<GenericParam> = scope.params().cloned().collect();
+            let trait_params = scope.declared_params();
             // A trait with no arguments written takes its parameters as they are.
             if !trait_args.is_empty() && trait_args.len() != trait_params.len() {
                 return Vec::new();
             }
-            gat.requirements(&args, &trait_params, &trait_args)
+            gat.requirements(&args, trait_params, &trait_args)
         }
         None => Vec::new(),
     }

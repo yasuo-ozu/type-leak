@@ -496,30 +496,36 @@ fn parameter_projection(ty: &TypePath) -> Option<(&Ident, Path)> {
 
 /// The one trait bound of `param`, inline or in a where predicate, without associated type
 /// bindings (`Iterator` for `T: Iterator<Item = u8>`). `None` for none, several, or one with a
-/// `for<'a>` binder; lifetime bounds and `?Sized` do not count.
+/// `for<'a>` binder, on the bound or on its where predicate; lifetime bounds and `?Sized` do not
+/// count.
 fn single_bound(param: &TypeParam, where_clause: Option<&WhereClause>) -> Option<Path> {
     let predicates = where_clause
         .into_iter()
         .flat_map(|where_clause| where_clause.predicates.iter())
         .filter_map(|predicate| match predicate {
             WherePredicate::Type(PredicateType {
-                lifetimes: None,
+                lifetimes,
                 bounded_ty,
                 bounds,
                 ..
-            }) if type_name(bounded_ty) == Some(&param.ident) => Some(bounds.iter()),
+            }) if type_name(bounded_ty) == Some(&param.ident) => {
+                Some(bounds.iter().map(move |bound| (bound, lifetimes.is_some())))
+            }
             _ => None,
         })
         .flatten();
     let mut found = None;
-    for bound in param.bounds.iter().chain(predicates) {
+    let inline = param.bounds.iter().map(|bound| (bound, false));
+    for (bound, binder) in inline.chain(predicates) {
         match bound {
             TypeParamBound::Lifetime(_)
             | TypeParamBound::Trait(TraitBound {
                 modifier: TraitBoundModifier::Maybe(_),
                 ..
             }) => (),
-            TypeParamBound::Trait(bound) if found.is_none() && bound.lifetimes.is_none() => {
+            TypeParamBound::Trait(bound)
+                if found.is_none() && !binder && bound.lifetimes.is_none() =>
+            {
                 found = Some(bound.path.clone());
             }
             _ => return None,

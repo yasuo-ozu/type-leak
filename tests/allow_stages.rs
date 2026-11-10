@@ -111,27 +111,27 @@ fn allow_primitive_drops_a_primitive_path_in_a_const_expression_at_both_stages()
             fn c(
                 &self,
                 x: [u8; {
-                    let f = |a: u8| a;
+                    let f = |a: u8| g(a);
                     3
                 }],
             );
         }
     );
     let (before, after) = stages(&item, |c| c, Rule::Primitive);
-    // The closure's `a` is relative, so the array is still an error, with `u8` allowed. After the
-    // analysis the cause is `u8`, the first path of the array, and `a` is the second path: the rule
-    // removes `u8` from the paths of the error and leaves `a`. The error has paths, so it is
-    // accepted by them and not by its cause (which the rule allows).
-    assert_eq!(causes(&before), ["a"]);
+    // The closure's `g` is relative (its parameter `a` is not), so the array is still an error,
+    // with `u8` allowed. After the analysis the cause is `u8`, the first path of the array, and `g`
+    // is the second path: the rule removes `u8` from the paths of the error and leaves `g`. The
+    // error has paths, so it is accepted by them and not by its cause (which the rule allows).
+    assert_eq!(causes(&before), ["g"]);
     assert_eq!(causes(&after), ["u8"]);
     assert_eq!(before.errors().len(), after.errors().len());
     let texts = |error: &ErrorItem| -> Vec<String> {
         error.paths.iter().map(|p| quote!(#p).to_string()).collect()
     };
-    assert_eq!(texts(&after.errors()[0]), ["a"]);
+    assert_eq!(texts(&after.errors()[0]), ["g"]);
     assert_eq!(
         texts(&analyze(&item, Rules::new()).errors()[1]),
-        ["u8", "a"]
+        ["u8", "g"]
     );
 }
 

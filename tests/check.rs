@@ -331,16 +331,16 @@ fn the_causes_of_a_check_have_the_kind_of_their_syntax() {
             false,
         ),
         // The closure stops the array from being leaked, and the paths in it are causes of their
-        // own: `u8` a type, `a` an expression.
+        // own: `u8` a type, `g` an expression (`a` is the closure's own name).
         (
             parse_quote!(
                 [u8; {
-                    let c = |a: u8| a;
+                    let c = |a: u8| g(a);
                     3
                 }]
             ),
-            vec![("type", "u8"), ("expr", "a")],
-            vec![("expr", "| a : u8 | a")],
+            vec![("type", "u8"), ("expr", "g")],
+            vec![("expr", "| a : u8 | g (a)")],
             true,
         ),
         // A macro call is a macro in `must` (its path, written with the `!`) and an expression, with
@@ -378,7 +378,7 @@ fn the_causes_of_a_check_have_the_kind_of_their_syntax() {
     }
     let result = check(&parse_quote!(
         [u8; {
-            let c = |a: u8| a;
+            let c = |a: u8| g(a);
             3
         }]
     ));

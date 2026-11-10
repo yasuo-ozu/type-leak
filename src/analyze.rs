@@ -25,11 +25,11 @@ use crate::util::{
     absolute_example, binder_declares, binder_lifetimes, bound_cause, bounded_ident,
     declared_names, first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name, is_bare_self,
-    is_lifetime_param, is_primitive_name, is_type_param_named, is_whole_reference, names_in,
-    or_list, path_type, plain_self_head, push_once, self_head, self_in_param, self_in_predicate,
-    selves_in_generics, tidy, trait_head, trait_object_of, type_mentions_self, unwrap_type_group,
-    where_clause, where_predicate_mentions_self, without_arguments, without_default,
-    without_defaults,
+    is_lifetime_param, is_primitive_name, is_std_crate_path, is_type_param_named,
+    is_whole_reference, names_in, or_list, path_type, plain_self_head, push_once, self_head,
+    self_in_param, self_in_predicate, selves_in_generics, tidy, trait_head, trait_object_of,
+    type_mentions_self, unwrap_type_group, where_clause, where_predicate_mentions_self,
+    without_arguments, without_default, without_defaults,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -510,7 +510,8 @@ struct Position {
     /// While a binder is probed: the addresses of the types found to be leaked whole.
     binder_probe: Option<HashSet<usize>>,
     /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
-    /// declaring scope gives `Self` a meaning. `SelfScope::ty` is `None` meanwhile.
+    /// declaring scope gives `Self` a meaning. `SelfScope::ty` is `None` meanwhile, and an item
+    /// inside the type leaves the default.
     in_default: Option<bool>,
     /// The type is the default of a parameter of a nested item (`SelfScope::nested`). An entry here
     /// has no `Self` and no bound that names it ([`AnalyzeVisitor::context_of()`]); a type that
@@ -519,6 +520,9 @@ struct Position {
     /// The depth of the type owning the expression (array length, const argument) being visited.
     /// Types in it are not leaked alone: the copy would put an associated type path in a constant.
     expr_owner: Option<usize>,
+    /// The names that the blocks of the expression around declare: a path that starts with one
+    /// means the same wherever the copy is written.
+    locals: ValueScopes,
     /// In a receiver (`self: Box<Self>`), where rustc accepts only `Self` and types dereferencing
     /// to it: no type in it is optional.
     in_receiver: bool,
@@ -2609,11 +2613,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// a `Self` without meaning: the path is written as it is, and the caller visits its arguments.
     /// Returns `true` for a relative path.
     fn check_bound_path(&mut self, path: &Path, cause: Cause) -> bool {
+        let asked = Cause::Trait(path.clone());
         if self_head(path).is_some() && self.self_scope.ty.is_none() {
             self.records
                 .self_errors
                 .push(SelfMention::new(cause, self.place()));
-        } else if !self.is_free_path(&Cause::Trait(path.clone())) {
+        } else if !self.is_local(path, &asked) && !self.is_free_path(&asked) {
             let paths = vec![Cause::Trait(without_arguments(path))];
             self.push_relative_path(cause.clone(), cause, paths);
             return true;
@@ -2777,10 +2782,16 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             depth: self.self_scope.depth,
         };
         let outer = std::mem::replace(&mut self.self_scope, inner);
+        // The item cannot name the `Self` around it: it is not in the default, and its mentions of
+        // `Self` are not those of the type that holds it.
+        let in_default = self.position.in_default.take();
+        let mentions_self = self.frame.mentions_self;
         self.with_item_generics(generics, gats, |visitor| {
             visitor.self_scope.depth = if declares { visitor.scopes.len() } else { 0 };
             f(visitor)
         });
+        self.frame.mentions_self = mentions_self;
+        self.position.in_default = in_default;
         self.self_scope = outer;
     }
 
@@ -3406,6 +3417,9 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
     /// syntax that a mention of `Self` that has no meaning, or a relative path that is leaked, is
     /// reported at.
     fn visit_path_of(&mut self, i: &Path, asked: &Cause, written: &Cause) {
+        if self.is_local(i, asked) {
+            return syn::visit::visit_path(self, i);
+        }
         let in_type = self.position.type_depth > 0;
         let starts_with_generic = self.starts_with_generic(i);
         let free = self.is_free_path(asked);
@@ -3434,6 +3448,144 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             }
         }
         syn::visit::visit_path(self, i)
+    }
+
+    /// Returns `true` if `path`, asked about as `asked`, starts with a name that a block around
+    /// declares (`Position::locals`): an item, or a binding for a value. Macros are named apart.
+    fn is_local(&self, path: &Path, asked: &Cause) -> bool {
+        match asked {
+            Cause::Macro(_) => false,
+            Cause::Expr(_) => self.position.locals.is_local(path, false),
+            _ => self.position.locals.is_local(path, true),
+        }
+    }
+
+    /// Runs `f` in a new scope of `Position::locals`, with the bindings of `pats` declared.
+    fn with_locals<'p>(
+        &mut self,
+        pats: impl IntoIterator<Item = &'p Pat>,
+        f: impl FnOnce(&mut Self),
+    ) {
+        self.position.locals.scopes.push(ValueScope::default());
+        for pat in pats {
+            self.bind_pattern(pat);
+        }
+        f(self);
+        self.position.locals.scopes.pop();
+    }
+
+    /// Declares the bindings of `pat` in the innermost scope of `Position::locals`.
+    fn bind_pattern(&mut self, pat: &Pat) {
+        for ident in bindings_of(pat) {
+            self.position.locals.bind(&ident);
+        }
+    }
+
+    /// Visits `attrs`, and declares and visits `label`, as the walk of an expression does.
+    fn walk_head(&mut self, attrs: &[Attribute], label: Option<&Label>) {
+        for attr in attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(label) = label {
+            self.position.locals.declare(label.name.to_string());
+            self.visit_label(label);
+        }
+    }
+
+    /// Walks `i` as `syn::visit::visit_expr()` does, with the names that it declares in
+    /// `Position::locals`: a pattern binds in the body or branch after it.
+    fn walk_expr(&mut self, i: &Expr) {
+        match i {
+            Expr::Async(e) => {
+                self.walk_head(&e.attrs, None);
+                self.walk_block(&e.block)
+            }
+            Expr::Block(e) => {
+                self.walk_head(&e.attrs, e.label.as_ref());
+                self.walk_block(&e.block)
+            }
+            Expr::Const(e) => {
+                self.walk_head(&e.attrs, None);
+                self.walk_block(&e.block)
+            }
+            Expr::TryBlock(e) => {
+                self.walk_head(&e.attrs, None);
+                self.walk_block(&e.block)
+            }
+            Expr::Unsafe(e) => {
+                self.walk_head(&e.attrs, None);
+                self.walk_block(&e.block)
+            }
+            Expr::Loop(e) => {
+                self.walk_head(&e.attrs, e.label.as_ref());
+                self.walk_block(&e.body)
+            }
+            Expr::While(e) => {
+                self.walk_head(&e.attrs, e.label.as_ref());
+                self.with_locals(None, |visitor| {
+                    visitor.visit_expr(&e.cond);
+                    visitor.walk_block(&e.body)
+                })
+            }
+            Expr::ForLoop(e) => {
+                self.walk_head(&e.attrs, e.label.as_ref());
+                self.visit_pat(&e.pat);
+                self.visit_expr(&e.expr);
+                self.with_locals(Some(&*e.pat), |visitor| visitor.walk_block(&e.body))
+            }
+            Expr::If(e) => {
+                self.walk_head(&e.attrs, None);
+                self.with_locals(None, |visitor| {
+                    visitor.visit_expr(&e.cond);
+                    visitor.walk_block(&e.then_branch)
+                });
+                if let Some((_, branch)) = &e.else_branch {
+                    self.visit_expr(branch);
+                }
+            }
+            Expr::Let(e) => {
+                syn::visit::visit_expr_let(self, e);
+                self.bind_pattern(&e.pat)
+            }
+            Expr::Closure(e) => self.with_locals(&e.inputs, |visitor| {
+                syn::visit::visit_expr_closure(visitor, e)
+            }),
+            Expr::Match(e) => {
+                self.walk_head(&e.attrs, None);
+                self.visit_expr(&e.expr);
+                for arm in &e.arms {
+                    self.with_locals(Some(&arm.pat), |visitor| visitor.visit_arm(arm));
+                }
+            }
+            _ => syn::visit::visit_expr(self, i),
+        }
+    }
+
+    /// Walks `i` as `syn::visit::visit_block()` does, in a scope of `Position::locals` where its
+    /// items are declared, and each `let` from the next statement. An item sees no binding.
+    fn walk_block(&mut self, i: &Block) {
+        self.with_locals(None, |visitor| {
+            let items = i.stmts.iter().filter_map(|stmt| match stmt {
+                Stmt::Item(item) => Some(item),
+                _ => None,
+            });
+            declare_items(&mut visitor.position.locals, items);
+            for stmt in &i.stmts {
+                match stmt {
+                    Stmt::Local(local) => {
+                        visitor.visit_local(local);
+                        visitor.bind_pattern(&local.pat);
+                    }
+                    Stmt::Item(item) => {
+                        let locals = &mut visitor.position.locals;
+                        let barrier = std::mem::replace(&mut locals.barrier, locals.scopes.len());
+                        visitor.visit_item(item);
+                        visitor.position.locals.barrier = barrier;
+                    }
+                    _ => visitor.visit_stmt(stmt),
+                }
+            }
+        })
     }
 
     /// Visits the type macro `i` (`m`), which cannot be analyzed: it is leaked whole.
@@ -3726,9 +3878,18 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         // In an expression of a type (an array length), the module goes with the type: its items
         // are nested items with local generics, and it has no `Self`.
         if self.position.type_depth > 0 {
-            return self.with_item(&Generics::default(), None, false, Vec::new(), |visitor| {
+            // Its items name each other, and none of the names of the blocks around.
+            let mut locals = ValueScopes::default();
+            locals.scopes.push(ValueScope::default());
+            if let Some((_, items)) = &i.content {
+                declare_items(&mut locals, items);
+            }
+            let outer = std::mem::replace(&mut self.position.locals, locals);
+            self.with_item(&Generics::default(), None, false, Vec::new(), |visitor| {
                 syn::visit::visit_item_mod(visitor, i)
             });
+            self.position.locals = outer;
+            return;
         }
         // As an item, it is not analyzed: its names would be the copy's own in it.
         let ident = &i.ident;
@@ -3996,7 +4157,6 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                     Cause::Unreadable(quote!(#i)),
                     paths,
                 );
-                return;
             }
         }
         if let Some(expr) = &i.default {
@@ -4079,7 +4239,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             self.push_elided(Cause::Lifetime(i.clone()));
         } else if let Some(scope) = self.scope_of(&i.to_string()) {
             self.mention_scope(scope);
-        } else if i.ident != "static" {
+        } else if i.ident != "static" && !self.position.locals.declares(&i.to_string()) {
             self.push_must(Cause::Lifetime(i.clone()), None);
         }
     }
@@ -4095,7 +4255,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             self.position.expr_owner = Some(self.position.type_depth);
         }
         let enclosing = std::mem::take(&mut self.position.enclosing);
-        syn::visit::visit_expr(self, i);
+        self.walk_expr(i);
         self.position.enclosing = enclosing;
         self.position.expr_owner = outer;
     }
@@ -4150,7 +4310,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
         let (asked, written) = expr_causes(i);
-        if self.position.type_depth == 0 {
+        if self.position.type_depth == 0 && !self.is_local(&i.path, &asked) {
             // Values starting with a generic in scope or `Self` do not depend on the context.
             let is_self = i.qself.is_none() && plain_self_head(&i.path).is_some();
             if is_self {
@@ -5122,12 +5282,14 @@ fn is_bare_ident(ty: &Type) -> bool {
 // consts and function bodies; enum discriminants and const parameter defaults always. The copy
 // writes a value as it is, so a path in it that depends on where it is written is an error of a
 // relative path. The walk follows the scopes of a body (`scopes`, `barrier`): bindings, block
-// items, `use`s, generics and `Self` are local. A type in a type position (cast, `let`, closure,
+// items, `use`s and generics are local. `Self` is known too: it is the scope's, or the `Self` of
+// an item that a block declares (`self_items`). A type in a type position (cast, `let`, closure,
 // turbofish, qualified self type) is leaked as any type of the item, unless it names what the
 // value declares or is in a macro or a block item (`reads`). What the walk cannot read (macro
 // arguments that are no expressions, `macro_rules!`, a glob `use`, unparsed syntax) is rejected.
 // None of this is done in a type (an array length): there the value of a nested item is part of
-// the type, which the visitor reads like the rest of the length, whatever `check_values` says.
+// the type, which the visitor reads like the rest of the length, whatever `check_values` says. The
+// visitor knows the names that the blocks there declare (`Position::locals`).
 
 impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
@@ -5153,7 +5315,20 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
     /// default body of a method of a trait. The generics of `sig` are in scope.
     fn check_body(&mut self, sig: &Signature, block: &Block, default: bool) {
         if self.position.type_depth > 0 {
-            return self.visit_block(block);
+            // The parameters and the receiver are bindings of the body.
+            let params = sig.inputs.iter().filter_map(|input| match input {
+                FnArg::Typed(arg) => Some(&*arg.pat),
+                FnArg::Receiver(_) => None,
+            });
+            return self.with_locals(params, |visitor| {
+                if let Some(receiver) = sig.receiver() {
+                    visitor
+                        .position
+                        .locals
+                        .bind(&Ident::from(receiver.self_token));
+                }
+                visitor.walk_block(block)
+            });
         }
         self.read_value("body", &sig.ident, default, |walk| {
             for input in &sig.inputs {
@@ -5192,7 +5367,7 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
 }
 
 /// The names that a scope of a value declares.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ValueScope {
     /// The bindings of patterns: a `let`, a parameter, a match arm, a `for`.
     bindings: HashSet<String>,
@@ -5200,72 +5375,46 @@ struct ValueScope {
     items: HashSet<String>,
 }
 
-/// The walk of a value: it rejects the relative paths and leaks the types in type positions.
-struct ValueWalk<'a, 'r, A> {
-    visitor: &'a mut AnalyzeVisitor<'r, A>,
-    /// Where the walk is, as the notes say it: "the default value of `N`".
-    what: String,
-    /// Never empty. The first is the scope of the value itself.
+/// The scopes of a value, innermost last, and the names they declare.
+#[derive(Clone, Default)]
+struct ValueScopes {
     scopes: Vec<ValueScope>,
     /// The first scope whose bindings are seen. An item in a block sees the items around it, but
     /// not the bindings.
     barrier: usize,
-    /// Greater than 0 where the walk reads a type itself instead of leaking it: in an item that a
-    /// block declares, in the arguments of a macro (the visitor does not rewrite tokens), and in
-    /// a type that names something the value declares.
-    reads: usize,
-    /// While such a type is read: the name it has that the value declares.
-    declared_name: Option<String>,
 }
 
-impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
-    fn new(visitor: &'a mut AnalyzeVisitor<'r, A>, what: String) -> Self {
-        Self {
-            visitor,
-            what,
-            scopes: vec![ValueScope::default()],
-            barrier: 0,
-            reads: 0,
-            declared_name: None,
+impl ValueScopes {
+    /// Binds `ident` in the innermost scope, if any.
+    fn bind(&mut self, ident: &Ident) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.bindings.insert(ident_name(ident));
         }
     }
 
-    fn scope(&mut self) -> &mut ValueScope {
-        self.scopes.last_mut().expect("a scope")
+    /// Declares the item, generic or lifetime `name` in the innermost scope, if any.
+    fn declare(&mut self, name: String) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.items.insert(name);
+        }
     }
 
-    fn bind(&mut self, ident: &Ident) {
-        self.scope().bindings.insert(ident_name(ident));
-    }
-
-    fn declare(&mut self, ident: &Ident) {
-        self.scope().items.insert(ident_name(ident));
-    }
-
-    /// Declares a name that is not an identifier: a lifetime (`'a`).
-    fn declare_name(&mut self, name: String) {
-        self.scope().items.insert(name);
-    }
-
-    /// Returns `true` if the value declares `name` (an item, a generic, a lifetime or a binding),
-    /// wherever it appears: in a path, a lifetime or the tokens of a macro.
-    fn declares(&self, name: &str) -> bool {
+    /// Returns `true` if a scope declares `name` as an item.
+    fn declares_item(&self, name: &str) -> bool {
         self.scopes.iter().any(|scope| scope.items.contains(name))
+    }
+
+    /// Returns `true` if a scope declares `name` (an item, a generic, a lifetime or a binding).
+    fn declares(&self, name: &str) -> bool {
+        self.declares_item(name)
             || self.scopes[self.barrier..]
                 .iter()
                 .any(|scope| scope.bindings.contains(name))
     }
 
-    /// Runs `f` in a new scope.
-    fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
-        self.scopes.push(ValueScope::default());
-        f(self);
-        self.scopes.pop();
-    }
-
-    /// Returns `true` if the path starts with a name that the value declares: an item (a path of
-    /// any length), or a binding (a single name).
-    fn is_local(&self, path: &Path) -> bool {
+    /// Returns `true` if the path starts with a declared name: an item (a path of any length), or a
+    /// binding (a single name) unless `items_only`.
+    fn is_local(&self, path: &Path, items_only: bool) -> bool {
         let first = match path
             .segments
             .first()
@@ -5275,11 +5424,77 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
             None => return false,
         };
         let name = ident_name(&first.ident);
-        if path.segments.len() == 1 && first.arguments.is_none() {
+        if path.segments.len() == 1 && first.arguments.is_none() && !items_only {
             self.declares(&name)
         } else {
-            self.scopes.iter().any(|scope| scope.items.contains(&name))
+            self.declares_item(&name)
         }
+    }
+}
+
+/// The walk of a value: it rejects the relative paths and leaks the types in type positions.
+struct ValueWalk<'a, 'r, A> {
+    visitor: &'a mut AnalyzeVisitor<'r, A>,
+    /// Where the walk is, as the notes say it: "the default value of `N`".
+    what: String,
+    /// Never empty. The first is the scope of the value itself.
+    names: ValueScopes,
+    /// Greater than 0 where the walk reads a type itself instead of leaking it: in an item that a
+    /// block declares, in the arguments of a macro (the visitor does not rewrite tokens), and in
+    /// a type that names something the value declares.
+    reads: usize,
+    /// While such a type is read: the name it has that the value declares.
+    declared_name: Option<String>,
+    /// Greater than 0 inside a struct, an enum, a union, a trait or an impl that a block declares,
+    /// where `Self` is the item's own.
+    self_items: usize,
+}
+
+impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
+    fn new(visitor: &'a mut AnalyzeVisitor<'r, A>, what: String) -> Self {
+        Self {
+            visitor,
+            what,
+            names: ValueScopes {
+                scopes: vec![ValueScope::default()],
+                barrier: 0,
+            },
+            reads: 0,
+            declared_name: None,
+            self_items: 0,
+        }
+    }
+
+    fn bind(&mut self, ident: &Ident) {
+        self.names.bind(ident);
+    }
+
+    fn declare(&mut self, ident: &Ident) {
+        self.names.declare(ident_name(ident));
+    }
+
+    /// Declares a name that is not an identifier: a lifetime (`'a`).
+    fn declare_name(&mut self, name: String) {
+        self.names.declare(name);
+    }
+
+    /// Returns `true` if the value declares `name` (an item, a generic, a lifetime or a binding),
+    /// wherever it appears: in a path, a lifetime or the tokens of a macro.
+    fn declares(&self, name: &str) -> bool {
+        self.names.declares(name)
+    }
+
+    /// Runs `f` in a new scope.
+    fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
+        self.names.scopes.push(ValueScope::default());
+        f(self);
+        self.names.scopes.pop();
+    }
+
+    /// Returns `true` if the path starts with a name that the value declares: an item (a path of
+    /// any length), or a binding (a single name).
+    fn is_local(&self, path: &Path) -> bool {
+        self.names.is_local(path, false)
     }
 
     /// Returns `true` if the path of `cause` means the same wherever the value is written: it
@@ -5294,7 +5509,9 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
             return true;
         }
         if self_head(path).is_some() {
-            self.visitor.check_self_has_meaning(Cause::expr_path(path));
+            if self.self_items == 0 {
+                self.visitor.check_self_has_meaning(Cause::expr_path(path));
+            }
             return true;
         }
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
@@ -5464,23 +5681,30 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
     fn macro_call(&mut self, mac: &Macro) {
         let path = &mac.path;
         let cause = Cause::Macro(path.clone());
+        // A relative `std::vec!` is the library's if the rule allowed it, and the value does not
+        // declare `std`.
+        let allowed = path.leading_colon.is_none()
+            && is_std_crate_path(path)
+            && self.visitor.is_free_path(&cause)
+            && !self.is_local(path);
         if !self.is_known(&cause) {
             let help = macro_help(path);
             self.reject(cause, Some(help));
         }
         self.reads += 1;
-        self.macro_tokens(mac);
+        self.macro_tokens(mac, allowed);
         self.reads -= 1;
     }
 
-    fn macro_tokens(&mut self, mac: &Macro) {
+    /// Checks the arguments of `mac`. `allowed`: the rule allowed its relative path.
+    fn macro_tokens(&mut self, mac: &Macro, allowed: bool) {
         let path = &mac.path;
         let tokens = &mac.tokens;
         // These name no item in their arguments (`cfg!(unix)`, `stringify!(a b)`).
-        if is_std_macro(path, &["cfg", "stringify"]) {
+        if is_std_macro(path, &["cfg", "stringify"], allowed) {
             return;
         }
-        if is_std_macro(path, &["matches"]) {
+        if is_std_macro(path, &["matches"], allowed) {
             if let Ok((expr, pat, guard)) = parse_matches.parse2(tokens.clone()) {
                 self.visit_expr(&expr);
                 self.scoped(|walk| {
@@ -5493,7 +5717,7 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
             }
         }
         match macro_exprs(tokens) {
-            Some(args) => self.macro_arguments(&args, format_string(path)),
+            Some(args) => self.macro_arguments(&args, format_string(path, allowed)),
             None => self.cannot_read(
                 quote!(#path ! (#tokens)),
                 "the arguments of the macro are not expressions",
@@ -5546,6 +5770,30 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
         self.qualified(i.qself.as_ref(), &i.path)
     }
 
+    fn visit_expr_struct(&mut self, i: &'ast ExprStruct) {
+        self.qualified(i.qself.as_ref(), &i.path);
+        for field in &i.fields {
+            self.visit_field_value(field);
+        }
+        if let Some(rest) = &i.rest {
+            self.visit_expr(rest);
+        }
+    }
+
+    fn visit_pat_struct(&mut self, i: &'ast PatStruct) {
+        self.qualified(i.qself.as_ref(), &i.path);
+        for field in &i.fields {
+            self.visit_field_pat(field);
+        }
+    }
+
+    fn visit_pat_tuple_struct(&mut self, i: &'ast PatTupleStruct) {
+        self.qualified(i.qself.as_ref(), &i.path);
+        for elem in &i.elems {
+            self.visit_pat(elem);
+        }
+    }
+
     fn visit_type_path(&mut self, i: &'ast TypePath) {
         self.qualified(i.qself.as_ref(), &i.path)
     }
@@ -5587,15 +5835,9 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
         }
     }
 
-    /// A name in a pattern is a binding, unless it is a path to a constant, a unit struct or a
-    /// variant. Those are written with a capital letter (the lint `non_snake_case` makes a binding
-    /// with one a warning), and a `ref` or `mut` name or one with `@` is a binding for certain.
+    /// A name in a pattern is a binding ([`is_binding()`]) or a path.
     fn visit_pat_ident(&mut self, i: &'ast PatIdent) {
-        let name = ident_name(&i.ident);
-        let capital = name.chars().next().map_or(false, char::is_uppercase);
-        let binding =
-            i.by_ref.is_some() || i.mutability.is_some() || i.subpat.is_some() || !capital;
-        if binding {
+        if is_binding(i) {
             self.bind(&i.ident);
         } else {
             self.check_name(&i.ident);
@@ -5643,9 +5885,14 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
 
     fn visit_item(&mut self, i: &'ast Item) {
         // The item sees the items around it, and the generics of its own, not the bindings.
-        let outer = std::mem::replace(&mut self.barrier, self.scopes.len());
+        let outer = std::mem::replace(&mut self.names.barrier, self.names.scopes.len());
         // The types of an item that a block declares are read, not leaked.
         self.reads += 1;
+        let has_self = matches!(
+            i,
+            Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_) | Item::Impl(_)
+        );
+        self.self_items += usize::from(has_self);
         self.scoped(|walk| match i {
             Item::Use(item) => {
                 if has_glob(&item.tree) {
@@ -5663,8 +5910,9 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
             Item::Verbatim(tokens) => walk.cannot_read(tokens.clone(), "syn does not parse it"),
             _ => syn::visit::visit_item(walk, i),
         });
+        self.self_items -= usize::from(has_self);
         self.reads -= 1;
-        self.barrier = outer;
+        self.names.barrier = outer;
     }
 
     fn visit_item_mod(&mut self, i: &'ast ItemMod) {
@@ -5818,6 +6066,48 @@ impl<'ast, A: Allow> Visit<'ast> for Scan<'_, '_, '_, A> {
     }
 }
 
+/// Returns `true` if the name of `i` is a binding, not a path to a constant, a unit struct or a
+/// variant. Those are written with a capital letter (the lint `non_snake_case` makes a binding with
+/// one a warning), and a `ref` or `mut` name or one with `@` is a binding for certain.
+fn is_binding(i: &PatIdent) -> bool {
+    let capital = ident_name(&i.ident)
+        .chars()
+        .next()
+        .map_or(false, char::is_uppercase);
+    i.by_ref.is_some() || i.mutability.is_some() || i.subpat.is_some() || !capital
+}
+
+/// Declares in `locals` the names of the `items` of a block or a module in a type, but those of a
+/// `use`, an `extern crate` and a `macro_rules!`: the visitor does not read what they name.
+fn declare_items<'i>(locals: &mut ValueScopes, items: impl IntoIterator<Item = &'i Item>) {
+    for item in items {
+        if !matches!(item, Item::Use(_) | Item::ExternCrate(_) | Item::Macro(_)) {
+            for name in declared_names(item) {
+                locals.declare(ident_name(&name));
+            }
+        }
+    }
+}
+
+/// The bindings of the pattern `pat` (see [`is_binding()`]), not those of a value in it.
+fn bindings_of(pat: &Pat) -> Vec<Ident> {
+    struct Bindings(Vec<Ident>);
+    impl<'ast> Visit<'ast> for Bindings {
+        fn visit_pat_ident(&mut self, i: &'ast PatIdent) {
+            if is_binding(i) {
+                self.0.push(i.ident.clone());
+            }
+            syn::visit::visit_pat_ident(self, i)
+        }
+        fn visit_type(&mut self, _: &'ast Type) {}
+        fn visit_expr(&mut self, _: &'ast Expr) {}
+        fn visit_block(&mut self, _: &'ast Block) {}
+    }
+    let mut bindings = Bindings(Vec::new());
+    bindings.visit_pat(pat);
+    bindings.0
+}
+
 fn has_glob(tree: &UseTree) -> bool {
     match tree {
         UseTree::Path(p) => has_glob(&p.tree),
@@ -5841,9 +6131,9 @@ fn macro_exprs(tokens: &TokenStream) -> Option<Vec<Expr>> {
     repeat.parse2(tokens.clone()).ok()
 }
 
-/// Returns `true` if `path` is the macro of the standard library `names`: `cfg!` or
-/// `::core::cfg!`. (Another path ending in the same name is a macro of its own.)
-fn is_std_macro(path: &Path, names: &[&str]) -> bool {
+/// Returns `true` if `path` is the macro of the standard library `names`: `cfg!`, `::core::cfg!`,
+/// or `core::cfg!` if `allowed`. (Another path ending in the same name is a macro of its own.)
+fn is_std_macro(path: &Path, names: &[&str], allowed: bool) -> bool {
     let name = match path.segments.last() {
         Some(seg) => seg.ident.to_string(),
         None => return false,
@@ -5851,10 +6141,7 @@ fn is_std_macro(path: &Path, names: &[&str]) -> bool {
     names.contains(&name.as_str())
         && match path.segments.len() {
             1 => true,
-            2 => {
-                path.leading_colon.is_some()
-                    && matches!(path.segments.first(), Some(seg) if seg.ident == "core" || seg.ident == "std")
-            }
+            2 => (path.leading_colon.is_some() || allowed) && is_std_crate_path(path),
             _ => false,
         }
 }
@@ -5951,11 +6238,11 @@ const STD_MACROS: &[(&str, &str, FormatString)] = &[
 
 /// Tells where the format string is in the macro `path`: for the macros of the standard library
 /// that format, the position; for the others of the library, none; for a macro of the user, any
-/// literal may be.
-fn format_string(path: &Path) -> FormatString {
+/// literal may be. `allowed`: the rule allowed the relative path.
+fn format_string(path: &Path, allowed: bool) -> FormatString {
     STD_MACROS
         .iter()
-        .find(|(name, _, _)| is_std_macro(path, &[name]))
+        .find(|(name, _, _)| is_std_macro(path, &[name], allowed))
         .map_or(FormatString::Any, |&(_, _, format)| format)
 }
 
