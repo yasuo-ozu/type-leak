@@ -6784,9 +6784,16 @@ fn accept_referrer(
             macro_prefix,
             item.id,
             module,
-            // The Leaker carries the errors of these items, and the Referrer drops them.
+            // The Leaker carries the errors of these items, and the Referrer drops them
+            // (`TYPE_LEAK_PROP_IGNORE`: by `LeakerResult::ignore()`).
             if macro_prefix == "__tl_prop_" && carries_result(item.id) {
-                ", allow(all)"
+                if std::env::var("TYPE_LEAK_PROP_IGNORE")
+                    .map_or(false, |value| !matches!(value.as_str(), "" | "0"))
+                {
+                    ", ignore(all)"
+                } else {
+                    ", allow(all)"
+                }
             } else {
                 ""
             }

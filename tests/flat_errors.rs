@@ -134,7 +134,20 @@ fn a_bound_written_as_it_is_has_the_error_inside_it_after_it() {
     );
     let direct = analyze(&absolute, Rules::new());
     assert_eq!(direct.errors().len(), 1);
-    assert_eq!(text(&direct.errors()[0]), text(inside));
+    // (The part that it is about is another one of another Referrer.)
+    let same = &direct.errors()[0];
+    assert_eq!(text(&same.cause), text(&inside.cause));
+    assert_eq!(same.reason, inside.reason);
+    assert_eq!(same.message, inside.message);
+    assert_eq!(
+        same.notes.iter().map(|(_, note)| note).collect::<Vec<_>>(),
+        inside
+            .notes
+            .iter()
+            .map(|(_, note)| note)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(same.help_text(), inside.help_text());
     // The Referrer is the one of the absolute bound.
     assert_eq!(
         result.clone().into_referrer().iter().count(),

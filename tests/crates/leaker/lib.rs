@@ -2747,4 +2747,38 @@ pub mod kinds {
         pub only_u128: Wrap<Keyed<0, M>>,
         pub rel: Rel,
     }
+
+    /// 9260 (`LeakerResult::ignore()`): the type `Two<Leaf, Held<'_>>` is written as it is (the elided
+    /// lifetime), `Held<'_>` in it has an error of its own, and `Leaf` in it is an entry beside the
+    /// entry `Leaf` of `y`. The Referrer's macro says `ignore(type Two<Leaf, Held<'_>>)`: that one
+    /// call drops both errors, and the copy writes the whole type as it is (`Leaf` in it too), where
+    /// `allow()` would write `Two` and `Held` and replace the `Leaf` in it.
+    #[prop_leak_result(id = 9260, prelude = true)]
+    pub trait IgnoredFlat {
+        fn f(&self, x: Two<Leaf, Held<'_>>, y: Leaf) -> Rel;
+    }
+
+    /// A type that needs `Clone` of its first parameter, as the declaration of the leaked type of
+    /// the `NestedSelfInBounds` risk may.
+    pub struct NeedsClone<A: ::core::clone::Clone, B>(pub PhantomData<(A, B)>);
+
+    /// 9261 (`LeakerResult::ignore()`): the field names the `Self` of this nested struct and uses a
+    /// generic whose bound names it (`NestedSelfInBounds`): an entry for any type, whose impl would
+    /// be `impl<__S, T: AsRef<__S>> Repeater<..> for _ { type Type = NeedsClone<__S, T>; }`: E0277 in
+    /// this crate (`__S: Clone` is not known), as the risk says. The macro calls `ignore()` for the
+    /// error (`ignore_risks`), so the entry has no impl and the copy writes the field as it is, with
+    /// its own `Self`; `rel` is an entry beside it. (With `nested_self_entries = true`, which only
+    /// takes the risk, this crate does not build.)
+    #[prop_leak_accept(id = 9261, prelude = true, scope = "mod", ignore_risks = true)]
+    pub struct IgnoredEntry<T: ::core::convert::AsRef<Self>> {
+        pub needs: NeedsClone<Self, T>,
+        pub rel: Rel,
+    }
+
+    /// The field needs `IgnoredEntry<T>: Clone`.
+    impl<T: ::core::convert::AsRef<IgnoredEntry<T>>> ::core::clone::Clone for IgnoredEntry<T> {
+        fn clone(&self) -> Self {
+            unimplemented!()
+        }
+    }
 }

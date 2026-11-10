@@ -2,19 +2,22 @@
 //! an item that cannot be interned ([recovery](crate::Leaker#errors-and-recovery)).
 
 use crate::allow::Place;
-use crate::analysis::{CheckResult, SelfMention};
+use crate::analysis::{CheckResult, Part, SelfMention};
+use crate::context::Context;
 use crate::util::{
     has_lifetime_bound, is_std_crate_path, or_list, path_starts_with, path_type, tidy,
     without_arguments, without_crate_prefix, KNOWN_NAMES,
 };
-use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Literal, Span, TokenStream, TokenTree};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    braced, bracketed, parenthesized, token, Expr, ExprPath, Ident, Lifetime, LitStr, Path, Token,
-    Type,
+    braced, bracketed, parenthesized, token, Expr, ExprPath, Ident, Lifetime, LitInt, LitStr, Path,
+    Token, Type,
 };
 use template_quote::{quote, ToTokens};
 
@@ -327,15 +330,17 @@ pub enum Reason {
     /// that the bound holds for ([`SelfRequirement::Any`](crate::SelfRequirement::Any)), and the
     /// copy passes its own type.
     ///
-    /// The error has no [`paths`](ErrorItem::paths):
-    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops it if the rule allows its cause,
-    /// and then you promise two things. The declaration of the leaked type has no trait bound on
-    /// the parameter that receives `Self` (`struct Wrap<A: Clone, B>`), else the impl fails in the
-    /// Leaker's crate (E0277): write the type with an absolute path or give the item its own
-    /// `intern_*` call. And rustc before 1.70 fails with E0275 if the copy's field is the last
-    /// field of a struct: put it first, or add `where Self: Sized` to the item. A default of a
-    /// parameter is not changed (E0735), and a bound that names a leaked type that names `Self` is
-    /// still an error.
+    /// The error has no [`paths`](ErrorItem::paths).
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry, so the copy writes
+    /// the type as it is, and none of the following matters.
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops the error if the rule allows its
+    /// cause, and keeps the entry, and then you promise two things. The declaration of the leaked
+    /// type has no trait bound on the parameter that receives `Self` (`struct Wrap<A: Clone, B>`),
+    /// else the impl fails in the Leaker's crate (E0277): write the type with an absolute path or
+    /// give the item its own `intern_*` call. And rustc before 1.70 fails with E0275 if the copy's
+    /// field is the last field of a struct: put it first, or add `where Self: Sized` to the item. A
+    /// default of a parameter is not changed (E0735), and a bound that names a leaked type that
+    /// names `Self` is still an error.
     NestedSelfInBounds,
     /// A type in a bound or where predicate that the copy cannot write through the Repeater
     /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)).
@@ -452,6 +457,58 @@ pub struct ErrorItem {
     /// several where one cause holds several paths (`dyn A + B`). A rule drops the error if it
     /// accepts all of them.
     pub paths: Vec<Cause>,
+    /// What the error is about in the Referrer, for
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore).
+    pub(crate) link: Link,
+}
+
+/// What an error is about, so that [`LeakerResult::ignore()`](crate::LeakerResult::ignore) can
+/// find it in the Referrer. The analysis gives the data it has (`raw`); the Leaker resolves it to
+/// indices when it makes the result. Serialized after the paths of the error, each word only if it
+/// is set: `id N`, `part N`, `entry N`, `inner [N, ..]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Link {
+    /// The number that the errors held in `inner` are known by: set only for an error that some
+    /// other error holds. It counts the errors of the Leaker in the order found, also those that a
+    /// rule dropped, so it stays the same when errors are dropped.
+    pub(crate) id: Option<usize>,
+    /// The index in the parts of the Referrer of the part that the copy writes as written for
+    /// this error.
+    pub(crate) part: Option<usize>,
+    /// The index of the entry that the error is about (a risk, not a part).
+    pub(crate) entry: Option<usize>,
+    /// The errors revealed inside its part, by `id`.
+    pub(crate) inner: Vec<usize>,
+    /// What the analysis knows, until the Leaker makes the result.
+    pub(crate) raw: Raw,
+}
+
+/// What the analysis knows of what an error is about.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Raw {
+    /// The part that the copy writes as written.
+    pub(crate) part: Option<Part>,
+    /// The entry that the error is about, as its context and type.
+    pub(crate) entry: Option<(Context, Type)>,
+}
+
+impl Link {
+    /// Counts `by` more errors before these: for an error recorded after others.
+    pub(crate) fn shift(&mut self, by: usize) {
+        self.id = self.id.map(|id| id + by);
+        for id in &mut self.inner {
+            *id += by;
+        }
+    }
+}
+
+/// Makes each error hold only the errors inside its part that are in `errors`: after errors were
+/// dropped, the others do not hold them.
+pub(crate) fn forget_dropped(errors: &mut [ErrorItem]) {
+    let present: HashSet<usize> = errors.iter().filter_map(|error| error.link.id).collect();
+    for error in errors {
+        error.link.inner.retain(|id| present.contains(id));
+    }
 }
 
 impl ErrorItem {
@@ -574,6 +631,44 @@ pub fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
         .unwrap_or_else(|| syn::Error::new(Span::call_site(), "not internable"))
 }
 
+/// Two errors are equal if every field is: the tokens by their kinds and text, apart from spans
+/// and spacing, and what the error is about in the Referrer.
+impl PartialEq for ErrorItem {
+    fn eq(&self, other: &Self) -> bool {
+        let same_at = |a: &(TokenStream, String), b: &(TokenStream, String)| {
+            a.1 == b.1 && same_tokens(&a.0, &b.0)
+        };
+        self.cause == other.cause
+            && self.reason == other.reason
+            && self.message == other.message
+            && self.notes.len() == other.notes.len()
+            && self
+                .notes
+                .iter()
+                .zip(&other.notes)
+                .all(|(a, b)| same_at(a, b))
+            && match (&self.help, &other.help) {
+                (Some(a), Some(b)) => same_at(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.in_value == other.in_value
+            && self.in_default == other.in_default
+            && self.paths == other.paths
+            && self.link == other.link
+    }
+}
+
+impl Eq for ErrorItem {}
+
+/// Returns `true` if the streams have the same tokens, apart from spans and spacing.
+fn same_tokens(a: &TokenStream, b: &TokenStream) -> bool {
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    Token::collect(a.clone(), &mut left);
+    Token::collect(b.clone(), &mut right);
+    left == right
+}
+
 /// The message of the error.
 impl std::fmt::Display for ErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -625,9 +720,33 @@ impl Parse for ErrorItem {
             None
         };
         let (mut in_value, mut in_default, mut paths) = (false, false, Vec::new());
+        let mut link = Link::default();
+        // The words of the link may be written once.
+        let mut written: Vec<String> = Vec::new();
         while !item.is_empty() {
             let word = item.call(Ident::parse_any)?;
-            match word.to_string().as_str() {
+            let name = word.to_string();
+            if matches!(name.as_str(), "id" | "part" | "entry" | "inner") {
+                if written.contains(&name) {
+                    return Err(syn::Error::new(
+                        word.span(),
+                        format!("`{}` is written twice", name),
+                    ));
+                }
+                written.push(name.clone());
+            }
+            match name.as_str() {
+                "id" => link.id = Some(item.parse::<LitInt>()?.base10_parse()?),
+                "part" => link.part = Some(item.parse::<LitInt>()?.base10_parse()?),
+                "entry" => link.entry = Some(item.parse::<LitInt>()?.base10_parse()?),
+                "inner" => {
+                    let list;
+                    bracketed!(list in item);
+                    let ids = Punctuated::<LitInt, Token![,]>::parse_terminated(&list)?;
+                    for id in ids {
+                        link.inner.push(id.base10_parse()?);
+                    }
+                }
                 "value" => in_value = true,
                 "default" => in_default = true,
                 "paths" => {
@@ -668,6 +787,7 @@ impl Parse for ErrorItem {
             in_value,
             in_default,
             paths,
+            link,
         })
     }
 }
@@ -703,8 +823,27 @@ impl ToTokens for ErrorItem {
                 .collect();
             quote!(paths [#(for path in &paths), { #path }])
         });
+        let link = &self.link;
+        let number = |n: usize| Literal::usize_unsuffixed(n);
+        let id = link.id.map(|id| {
+            let id = number(id);
+            quote!(id #id)
+        });
+        let part = link.part.map(|part| {
+            let part = number(part);
+            quote!(part #part)
+        });
+        let entry = link.entry.map(|entry| {
+            let entry = number(entry);
+            quote!(entry #entry)
+        });
+        let inner = (!link.inner.is_empty()).then(|| {
+            let ids: Vec<Literal> = link.inner.iter().map(|&id| number(id)).collect();
+            quote!(inner [#(for id in &ids), { #id }])
+        });
         tokens.extend(quote!({
             #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help #value #default #paths
+            #id #part #entry #inner
         }));
     }
 }
@@ -727,6 +866,7 @@ pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
         in_value: mention.place.in_value,
         in_default: mention.place.in_default,
         paths: Vec::new(),
+        link: Link::default(),
     }
 }
 
@@ -787,6 +927,13 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
         in_value: conflict.place.in_value,
         in_default: conflict.place.in_default,
         paths: conflict.paths.clone(),
+        link: Link {
+            raw: Raw {
+                part: conflict.part.clone(),
+                entry: conflict.origin.entry.clone(),
+            },
+            ..Link::default()
+        },
     })
 }
 

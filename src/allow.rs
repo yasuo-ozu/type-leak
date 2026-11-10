@@ -2,7 +2,7 @@
 //! build one, and the filter that applies it to errors. [`LeakerResult`](crate::LeakerResult)
 //! applies it to its errors.
 
-use crate::error::{Cause, ErrorItem};
+use crate::error::{forget_dropped, Cause, ErrorItem};
 use crate::util::{is_std_crate_path, self_head, starts_with_known, Known};
 use syn::Path;
 
@@ -268,7 +268,7 @@ fn accepts<A: Allow + ?Sized>(rule: &A, error: &ErrorItem) -> bool {
 
 /// Drops the errors that `rule` accepts. An error that stays loses the paths that the rule allows,
 /// so that rules given one after the other add up as they do in one set (and in the serialization of
-/// the error, which carries its paths).
+/// the error, which carries its paths), and the errors inside its part that are dropped.
 pub(crate) fn filter<A: Allow + ?Sized>(rule: &A, errors: &mut Vec<ErrorItem>) {
     errors.retain(|error| !accepts(rule, error));
     for error in errors.iter_mut() {
@@ -277,4 +277,5 @@ pub(crate) fn filter<A: Allow + ?Sized>(rule: &A, errors: &mut Vec<ErrorItem>) {
             .paths
             .retain(|entry| !allows_entry(rule, entry, place));
     }
+    forget_dropped(errors);
 }

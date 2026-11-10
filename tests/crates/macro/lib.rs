@@ -508,12 +508,13 @@ impl VisitMut for QualifyProjections<'_> {
 
 /// The context of the entry `ix`.
 pub(crate) fn entry_context(referrer: &Referrer, ix: EntryId) -> &Context {
-    referrer.iter().nth(ix.index()).unwrap().2
+    referrer.iter().find(|(id, _, _)| *id == ix).unwrap().2
 }
 
 /// The type of the entry `ix`.
 pub(crate) fn entry_type(referrer: &Referrer, ix: EntryId) -> &Type {
-    referrer.iter().nth(ix.index()).unwrap().1
+    // The entries that `LeakerResult::ignore()` removed have no place in `iter()`.
+    referrer.iter().find(|(id, _, _)| *id == ix).unwrap().1
 }
 
 

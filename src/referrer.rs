@@ -16,7 +16,7 @@ use crate::util::{
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use syn::ext::IdentExt;
 use syn::fold::Fold;
@@ -61,6 +61,10 @@ use template_quote::{quote, ToTokens};
 pub struct Referrer {
     /// The type of each entry and the id of its context (a key of `contexts`), by index.
     entries: Vec<(Type, ContextId)>,
+    /// The indices of the entries that
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removed. They keep their place, so
+    /// the others keep their indices. They are no entries: the copy writes their types as written.
+    removed: BTreeSet<usize>,
     /// Every context, by id. The context of a module has its path, hint and parent
     /// (`ModuleScope::Itself`).
     contexts: BTreeMap<ContextId, Context>,
@@ -85,11 +89,13 @@ impl PartialEq for Referrer {
     fn eq(&self, other: &Self) -> bool {
         let Self {
             entries,
+            removed,
             contexts,
             parts,
             ..
         } = self;
         *entries == other.entries
+            && *removed == other.removed
             && *contexts == other.contexts
             && contexts
                 .values()
@@ -299,6 +305,7 @@ impl Referrer {
     /// (`Leaker::new().result()` writes `"tag" ()`).
     pub(crate) fn new(
         entries: impl IntoIterator<Item = (ContextId, Type)>,
+        removed: BTreeSet<usize>,
         mut contexts: BTreeMap<ContextId, Context>,
         parts: Vec<PartItem>,
     ) -> Self {
@@ -307,6 +314,7 @@ impl Referrer {
         }
         let mut referrer = Self {
             entries: Vec::new(),
+            removed,
             contexts,
             by_tokens: HashMap::new(),
             parts,
@@ -435,7 +443,8 @@ impl Referrer {
     /// Returns what the part is that `ty` is, if it is one: whether it is copied whole (see
     /// [`PartItem::whole`]). A part has the same tokens, is in a predicate as `at` says, and has the
     /// context that `ty` has in `scopes` (none, if `ty` has none there). A part with an anchor counts
-    /// only if its anchor is one of the `active` ones ([`Referrer::anchors()`]).
+    /// only if its anchor is one of the `active` ones ([`Referrer::anchors()`]). A part with no
+    /// anchor and no mark counts only if it is whole.
     fn part_of(
         &self,
         cause: &Cause,
@@ -456,6 +465,13 @@ impl Referrer {
                 whole,
                 ..
             } = &self.parts[ix];
+            // A part that only its head conflicts in, with no anchor and no mark, is no part until
+            // `LeakerResult::ignore()` makes it whole: the visitor finds nothing to replace at its
+            // head (an entry of the same tokens and context would have the same conflict), and the
+            // types in it are replaced as any entry is.
+            if !*whole && within.is_none() && mark.is_none() {
+                continue;
+            }
             let matches = *in_predicate == at.place.in_predicate
                 && (within.is_none() || active.contains(&ix))
                 && match (mark, at.signature) {
@@ -631,13 +647,42 @@ impl Referrer {
         }
     }
 
-    /// Returns `true` if there are no entries.
+    /// Returns `true` if there are no entries. An entry that
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removed is none.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.len() == self.removed.len()
+    }
+
+    /// The number of entries, with the removed ones: the indices are below it.
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The number of parts, which the indices of the parts that an error is about are below.
+    pub(crate) fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// The indices of the entries, without the removed ones, in order.
+    pub(crate) fn live(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.entries.len()).filter(move |ix| !self.removed.contains(ix))
+    }
+
+    /// Makes the part `ix` whole: nothing is looked up in it
+    /// ([`LeakerResult::ignore()`](crate::LeakerResult::ignore)).
+    pub(crate) fn make_whole(&mut self, ix: usize) {
+        self.parts[ix].whole = true;
+    }
+
+    /// Removes the entry `ix`, and keeps the indices of the others.
+    pub(crate) fn remove(&mut self, ix: usize) {
+        assert!(ix < self.entries.len(), "no entry {} to remove", ix);
+        self.removed.insert(ix);
     }
 
     /// Returns the [`EntryId`], the type and the [`Context`] of each entry, in the order of the
-    /// entries.
+    /// entries. An entry that [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removed is
+    /// left out, and the others keep their [`EntryId`]s.
     ///
     /// Write an impl for each
     /// ([`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls)). The id is what
@@ -656,18 +701,18 @@ impl Referrer {
     /// assert_eq!(context.generics, parse_quote!(<T>)); // the entry uses `T`
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = (EntryId, &Type, &Context)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(move |(ix, (ty, context))| (EntryId::new(ix), ty, &self.contexts[context]))
+        self.live().map(move |ix| {
+            let (ty, context) = &self.entries[ix];
+            (EntryId::new(ix), ty, &self.contexts[context])
+        })
     }
 
     /// Returns `true` if some entry names `Self`, or its context's generics do.
     ///
     /// `Self::Item` and `<Self as ::p::Tr>::X` count, `::p::Self` does not. A top-level context
-    /// with no entry is not looked at.
+    /// with no entry is not looked at, nor is a removed entry.
     pub fn has_self(&self) -> bool {
-        (0..self.entries.len()).any(|ix| self.needs_self(ix))
+        self.live().any(|ix| self.needs_self(ix))
     }
 
     /// Returns `true` if the entry `ix` needs what `Self` stands for.
@@ -686,7 +731,8 @@ impl Referrer {
     /// given the same `id`.
     ///
     /// It is `None` if the entry names `Self`, or its context's generics do: write what `Self` stands
-    /// for there.
+    /// for there, and for an entry that [`LeakerResult::ignore()`](crate::LeakerResult::ignore)
+    /// removed, which has no impl.
     ///
     /// # Panics
     ///
@@ -699,7 +745,8 @@ impl Referrer {
             ix,
             self.entries.len()
         );
-        (!self.needs_self(ix.index())).then(|| bucket_type(id, ix.index()))
+        (!self.removed.contains(&ix.index()) && !self.needs_self(ix.index()))
+            .then(|| bucket_type(id, ix.index()))
     }
 
     // The two checks that `LeakerResult::repeater_impls()` makes before it iterates: they find the
@@ -1289,7 +1336,15 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> EntryFolder<'a, 'b, F> {
                 return None;
             }
         }
-        self.referrer.find(self.at, ty, self.scopes, enclosing)
+        match self.referrer.find(self.at, ty, self.scopes, enclosing) {
+            // A removed entry is written as written, and nothing in it is looked up: it is no
+            // entry, and neither are its components, which are in the type as written.
+            Some(ix) if self.referrer.removed.contains(&ix) => {
+                self.at.place.protected = true;
+                None
+            }
+            found => found,
+        }
     }
 
     /// Returns `true` in the probe of a signature ([`SignatureFacts::inputs_probe()`]) if `ty`, which is no
@@ -2144,7 +2199,7 @@ where
 //     mark        = elided | 'x , ..
 //     context     = id | unwritable             (`unwritable`: no context can be written)
 //     count       = the number of groups        (only if it is not 1)
-//     group       = [# id] [declaration] ( Type , .. )
+//     group       = [# id] [declaration] ( [-] Type , .. )
 //     declaration = [< generics > where .. ;]
 //                   [Self : path ; | Self = Type ; | Self ;]
 //                   [Self : 'a + 'b ;]
@@ -2157,8 +2212,16 @@ where
 // - `# id` is written only if `id` is not the one after that of the group before (the first group
 //   is expected to have `0`).
 // - A context with no entry has one group, `()`, before the first group of a larger id.
+// - `- Type` is an entry that `LeakerResult::ignore()` removed: it has its index, no impl, and the
+//   copy writes its type as written.
 // - The `KIND ( CAUSE )` of a part is that of an `ErrorItem`. A bracket cannot start a group, so
 //   `parts` needs no marker. The count lets other tokens follow the Referrer.
+// - A `LeakerResult` writes the errors after the Referrer: `@ [ { error } .. ]`, each error
+//   `KIND ( CAUSE ) Reason "message" [notes] [help] [value] [default] [paths [..]] [id N] [part N]
+//   [entry N] [inner [N, ..]]`. `part N` and `entry N` are an index of `parts` and of the entries
+//   (of a group, counting the removed ones): what `LeakerResult::ignore()` changes for the error. An
+//   error that another error holds inside its part has an `id`, which the `inner` of the other
+//   lists. The parser refuses an index that is not there.
 
 const FORMAT_TAG_PREFIX: &str = "type-leak-format-";
 
@@ -2214,10 +2277,11 @@ impl Referrer {
     // 16:
     //    - The Referrer carries the types that the Leaker copies as written, the parts (see the
     //      grammar above), and the visitor does not look each up as an entry; in a `whole` one
-    //      nothing is looked up. Only a part that is whole, has an anchor or a mark is carried: a
-    //      type copied as written whose head alone conflicts is no part (an entry of its tokens
-    //      and context would have the same conflict), and the types in it are replaced as any
-    //      entry is. A part that a signature made has a mark (`sig ('x)`: the method lifetimes of
+    //      nothing is looked up. A part that is whole, has an anchor or a mark is needed by the
+    //      copy; a type copied as written whose head alone conflicts is a part too if an error is
+    //      about it, but the visitor does not look at it until `LeakerResult::ignore()` makes it
+    //      whole (an entry of its tokens and context would have the same conflict, and the types
+    //      in it are replaced as any entry is). A part that a signature made has a mark (`sig ('x)`: the method lifetimes of
     //      the type that the output names and no bound does, E0195, where the copy leaves one
     //      unconstrained: only types leaked whole hold it, and no input keeps it as written;
     //      `sig (elided)`: the signature relies on elision, E0106) and is left only in the
@@ -2238,6 +2302,11 @@ impl Referrer {
     //      is the number of groups.
     //    - An error writes each of its paths with its kind (`paths [type (Rel), trait (Tr), ..]`;
     //      a path of unknown kind is `unknown (p)`).
+    //    - An error writes what it is about in the Referrer, for `LeakerResult::ignore()`: the part
+    //      (`part N`) or the entry (`entry N`), the errors inside the part (`inner [N, ..]`, each
+    //      written with its `id N`).
+    //    - An entry that `LeakerResult::ignore()` removed is written `- Type` in its group: it keeps
+    //      its index, has no impl, and the copy writes its type as written.
     //    - Not serialized: the Repeater has one `KEY: u128` (`repeater_key(ID, NTH)`) instead of
     //      `ID: u64, NTH: usize`, and a `U64` slot instead of the `U128` one (a `u128` const goes
     //      in `KEY`), so the impls and projections of 15 do not match.
@@ -2268,7 +2337,12 @@ impl Parse for Referrer {
             reader.group(input)?;
         }
         reader.check(&part_contexts)?;
-        Ok(Self::new(reader.entries, reader.contexts, parts))
+        Ok(Self::new(
+            reader.entries,
+            reader.removed,
+            reader.contexts,
+            parts,
+        ))
     }
 }
 
@@ -2329,6 +2403,8 @@ fn read_parts(input: parse::ParseStream) -> Result<(Vec<PartItem>, ContextRefs)>
 struct Reader {
     /// The entries read, each with the id of its context.
     entries: Vec<(ContextId, Type)>,
+    /// The indices of the entries that were written as removed (`- Type`).
+    removed: BTreeSet<usize>,
     /// The contexts read.
     contexts: BTreeMap<ContextId, Context>,
     /// The contexts that are modules (`mod { .. }`).
@@ -2455,12 +2531,24 @@ impl Reader {
     ) -> Result<()> {
         let content: parse::ParseBuffer<'_>;
         parenthesized!(content in input);
-        let group = Punctuated::<Type, Token![,]>::parse_terminated(&content)?;
+        // `Type` or `- Type` (removed), separated by commas.
+        let mut group = Vec::new();
+        while !content.is_empty() {
+            let removed = content.parse::<Option<Token![-]>>()?.is_some();
+            group.push((removed, content.parse::<Type>()?));
+            if !content.is_empty() {
+                content.parse::<Token![,]>()?;
+            }
+        }
         if self.modules.contains(&context) && !group.is_empty() {
             return Err(in_module(context, span, "which has no leaked type"));
         }
-        self.entries
-            .extend(group.into_iter().map(|ty| (context, ty)));
+        for (removed, ty) in group {
+            if removed {
+                self.removed.insert(self.entries.len());
+            }
+            self.entries.push((context, ty));
+        }
         Ok(())
     }
 
@@ -2754,7 +2842,12 @@ impl ToTokens for Referrer {
             if declared.insert(context) {
                 self.write_declaration(context, tokens);
             }
-            tokens.extend(quote!((#(for ix in run), { #{&self.entries[ix].0} })));
+            tokens.extend(quote! {
+                (#(for ix in run), {
+                    #(if self.removed.contains(&ix)) { - }
+                    #{&self.entries[ix].0}
+                })
+            });
             next = context.index() + 1;
         }
     }

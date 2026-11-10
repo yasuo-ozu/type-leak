@@ -2414,3 +2414,57 @@ fn const_generics_of_type_u64_and_u128_use_the_slots() {
         type_name::<l::kinds::Wrap<l::kinds::Keyed<0, 7>>>()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// `LeakerResult::ignore()`.
+// ---------------------------------------------------------------------------------------------
+
+/// `LeakerResult::ignore()` in the macros of both crates (fixtures 9260 and 9261).
+///
+/// 9260: the Referrer's macro says `ignore(type Two<Leaf, Held<'_>>)`. That one call drops the
+/// error of the type and the error inside it (`Held<'_>`), and the copy writes the whole type as it
+/// is, `Leaf` in it too, while `y: Leaf` is an entry: the host implements the trait only if the
+/// signature has the types of the original.
+///
+/// 9261: the field names the `Self` of a nested struct and uses a generic whose bound names it
+/// (`NestedSelfInBounds`), and the type of the field needs `Clone` of its first parameter. The
+/// entry for any type would have an impl that does not prove it (E0277 in the Leaker's crate: the
+/// crate does not build if the macro takes the risk with `allow()` and not `ignore()`). The Leaker's
+/// macro removes the entry, so there is no impl, and the copy has the field as written, with the
+/// `Self` of the copy.
+#[test]
+fn ignore_writes_a_whole_part_as_written_and_removes_the_entry_of_a_risk() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    assert_eq!(
+        reported(9260, __tl_report_9260!()),
+        // (`x` has an elided lifetime, which a witness cannot name.)
+        allowed("trait", 2, 3, 2)
+    );
+    assert_eq!(
+        errors(__tl_errors_9260!()),
+        [
+            error("RelativePath", "Type", "Two<Leaf,Held<'_>>"),
+            error("RelativePath", "Type", "Held<'_>")
+        ]
+    );
+    fn ignored_flat<T: l::IgnoredFlat>() {}
+    ignored_flat::<r::Host9260>();
+
+    // The entry of the risk is gone: one entry, `rel`, and its index is that of the entry that is
+    // left.
+    assert_eq!(reported(9261, __tl_report_9261!()), ok("struct", 1, 2, 2));
+    // The fields of the copy are the original types, with the `Self` of the copy: this compiles.
+    #[allow(dead_code)]
+    fn field<T: AsRef<r::IgnoredEntry<T>>>(
+        copy: &r::IgnoredEntry<T>,
+    ) -> &l::NeedsClone<r::IgnoredEntry<T>, T> {
+        &copy.needs
+    }
+    #[allow(dead_code)]
+    fn rel<T: AsRef<r::IgnoredEntry<T>>>(copy: &r::IgnoredEntry<T>) -> &l::Rel {
+        &copy.rel
+    }
+}

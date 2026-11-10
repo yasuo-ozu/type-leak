@@ -1152,12 +1152,16 @@ fn the_errors_of_the_calls_are_one_list_in_the_order_found_each_once() {
     let found: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
     assert_eq!(found, [rel.clone(), rel_tr(), rel_tr(), rel.clone()]);
     // The parts are distinct: the same tokens in the same place are one. `Rel<'_>` holds its own
-    // lifetime and is the same conflict wherever it is, so it is no part, whereas the trait object
-    // is in a path that owns the cause, which tells it from the entry of the same tokens.
+    // lifetime and is the same conflict wherever it is, so it is a part only because its error is
+    // about it (the last, after those that the Referrer needs), whereas the trait object is in a
+    // path that owns the cause, which tells it from the entry of the same tokens.
     let referrer = result.into_referrer();
     assert_eq!(
         parts_of(&referrer),
-        ["type (dyn RelTr) 0 in (:: p :: W < '_ , dyn RelTr >) 0"]
+        [
+            "type (dyn RelTr) 0 in (:: p :: W < '_ , dyn RelTr >) 0",
+            "type (Rel < '_ >) 0"
+        ]
     );
     // Two outermost calls are one list, in the order of the calls.
     let mut leaker = Leaker::new();

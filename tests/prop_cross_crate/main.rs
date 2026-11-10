@@ -371,6 +371,10 @@
 //! - `TYPE_LEAK_PROP_ACCEPT`: if set (and not `0`), the Leaker accepts the items it rejects by
 //!   `LeakerResult::allow(cause)` of the cause of every error, and the test compiles the result: see
 //!   "Accepting the rejections".
+//! - `TYPE_LEAK_PROP_IGNORE`: if set (and not `0`), the same as `TYPE_LEAK_PROP_ACCEPT` with
+//!   `LeakerResult::ignore()` of every error, in turn, in place of `allow()`: the parts are whole,
+//!   and the entry of a `NestedSelfInBounds` risk is removed. The failures of the copies are the
+//!   same ones (`accept_families()`); the workspaces end in `-ignore`.
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. A name turns a feature on and
@@ -515,6 +519,8 @@ struct Run {
     /// `TYPE_LEAK_PROP_FEATURES` as it is.
     features: String,
     accept: bool,
+    /// `TYPE_LEAK_PROP_IGNORE`: `accept` with `LeakerResult::ignore()` in place of `allow()`.
+    ignore: bool,
     stages: bool,
     /// `TYPE_LEAK_PROP_CASE`.
     only: Option<usize>,
@@ -527,6 +533,9 @@ impl Run {
         let mut name = format!("ws-{}-{}-i{}", self.seed, self.cases, self.items);
         if self.accept {
             name += "-accept";
+        }
+        if self.ignore {
+            name += "-ignore";
         }
         if self.stages {
             name += "-stages";
@@ -557,8 +566,11 @@ impl Run {
             )
             .unwrap();
         }
-        if self.accept {
+        if self.accept && !self.ignore {
             command += " TYPE_LEAK_PROP_ACCEPT=1";
+        }
+        if self.ignore {
+            command += " TYPE_LEAK_PROP_IGNORE=1";
         }
         if let Some(case) = case.or(self.only) {
             write!(command, " TYPE_LEAK_PROP_CASE={}", case).unwrap();
@@ -749,7 +761,14 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
                 );
             }
         }
-        let leaker = leaker.replace(gen::ATTR, attr);
+        let mut leaker = leaker.replace(gen::ATTR, attr);
+        if mode == Mode::Accept && ignore_mode() {
+            // The items that are accepted are accepted by `ignore()` (`prop.rs: Args::ignore`).
+            leaker = leaker.replace(
+                "crate::__macro::prop_leak_accept(",
+                "crate::__macro::prop_leak_accept(ignore = true, ",
+            );
+        }
         let leaker = if stages {
             leaker
         } else {
@@ -1655,9 +1674,16 @@ impl RuleResult {
     }
 }
 
-/// `TYPE_LEAK_PROP_ACCEPT` is set (and is not `0`).
+/// `TYPE_LEAK_PROP_ACCEPT` is set (and is not `0`), or `TYPE_LEAK_PROP_IGNORE`, which is the same
+/// with `LeakerResult::ignore()` in place of `allow()`.
 fn accept_mode() -> bool {
-    env_flag("TYPE_LEAK_PROP_ACCEPT")
+    env_flag("TYPE_LEAK_PROP_ACCEPT") || ignore_mode()
+}
+
+/// `TYPE_LEAK_PROP_IGNORE` is set (and is not `0`): the Leaker's and the Referrer's macros accept the
+/// errors of an item with `LeakerResult::ignore()` of each.
+fn ignore_mode() -> bool {
+    env_flag("TYPE_LEAK_PROP_IGNORE")
 }
 
 /// A short reason of a rejection, for the statistics: the family of its first error (the message of
@@ -3885,8 +3911,14 @@ fn summarize(
             .collect();
         writeln!(
             s,
-            "  accept mode (TYPE_LEAK_PROP_ACCEPT): {} items rejected at the first analysis were accepted by allow() of the causes of their errors ({}); entries: {}; type positions: {}, witnesses checked: {}",
+            "  accept mode ({}): {} items rejected at the first analysis were accepted by {} of the causes of their errors ({}); entries: {}; type positions: {}, witnesses checked: {}",
+            if ignore_mode() {
+                "TYPE_LEAK_PROP_IGNORE"
+            } else {
+                "TYPE_LEAK_PROP_ACCEPT"
+            },
             allowed,
+            if ignore_mode() { "ignore()" } else { "allow()" },
             by_kind.join(", "),
             stats.allowed_entries,
             stats.allowed_positions,
@@ -4028,6 +4060,7 @@ fn random_items_leak_across_crates() {
         items: items_per_module,
         features: features_env,
         accept,
+        ignore: ignore_mode(),
         stages: stages_on,
         only,
     };
@@ -4882,6 +4915,7 @@ mod checks {
             items: 8,
             features: String::new(),
             accept: false,
+            ignore: false,
             stages: false,
             only: None,
         };
@@ -6115,6 +6149,7 @@ mod checks {
             items: 8,
             features: String::new(),
             accept: false,
+            ignore: false,
             stages: false,
             only: None,
         };
@@ -6408,6 +6443,7 @@ mod checks {
             items: 8,
             features: String::new(),
             accept: false,
+            ignore: false,
             stages: false,
             only: None,
         };
@@ -7144,6 +7180,7 @@ mod checks {
             items: 8,
             features: String::new(),
             accept: false,
+            ignore: false,
             stages: false,
             only: None,
         }

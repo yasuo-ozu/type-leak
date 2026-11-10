@@ -940,9 +940,9 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     let referrer = result.into_referrer();
-    // The outermost context, the failed scope, and its inner scopes: the ids returned. (`Rel2<'_>`,
-    // copied as written, is no part of the Referrer, so it has no context.)
-    assert_eq!(common::context_ids(&referrer).len(), 4);
+    // The outermost context, the failed scope, and its inner scopes: the ids returned, and the
+    // context of `Rel2<'_>`, which is copied as written and is a part, as its error is about it.
+    assert_eq!(common::context_ids(&referrer).len(), 5);
     for id in &ids {
         assert!(common::context_ids(&referrer)
             .into_iter()

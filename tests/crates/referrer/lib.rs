@@ -334,7 +334,7 @@ pub mod kinds {
 /// replaced as usual.
 pub mod accepted {
     #[allow(unused_imports)]
-    use type_leak_test_leaker::kinds::{ElidedTr, Held, Leaf, SharedTr, Two, Wrap};
+    use type_leak_test_leaker::kinds::{ElidedTr, Held, Leaf, NeedsClone, SharedTr, Two, Wrap};
 
     type_leak_test_leaker::__tl_prop_9184!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9185!(path = ::type_leak_test_leaker::kinds, accept);
@@ -381,6 +381,22 @@ pub mod accepted {
     // The types in a type written as it is that hold a lifetime of a method are written as they are.
     type_leak_test_leaker::__tl_prop_9221!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9222!(path = ::type_leak_test_leaker::kinds, accept);
+
+    // `LeakerResult::ignore()`: one call drops the error of `Two<Leaf, Held<'_>>` and the error
+    // inside it, and the copy writes the whole type as it is; the Leaker's macro removes the entry
+    // of the risk of `IgnoredEntry` (no impl), and the copy writes the field as it is, with the
+    // `Self` of the copy, which needs the `Clone` that its type has no bound for.
+    type_leak_test_leaker::__tl_prop_9260!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        ignore(type Two<Leaf, Held<'_>>)
+    );
+    type_leak_test_leaker::__tl_prop_9261!(path = ::type_leak_test_leaker::kinds);
+    impl<T: ::core::convert::AsRef<IgnoredEntry<T>>> ::core::clone::Clone for IgnoredEntry<T> {
+        fn clone(&self) -> Self {
+            unimplemented!()
+        }
+    }
 
     // The traits of two items analyzed together: `f` keeps the type as written, `Held` and `Wrap`
     // are named here (F48).

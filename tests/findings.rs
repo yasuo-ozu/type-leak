@@ -11042,8 +11042,9 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
     );
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
     let referrer = result.into_referrer();
-    // Not whole, and no entry has its tokens and context: no part.
-    assert!(parts_of(&referrer).is_empty());
+    // Not whole, and no entry has its tokens and context: a part that the visitor does not look at,
+    // which is there because the error is about it.
+    assert_eq!(parts_of(&referrer), ["type (Rel < T , Other >) unwritable"]);
     let (other, outer) = (
         entry(&referrer, "Other"),
         entry(&referrer, "Rel < T , Other >"),
@@ -11277,8 +11278,11 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
         [Reason::SelfInImplSelfType, Reason::UnprovableBound]
     );
     let referrer = result.into_referrer();
-    // The self type is no part (not whole); the `Self` of the bound, in a predicate, is whole.
-    assert_eq!(parts_of(&referrer).len(), 1);
+    // The `Self` of the bound, in a predicate, is whole. The self type is not: it is a part that
+    // the visitor does not look at, there because its error is about it (the last part).
+    let parts = parts_of(&referrer);
+    assert_eq!(parts.len(), 2);
+    assert!(parts[0].contains("predicate") && !parts[1].contains("whole"));
     let mut copy = item.clone();
     referrer
         .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
@@ -11658,9 +11662,10 @@ fn f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it() {
             "trait Tr4 { fn f < 'x > (& self , a : Wrap < 'x >) -> P < 0usize > ; }",
         ]
     );
-    // Without the mark, the part is left everywhere: the field of `S` and `g` too.
-    let unmarked: Referrer = parse_str(&string(&referrer).replace(" sig ('x)", "")).unwrap();
-    assert_eq!(parts_of(&unmarked), ["type (Wrap < 'x >) 0"]);
+    // Without the mark, a part that is whole is left everywhere: the field of `S` and `g` too. (A
+    // part that is neither whole nor marked nor anchored is not looked at.)
+    let unmarked: Referrer = parse_str(&string(&referrer).replace(" sig ('x)", " whole")).unwrap();
+    assert_eq!(parts_of(&unmarked), ["type (Wrap < 'x >) 0 whole"]);
     let copies = f48_copies(&unmarked, &contexts, &items);
     assert_eq!(copies[1], "struct S < 'x > { w : Wrap < 'x > , }");
     assert!(copies[0].contains("fn g < 'x > (& self , a : Wrap < 'x >)"));

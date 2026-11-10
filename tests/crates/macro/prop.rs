@@ -106,6 +106,15 @@ pub(crate) struct Args {
     /// a bound that does: it accepts the `NestedSelfInBounds` errors (`LeakerResult::allow()`). Else
     /// they stay, and the item is rejected.
     nested_self_entries: bool,
+    /// The macro removes the entry of a risk of that kind instead of taking it: it calls
+    /// `LeakerResult::ignore()` for each `NestedSelfInBounds` error, so the entry has no impl and the
+    /// copy writes its type as written (the declaration of the type may have a bound that the impl
+    /// cannot prove, E0277). Not drawn by the property test.
+    ignore_risks: bool,
+    /// `TYPE_LEAK_PROP_IGNORE`: an item that `prop_leak_accept` accepts is accepted by
+    /// `LeakerResult::ignore()` of every error, in turn ([`ignore_all()`]), not by `allow()`: the
+    /// Referrer that the macro emits has the parts whole and the entries of the risks removed.
+    ignore: bool,
     /// `marker = "::path::Marker"`: the impls of the entries that name no `Self`, nor do their
     /// generics, are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner,
     /// where they are otherwise for a primitive type that the id and the index choose
@@ -149,6 +158,8 @@ impl Parse for Args {
             values: false,
             bodies: false,
             nested_self_entries: false,
+            ignore_risks: false,
+            ignore: false,
             no_nested_self: false,
             stages: false,
             accepted: false,
@@ -175,6 +186,8 @@ impl Parse for Args {
                 ("values", Lit::Bool(b)) => args.values = b.value,
                 ("bodies", Lit::Bool(b)) => args.bodies = b.value,
                 ("nested_self_entries", Lit::Bool(b)) => args.nested_self_entries = b.value,
+                ("ignore_risks", Lit::Bool(b)) => args.ignore_risks = b.value,
+                ("ignore", Lit::Bool(b)) => args.ignore = b.value,
                 ("no_nested_self", Lit::Bool(b)) => args.no_nested_self = b.value,
                 ("stages", Lit::Bool(b)) => args.stages = b.value,
                 ("accepted", Lit::Bool(b)) => args.accepted = b.value,
@@ -199,6 +212,7 @@ impl Args {
         let (redeclare, values) = (self.redeclare, self.values);
         let bodies = self.bodies;
         let (nested_self_entries, accepted) = (self.nested_self_entries, self.accepted);
+        let (ignore_risks, ignore) = (self.ignore_risks, self.ignore);
         let no_nested_self = self.no_nested_self;
         let (stages, stage) = (self.stages, self.stage);
         let via = &self.via;
@@ -213,7 +227,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
+        quote!(id = #id, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, ignore_risks = #ignore_risks, ignore = #ignore, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
     }
 
     /// The item is nested in `enter_mod` and has a `Self` of its own: the copy is wrapped in a
@@ -547,6 +561,18 @@ fn analyze_config<A: Allow>(
             .map(|error| error.cause.clone())
             .collect();
         result = result.allow(move |cause: &Cause, _: Place| risks.contains(cause));
+    }
+    if args.ignore_risks {
+        // The entry of each risk is removed: no impl, and the copy writes the type as written.
+        let risks: Vec<ErrorItem> = result
+            .errors()
+            .iter()
+            .filter(|error| error.reason == Reason::NestedSelfInBounds)
+            .cloned()
+            .collect();
+        for risk in &risks {
+            result = result.ignore(risk);
+        }
     }
     (result, context, assertions)
 }
@@ -3657,11 +3683,12 @@ fn shadow_check(
         return Ok(0);
     }
     let mut draw = Draw(seed);
-    let shadowable: Vec<std::collections::BTreeSet<String>> = referrer
+    let shadowable: Vec<(EntryId, std::collections::BTreeSet<String>)> = referrer
         .iter()
-        .map(|(ix, _, _)| shadowable(referrer, ix))
+        .map(|(ix, _, _)| (ix, shadowable(referrer, ix)))
         .collect();
-    let candidates: std::collections::BTreeSet<&String> = shadowable.iter().flatten().collect();
+    let candidates: std::collections::BTreeSet<&String> =
+        shadowable.iter().flat_map(|(_, names)| names).collect();
     if candidates.is_empty() {
         return Ok(0);
     }
@@ -3703,7 +3730,12 @@ fn shadow_check(
     )?;
     let declared: std::collections::HashSet<String> =
         shadowing.names.iter().map(|name| name.to_string()).collect();
-    let hidden = |ix: &EntryId| shadowable[ix.index()].iter().any(|name| declared.contains(name));
+    let hidden = |ix: &EntryId| {
+        shadowable
+            .iter()
+            .filter(|(id, _)| id == ix)
+            .any(|(_, names)| names.iter().any(|name| declared.contains(name)))
+    };
     let expected: std::collections::BTreeSet<EntryId> =
         control.used.iter().copied().filter(|ix| !hidden(ix)).collect();
     let hides = control.used.iter().filter(|ix| hidden(ix)).count();
@@ -3762,7 +3794,7 @@ fn instance_part(
     let replaced: Vec<String> = visited
         .used
         .iter()
-        .filter_map(|ix| referrer.iter().nth(ix.index()))
+        .filter_map(|ix| referrer.iter().find(|(id, _, _)| id == ix))
         .map(|(_, entry, _)| quote!(#entry).to_string())
         .collect();
     let visited_params = match &visited.item {
@@ -5252,6 +5284,23 @@ fn allow_all(result: LeakerResult, what: &str) -> LeakerResult {
     allowed
 }
 
+/// `LeakerResult::ignore()` of the first error, until none remains (`TYPE_LEAK_PROP_IGNORE`). Each
+/// call drops that error, so it ends; if one stays, the macro panics as [`allow_all()`] does.
+fn ignore_all(mut result: LeakerResult, what: &str) -> LeakerResult {
+    while let Some(error) = result.errors().first().cloned() {
+        let before = result.errors().len();
+        result = result.ignore(&error);
+        if result.errors().len() >= before {
+            panic!(
+                "IGNORE LEFT ERRORS: {}: ignore() of an error did not drop it: {}",
+                what,
+                crate::messages(&[error]).replace('\n', " ; ")
+            );
+        }
+    }
+    result
+}
+
 /// What [`leak()`] does with an item that the Leaker rejects.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Mode {
@@ -5401,6 +5450,14 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
         }
         args.accepted = true;
     }
+    // `TYPE_LEAK_PROP_IGNORE`: the result that is accepted has every error ignored, so the parts
+    // are whole and the entries of the risks are removed. (A result that the Referrer's macro
+    // carries with its errors is ignored there.)
+    let result = if args.ignore && mode == Mode::Accept && !errors.is_empty() {
+        ignore_all(result, &format!("item {}", id))
+    } else {
+        result
+    };
     // What the macro of the Referrer carries: the result with its errors, or the Referrer.
     let carried = (mode == Mode::Result).then(|| result.to_token_stream());
     // The recovered Referrer: the parts that conflict are copied as written.
@@ -5511,7 +5568,9 @@ fn unreplaced(referrer: &Referrer, ty: &Type) -> Type {
                         {
                             let key = key.base10_parse::<u128>().unwrap_or(0);
                             let ix = (key & u128::from(u64::MAX)) as usize;
-                            if let Some((_, entry, _)) = self.0.iter().nth(ix) {
+                            if let Some((_, entry, _)) =
+                                self.0.iter().find(|(id, _, _)| id.index() == ix)
+                            {
                                 *ty = entry.clone();
                                 return;
                             }
@@ -5771,6 +5830,72 @@ struct StageCopy {
 /// an error that the analysis without it found, or the config with the rule finds other errors than
 /// the analysis without it, or another Referrer than the result with the rule.
 fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, TokenStream) {
+    /// The text of an error as the serialization writes it, without the words about what it is
+    /// about in the Referrer (`id N`, `part N`, `entry N`, `inner [..]`), which the config and the
+    /// result do not share: they number the parts of their own Referrers.
+    fn error_text(error: &ErrorItem) -> String {
+        use proc_macro2::{Delimiter, TokenTree};
+        let written = error.to_token_stream();
+        let mut inside = match written.into_iter().next() {
+            Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => {
+                group.stream().into_iter()
+            }
+            _ => panic!("test macro: an error is written as one brace group"),
+        };
+        let mut kept = TokenStream::new();
+        while let Some(token) = inside.next() {
+            match &token {
+                TokenTree::Ident(word)
+                    if word == "id" || word == "part" || word == "entry" || word == "inner" =>
+                {
+                    inside.next();
+                }
+                _ => kept.extend([token]),
+            }
+        }
+        kept.to_string()
+    }
+
+    /// What the copy of a Referrer needs of it: the entries with their contexts, and the parts that
+    /// are whole, have an anchor or a mark. Not the parts that only an error is about, which the
+    /// visitor does not look at: the result has them for the errors that a rule dropped, and the
+    /// config never found those errors.
+    fn copy_needs(referrer: &Referrer) -> (Vec<String>, Vec<String>) {
+        use proc_macro2::{Delimiter, TokenTree};
+        let entries = referrer
+            .iter()
+            .map(|(ix, ty, context)| format!("{} {} {:?}", ix, quote!(#ty), context))
+            .collect();
+        // The parts are in the bracket group after the format tag, divided by commas.
+        let mut tokens = referrer.to_token_stream().into_iter();
+        tokens.next();
+        let mut parts = Vec::new();
+        if let Some(TokenTree::Group(group)) = tokens.next() {
+            if group.delimiter() == Delimiter::Bracket {
+                let mut part = Vec::new();
+                let mut done = |part: &mut Vec<TokenTree>| {
+                    let needed = part.iter().any(|token| {
+                        matches!(token, TokenTree::Ident(word)
+                            if word == "whole" || word == "sig" || word == "in")
+                    });
+                    if needed {
+                        let text: TokenStream = part.drain(..).collect();
+                        parts.push(text.to_string());
+                    }
+                    part.clear();
+                };
+                for token in group.stream() {
+                    match &token {
+                        TokenTree::Punct(punct) if punct.as_char() == ',' => done(&mut part),
+                        _ => part.push(token),
+                    }
+                }
+                done(&mut part);
+            }
+        }
+        (entries, parts)
+    }
+
     let id = args.id;
     // The primitive types are allowed, so that the rule is the only path rule that differs: with
     // `u8` relative, `Into<u8>` is an error with a relative path that no rule leaves out. The names
@@ -5788,12 +5913,7 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
         analyze_with(original, &plain_args, Some(rule));
     let plain_errors = plain.errors().to_vec();
     let after = rule.on_result(plain.clone());
-    let text = |errors: &[ErrorItem]| -> Vec<String> {
-        errors
-            .iter()
-            .map(|e| e.to_token_stream().to_string())
-            .collect()
-    };
+    let text = |errors: &[ErrorItem]| -> Vec<String> { errors.iter().map(error_text).collect() };
     let causes = |result: &LeakerResult| -> String {
         let text = |error: &ErrorItem| error.cause.to_token_stream().to_string();
         let joined = result
@@ -5806,7 +5926,8 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
     };
     let applies = rule != Rule::Values || args.values;
     let same_errors = text(before.errors()) == text(after.errors());
-    let same_referrer = before.clone().into_referrer() == after.clone().into_referrer();
+    let same_referrer = copy_needs(&before.clone().into_referrer())
+        == copy_needs(&after.clone().into_referrer());
     let matters = applies
         && (rule == Rule::Prelude
             || text(plain.errors()) != text(after.errors())
@@ -6006,6 +6127,32 @@ impl Parse for AllowArg {
     }
 }
 
+/// What the Referrer's invocation ignores (`ignore(trait Path, type Ty, all)`): the error that has
+/// the cause, each with `LeakerResult::ignore()`, or every error (`all`, [`ignore_all()`]).
+enum IgnoreArg {
+    Cause(Cause),
+    All,
+}
+
+impl Parse for IgnoreArg {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.parse::<Option<Token![trait]>>()?.is_some() {
+            return Ok(IgnoreArg::Cause(Cause::Trait(input.parse()?)));
+        }
+        if input.parse::<Option<Token![type]>>()?.is_some() {
+            return Ok(IgnoreArg::Cause(Cause::Type(input.parse()?)));
+        }
+        let word: Ident = input.parse()?;
+        if word != "all" {
+            return Err(Error::new(
+                word.span(),
+                "expected `all`, `trait <path>` or `type <type>`",
+            ));
+        }
+        Ok(IgnoreArg::All)
+    }
+}
+
 /// Input of `__prop_apply!`.
 struct ApplyInput {
     /// A Referrer without errors reads as a result too.
@@ -6023,6 +6170,8 @@ struct ApplyInput {
     accept: bool,
     /// What the invocation allows of the errors of the result.
     allow: Vec<AllowArg>,
+    /// What the invocation ignores of the errors, before it allows.
+    ignore: Vec<IgnoreArg>,
     /// The crate of the invocation has none of the Leaker's names (`allow_stages`): a module copy
     /// drops its imports as the copy of an ordinary item does, and the names that the rule allows
     /// are the only ones to resolve.
@@ -6082,6 +6231,7 @@ impl Parse for ApplyInput {
         let (mut inst, mut shadow) = (None, None);
         let mut lifetime_args = false;
         let mut allow = Vec::new();
+        let mut ignore = Vec::new();
         while input.parse::<Option<Token![,]>>()?.is_some() {
             let keyword: Ident = input.parse()?;
             match keyword.to_string().as_str() {
@@ -6098,9 +6248,15 @@ impl Parse for ApplyInput {
                     parenthesized!(content in input);
                     allow.extend(Punctuated::<AllowArg, Token![,]>::parse_terminated(&content)?);
                 }
+                "ignore" => {
+                    let content;
+                    parenthesized!(content in input);
+                    let causes = Punctuated::<IgnoreArg, Token![,]>::parse_terminated(&content)?;
+                    ignore.extend(causes);
+                }
                 _ => return Err(Error::new(
                     keyword.span(),
-                    "expected `dyn_host`, `accept`, `clean`, `constants`, `imports`, `inst(..)`, `lifetime_args`, `shadow(..)` or `allow(..)`",
+                    "expected `dyn_host`, `accept`, `clean`, `constants`, `imports`, `inst(..)`, `lifetime_args`, `shadow(..)`, `allow(..)` or `ignore(..)`",
                 )),
             }
         }
@@ -6113,6 +6269,7 @@ impl Parse for ApplyInput {
             dyn_host,
             accept,
             allow,
+            ignore,
             clean,
             constants,
             inst,
@@ -6148,6 +6305,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         dyn_host,
         accept,
         allow,
+        ignore,
         clean,
         constants,
         inst,
@@ -6157,6 +6315,28 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     } = parse2(input)?;
     if args.accepted != accept {
         return Ok(TokenStream::new());
+    }
+    // `LeakerResult::ignore()` of the error that has each cause, or of every one, before the rest
+    // is allowed.
+    for ignored in ignore {
+        let cause = match ignored {
+            IgnoreArg::Cause(cause) => cause,
+            IgnoreArg::All => {
+                result = ignore_all(result, &format!("item {}", args.id));
+                continue;
+            }
+        };
+        let found = result.errors().iter().find(|error| error.cause == cause);
+        let error = found.cloned().ok_or_else(|| {
+            Error::new(
+                Span::call_site(),
+                format!(
+                    "test macro: no error has the cause `{}`",
+                    cause.to_token_stream()
+                ),
+            )
+        })?;
+        result = result.ignore(&error);
     }
     for allowed in allow {
         result = match allowed {

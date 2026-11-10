@@ -7,10 +7,10 @@ use crate::analyze::{module_names, AnalyzeVisitor, Finished, ModuleNames, ScopeS
 use crate::context::SelfRequirement;
 use crate::context::{Context, ContextId, Contexts, Gat, ModuleScope};
 use crate::encode::EncodeError;
-use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
-use crate::graph::{is_whole_reference, sorted_entries, NodeKey, TypeGraph};
+use crate::error::{forget_dropped, ErrorItem};
+use crate::graph::{is_whole_reference, sorted_entries, NodeKey, TypeGraph, TypeKey};
 #[cfg(doc)]
 use crate::referrer::EntryId;
 use crate::referrer::Referrer;
@@ -57,7 +57,8 @@ use template_quote::{quote, ToTokens};
 /// (a leaked type there may be unprovable), a bare identifier that may be a const, a reference, a
 /// type that holds a trait object that takes its lifetime from it. A panic in a closure rolls its
 /// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and
-/// panics. [`LeakerResult::allow()`] drops the errors you accept.
+/// panics. [`LeakerResult::allow()`] drops the errors you accept, and [`LeakerResult::ignore()`]
+/// accepts one and has the copy write the whole part that it is about as written.
 ///
 /// # Limitations
 ///
@@ -82,7 +83,7 @@ use template_quote::{quote, ToTokens};
 ///   [`Reason::NestedSelfInBounds`]: when you accept it with [`LeakerResult::allow()`], the
 ///   declaration of the type must have no trait bound on the parameter that receives `Self`
 ///   (E0277), and rustc before 1.70 fails with E0275 if the copy's field is the last field of a
-///   struct.
+///   struct. [`LeakerResult::ignore()`] removes the entry instead, so neither holds.
 ///
 /// ## Outlives bounds
 ///
@@ -173,6 +174,9 @@ pub struct Leaker<A = ()> {
     parts: Vec<PartItem>,
     /// The errors of the outermost calls, in the order found.
     errors: Vec<ErrorItem>,
+    /// The number of errors that the calls found, also those that a rule dropped: the ids of the
+    /// errors of the next call count from it (`Link::id`).
+    found: usize,
 }
 
 impl Leaker {
@@ -200,6 +204,7 @@ impl<A: Allow> Leaker<A> {
             assumed_primitives: Vec::new(),
             parts: Vec::new(),
             errors: Vec::new(),
+            found: 0,
         }
     }
 
@@ -391,14 +396,14 @@ impl<A: Allow> Leaker<A> {
     /// only a type of another crate (`::foo::X`), each sorted by context (in order of first
     /// appearance) and tokens.
     pub fn result(mut self) -> LeakerResult {
-        let errors = std::mem::take(&mut self.errors);
+        let mut errors = std::mem::take(&mut self.errors);
         LeakerResult {
-            referrer: self.referrer(),
+            referrer: self.referrer(&mut errors),
             errors,
         }
     }
 
-    fn referrer(mut self) -> Referrer {
+    fn referrer(mut self, errors: &mut [ErrorItem]) -> Referrer {
         // Not `reduce_roots()`: the graph of the kept entries would be built only to be read.
         let types = std::mem::take(&mut self.types);
         let (required, optional) = if types.is_reduced() {
@@ -407,6 +412,7 @@ impl<A: Allow> Leaker<A> {
             let (required, optional) = reduce(&types);
             (sorted_entries(required), sorted_entries(optional))
         };
+        self.resolve_links(errors, required.iter().chain(&optional));
         let contexts = self.contexts;
         let context_of = |id: ContextId| contexts.get(id).clone();
         let mut context_map: BTreeMap<ContextId, Context> = self
@@ -445,7 +451,38 @@ impl<A: Allow> Leaker<A> {
                 }
             }
         }
-        Referrer::new(entries, context_map, self.parts)
+        Referrer::new(entries, BTreeSet::new(), context_map, self.parts)
+    }
+
+    /// Resolves what the analysis knows of what each error is about (`Link::raw`) to indices: the
+    /// part, which is recorded if the Referrer has not got it (a part that only its head
+    /// conflicts in), and the entry. The contexts that this adds come last.
+    fn resolve_links<'k>(
+        &mut self,
+        errors: &mut [ErrorItem],
+        entries: impl Iterator<Item = &'k NodeKey>,
+    ) {
+        let entries: Vec<&NodeKey> = entries.collect();
+        for error in errors {
+            let raw = std::mem::take(&mut error.link.raw);
+            if let Some(part) = raw.part {
+                let item = part.item(&mut self.contexts);
+                let at = self.parts.iter().position(|known| *known == item);
+                error.link.part = Some(at.unwrap_or_else(|| {
+                    self.parts.push(item);
+                    self.parts.len() - 1
+                }));
+            }
+            if let Some((context, ty)) = raw.entry {
+                let context = self.contexts.find(&context);
+                let key = TypeKey::new(&ty);
+                error.link.entry = context.and_then(|context| {
+                    entries
+                        .iter()
+                        .position(|entry| entry.context == context && entry.ty == key)
+                });
+            }
+        }
     }
 
     /// Chooses the fewest entries from which every leaked type can be built, and removes every
@@ -478,7 +515,8 @@ impl<A: Allow> Leaker<A> {
 /// that an [`Allow`] accepts (you promise that the part compiles as written). It leaves the
 /// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::from_config()`]. A rule
 /// here only approximates the one of the Leaker (more errors may remain, and a copy may fail to
-/// build): give rules to the Leaker when you can.
+/// build): give rules to the Leaker when you can. [`ignore()`](LeakerResult::ignore) accepts one
+/// error, and has the copy write its whole part as written, or removes its entry.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -514,9 +552,86 @@ impl LeakerResult {
     ///
     /// See [`Allow`] for what the rule is asked. A closure needs `&Cause` and
     /// [`Place`](crate::Place) annotated when it is not written in the call
-    /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none.
+    /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none. To
+    /// have the copy write the whole part as written, use [`ignore()`](LeakerResult::ignore).
     pub fn allow(mut self, rule: impl Allow) -> Self {
         filter(&rule, &mut self.errors);
+        self
+    }
+
+    /// Accepts `error`, one of [`errors()`](LeakerResult::errors): the copy writes the part that it
+    /// is about as written, whole, and nothing is looked up in it. The error goes, and so do the
+    /// errors revealed inside that part and the errors about the same part.
+    ///
+    /// [`allow()`](LeakerResult::allow) writes only the head that is wrong as written (`MyType` in
+    /// `MyType<'_, Rel>`) and replaces the entries in the arguments; `ignore()` writes all of
+    /// `MyType<'_, Rel>` as written, so `Rel` is not replaced there. An entry that is used at
+    /// another place is still one there. You promise that the part compiles as written.
+    ///
+    /// The error of an entry ([`Reason::NestedSelfInBounds`]) removes the entry instead: it gets no
+    /// impl ([`repeater_impls()`](LeakerResult::repeater_impls)), [`Referrer::iter()`] skips it,
+    /// and the copy writes its type as written wherever it would have been replaced. The other
+    /// entries keep their [`EntryId`]s, so it can be called before or after the impls are written.
+    ///
+    /// An error that is about no part (a `Self` without meaning, a path in a value) is only
+    /// dropped. An error about an entry inside the part stays: the entry may be used elsewhere, so
+    /// ignore it on its own. If `error` is not one of the errors, nothing changes, so calling it
+    /// again is harmless. Call it before [`allow()`](LeakerResult::allow) for the same error.
+    ///
+    /// ```
+    /// # use {syn::*, type_leak::*};
+    /// # use syn::visit_mut::VisitMut;
+    /// let item: ItemStruct = parse_quote!(struct S<'a>(MyType<'_, Inner<'_>, Rel>, Rel, &'a u8););
+    /// let mut leaker = Leaker::new();
+    /// let top_level = leaker.intern_struct(&item);
+    /// let result = leaker.result();
+    /// // `MyType` and, inside it, `Inner<'_>`.
+    /// assert_eq!(result.errors().len(), 2);
+    ///
+    /// let error = result.errors()[0].clone();
+    /// let result = result.ignore(&error);
+    /// assert!(result.errors().is_empty());
+    /// let referrer = result.finish().unwrap();
+    ///
+    /// let mut copy = item.clone();
+    /// referrer
+    ///     .visitor(top_level, |_, ix, _| parse_str(&format!("E{}", ix.index())).unwrap())
+    ///     .visit_item_struct_mut(&mut copy);
+    /// // `Rel` is replaced in the second field only.
+    /// assert_eq!(copy, parse_quote!(struct S<'a>(MyType<'_, Inner<'_>, Rel>, E0, E1);));
+    /// ```
+    pub fn ignore(mut self, error: &ErrorItem) -> Self {
+        let at = match self.errors.iter().position(|known| known == error) {
+            Some(at) => at,
+            None => return self,
+        };
+        let (part, entry) = (self.errors[at].link.part, self.errors[at].link.entry);
+        // The errors about the same part, or entry, go together.
+        let same = |known: &ErrorItem| {
+            (part.is_some() && known.link.part == part)
+                || (entry.is_some() && known.link.entry == entry)
+        };
+        let mut inside = HashSet::new();
+        for (ix, known) in self.errors.iter().enumerate() {
+            if ix == at || same(known) {
+                if let Some(part) = known.link.part {
+                    self.referrer.make_whole(part);
+                }
+                if let Some(entry) = known.link.entry {
+                    self.referrer.remove(entry);
+                }
+                inside.extend(known.link.inner.iter().copied());
+            }
+        }
+        // An error about an entry inside the part stays: the entry may be used elsewhere.
+        let mut ix = 0;
+        self.errors.retain(|known| {
+            ix += 1;
+            let revealed = known.link.entry.is_none()
+                && known.link.id.map_or(false, |id| inside.contains(&id));
+            !(ix - 1 == at || same(known) || revealed)
+        });
+        forget_dropped(&mut self.errors);
         self
     }
 
@@ -549,7 +664,8 @@ impl LeakerResult {
     ///
     /// It is the Leaker's side that writes the impls: write one for every entry, in
     /// [`RepeaterImpl::module`] if it is `Some`. The items come in the order of the entries
-    /// ([`Referrer::iter()`]), each with its [`EntryId`] in [`RepeaterImpl::entry`], which the
+    /// ([`Referrer::iter()`], so without those that [`ignore()`](LeakerResult::ignore) removed),
+    /// each with its [`EntryId`] in [`RepeaterImpl::entry`], which the
     /// Repeater's `KEY` ([`repeater_key()`](crate::repeater_key)) and [`Referrer::bucket_self()`]
     /// take.
     ///
@@ -618,14 +734,15 @@ impl LeakerResult {
         mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError> + 'a,
     ) -> std::result::Result<impl Iterator<Item = RepeaterImpl> + 'a, EncodeError> {
         check_repeater_path(repeater);
-        let count = self.referrer.iter().count();
-        for ix in 0..count {
+        // The entries that no `ignore()` removed.
+        let live: Vec<usize> = self.referrer.live().collect();
+        for &ix in &live {
             self.referrer.check_marker(ix, target)?;
         }
-        for ix in 0..count {
+        for &ix in &live {
             self.referrer.check_consts(ix, target, &mut const_fn)?;
         }
-        Ok((0..count).map(move |ix| {
+        Ok(live.into_iter().map(move |ix| {
             self.referrer
                 .repeater_impl(repeater, id, ix, target, &mut const_fn)
                 .unwrap_or_else(|error| {
@@ -659,8 +776,9 @@ impl ToTokens for LeakerResult {
 /// serialized Referrer parses with no errors.
 impl Parse for LeakerResult {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let referrer = input.parse()?;
+        let referrer: Referrer = input.parse()?;
         let mut errors = Vec::new();
+        let mut spans = Vec::new();
         if input.peek(Token![@]) && input.peek2(token::Bracket) {
             input.parse::<Token![@]>()?;
             let list;
@@ -669,11 +787,44 @@ impl Parse for LeakerResult {
                 if !list.peek(token::Brace) {
                     return Err(list.error("expected an error `{ .. }` in `@ [ .. ]`"));
                 }
+                spans.push(list.span());
                 errors.push(list.parse()?);
             }
         }
+        check_links(&referrer, &errors, &spans)?;
         Ok(LeakerResult { referrer, errors })
     }
+}
+
+/// Fails at the span of the first error that is about a part, an entry or an error that is not
+/// there, or has the `id` of another.
+fn check_links(referrer: &Referrer, errors: &[ErrorItem], spans: &[Span]) -> syn::Result<()> {
+    let mut ids = HashSet::new();
+    for (error, span) in errors.iter().zip(spans) {
+        let link = &error.link;
+        if let Some(part) = link.part.filter(|&part| part >= referrer.part_count()) {
+            let message = format!("the part {} of an error is not one of the parts", part);
+            return Err(syn::Error::new(*span, message));
+        }
+        if let Some(entry) = link.entry.filter(|&entry| entry >= referrer.entry_count()) {
+            let message = format!("the entry {} of an error is not one of the entries", entry);
+            return Err(syn::Error::new(*span, message));
+        }
+        if let Some(id) = link.id.filter(|&id| !ids.insert(id)) {
+            let message = format!("the id {} is the id of another error", id);
+            return Err(syn::Error::new(*span, message));
+        }
+    }
+    for (error, span) in errors.iter().zip(spans) {
+        if let Some(id) = error.link.inner.iter().find(|id| !ids.contains(id)) {
+            let message = format!(
+                "an error inside an error has the id {}: no error has it",
+                id
+            );
+            return Err(syn::Error::new(*span, message));
+        }
+    }
+    Ok(())
 }
 
 impl<A: Allow> Scopes for Leaker<A> {
@@ -696,13 +847,14 @@ impl<A: Allow> Scopes for Leaker<A> {
             visitor.start(&spec);
             let result = f(&mut View::new(&mut visitor));
             let (finished, mut errors) = visitor.finish(&spec, &root);
+            let found = errors.len();
             // The errors that the rule accepts are dropped here, as `LeakerResult` drops
             // them later. It is user code too: if it panics, nothing is recorded.
             filter(visitor.rule(), &mut errors);
-            (finished, errors, result)
+            (finished, errors, found, result)
         }));
         visitor.swap_contexts(&mut self.contexts);
-        let (finished, errors, result) = match outcome {
+        let (finished, mut errors, found, result) = match outcome {
             Ok(done) => done,
             Err(payload) => {
                 self.contexts.truncate(mark);
@@ -710,6 +862,11 @@ impl<A: Allow> Scopes for Leaker<A> {
             }
         };
         let top_level = self.record(&spec, root, finished);
+        // The ids of the errors count from the first error of this call, also those dropped.
+        for error in &mut errors {
+            error.link.shift(self.found);
+        }
+        self.found += found;
         self.errors.extend(errors);
         (top_level, result)
     }

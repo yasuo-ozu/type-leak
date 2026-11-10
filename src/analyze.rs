@@ -4,10 +4,11 @@ use crate::allow::{Allow, Place};
 #[cfg(doc)]
 use crate::analysis::drop_optional;
 use crate::analysis::{
-    ambiguous_types, anchor_parts, as_written, correct_effects, correct_unmeant_self, each_pending,
-    each_pending_mut, error_effects, has_ambiguous, has_error, has_optional_candidate, names_self,
-    part_names_self, primitive_effects, primitive_names, scope_error, shift_seen, CheckResult,
-    Effect, Part, PendingType, SelfMention, SignatureFacts, SignatureMark,
+    adopt, ambiguous_types, anchor_parts, as_written, correct_effects, correct_unmeant_self,
+    each_pending, each_pending_mut, error_effects, has_ambiguous, has_error,
+    has_optional_candidate, names_self, part_names_self, primitive_effects, primitive_names,
+    scope_error, shift_seen, CheckResult, Effect, Origin, Part, PendingType, SelfMention,
+    SignatureFacts, SignatureMark,
 };
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, Scope, SelfRequirement,
@@ -32,6 +33,7 @@ use crate::util::{
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -1592,7 +1594,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     self.records.self_errors.extend(
                         selves_in_generics(&generics)
                             .into_iter()
-                            .map(|cause| SelfMention { cause, place }),
+                            .map(|cause| SelfMention::new(cause, place)),
                     );
                 }
                 // Checked like the root of a trait bound, before what the closure visits.
@@ -1761,10 +1763,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// default of a parameter of a scope that declares nothing.
     fn check_self_has_meaning(&mut self, cause: Cause) {
         if !self.self_has_meaning() {
-            self.records.self_errors.push(SelfMention {
-                cause,
-                place: self.place(),
-            });
+            self.records
+                .self_errors
+                .push(SelfMention::new(cause, self.place()));
         }
     }
 
@@ -2219,7 +2220,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     part.mark = mark;
                 }
                 if bare {
-                    self.frame.effects.extend(error_effects(effects));
+                    let mut inside = error_effects(effects);
+                    self.adopt_inside(&mut inside, &conflict, inner.self_start);
+                    self.frame.effects.extend(inside);
                     return self.push_error(conflict);
                 }
                 self.conflict_inside(conflict, inner.self_start, whole, effects)
@@ -2589,7 +2592,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.not_optional_in_bounds(&context);
         let mut risk = None;
         if self.nested_self_risk(ty, &context) {
-            risk = Some(self.nested_self_error(ty, inner));
+            risk = Some(self.nested_self_error(ty, &context, inner));
         }
         let pending = PendingType {
             required: true,
@@ -2743,13 +2746,24 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     ) {
         conflict.seen = self_start;
         conflict.place = self.place();
-        let effects = if whole {
+        let mut effects = if whole {
             as_written(effects, &mut conflict.paths)
         } else {
             effects
         };
+        self.adopt_inside(&mut effects, &conflict, self_start);
         self.frame.effects.push(Effect::Error(Box::new(conflict)));
         self.frame.effects.extend(effects);
+    }
+
+    /// Makes the errors in `effects`, and the mentions of `Self` without meaning from `self_start`
+    /// on, errors revealed inside the part of `conflict` ([`Origin::outer`]).
+    fn adopt_inside(&mut self, effects: &mut [Effect], conflict: &CheckResult, self_start: usize) {
+        let token = &conflict.origin.token;
+        adopt(effects, token);
+        for mention in &mut self.records.self_errors[self_start..] {
+            mention.outer.get_or_insert_with(|| token.clone());
+        }
     }
 
     /// Returns the part for a bound whose trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), which the
@@ -2856,13 +2870,17 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
 
     /// The error of an entry for which [`AnalyzeVisitor::nested_self_risk()`] holds. The type is
     /// leaked all the same: nothing in it is copied as written, so the error has no paths.
-    fn nested_self_error(&self, ty: &Type, inner: &Frame) -> CheckResult {
+    fn nested_self_error(&self, ty: &Type, context: &Context, inner: &Frame) -> CheckResult {
         let self_path = self
             .context_of_as(ty, inner, false)
             .ok()
             .and_then(|plain| self.self_in_bounds(&plain))
             .unwrap_or_else(Cause::self_type);
         CheckResult {
+            origin: Origin {
+                entry: Some((context.clone(), ty.clone())),
+                ..Origin::default()
+            },
             note: Some(
                 "it names the `Self` of an item nested in the analyzed syntax, and so do the \
                  bounds of its generics: the entry is for any type that the bound holds for, and \
@@ -3496,10 +3514,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// relative path.
     fn check_bound_path(&mut self, path: &Path, cause: Cause) -> bool {
         if self_head(path).is_some() && self.self_scope.ty.is_none() {
-            self.records.self_errors.push(SelfMention {
-                cause,
-                place: self.place(),
-            });
+            self.records
+                .self_errors
+                .push(SelfMention::new(cause, self.place()));
         } else if !self.is_context_free(&Cause::Trait(path.clone())) {
             let paths = vec![Cause::Trait(without_arguments(path))];
             self.relative_path(cause.clone(), cause, paths);
@@ -3903,7 +3920,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             _ => return,
         };
         let facts = SignatureFacts::of(sig);
-        let mut conflicts = Vec::new();
+        // Each conflict, with the address of the type it is about.
+        let mut conflicts: Vec<(usize, CheckResult)> = Vec::new();
         // The types that the conflicts are about, by address.
         let mut corrected: HashSet<usize> = HashSet::new();
         // The optional types that only keep a lifetime constrained, by address.
@@ -3923,6 +3941,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 let (named, conflict) = &leaked[&ty];
                 if named.contains(lifetime) {
                     let mut conflict = conflict.clone();
+                    // Each conflict is one of its own, though the type is the same.
+                    conflict.origin = Origin::default();
                     conflict
                         .impossible
                         .insert(0, Cause::Lifetime(lifetime.clone()));
@@ -3933,10 +3953,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     if report(&conflict).is_some() {
                         corrected.insert(ty);
                     }
-                    conflicts.push(conflict);
+                    conflicts.push((ty, conflict));
                 }
             }
         }
+        // The part that each corrected type is made, and the types inside it, by address.
+        let made: RefCell<HashMap<usize, (Part, Vec<usize>)>> = RefCell::new(HashMap::new());
         // The type is the entry that the conflict is about, chosen before the conflict was found:
         // it is copied as written whole instead, as a trait object is (see `own_context()`). Only
         // the types of this signature are looked at: an address of the syntax can be one of a type
@@ -3954,9 +3976,16 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     }
                     let mut part = pending.part();
                     part.mark = Some(facts.unconstrained_mark(&leaked[&pending.origin].0));
+                    let mut inside = Vec::new();
+                    let mut note = |inner: &PendingType| inside.push(inner.origin);
+                    each_pending(&pending.inside, &mut note);
+                    each_pending(&pending.components, &mut note);
+                    made.borrow_mut()
+                        .insert(pending.origin, (part.clone(), inside));
                     Some(part)
                 }));
         }
+        self.link_unconstrained(&mut conflicts, &made.into_inner());
         // After the types copied as written are corrected: the optional types in them are among
         // the effects now.
         if !kept_optional.is_empty() {
@@ -3969,11 +3998,46 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let place = self.place();
         self.frame
             .effects
-            .extend(conflicts.into_iter().map(|mut conflict| {
+            .extend(conflicts.into_iter().map(|(_, mut conflict)| {
                 conflict.seen = seen;
                 conflict.place = place;
                 Effect::Error(Box::new(conflict))
             }));
+    }
+
+    /// Links the conflicts of `check_leaked_lifetimes()` to what they are about: each gets the part
+    /// that its type was made (without the primitive names, which that part has), and the conflict
+    /// of the innermost type around it, if one of the types is inside another (`made` has the
+    /// types inside each part): copied as written whole, the outer one holds the inner one.
+    fn link_unconstrained(
+        &self,
+        conflicts: &mut [(usize, CheckResult)],
+        made: &HashMap<usize, (Part, Vec<usize>)>,
+    ) {
+        for (ty, conflict) in conflicts.iter_mut() {
+            conflict.part = made.get(ty).map(|(part, _)| Part {
+                primitives: Vec::new(),
+                ..part.clone()
+            });
+        }
+        let tokens: Vec<(usize, Rc<()>)> = conflicts
+            .iter()
+            .map(|(ty, conflict)| (*ty, conflict.origin.token.clone()))
+            .collect();
+        for (ty, conflict) in conflicts.iter_mut() {
+            // The type with the fewest types inside it among those that hold this one.
+            let around = made
+                .iter()
+                .filter(|(outer, (_, inside))| *outer != ty && inside.contains(ty))
+                .min_by_key(|(outer, (_, inside))| (inside.len(), **outer));
+            let token = around.and_then(|(outer, _)| {
+                tokens
+                    .iter()
+                    .find(|(candidate, _)| candidate == outer)
+                    .map(|(_, token)| token.clone())
+            });
+            conflict.origin.outer = token;
+        }
     }
 
     /// Returns the optional types that hold `lifetime`, if only they keep it constrained in the
@@ -4952,7 +5016,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             let inside = self.frame.effects.split_off(start + 1);
             let primitives = primitive_names(&inside);
             let mut paths = Vec::new();
-            let inside = as_written(inside, &mut paths);
+            let mut inside = as_written(inside, &mut paths);
             let part = self.node_part(bound_cause(i), &i.path, primitives);
             if let Some(Effect::Error(head)) = self.frame.effects.last_mut() {
                 for path in paths {
@@ -4961,6 +5025,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                     }
                 }
                 head.part = Some(part);
+                adopt(&mut inside, &head.origin.token);
             }
             self.frame.effects.extend(inside);
         }
@@ -5653,11 +5718,12 @@ fn cut_conflicts(
                 } = *pending;
                 let mut inner = inside;
                 inner.extend(components);
-                let inner = if whole {
+                let mut inner = if whole {
                     as_written(inner, &mut error.paths)
                 } else {
                     cut_conflicts(inner, conflict, seen, place, not_optional)
                 };
+                adopt(&mut inner, &error.origin.token);
                 found.push(Effect::Error(Box::new(error)));
                 found.extend(inner);
                 continue;

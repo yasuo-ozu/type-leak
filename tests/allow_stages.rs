@@ -325,8 +325,7 @@ fn reading_values() -> Rules<impl Allow + Clone> {
 #[test]
 fn the_values_and_defaults_rules_give_the_same_errors_and_entries_at_both_stages() {
     // The config is asked about each path of a value or of a default, so it writes them as they
-    // are: no error is found. The result finds the errors and drops them; a path of a value is no
-    // part, so the Referrers are equal.
+    // are: no error is found. The result finds the errors and drops them; the entries are equal.
     let mut dropped = 0;
     for (name, item) in places() {
         for rule in [Rule::Values, Rule::Default] {
@@ -343,7 +342,17 @@ fn the_values_and_defaults_rules_give_the_same_errors_and_entries_at_both_stages
             };
             assert_eq!(ser(&before), ser(&after), "{}", name);
             assert_eq!(entries(&before), entries(&after), "{}", name);
-            assert_eq!(before.into_referrer(), after.into_referrer(), "{}", name);
+            // The entries and their contexts are the same. The parts are not: the result has the
+            // part that each error it dropped was about, which the config never found.
+            let seen = |result: LeakerResult| {
+                let referrer = result.into_referrer();
+                let found: Vec<_> = referrer
+                    .iter()
+                    .map(|(ix, ty, context)| (ix, ty.clone(), context.clone()))
+                    .collect();
+                found
+            };
+            assert_eq!(seen(before), seen(after), "{}", name);
         }
     }
     assert!(dropped > 0);

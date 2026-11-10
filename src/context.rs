@@ -1484,6 +1484,11 @@ impl Contexts {
         id
     }
 
+    /// The id of `context`, if it is interned.
+    pub(crate) fn find(&self, context: &Context) -> Option<ContextId> {
+        self.ids.get(context).copied()
+    }
+
     /// The module number is the context index, so ids are the same for the same calls.
     pub(crate) fn intern_module(
         &mut self,

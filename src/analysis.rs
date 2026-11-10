@@ -12,7 +12,8 @@ use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use syn::{FnArg, Ident, Lifetime, Signature, Type};
 use template_quote::quote;
 
@@ -90,6 +91,22 @@ pub struct CheckResult {
     /// The relative paths that the copy writes as they are, with their kinds and without their
     /// arguments: the heads of the type that conflicts ([`ErrorItem::paths`]).
     pub(crate) paths: Vec<Cause>,
+    /// Which conflict this is, inside which, and the entry it is about, so that
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) finds them in the result.
+    pub(crate) origin: Origin,
+}
+
+/// What links a conflict to the others and to the Referrer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Origin {
+    /// Names the conflict: its clones share it, and no other conflict has it. Only the address is
+    /// compared.
+    pub(crate) token: Rc<()>,
+    /// The `token` of the conflict that holds this one inside its part: the innermost one.
+    pub(crate) outer: Option<Rc<()>>,
+    /// The entry that the conflict is about, as its context and type: a risk of an entry, which is
+    /// one all the same ([`Reason::NestedSelfInBounds`]).
+    pub(crate) entry: Option<(Context, Type)>,
 }
 
 /// A mention of `Self` that has no meaning where it is written ([`Reason::SelfWithoutMeaning`]).
@@ -99,11 +116,24 @@ pub(crate) struct SelfMention {
     pub(crate) cause: Cause,
     /// Where it is written.
     pub(crate) place: Place,
+    /// The `token` of the conflict that holds it inside its part ([`Origin::outer`]).
+    pub(crate) outer: Option<Rc<()>>,
+}
+
+impl SelfMention {
+    pub(crate) fn new(cause: Cause, place: Place) -> Self {
+        Self {
+            cause,
+            place,
+            outer: None,
+        }
+    }
 }
 
 /// A type that the Leaker copies as written, which the Referrer must not look up as an entry. It
-/// becomes a [`PartItem`] when its effect is applied, if it is [`recorded()`](Part::recorded).
-#[derive(Clone, Debug)]
+/// becomes a [`PartItem`] when its effect is applied, if it is [`recorded()`](Part::recorded), or
+/// when an error is about it.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Part {
     /// The type, as a [`Cause::Type`], or the bound whose trait path conflicts (it is no type, and
     /// whole).
@@ -128,6 +158,24 @@ pub(crate) struct Part {
 }
 
 impl Part {
+    /// The part as the Referrer carries it, with its contexts interned.
+    pub(crate) fn item(&self, contexts: &mut Contexts) -> PartItem {
+        PartItem {
+            part: self.cause.clone(),
+            whole: self.whole,
+            context: self
+                .context
+                .as_ref()
+                .map(|context| contexts.intern(context.clone())),
+            in_predicate: self.in_predicate,
+            within: self
+                .within
+                .as_ref()
+                .map(|(ty, context)| (ty.clone(), contexts.intern(context.clone()))),
+            mark: self.mark.clone(),
+        }
+    }
+
     /// Returns `true` if the Referrer needs to know the part. A part that is not whole, with no
     /// anchor and no mark, has the same conflict wherever its tokens and context are found, so no
     /// entry has them and the visitor finds nothing to replace at its head; the types in it are
@@ -142,6 +190,10 @@ impl Part {
 /// [`Part::recorded()`]). Serialized as `KIND (
 /// CAUSE ) CONTEXT [whole] [sig ( MARK )] [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a
 /// `CONTEXT` of `None`.
+///
+/// A part that is not whole, has no anchor and no mark is there only because an error is about
+/// it ([`LeakerResult::ignore()`](crate::LeakerResult::ignore) makes it whole): the visitor does
+/// not look at it before.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartItem {
     /// A [`Cause::Type`].
@@ -398,6 +450,7 @@ impl CheckResult {
             seen: 0,
             place: Place::default(),
             paths: Vec::new(),
+            origin: Origin::default(),
         }
     }
 
@@ -479,19 +532,7 @@ impl Analysis {
                         if !part.recorded() {
                             continue;
                         }
-                        let item = PartItem {
-                            part: part.cause.clone(),
-                            whole: part.whole,
-                            context: part
-                                .context
-                                .as_ref()
-                                .map(|context| contexts.intern(context.clone())),
-                            in_predicate: part.in_predicate,
-                            within: part.within.as_ref().map(|(ty, context)| {
-                                (ty.clone(), contexts.intern(context.clone()))
-                            }),
-                            mark: part.mark.clone(),
-                        };
+                        let item = part.item(contexts);
                         if !self.parts.contains(&item) {
                             self.parts.push(item);
                         }
@@ -506,7 +547,7 @@ impl Analysis {
 
 /// Returns the errors of an analysis in the order found: the conflicts among `effects`, then the
 /// cycles in `conflicts`, with the mentions of `Self` without meaning placed by
-/// [`CheckResult::seen`].
+/// [`CheckResult::seen`]. Each is linked to the errors revealed inside its part ([`link_errors()`]).
 pub(crate) fn scope_error(
     effects: &[Effect],
     self_errors: &[SelfMention],
@@ -515,25 +556,86 @@ pub(crate) fn scope_error(
     let mut errors = Vec::new();
     collect_errors(effects, &mut errors);
     errors.extend(conflicts.iter().cloned());
-    // The mentions, with the number of the mentions before each.
+    // The mentions, with the number of the mentions before each, and the conflict around each.
     let mut mentions = self_errors
         .iter()
         .enumerate()
-        .map(|(index, mention)| (index, self_without_meaning(mention)))
+        .map(|(index, mention)| (index, self_without_meaning(mention), mention.outer.clone()))
         .peekable();
     let mut items: Vec<ErrorItem> = Vec::new();
+    // The token of the conflict of each item, and that of the conflict around it.
+    let mut origins: Vec<Held> = Vec::new();
     // A conflict without a cause that depends on the context is no error: `report()` gives none.
     for (conflict, item) in errors
         .iter()
         .filter_map(|conflict| Some((conflict, report(conflict)?)))
     {
-        while let Some((_, mention)) = mentions.next_if(|(index, _)| *index < conflict.seen) {
+        while let Some((_, mention, outer)) =
+            mentions.next_if(|(index, _, _)| *index < conflict.seen)
+        {
             items.push(mention);
+            origins.push((None, outer));
         }
         items.push(item);
+        origins.push((
+            Some(conflict.origin.token.clone()),
+            conflict.origin.outer.clone(),
+        ));
     }
-    items.extend(mentions.map(|(_, mention)| mention));
+    for (_, mention, outer) in mentions {
+        items.push(mention);
+        origins.push((None, outer));
+    }
+    link_errors(&mut items, &origins);
     items
+}
+
+/// The token of an error's conflict, and the token of the conflict that holds it inside its part.
+type Held = (Option<Rc<()>>, Option<Rc<()>>);
+
+/// Links each error to the errors revealed inside its part, those that it holds directly or
+/// through another: `inner` of the error, by the `id` of each, which an error gets if some error
+/// holds it. The ids are the positions in `items`.
+fn link_errors(items: &mut [ErrorItem], origins: &[Held]) {
+    let positions: HashMap<*const (), usize> = origins
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (token, _))| Some((Rc::as_ptr(token.as_ref()?), at)))
+        .collect();
+    let mut inner: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
+    let mut held = vec![false; items.len()];
+    for (at, (_, outer)) in origins.iter().enumerate() {
+        let mut around = outer.as_ref();
+        // The chain is as long as the nesting is deep, and cannot make a cycle.
+        for _ in 0..origins.len() {
+            let holder = match around.and_then(|token| positions.get(&Rc::as_ptr(token))) {
+                Some(&holder) if holder != at => holder,
+                _ => break,
+            };
+            inner[holder].push(at);
+            held[at] = true;
+            around = origins[holder].1.as_ref();
+        }
+    }
+    for (at, item) in items.iter_mut().enumerate() {
+        item.link.id = held[at].then(|| at);
+        item.link.inner = std::mem::take(&mut inner[at]);
+    }
+}
+
+/// Makes the errors among `effects` that no conflict holds yet errors revealed inside the part of
+/// the conflict `token`, which copies them as written ([`Origin::outer`]). The innermost conflict
+/// holds an error, as the types inside are decided first.
+pub(crate) fn adopt(effects: &mut [Effect], token: &Rc<()>) {
+    for effect in effects {
+        match effect {
+            Effect::Error(error) => {
+                error.origin.outer.get_or_insert_with(|| token.clone());
+            }
+            Effect::Type(pending) => adopt(&mut pending.components, token),
+            Effect::Primitive(_) => (),
+        }
+    }
 }
 
 /// Counts `by` more mentions of `Self` without meaning before the conflicts in `effects` (see
@@ -659,17 +761,14 @@ pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool
 
 /// Returns `true` if the part of `error`, if any, has a context that depends on `Self`, or none
 /// because a bound names a `Self` that has no name: the Referrer finds it by that, so it needs to
-/// know what `Self` is.
+/// know what `Self` is. That holds for a part that is not recorded too (see
+/// [`Part::recorded()`]): it is, if its error is not dropped, and `ignore()` makes it whole.
 pub(crate) fn part_names_self(error: &CheckResult, declared: &SelfRequirement) -> bool {
-    error
-        .part
-        .as_ref()
-        .filter(|part| part.recorded())
-        .map_or(false, |part| {
-            part.context
-                .as_ref()
-                .map_or(true, |context| depends_on_self(context, declared))
-        })
+    error.part.as_ref().map_or(false, |part| {
+        part.context
+            .as_ref()
+            .map_or(true, |context| depends_on_self(context, declared))
+    })
 }
 
 fn depends_on_self(context: &Context, declared: &SelfRequirement) -> bool {

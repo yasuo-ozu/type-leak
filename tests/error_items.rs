@@ -889,6 +889,8 @@ fn assert_same(read: &ErrorItem, item: &ErrorItem) {
     assert_eq!(read.in_value, item.in_value, "{}", item.message);
     assert_eq!(read.in_default, item.in_default, "{}", item.message);
     assert_eq!(read.paths, item.paths, "{}", item.message);
+    // What the error is about in the Referrer is read back too, so the errors are equal.
+    assert_eq!(*read, *item, "{}", item.message);
 }
 
 #[test]
@@ -959,12 +961,12 @@ fn every_error_is_written_and_read_back() {
 fn the_serialized_form_is_one_brace_group_for_each_item() {
     let items = errors(relative_path);
     // The tokens of the cause, of the notes and of the help are written as they are, the message,
-    // the notes and the help as string literals.
+    // the notes and the help as string literals. The part that the error is about comes last.
     assert_eq!(
         items[1].to_token_stream().to_string(),
         "{ type (MyType < '_ >) RelativePath \"use absolute path: 'MyType<'_>'\" \
          [('_) \"it cannot be leaked as a whole because of `'_`\"] \
-         (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\" paths [type (MyType)] }"
+         (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\" paths [type (MyType)] part 1 }"
     );
     // A serialization is not a report: it is no `compile_error!`.
     let all: proc_macro2::TokenStream = items.iter().map(ToTokens::to_token_stream).collect();
