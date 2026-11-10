@@ -2,8 +2,8 @@
 //! Referrer's crate (`type-leak-test-referrer`) cannot name.
 
 // The Repeater's implementations copy the types as they are written, including the parentheses
-// of `(dyn RelTr)` in `s::PathDyn`.
-#![allow(unused_parens)]
+// of `(dyn RelTr)` in `s::PathDyn`, and the braces of a const parameter (`[u8; { N }]`).
+#![allow(unused_parens, unused_braces)]
 
 #[doc(hidden)]
 pub use type_leak_test_macro as __macro;
@@ -1333,12 +1333,13 @@ pub mod kinds {
     }
 
     // Traits nested in a module whose generic has a bound that names their own `Self` (`T:
-    // AsRef<Self>`), and whose parameter defaults use it (`U = Defd<T>`). `Self` is the
-    // implementor, so the entry is for the implementors of the trait (`Self: Tr<T, U>`), and the
-    // Visitor writes it like any entry of the trait: `with_nested_self()` (it used to leave the
-    // default as written, `Defd<T>`, which the Referrer's crate cannot resolve). A parameter
-    // default exists only in a declaration, so the Referrer's crate declares the copy
-    // (`redeclare`), and checks that its defaults are the types of the original.
+    // AsRef<Self>`), and whose parameter defaults use it (`U = Defd<T>`). The default does not name
+    // `Self`, so it is analyzed alone, as that of a trait that a scope enters: its entry is for any
+    // type that the bound holds for, and the Visitor writes it with the ordinary closure, which
+    // picks the host (it would keep the default as written, `Defd<T>`, which the Referrer's crate
+    // cannot resolve, if it were not an entry). A parameter default exists only in a declaration,
+    // so the Referrer's crate declares the copy (`redeclare`), and checks that its defaults are
+    // the types of the original.
 
     /// Types that the Referrer's crate does not import: a default that it keeps as written does not
     /// resolve there (E0412).
@@ -1378,7 +1379,7 @@ pub mod kinds {
         fn plain(&self) -> Rel;
     }
 
-    /// One default: the host implements the trait for any `U`, and the default passes `()`.
+    /// One default, written for the host: `T: AsRef<Host>` holds for the types that it is used with.
     #[prop_leak(id = 9131, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
     pub trait SelfDefault<T: AsRef<Self>, U = Defd<T>> {
         fn get(&self, t: T, u: U);
@@ -2100,6 +2101,29 @@ pub mod kinds {
         pub fn g(&self, _y: Leaf) {}
     }
 
+    /// The only inputs that name the lifetime of a method are `Two` and `Held<'b>` in it
+    /// (`UnconstrainedLifetime`): leaked, `'b` would be in no input that constrains it, early-bound
+    /// where the trait has it late-bound (E0195 in the impl of the host). Both are written as
+    /// they are, so `'b` stays in the copy, and `Leaf` is an entry. In `g` every one of three
+    /// types is in the way of the lifetime, in `h` two ways, each through a `Held<'d>`.
+    #[prop_leak_accept(id = 9221, allow_self = true, prelude = true)]
+    pub trait NestedMethodLifetime {
+        fn f<'b>(&self, x: Two<Leaf, *mut Held<'b>>) -> &'b u8;
+        fn g<'c>(&self, x: Two<Two<Leaf, Held<'c>>, Leaf>) -> &'c u8;
+        fn h<'d>(&self, x: Two<Held<'d>, *mut Held<'d>>) -> &'d u8;
+    }
+
+    /// The same where an optional entry is on the way to the lifetime: `Wrap<Held<'b>>` of this
+    /// crate by its own name is replaced by a strict Referrer unless it is the only one that keeps
+    /// `'b` constrained, and then it is written as it is, with `Held<'b>` in it.
+    #[prop_leak_accept(id = 9222, allow_self = true, prelude = true, strict = true)]
+    pub trait NestedOptionalLifetime {
+        fn f<'b>(
+            &self,
+            x: Two<Leaf, ::type_leak_test_leaker::kinds::Wrap<Held<'b>>>,
+        ) -> &'b u8;
+    }
+
     /// The where predicate of the trait names `Self` (`SelfInTraitPredicate`): the type in it is
     /// copied as written, and the impl of the host must satisfy the predicate with the
     /// original types (F44).
@@ -2311,4 +2335,174 @@ pub mod kinds {
     /// (`RelPoint { a: 1 }`). Not reported before, and the copy could not resolve `RelPoint`.
     #[prop_leak(id = 9218, allow_self = true, scope = "mod")]
     pub struct LiteralDefault<const N: usize = { RelPoint { a: 1 }.a }>(pub [u8; N]);
+
+    // F64 (`tests/findings.rs`): a bound that stays in the context of an entry and names its
+    // generic through a type alias, next to an equation of the generic. It fails to build on the
+    // code before the fix.
+
+    /// F64: the bounds of the generics name them through the alias `WIt`, which the Leaker cannot
+    /// tell from a struct. `Wrap<Self>` in the predicate of `m` keeps `U: Fn(WIt<U>)` whole, and
+    /// `Wrap<V>` in the predicate of `n`, next to the equation of `V` there, has `V: Fn(WIt<V>)`:
+    /// rustc proves neither in the environment of the copy (E0277 "expected an `Fn(u8)` closure,
+    /// found `U`"). The Leaker rejects both, so the Referrer's macro expands to nothing. The rule
+    /// of the Leaker allows the alias, as it does where the crate has rules of its own for its
+    /// paths.
+    #[prop_leak(
+        id = 9223,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::WIt"
+    )]
+    pub trait AliasBound<T, U: Iterator<Item = u8>, V: Iterator>
+    where
+        U: Fn(::type_leak_test_leaker::kinds::WIt<U>) -> u8,
+        V: Fn(::type_leak_test_leaker::kinds::WIt<V>) -> u8,
+    {
+        fn m(&self, a: u8)
+        where
+            Wrap<Self>: Default;
+
+        fn n(&self, a: u8)
+        where
+            V: Iterator<Item = u8>,
+            Wrap<V>: Default;
+    }
+
+    // F65 and F66 (`tests/findings.rs`): the Referrer's crate uses the copy at an instantiation
+    // that leaves the defaults out (`inst(..)`). Each fails to build on the code before the fix.
+
+    /// F65: the default `Defd<T>` of a trait nested in a module, whose bound `T: AsRef<Self>` names
+    /// `Self`. `Referrer::complete_args()` found no entry for it and left it as written, a type that
+    /// the Referrer's crate does not import (E0412). The trait is not declared again there: the
+    /// use site completes the arguments.
+    #[prop_leak(id = 9224, allow_self = true, scope = "mod", prelude = true)]
+    pub trait NestedSelfBoundDefault<T: AsRef<Self>, U = Defd<T>> {
+        fn get(&self, t: T, u: U);
+    }
+
+    /// F66: a braced const parameter as the length of an array, in a type that is no entry. The use
+    /// site writes the argument of `N` instead of it: `[u8; { { N } }]` is rejected by rustc.
+    /// `N` is named by a bound, so the use site passes it by its own name.
+    #[prop_leak(id = 9225, allow_self = true, prelude = true)]
+    pub struct BracedLength<const N: usize, T: Into<[u8; N]>>(pub T, pub [u8; { N }], pub Rel);
+
+    /// F66: the same in the arguments of a path (`IntoIter<u8, { N }>`).
+    #[prop_leak(id = 9226, allow_self = true, prelude = true)]
+    pub struct BracedArgument<const N: usize, T: Into<[u8; N]>>(
+        pub T,
+        pub ::core::array::IntoIter<u8, { N }>,
+        pub Rel,
+    );
+
+    /// F66: the default of a type parameter that names a braced const parameter, which
+    /// `Referrer::complete_args()` substitutes.
+    #[prop_leak(id = 9227, allow_self = true, prelude = true)]
+    pub struct BracedDefault<const N: usize, T: Into<[u8; N]>, U = [u8; { N }]>(
+        pub T,
+        pub U,
+        pub Rel,
+    );
+
+    // F67 (`tests/findings.rs`): a trait object bounded by a method lifetime under a type of a crate
+    // that the Leaker does not allow. They fail to build on the code before the fix.
+
+    /// F67: `Box<dyn Fn(Rel) + 'x>` is the only input of `f` that holds the lifetime, in the
+    /// arguments of a `Vec`; both are of `::std`, which the rule does not allow. The Leaker leaked
+    /// the box, so the copy had `'x` in a projection only, early-bound where the trait has it
+    /// late-bound (E0195 in the impl of the host). Both are written as they are now, and the only
+    /// entry is `Rel`.
+    #[prop_leak(id = 9228, allow_self = true, prelude = true)]
+    pub trait ObjectInVec {
+        fn f<'x>(
+            &self,
+            a: ::std::vec::Vec<::std::boxed::Box<dyn ::core::ops::Fn(Rel) + 'x>>,
+        ) -> &'x u8;
+    }
+
+    /// F67: the same under an `Option`, under two boxes, and in a tuple.
+    #[prop_leak(id = 9229, allow_self = true, prelude = true)]
+    pub trait ObjectUnderTypes {
+        fn f<'a>(
+            &self,
+            x: ::std::vec::Vec<::std::option::Option<::std::boxed::Box<dyn ::core::ops::Fn(Rel) + 'a>>>,
+        ) -> &'a u8;
+        fn g<'b>(
+            &self,
+            x: ::std::vec::Vec<::std::boxed::Box<::std::boxed::Box<dyn ::core::ops::Fn(Rel) + 'b>>>,
+        ) -> &'b u8;
+        fn h<'c>(
+            &self,
+            x: ::std::vec::Vec<(::std::boxed::Box<dyn ::core::ops::Fn(Rel) + 'c>, u8)>,
+        ) -> &'c u8;
+    }
+
+    // F68 (`tests/findings.rs`): the self type of an impl is a type of this crate by an absolute path
+    // that the rule does not allow, an optional entry; a bound of a generic names an optional type,
+    // another names `Self`, and a predicate is on an entry that uses the generic. A Referrer that
+    // replaced the self type had E0277 in the copy. It fails to build on the code before the fix.
+
+    /// The self type of the impl below, and the type that a bound names.
+    pub struct OptSelf<const N: usize>;
+    pub struct OptBound;
+
+    /// F68: `Wrap<X>: Default` is a predicate on an entry whose context has `X: Fn(&Self)`, and
+    /// `Self` is the optional type `OptSelf<0>`, which the bound `X: AsRef<(&'static OptBound,
+    /// bool)>` hid from the check. The strict copy was E0277 ("expected an `Fn(&OptSelf<0>)`
+    /// closure, found `X`"). `OptSelf<0>` is no entry now, and the copy writes it as it is.
+    #[prop_leak(id = 9230, allow_self = true, prelude = true)]
+    impl ::type_leak_test_leaker::kinds::OptSelf<0> {
+        pub fn m<X>(&self, _a0: X)
+        where
+            X: ::core::convert::AsRef<(&'static ::type_leak_test_leaker::kinds::OptBound, bool)>,
+            X: ::core::ops::Fn(&Self) -> u8,
+            Wrap<X>: ::core::default::Default,
+        {
+        }
+    }
+
+    // F69 (`tests/findings.rs`): the copy is used at an instantiation that gives the type parameter
+    // a type with a lifetime (`inst(..)` with `lifetime_args`: `&'static str`, `(&'static str, u8)`,
+    // ..), where the parameter is in the inputs of a function pointer or `Fn(..)` whose output has an
+    // elided lifetime. The use site must name that lifetime. Each fails to build on the code before
+    // the fix.
+
+    /// F69: a function pointer over a type of `::core` (no entry), so the use site writes the
+    /// argument of `T` into it, and one with a binder whose input names the lifetime. `Rel` is the
+    /// only entry.
+    #[prop_leak(id = 9231, allow_self = true, prelude = true)]
+    pub struct ElidedPointer<T>(
+        pub fn(&::core::cell::Cell<[T; 1]>) -> &u8,
+        pub for<'e> fn(&'e T) -> &u8,
+        pub fn(&T, u8) -> &u8,
+        pub Rel,
+    );
+
+    /// F69: the same in a trait object and a function pointer, in the arguments of a method (the host
+    /// implements the trait for the instantiation).
+    #[prop_leak(id = 9232, allow_self = true, prelude = true)]
+    pub trait ElidedMethods<T> {
+        fn call(&self, f: &dyn ::core::ops::Fn(&T) -> &u8, g: fn(&T) -> &u8) -> Rel;
+    }
+
+    /// F69: the default of a parameter that is such a function pointer, which
+    /// `Referrer::complete_args()` completes when the use site leaves it out.
+    #[prop_leak(id = 9233, allow_self = true, prelude = true)]
+    pub struct ElidedDefault<T, U = fn(&T) -> &u8>(pub T, pub U, pub Rel);
+
+    // F70 (`tests/findings.rs`): the same where an entry is in the inputs, and the Referrer replaces
+    // it (`strict`): the path through the Repeater names the lifetime that the use site gives `T`.
+    // Each fails to build on the code before the fix.
+
+    /// F70: `Vec<T>` of `::std` is an optional entry that a strict Referrer replaces, in a function
+    /// pointer. The Leaker leaks it alone.
+    #[prop_leak(id = 9234, allow_self = true, prelude = true)]
+    pub struct ElidedEntry<T>(pub fn(&::std::vec::Vec<T>) -> &u8, pub Rel);
+
+    /// F70: the same in the sugar of `Fn(..)` of a trait object, which no reference or box holds
+    /// (it would be the entry).
+    #[prop_leak(id = 9235, allow_self = true, prelude = true)]
+    pub struct ElidedEntryObject<T>(
+        pub ::core::marker::PhantomData<dyn ::core::ops::Fn(&::std::vec::Vec<T>) -> &u8>,
+        pub Rel,
+    );
 }

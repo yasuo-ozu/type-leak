@@ -111,6 +111,9 @@ use template_quote::{quote, ToTokens};
 /// `Self::A` or a normalized associated type, or projects a generic bounded by a non-standard
 /// trait. If another bound of `T` fixes an associated type (`T: Iterator<Item = u8>`), a bound that
 /// names `T` (`T: Fn(Wrap<T>)`) is left out of the entries' context: E0277 if the type needs it.
+/// An entry that names `Self` keeps every bound, and in a predicate it is an error if one names `T`
+/// in a path that may be a type alias of a projection, which the Leaker cannot read (`T:
+/// Fn(Wrap<T>)`, not `T: From<T>`), also where a predicate of a method equates the `Item` of `T`.
 ///
 /// ## Bare identifiers and consts
 ///

@@ -1333,7 +1333,8 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
 /// a type alias (`T: Fn(Alias<T>)`), which the Leaker cannot tell from a struct. The impl does not
 /// need that bound to name the entry, so the context leaves out such a bound, the Leaker and the
 /// Referrer alike (see [`left_out_bounds()`]), except for the generics that [`Whole`] keeps (see
-/// `Context::compute()`).
+/// `Context::compute()`). The Leaker rejects an entry in a predicate if such a bound stays
+/// (`hidden_projection()` in the `unstable` module, which follows [`hiding_bounds()`]).
 struct LeftOut {
     whole: Whole,
     cache: HashMap<(usize, String), HashSet<String>>,
@@ -1417,12 +1418,12 @@ impl LeftOut {
     }
 }
 
-fn bound_text(bound: &TypeParamBound) -> String {
+pub(crate) fn bound_text(bound: &TypeParamBound) -> String {
     quote!(#bound).to_string()
 }
 
 /// The name of the generic that a where predicate's bounded type is, if it is a bare name.
-fn bounded_ident(ty: &Type) -> Option<String> {
+pub(crate) fn bounded_ident(ty: &Type) -> Option<String> {
     match unwrap_type_group(ty) {
         Type::Path(TypePath { qself: None, path }) => path.get_ident().map(ident_name),
         _ => None,
@@ -1431,7 +1432,7 @@ fn bounded_ident(ty: &Type) -> Option<String> {
 
 /// Returns `true` if `bound` is a trait bound with an equation of an associated type
 /// (`Iterator<Item = u8>`).
-fn binds_assoc(bound: &TypeParamBound) -> bool {
+pub(crate) fn binds_assoc(bound: &TypeParamBound) -> bool {
     match bound {
         TypeParamBound::Trait(bound) => matches!(
             bound.path.segments.last().map(|seg| &seg.arguments),
@@ -1505,16 +1506,32 @@ fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
             _ => (),
         }
     }
-    let fixes = bounds.iter().any(|bound| {
-        binds_assoc(bound) || (may_define_assoc(bound) && !arguments_mention(bound, name))
-    });
+    hiding_bounds(&bounds, name, false)
+        .into_iter()
+        .map(bound_text)
+        .collect()
+}
+
+/// Returns the bounds among `bounds`, all those of the type parameter `name`, that name `name` in
+/// the arguments of their path and may hide a projection of it (`T: Fn(X<T>)`), because another
+/// one fixes an associated type (see [`left_out_bounds()`]), or `equated` says that an equation of
+/// `name` is in scope elsewhere (the where clause of a method). An equation is no such bound.
+pub(crate) fn hiding_bounds<'b>(
+    bounds: &[&'b TypeParamBound],
+    name: &str,
+    equated: bool,
+) -> Vec<&'b TypeParamBound> {
+    let fixes = equated
+        || bounds.iter().any(|bound| {
+            binds_assoc(bound) || (may_define_assoc(bound) && !arguments_mention(bound, name))
+        });
     if !fixes {
-        return HashSet::new();
+        return Vec::new();
     }
     bounds
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|bound| !binds_assoc(bound) && arguments_mention(bound, name))
-        .map(bound_text)
         .collect()
 }
 

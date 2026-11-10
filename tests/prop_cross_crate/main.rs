@@ -49,6 +49,19 @@
 //!   a construct with fewer than three times that. At least `TYPE_LEAK_PROP_MIN_CHECKED` percent
 //!   of the type positions of the accepted items must have been compared with their witness
 //!   (turning the floors off with `TYPE_LEAK_PROP_MIN_ACCEPT=0` does not turn this off).
+//!   The floors count the items that have no forced shape (below): the table of the summary
+//!   has the share of all the items too (`all%`), and a line says how many items were left out.
+//! - The forced shapes. The generator writes some shapes only to reach a `Reason` that random types
+//!   rarely do, and the Leaker must reject the item that has one, under the settings of the item
+//!   (`FORCED`, which classifies `SHAPE_TAGS`, with the numbers measured): such an item is left out
+//!   of the floors, and fails the run if the Leaker accepts it ("SHOULD BE REJECTED") or rejects it
+//!   with no error of the shape's reason ("SHOULD BE REJECTED FOR ITS SHAPE": the reason, and the
+//!   kind of the cause or its tokens where they tell the shape, `Forced`). A shape that the Leaker
+//!   may accept (`nested_self_in_bounds_option`, a macro of the Leaker's crate by an absolute path)
+//!   is not forced, and its items count in the floors, and so are those of a shape that only some of
+//!   its items force (the tag `gen::FORCED_*` that the text of the item gives, `gen::forced_in()`).
+//!   The summary counts the items of each forced shape, so that the check cannot pass with none
+//!   (`Stats::forced_check_problems()`: at least one item in `FORCED_SHARE` has one).
 //!
 //! The generator keeps the shapes that the Leaker rejects (a predicate that names a leaked type
 //! that uses a generic, an `impl Trait` argument, ...) in a share of the items (`gen::Gen::cyclic`),
@@ -82,10 +95,28 @@
 //!   one that the item wrote: a tag `bound_cycle=<bounded>|<bound>` of the same generic and with
 //!   that bound (`Agree::Bound`). A predicate on a type that is no generic is proved by an impl
 //!   and is none, unless it names the `Item` of an iterator;
+//! - an `UnprovableBound` whose note says that the path of a bound of a generic may be a type alias
+//!   of a projection (`U: Fn(BIt<U>) -> u8` next to `U: Iterator<Item = u8>` or `U: BItem`; the
+//!   Leaker cannot tell an alias from a struct, so a struct path is rejected too) needs the generic
+//!   and the bound in a tag `hidden_bound=<generic>|<bound>` that the item wrote, with an entry
+//!   that keeps the bound (`Self`, or the self type of the impl, in a predicate): `Agree::Hidden`;
 //! - an `UnconstrainedLifetime` needs a leaked path or trait object that holds the lifetime of a
 //!   method, behind a reference in its arguments too (`Rel<&'x str>`): `method_lifetime=<type>`,
 //!   which the cause is (`Agree::Type`);
-//! - `bare:<Name>` is read from the text of the item where the Leaker does not allow the prelude.
+//! - `bare:<Name>` is read from the text of the item where the Leaker does not allow the prelude;
+//! - the shapes that reach the other reasons are tags of what the item writes (`gen::TAG_*`,
+//!   `SHAPE_TAGS`): `SelfWithoutMeaning` needs `self_without_meaning` (a field that names `Self` in
+//!   an item analyzed in `enter_generics`), `SelfInDefault` `self_in_default` (a trait whose default
+//!   names `Self`), `SelfInTraitPredicate` `self_in_trait_predicate` (a type that names `Self` in
+//!   the header of a trait or an impl, not as the bounded type), `SelfInImplSelfType`
+//!   `impl_header_self` (the generics or the where clause of an impl name `Self`), `Unreadable`
+//!   `unreadable_value` (a glob import or a `macro_rules!` in a body, with `values`),
+//!   `NestedSelfInBounds` `nested_self_in_bounds` (the shape of `self_bound_adts` without the
+//!   option; the Leaker must reject it) or `nested_self_in_bounds_text` (a bound that names `Self`
+//!   in an item nested in `enter_mod` without the option), a cause of the kind `Macro` `macro_path`,
+//!   a path that holds an array whose length is a macro call `macro_call`, and `Rl<'_>`
+//!   `elided_arg`. Items with the option off are rejected if they have the shape, and with it on
+//!   no rejection has a tag, so a `NestedSelfInBounds` with the option on fails the run.
 //!
 //! What a Leaker leaks is read from the text and from the settings of the Leaker's crate
 //! (`Gen::names_leaked_type()`: a relative path, `Self`, a path of `std` or of the Leaker's crate
@@ -226,6 +257,42 @@
 //! each item whose number of errors differs its causes and what became of its copy. `STAGES FAILED`
 //! is the failure of an error that remains when every cause is allowed, as `ACCEPT FAILED` is.
 //!
+//! # More of the API than the copies compare
+//!
+//! - **Other calls of one scope** (`via` in the attribute of an item, `gen::Gen::with_via()`, `Args::via`
+//!   of the macro): a struct, an enum or a union by `enter_type`, with its generics given to the view
+//!   by parts (`visit_type_param_bound`, `visit_where_clause`, `visit_type`), with `View::check()` on its
+//!   types first (a scope for the generics of a method nested in the view), or nested in `enter_mod`
+//!   by `View::enter_type`; a trait by `enter_trait` with the parts or the checks; a trait impl by
+//!   `enter_impl` with the path of its trait, and an impl by `enter_impl` and the walk of syn. The
+//!   analysis must equal that of the plain scope (`VIA DIFFERS`), `check()` must record nothing and
+//!   say what the copy does (`CHECK DISAGREES`), and the copy is compared as the others are.
+//! - **Use sites with arguments** (`inst(N)`, `prop.rs: Instance`): the item is also used at an
+//!   instantiation of its generics (lifetimes `'static` or named by the use site, types `(u8, u16)`,
+//!   `Vec<u8>`, `str`, consts `3`, `{ 2 + 1 }`, the defaults at the end left out for
+//!   `Referrer::complete_args()`): a trait is implemented for a host with them, each position is
+//!   compared with the witness called with them, `S<given>` must be `S<completed>`, and
+//!   `Referrer::context_generic_args()` must refuse a list with an argument too many, of another
+//!   kind or missing. A parameter that a function pointer or `Fn(..)` with an elided output names in
+//!   its inputs is given a type that holds a lifetime (`&'static str`) in a share of the items, and
+//!   the copy must name the elided lifetime there (F69, `UseSite::substitute()`, and F70 where the
+//!   path through the Repeater that replaces an entry in the inputs names it): the summary counts the
+//!   pairs of a parameter and a signature (`inst_elided`), and those with a replaced entry in the
+//!   inputs (`inst_elided_entry`).
+//! - **Shadowing** (`shadow(N)`, `prop.rs: shadow_check()`): the item is copied inside a module and a
+//!   block that declare names its entries start with: the visitor must leave those entries.
+//! - **Unique names**: each copy is in a module of its own (`c<id>`), so a relative path that it keeps by
+//!   mistake cannot resolve to the copy of another item.
+//! - **The carried errors** (`prop.rs: carry()`, `gen::errors_crate()`): the crate `tlp_e_NNN` reads the
+//!   result of each item back from tokens (`LeakerResult`, the `@[..]` list), the errors must be the
+//!   Leaker's, `allow()` drops none, the first or all, and the rest is reported with
+//!   `ErrorItem::emit()`: the crate does not compile, and its diagnostics are matched with the
+//!   Leaker's errors (`carry_failures()`). With `TYPE_LEAK_PROP_ACCEPT` a fifth of the items are leaked
+//!   with `prop_leak_result` and the crate of the accepted items drops their errors (`allow(all)`).
+//!
+//! What the macros did is counted (`TLCOUNT` on their stderr, `use_summary()`), and a run where `inst`
+//! or `shadow` was asked of many items and compared nothing fails.
+//!
 //! # Bare and absolute spellings
 //!
 //! Bounds, where clauses, supertraits and trait objects name `Sized`, `?Sized`, `Send`, `Sync`,
@@ -331,9 +398,9 @@
 //!   `-name` turns it off, also one that is on by default (`-nested_self_entries`); `all` turns
 //!   every feature on, and the words are read in order (`all,-strict_anchors`). With one of `inferred_outlives`,
 //!   `impl_self_outlives`, or `all`, the test fails with the reproduction of that finding
-//!   (`tests/findings.rs` has each one as a library-level test). `strict_anchors` (F18, about the
-//!   items whose Referrer replaces optional entries, the modes but `all`) is fixed, and off by
-//!   default: the items that have it are invoked with `all` unless it is asked for. `unsized_params`,
+//!   (`tests/findings.rs` has most of them as a library-level test). `strict_anchors` (F18, about the
+//!   items whose Referrer replaces optional entries, the modes but `all`) is fixed, and on by
+//!   default (`-strict_anchors`: the items that have it are invoked with `all`). `unsized_params`,
 //!   `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`, `module_crate_paths`,
 //!   `bound_merge_syntax`, `fn_pointer_self`, `elided_fn_generics`, `impl_self_bounds` (F13),
 //!   `impl_pred_leaked` (F14), `self_elision` (F15, F23), `implied_outlives` (F16),
@@ -355,8 +422,10 @@
 //!   `self_bound_adts` (F41: a struct, an enum or a union nested in `enter_mod` with a generic
 //!   whose bound names its own `Self` and a default that uses it; the Leaker must accept it, which
 //!   `unexplained()` checks) and `nested_self_entries` (F42: the macro asks for
-//!   `nested_self_entries` for the items nested in `enter_mod`, and those of
-//!   `self_bound_adts` have a field that names `Self` in a relative type),
+//!   `nested_self_entries` for half of the items nested in `enter_mod`, and those of
+//!   `self_bound_adts` have a field that names `Self` in a relative type: without the option the
+//!   Leaker rejects it with `NestedSelfInBounds`, which `unexplained()` requires, and the option
+//!   makes it accept it),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
@@ -551,6 +620,15 @@ fn accept_name(i: usize) -> String {
     format!("tlp_a_{:03}", i)
 }
 
+/// The crate that reports the errors the Leaker carries (`gen::Case::errors_referrer`).
+fn errors_dir(i: usize) -> String {
+    format!("c{:03}_e", i)
+}
+
+fn errors_name(i: usize) -> String {
+    format!("tlp_e_{:03}", i)
+}
+
 /// The decoy crate of a case (`gen::Decoy`), which `tlp_l_NNN` means in the decoy Referrer's crate.
 fn decoy_dir(i: usize) -> String {
     format!("c{:03}_d", i)
@@ -644,6 +722,9 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
             if mode == Mode::Accept {
                 dirs.push(format!("\"{}\"", accept_dir(*i)));
             }
+            if mode != Mode::Identity {
+                dirs.push(format!("\"{}\"", errors_dir(*i)));
+            }
             if mode != Mode::Identity && case.decoy.is_some() {
                 dirs.push(format!("\"{}\"", decoy_dir(*i)));
                 dirs.push(format!("\"{}\"", decoy_referrer_dir(*i)));
@@ -688,7 +769,21 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
             Mode::Accept => "crate::__macro::prop_leak_accept",
             Mode::Identity => "crate::__macro::prop_leak_noop",
         };
-        let leaker = case.leaker.replace(gen::ATTR, attr);
+        let mut leaker = case.leaker.clone();
+        if mode == Mode::Accept {
+            // A fifth of the items carry their result to the Referrer (`gen::carries_result()`).
+            for item in case
+                .items
+                .iter()
+                .filter(|item| gen::carries_result(item.id))
+            {
+                leaker = leaker.replace(
+                    &format!("{}(id = {},", gen::ATTR, item.id),
+                    &format!("crate::__macro::prop_leak_result(id = {},", item.id),
+                );
+            }
+        }
+        let leaker = leaker.replace(gen::ATTR, attr);
         let leaker = if stages {
             leaker
         } else {
@@ -785,6 +880,23 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
             std::fs::write(dir.join("src/lib.rs"), &decoy.referrer).unwrap();
         }
 
+        {
+            let dir = ws.join(errors_dir(*i));
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+                     [dependencies]\n{} = {{ path = \"../{}\" }}\n",
+                    errors_name(*i),
+                    leaker_name(*i),
+                    leaker_dir(*i)
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("src/lib.rs"), &case.errors_referrer).unwrap();
+        }
+
         if mode == Mode::Accept {
             let dir = ws.join(accept_dir(*i));
             std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -861,6 +973,16 @@ struct Build {
     artifacts: HashSet<String>,
     /// What cargo printed to stderr.
     stderr: String,
+    /// What the macros of the Referrer's crates counted of the copies they made at an instantiation
+    /// of the generics and inside a module and a block (`TLCOUNT <what> <id> <n>` on stderr).
+    counts: Vec<Count>,
+}
+
+/// `what` is `inst` (positions compared at an instantiation) or `shadow` (entries that a module and a
+/// block hid) of one item, and `n` how many.
+struct Count {
+    what: String,
+    n: usize,
 }
 
 fn span_lines(span: &Json, out: &mut Vec<(String, u64)>) {
@@ -918,7 +1040,23 @@ fn cargo_build(ws: &Path, target: &Path) -> Build {
         executables: HashMap::new(),
         artifacts: HashSet::new(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        counts: Vec::new(),
     };
+    for line in build.stderr.lines() {
+        if let Some(count) = line.strip_prefix("TLCOUNT ") {
+            let mut words = count.split_whitespace();
+            if let (Some(what), Some(_), Some(n)) = (
+                words.next(),
+                words.next(),
+                words.next().and_then(|w| w.parse().ok()),
+            ) {
+                build.counts.push(Count {
+                    what: what.to_string(),
+                    n,
+                });
+            }
+        }
+    }
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some(json) = Json::parse(line) else {
             continue;
@@ -1762,6 +1900,23 @@ enum Agree {
     Bound,
     /// `method_lifetime=<type>`: the cause of the error is that type, or a part of it, or has it.
     Type,
+    /// `hidden_bound=<generic>|<bound>`: the note names the same generic and the same bound, as in
+    /// "names `U` in the arguments of the bound `Fn(BIt<U>) -> u8`".
+    Hidden,
+}
+
+/// What the note of an `UnprovableBound` says of a bound that may hide a projection.
+const HIDDEN_NOTE: &str = "whose path may be a type alias of a projection";
+
+/// The generic and the bound that the note of an `UnprovableBound` names as hiding a projection
+/// ("names `U` in the arguments of the bound `Fn(BIt<U>) -> u8`, whose path may be .."), as the
+/// Leaker's tokens print them.
+fn hidden_of_note(note: &str) -> Option<(&str, &str)> {
+    let marker = "` in the arguments of the bound `";
+    let at = note.find(marker)?;
+    let generic = note[..at].rsplit('`').next()?;
+    let rest = &note[at + marker.len()..];
+    Some((generic, &rest[..rest.find('`')?]))
 }
 
 fn family_of(name: &'static str, tags: &[&str]) -> Option<Family> {
@@ -1805,6 +1960,14 @@ impl Agree {
                 let cause = gen::norm(&error.tokens);
                 !cause.is_empty() && (payload.contains(&cause) || cause.contains(payload))
             }
+            Agree::Hidden => {
+                let Some((generic, bound)) = payload.split_once('|') else {
+                    return false;
+                };
+                hidden_of_note(&error.note).map_or(false, |(named, hides)| {
+                    named == generic && gen::norm(hides) == bound
+                })
+            }
         }
     }
 }
@@ -1830,14 +1993,38 @@ impl Family {
 /// defect.
 ///
 /// The `Reason` of the error decides. The tokens and the note tell the shapes of a reason apart
-/// (`MaybeConst`, `RelativePath`), and the message is not read. The reasons that the generator makes
-/// no item for (`Unreadable`, `SelfWithoutMeaning`, `SelfInDefault`, `UnnameableSelf`) are none of
-/// them.
+/// (`MaybeConst`, `RelativePath`), and the message is not read. The reason that the generator makes
+/// no item for (`UnnameableSelf`: it needs an item nested in a scope that has a `Self` of its own
+/// under generics that bound the outer one, which no valid item is) is none of them.
 fn family(error: &Rejection) -> Option<Family> {
     match error.reason.as_str() {
+        // The header of the trait writes `Self` in a type of a bound or a where predicate.
         "SelfInTraitPredicate" => family_of(
             "a leaked type that names `Self` in a bound or where predicate of its trait",
-            &[gen::TAG_BOUND_CYCLE, gen::TAG_SELF_IN_BOUNDS],
+            &[gen::TAG_SELF_IN_TRAIT_PRED],
+        ),
+        // `enter_generics` gives `Self` no meaning, and the item names it.
+        "SelfWithoutMeaning" => family_of(
+            "`Self` in an item analyzed in enter_generics, which gives it no meaning",
+            &[gen::TAG_SELF_NO_MEANING],
+        ),
+        // The default of a parameter of a trait names `Self`.
+        "SelfInDefault" => family_of(
+            "`Self` in the default of a parameter of a trait",
+            &[gen::TAG_SELF_IN_DEFAULT],
+        ),
+        // A glob import or a `macro_rules!` in a value that the Leaker reads.
+        "Unreadable" => family_of(
+            "syntax in a value that the Leaker cannot read (a glob import, a macro_rules!)",
+            &[gen::TAG_UNREADABLE],
+        ),
+        // A bound that names its generic through a path that may be an alias of a projection, next
+        // to a bound that fixes an associated type of it: the generic and the bound are ones the
+        // item wrote (`gen::hidden_bounds_in()`). The Leaker cannot tell an alias from a struct.
+        "UnprovableBound" if error.note.contains(HIDDEN_NOTE) => family_agreeing(
+            "a bound of a generic that names it in the arguments of a path that may be an alias of a projection that another bound of the generic fixes",
+            &[gen::TAG_HIDDEN_AT],
+            Agree::Hidden,
         ),
         // The bound of a generic that makes the cycle is one the item wrote: `Gen::note_bounds()`.
         "UnprovableBound" => family_agreeing(
@@ -1845,19 +2032,25 @@ fn family(error: &Rejection) -> Option<Family> {
             &[gen::TAG_BOUND_AT],
             Agree::Bound,
         ),
+        // The generics or the where clause of the impl write `Self` (`impl<T: AsRef<Self>> Rel<T>`).
         "SelfInImplSelfType" => family_of(
             "a type in the self type of an impl whose context depends on `Self` through a bound",
-            &[gen::TAG_SELF_IN_BOUNDS, gen::TAG_BOUND_CYCLE],
+            &[gen::TAG_IMPL_HEADER_SELF],
         ),
-        // `NestedSelfInBounds` is the same fault in a nested struct, enum or union, rejected
-        // without `nested_self_entries`.
-        "DeniedSelfInBounds" | "NestedSelfInBounds" => family_of(
+        "DeniedSelfInBounds" => family_of(
             "a type that uses a generic whose bound mentions a `Self` that cannot be leaked",
             &[
                 gen::TAG_BOUND_CYCLE,
                 gen::TAG_SELF_IN_BOUNDS,
                 gen::TAG_SELF_DENIED,
             ],
+        ),
+        // The same fault in a struct, an enum or a union nested in `enter_mod`, analyzed without
+        // `nested_self_entries`: the item wrote a type that names `Self` and a generic whose bound
+        // does (`gen::TAG_NESTED_SELF_BOUNDS`, put only where the option is off).
+        "NestedSelfInBounds" => family_of(
+            "a type that names the `Self` of a nested item and uses a generic whose bound names it, without nested_self_entries",
+            &[gen::TAG_NESTED_SELF_BOUNDS, gen::TAG_NESTED_SELF_TEXT],
         ),
         "SelfProjection" => family_of("`Self::A` where `Self` is a type", &[gen::TAG_SELF_ASSOC]),
         "UnconstrainedLifetime" => family_agreeing(
@@ -1871,17 +2064,30 @@ fn family(error: &Rejection) -> Option<Family> {
     }
 }
 
+/// Whether the note says that the type cannot be leaked whole because of a macro call
+/// (`because of `::tlp_l_000::two! ()``): an array length that a macro gives.
+fn because_of_macro(note: &str) -> bool {
+    let note: String = note.replace(char::is_whitespace, "");
+    note.starts_with("itcannotbeleakedasawholebecauseof`") && note.contains("two!(")
+}
+
 /// A bare name (`u32`, `T`, `R0`) as an argument of a type that cannot be leaked as a whole: it may
 /// be a const, so it is not leaked alone. The note says why the holder cannot be leaked, a reason
 /// that is an error of the item too.
 fn maybe_const_family(error: &Rejection) -> Option<Family> {
-    let tags: &[&str] = if error
+    let tags: &[&str] = if because_of_macro(&error.note) {
+        &[gen::TAG_MACRO_CALL]
+    } else if error
         .note
         .contains("which the module declares and the copy declares again")
     {
         &[gen::TAG_MODULE_SCOPE]
     } else if error.note.contains("because of `'") {
-        &[gen::TAG_METHOD_LIFETIME, gen::TAG_BINDER_NO_ANCHOR]
+        &[
+            gen::TAG_METHOD_LIFETIME,
+            gen::TAG_BINDER_NO_ANCHOR,
+            gen::TAG_ELIDED_ARG,
+        ]
     } else {
         &[
             gen::TAG_SELF_ASSOC,
@@ -1942,6 +2148,7 @@ fn relative_path_family(error: &Rejection) -> Option<Family> {
             vec![
                 gen::TAG_METHOD_LIFETIME.to_string(),
                 gen::TAG_BINDER_NO_ANCHOR.to_string(),
+                gen::TAG_ELIDED_ARG.to_string(),
             ],
         ));
     }
@@ -1964,6 +2171,22 @@ fn relative_path_family(error: &Rejection) -> Option<Family> {
                 gen::TAG_SELF_ASSOC.to_string(),
                 gen::TAG_SELF_DENIED.to_string(),
             ],
+        ));
+    }
+    // A type that holds an array whose length is a macro call (`[u8; ::k::two!()]`) cannot be leaked
+    // whole, so the relative path that holds it is an error.
+    if because_of_macro(&error.note) {
+        reasons.push((
+            "a type that holds a macro call in an array length, which cannot be leaked whole",
+            vec![gen::TAG_MACRO_CALL.to_string()],
+        ));
+    }
+    // The bare name of a macro (`two!()`), which the Referrer's crate cannot resolve: the cause is
+    // the macro's path.
+    if error.kind == "Macro" {
+        reasons.push((
+            "a macro called by its bare name, which the copy cannot resolve",
+            vec![gen::TAG_MACRO_PATH.to_string()],
         ));
     }
     // A relative path in a value (`crate::base::bf`, `RLEN`), which the Leaker reads with
@@ -2006,8 +2229,27 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
     }
     let mut problems = Vec::new();
     // The shapes of `self_bound_adts` (F41, F42) are accepted: no reason explains a rejection but a
-    // bare trait of the prelude, where the Leaker does not allow the prelude.
-    let must_accept = tags.contains(gen::TAG_SELF_BOUND_ADT);
+    // bare trait of the prelude, where the Leaker does not allow the prelude. With a type that names
+    // `Self` and the option off (`nested_self_in_bounds`) it must be rejected, by the reason of the
+    // shape: `NestedSelfInBounds`.
+    let nested_bounds = tags.contains(gen::TAG_NESTED_SELF_BOUNDS);
+    let must_accept = tags.contains(gen::TAG_SELF_BOUND_ADT) && !nested_bounds;
+    if nested_bounds
+        && !report
+            .rejections
+            .iter()
+            .any(|error| error.reason == "NestedSelfInBounds")
+        && !report
+            .rejections
+            .iter()
+            .any(|error| family(error).map_or(false, |f| f.name.starts_with("a bare trait")))
+    {
+        problems.push(
+            "SHOULD BE REJECTED WITH NestedSelfInBounds: a struct, enum or union nested in enter_mod \
+             without nested_self_entries, with a type that names `Self` and a generic whose bound does"
+                .to_string(),
+        );
+    }
     for error in &report.rejections {
         let family = family(error);
         if must_accept
@@ -2039,6 +2281,9 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
                         match family.agree {
                             Some(Agree::Bound) => " that agrees with the bound of the note",
                             Some(Agree::Type) => " that agrees with the cause",
+                            Some(Agree::Hidden) => {
+                                " that agrees with the generic and the bound of the note"
+                            }
                             None => "",
                         },
                         tags
@@ -2485,7 +2730,12 @@ fn case_packages(cases: &[Case]) -> HashSet<String> {
         .iter()
         .enumerate()
         .flat_map(|(i, case)| {
-            let mut names = vec![leaker_name(i), referrer_name(i), accept_name(i)];
+            let mut names = vec![
+                leaker_name(i),
+                referrer_name(i),
+                accept_name(i),
+                errors_name(i),
+            ];
             names.extend(case.stages.iter().map(|stage| stage_name(i, stage)));
             if case.decoy.is_some() {
                 names.extend([decoy_name(i), decoy_referrer_name(i)]);
@@ -2618,6 +2868,348 @@ struct Stats {
     documented: BTreeMap<&'static str, usize>,
     /// The errors that were allowed, by `Reason` and the kind of the cause.
     allowed_errors: BTreeMap<(String, String), usize>,
+    /// Every error of every rejection, by `Reason` and the kind of the cause: which of them the
+    /// generator reaches.
+    error_kinds: BTreeMap<(String, String), usize>,
+    /// The items that have a shape of `SHAPE_TAGS`: how many the Leaker accepted and rejected.
+    shapes: BTreeMap<&'static str, (usize, usize)>,
+    /// The items rejected that have a shape of `SHAPE_TAGS`, by the kind, the scope (the name of its
+    /// API) and the construct they have: what the shape costs the acceptance floors of each.
+    shape_rejected: BTreeMap<(&'static str, &'static str), usize>,
+    /// The items with a forced shape (`FORCED`), left out of the floors, and what the Leaker did
+    /// with each shape (by its tag).
+    left_out: usize,
+    forced: BTreeMap<&'static str, ForcedCount>,
+    /// Accepted and rejected over all the items, the forced ones too, by kind, scope and construct,
+    /// for the column `all%` of the tables.
+    all: BTreeMap<&'static str, (usize, usize)>,
+}
+
+/// What the Leaker did with the items of one forced shape: accepted (a failure), rejected with no
+/// error of the shape's reason (a failure), rejected with it.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct ForcedCount {
+    accepted: usize,
+    other: usize,
+    rejected: usize,
+}
+
+/// The shapes that the generator makes to reach a reason or a construct that the random types rarely
+/// do, each with the tag that the item has when it writes it (`gen::TAG_*`), and what it is. The
+/// summary counts the items with each, accepted and rejected.
+const SHAPE_TAGS: &[(&str, &str)] = &[
+    (
+        gen::TAG_NESTED_SELF_BOUNDS,
+        "nested Self in a bound, option off",
+    ),
+    (
+        gen::TAG_NESTED_SELF_OPTION,
+        "nested Self in a bound, option on",
+    ),
+    (gen::TAG_SELF_NO_MEANING, "Self in enter_generics"),
+    (gen::TAG_SELF_IN_DEFAULT, "Self in a trait default"),
+    (gen::TAG_SELF_IN_TRAIT_PRED, "Self in a trait predicate"),
+    (gen::TAG_IMPL_HEADER_SELF, "Self in an impl header"),
+    (gen::TAG_UNREADABLE, "unreadable value"),
+    (gen::TAG_MACRO_PATH, "relative macro path"),
+    (gen::TAG_ELIDED_ARG, "'_ in a path"),
+    (gen::TAG_DISCRIMINANT, "enum discriminant"),
+    (gen::TAG_QUALIFIED_PATH, "<T>::X path"),
+    (gen::TAG_MACRO_CALL, "macro call"),
+    (gen::TAG_WIDE_CONST, "wide const type"),
+];
+
+/// A shape that the generator writes so that the Leaker must reject the item, under the settings
+/// of every item (no rule of the analysis allows what the shape writes): the item is left out of the
+/// acceptance floors, and must be rejected with an error that says why (`Expect`).
+struct Forced {
+    /// The tag of the item that writes it: one of `SHAPE_TAGS`, or a tag `gen::FORCED_*` that the
+    /// text of the item gives where the tag of the shape is also on items that the Leaker accepts.
+    tag: &'static str,
+    /// The tag of `SHAPE_TAGS` that counts the shape.
+    shape: &'static str,
+    /// The errors of which the rejection must have one.
+    expect: &'static [Expect],
+    /// Only read when the Leaker reads the bodies of what it analyzes: not through `enter_trait`,
+    /// nor in a module.
+    in_body: bool,
+}
+
+/// An error that a rejection must have: its `Reason`, and, where they tell the shape from the item's
+/// other errors, the kind of its cause, a text that its tokens hold (without whitespace), whether the
+/// item is analyzed with `allow_self`, and a tag of the item. Where the Leaker has another reason
+/// that takes the place of the shape's own, it is another `Expect` with its condition.
+#[derive(Clone, Copy)]
+struct Expect {
+    reason: &'static str,
+    cause: Option<&'static str>,
+    tokens: Option<&'static str>,
+    allow_self: Option<bool>,
+    tag: Option<&'static str>,
+}
+
+impl Expect {
+    const fn reason(reason: &'static str) -> Expect {
+        Expect {
+            reason,
+            cause: None,
+            tokens: None,
+            allow_self: None,
+            tag: None,
+        }
+    }
+
+    const fn cause(self, cause: &'static str) -> Expect {
+        Expect {
+            cause: Some(cause),
+            ..self
+        }
+    }
+
+    const fn tokens(self, tokens: &'static str) -> Expect {
+        Expect {
+            tokens: Some(tokens),
+            ..self
+        }
+    }
+
+    const fn allow_self(self, allow_self: bool) -> Expect {
+        Expect {
+            allow_self: Some(allow_self),
+            ..self
+        }
+    }
+
+    const fn tag(self, tag: &'static str) -> Expect {
+        Expect {
+            tag: Some(tag),
+            ..self
+        }
+    }
+
+    /// Whether `error` of `item` is the one.
+    fn holds(&self, item: &gen::Item, error: &Rejection) -> bool {
+        error.reason == self.reason
+            && self.cause.map_or(true, |cause| error.kind == cause)
+            && self.tokens.map_or(true, |tokens| {
+                error
+                    .tokens
+                    .replace(char::is_whitespace, "")
+                    .contains(tokens)
+            })
+            && self.allow_self.map_or(true, |a| a == item.allow_self)
+            && self.tag.map_or(true, |tag| item.tags.contains(tag))
+    }
+
+    fn describe(&self) -> String {
+        let mut text = format!("the reason {}", self.reason);
+        if let Some(cause) = self.cause {
+            write!(text, " with a cause of the kind {}", cause).unwrap();
+        }
+        if let Some(tokens) = self.tokens {
+            write!(text, " whose tokens hold `{}`", tokens).unwrap();
+        }
+        if let Some(allow_self) = self.allow_self {
+            write!(text, " (item with allow_self {})", allow_self).unwrap();
+        }
+        if let Some(tag) = self.tag {
+            write!(text, " (item with the tag {})", tag).unwrap();
+        }
+        text
+    }
+}
+
+/// The forced shapes. The classification of `SHAPE_TAGS` (measured over the seeds 1 to 16, 60 cases;
+/// accepted/rejected of the items with the tag): forced, with no accepted item of the tag,
+/// `nested_self_in_bounds` (0/319), `self_without_meaning` (0/211), `self_in_default` (0/56) and
+/// `unreadable_value` (with `values`); forced in part, where the tag of the shape is also on items
+/// that are accepted and the shape is the tag `gen::FORCED_*` that the text gives:
+/// `self_in_trait_predicate` (741/565: a bound `T: AsRef<Self>` has it too), `impl_header_self`
+/// (71/177: a self type that no leaked type of names the generic), `macro_path` (22/207: an impl
+/// takes the tag of its type, `enter_impl` does not read signatures), `elided_arg` (44/314: a type of
+/// another crate is written as it is) and `discriminant` (189/85: the constants of the Leaker's crate
+/// by an absolute path are written as they are); not forced, `nested_self_in_bounds_option` (315/11:
+/// the Leaker must accept it), `macro_call` (429/312: the Leaker's own macro by an absolute path is
+/// written as it is), `qualified_path` (509/174: `<T>::Item` is a generic's) and `wide_const`
+/// (6600/1947, no shape of its own that rejects).
+const FORCED: &[Forced] = &[
+    Forced {
+        tag: gen::TAG_NESTED_SELF_BOUNDS,
+        shape: gen::TAG_NESTED_SELF_BOUNDS,
+        expect: &[Expect::reason("NestedSelfInBounds")],
+        in_body: false,
+    },
+    Forced {
+        tag: gen::TAG_SELF_NO_MEANING,
+        shape: gen::TAG_SELF_NO_MEANING,
+        expect: &[Expect::reason("SelfWithoutMeaning")],
+        in_body: false,
+    },
+    Forced {
+        tag: gen::TAG_SELF_IN_DEFAULT,
+        shape: gen::TAG_SELF_IN_DEFAULT,
+        expect: &[Expect::reason("SelfInDefault")],
+        in_body: false,
+    },
+    // With a bound of the generics that names a leaked type, the predicate is a cycle first.
+    Forced {
+        tag: gen::FORCED_SELF_IN_TRAIT_PRED,
+        shape: gen::TAG_SELF_IN_TRAIT_PRED,
+        expect: &[
+            Expect::reason("SelfInTraitPredicate"),
+            Expect::reason("UnprovableBound")
+                .tokens("<Self>")
+                .tag(gen::TAG_BOUND_CYCLE),
+        ],
+        in_body: false,
+    },
+    // Without `allow_self` the `Self` of the bound cannot be leaked at all.
+    Forced {
+        tag: gen::FORCED_IMPL_HEADER_SELF,
+        shape: gen::TAG_IMPL_HEADER_SELF,
+        expect: &[
+            Expect::reason("SelfInImplSelfType").allow_self(true),
+            Expect::reason("DeniedSelfInBounds").allow_self(false),
+        ],
+        in_body: false,
+    },
+    Forced {
+        tag: gen::TAG_UNREADABLE,
+        shape: gen::TAG_UNREADABLE,
+        expect: &[Expect::reason("Unreadable")],
+        in_body: true,
+    },
+    Forced {
+        tag: gen::FORCED_MACRO_PATH,
+        shape: gen::TAG_MACRO_PATH,
+        expect: &[Expect::reason("RelativePath").cause("Macro")],
+        in_body: false,
+    },
+    Forced {
+        tag: gen::FORCED_ELIDED_ARG,
+        shape: gen::TAG_ELIDED_ARG,
+        expect: &[Expect::reason("RelativePath").cause("Type").tokens("<'_>")],
+        in_body: false,
+    },
+    Forced {
+        tag: gen::FORCED_RELATIVE_DISCRIMINANT,
+        shape: gen::TAG_DISCRIMINANT,
+        expect: &[Expect::reason("RelativePath").cause("Expr")],
+        in_body: false,
+    },
+];
+
+/// Whether the items with a shape of `SHAPE_TAGS` are forced: all of them, those that the tag
+/// `gen::FORCED_*` of the shape marks, or none.
+fn forced_class(shape: &str) -> String {
+    let marks: Vec<&str> = FORCED
+        .iter()
+        .filter(|forced| forced.shape == shape)
+        .map(|forced| forced.tag)
+        .collect();
+    match marks.first() {
+        None => "not forced".to_string(),
+        Some(tag) if *tag == shape => "forced".to_string(),
+        Some(tag) => format!("forced in part ({})", tag),
+    }
+}
+
+/// What a report says of an item with a forced shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Verdict {
+    /// The Leaker accepted it.
+    Accepted,
+    /// It was rejected, but no error is one that the shape needs.
+    OtherReason,
+    /// It was rejected with one of the errors that the shape needs.
+    Rejected,
+}
+
+impl Forced {
+    fn verdict(&self, item: &gen::Item, report: &Report) -> Verdict {
+        if report.accepted {
+            Verdict::Accepted
+        } else if report
+            .rejections
+            .iter()
+            .any(|error| self.expect.iter().any(|expect| expect.holds(item, error)))
+        {
+            Verdict::Rejected
+        } else {
+            Verdict::OtherReason
+        }
+    }
+
+    /// What the shape is, as `SHAPE_TAGS` says.
+    fn what(&self) -> &'static str {
+        SHAPE_TAGS
+            .iter()
+            .find(|(tag, _)| *tag == self.shape)
+            .map_or(self.shape, |(_, what)| what)
+    }
+
+    /// The errors that the rejection must have one of, for `item`, as a sentence.
+    fn wanted(&self, item: &gen::Item) -> String {
+        let wanted: Vec<String> = self
+            .expect
+            .iter()
+            .filter(|expect| {
+                expect.allow_self.map_or(true, |a| a == item.allow_self)
+                    && expect.tag.map_or(true, |tag| item.tags.contains(tag))
+            })
+            .map(Expect::describe)
+            .collect();
+        format!("an error with {}", wanted.join(", or with "))
+    }
+}
+
+/// The forced shapes that an item has, under its own settings. Through `enter_impl` only the self
+/// type and the arguments of the trait are analyzed, so nothing of an item of that scope is forced.
+fn forced_of(item: &gen::Item) -> Vec<&'static Forced> {
+    if item.scope == "impl" {
+        return Vec::new();
+    }
+    FORCED
+        .iter()
+        .filter(|forced| item.tags.contains(forced.tag))
+        .filter(|forced| !(forced.in_body && (item.scope == "trait" || item.kind == "mod")))
+        .collect()
+}
+
+/// The generator must make a forced shape in at least one item in `FORCED_SHARE` of the analyzed
+/// ones, if the run has `FORCED_MIN_ANALYZED` of them or more (measured: about one in seven).
+const FORCED_SHARE: usize = 25;
+const FORCED_MIN_ANALYZED: usize = 100;
+
+const FORCED_ACCEPTED: &str = "SHOULD BE REJECTED: type-leak accepts an item with a forced shape";
+const FORCED_OTHER: &str = "SHOULD BE REJECTED FOR ITS SHAPE: type-leak rejects an item with a forced shape, with no error that the shape needs";
+
+/// What is wrong with the way the Leaker treated the forced shapes of an item: it accepted the item,
+/// or rejected it with no error that a shape needs. One entry each, with the class of the failure.
+fn forced_problems(item: &gen::Item, report: &Report) -> Vec<(&'static str, String)> {
+    forced_of(item)
+        .into_iter()
+        .filter_map(|shape| {
+            let (class, what) = match shape.verdict(item, report) {
+                Verdict::Rejected => return None,
+                Verdict::Accepted => (FORCED_ACCEPTED, "accepted the item".to_string()),
+                Verdict::OtherReason => (
+                    FORCED_OTHER,
+                    format!("rejected the item with:\n{}", describe(&report.rejections)),
+                ),
+            };
+            Some((
+                class,
+                format!(
+                    "the forced shape `{}` ({}) is in the item, and the Leaker must reject it with {}; it {}",
+                    shape.tag,
+                    shape.what(),
+                    shape.wanted(item),
+                    what
+                ),
+            ))
+        })
+        .collect()
 }
 
 /// The shapes of `trait_self_defaults` that the statistics count, with what each is: a trait
@@ -2677,7 +3269,40 @@ impl Stats {
                             count.nested_accepted += usize::from(nested && report.accepted);
                         }
                     }
+                    for (tag, _) in SHAPE_TAGS {
+                        if item.tags.contains(*tag) {
+                            let count = stats.shapes.entry(tag).or_default();
+                            if report.accepted {
+                                count.0 += 1;
+                            } else {
+                                count.1 += 1;
+                                let mut names: Vec<&'static str> = vec![kind_of(&report.kind)];
+                                names.extend(
+                                    SCOPES
+                                        .iter()
+                                        .filter(|(scope, _)| *scope == item.scope)
+                                        .map(|(_, api)| *api),
+                                );
+                                if item.kind != "mod" {
+                                    names.extend(CONSTRUCTS.iter().filter(|name| {
+                                        item.tags.contains(&format!(
+                                            "{}{}",
+                                            gen::TAG_CONSTRUCT,
+                                            name
+                                        ))
+                                    }));
+                                }
+                                for name in names {
+                                    *stats.shape_rejected.entry((tag, name)).or_default() += 1;
+                                }
+                            }
+                        }
+                    }
                     for error in &report.rejections {
+                        *stats
+                            .error_kinds
+                            .entry((error.reason.clone(), error.kind.clone()))
+                            .or_default() += 1;
                         if let Some(family) = family(error) {
                             *stats.families.entry(family.name).or_default() += 1;
                             if family.name.starts_with("a bare trait") {
@@ -2686,7 +3311,41 @@ impl Stats {
                         }
                     }
                     let kind = kind_of(&report.kind);
+                    // The items with a forced shape are rejected by construction: the floors do not
+                    // count them, and each is checked for its shape (`forced_checks()`).
+                    let forced = forced_of(item);
+                    let counted = forced.is_empty();
+                    stats.left_out += usize::from(!counted);
+                    for shape in &forced {
+                        let count = stats.forced.entry(shape.tag).or_default();
+                        match shape.verdict(item, report) {
+                            Verdict::Accepted => count.accepted += 1,
+                            Verdict::OtherReason => count.other += 1,
+                            Verdict::Rejected => count.rejected += 1,
+                        }
+                    }
+                    let mut names: Vec<&'static str> = vec![kind];
+                    names.extend(
+                        SCOPES
+                            .iter()
+                            .filter(|(scope, _)| *scope == item.scope)
+                            .map(|(_, api)| *api),
+                    );
                     if item.kind != "mod" {
+                        names.extend(CONSTRUCTS.iter().filter(|name| {
+                            item.tags
+                                .contains(&format!("{}{}", gen::TAG_CONSTRUCT, name))
+                        }));
+                    }
+                    for name in names {
+                        let all = stats.all.entry(name).or_default();
+                        if report.accepted {
+                            all.0 += 1;
+                        } else {
+                            all.1 += 1;
+                        }
+                    }
+                    if counted && item.kind != "mod" {
                         for name in CONSTRUCTS {
                             if item
                                 .tags
@@ -2701,7 +3360,11 @@ impl Stats {
                             }
                         }
                     }
-                    if let Some((_, api)) = SCOPES.iter().find(|(scope, _)| *scope == item.scope) {
+                    if let Some((_, api)) = SCOPES
+                        .iter()
+                        .find(|(scope, _)| *scope == item.scope)
+                        .filter(|_| counted)
+                    {
                         let counts = if report.accepted {
                             &mut stats.scope_accepted
                         } else {
@@ -2711,11 +3374,13 @@ impl Stats {
                         *counts.entry(api).or_default() += 1;
                     }
                     if report.accepted {
-                        *stats.accepted.entry(kind).or_default() += 1;
+                        if counted {
+                            *stats.accepted.entry(kind).or_default() += 1;
+                        }
                         stats.positions += report.positions;
                         stats.checked += report.checked;
                         stats.entries += report.entries;
-                    } else {
+                    } else if counted {
                         *stats.rejected.entry(kind).or_default() += 1;
                         *stats
                             .reasons
@@ -2759,6 +3424,39 @@ impl Stats {
         self.accepted.values().sum()
     }
 
+    /// The share accepted of all the items of a kind, scope or construct, the forced ones too.
+    fn all_rate(&self, name: &str) -> String {
+        match self.all.get(name) {
+            Some((a, r)) if a + r > 0 => format!("{:.0}%", 100.0 * *a as f64 / (a + r) as f64),
+            _ => "-".into(),
+        }
+    }
+
+    /// The shapes counted (the items that have a forced shape, with each of its shapes: an item can
+    /// have several).
+    fn forced_seen(&self) -> usize {
+        self.forced
+            .values()
+            .map(|c| c.accepted + c.other + c.rejected)
+            .sum()
+    }
+
+    /// Why the check of the forced shapes may have checked (almost) nothing, one line each: the
+    /// generator must make them in a share of the items (`FORCED_SHARE`), and a run that has too few
+    /// items for a share is not asked. The items that the Leaker accepted, or rejected for another
+    /// reason, are failures of their own (`forced_problems()`).
+    fn forced_check_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.analyzed >= FORCED_MIN_ANALYZED && self.left_out * FORCED_SHARE < self.analyzed {
+            problems.push(format!(
+                "only {} of {} analyzed items have a forced shape, fewer than one in {}: the check that \
+                 the Leaker rejects them for their reason tests (almost) nothing",
+                self.left_out, self.analyzed, FORCED_SHARE
+            ));
+        }
+        problems
+    }
+
     /// The reasons of the rejections of a kind, most frequent first.
     fn reasons_of(&self, kind: &str) -> Vec<(&str, usize)> {
         let mut reasons: Vec<(&str, usize)> = self
@@ -2773,58 +3471,108 @@ impl Stats {
 }
 
 /// The least share of the analyzed items of each kind, scope and construct that the Leaker must
-/// accept, in percent.
+/// accept, in percent. The items that have a forced shape (`FORCED`, which the run checks apart) are
+/// left out: 7.2% of the items analyzed (5.5% to 8.7% in a seed). The table of the summary has the
+/// share over all the items too (`all%`).
 ///
 /// A test that counts a rejection as a success passes when the Leaker rejects everything, or when
 /// the generator makes shapes that cannot be leaked (before the floors, 93% of the modules and
 /// 60% of the traits were rejected, and a macro that failed every `intern_*` still printed `ok`).
 /// These floors fail the run then.
 ///
-/// Measured over the seeds 1 to 16 at 60 cases, the accepted
-/// share was, lowest over the seeds / pooled (and the fewest items of a seed):
+/// Measured over the seeds 1 to 16 at 60 cases (2026-11-02, with the fixes of F65 to F67), the share
+/// accepted of the items without a forced shape was, lowest over the seeds / pooled (and the fewest
+/// items of a seed); in brackets the lowest before wave 3A, and the lowest over all the items:
 ///
-/// - kinds: struct 94.1/96.0 (296), enum 93.5/95.5 (152), union 90.4/95.5 (75), trait 72.7/77.1
-///   (351), inherent impl 81.4/86.5 (135), trait impl 63.0/71.2 (63), module 68.9/76.8 (84);
-/// - scopes: `enter_mod` 89.9/93.4 (160), `enter_generics` 90.5/95.2 (47), `enter_trait` 67.9/80.3
-///   (28), `enter_impl` 100/100 (31);
-/// - constructs (`gen::CONSTRUCTS`, the items that have it, not the modules): gat 50.8/57.8 (52),
-///   const_param 76.5/79.7 (463), impl_trait_arg 58.9/66.0 (165), param_default 82.2/85.7 (170),
-///   binder 73.4/78.7 (254), dyn_object 78.7/82.4 (468), fn_pointer 78.5/80.9 (375), assoc_const
-///   69.6/73.5 (225), lifetime_param 80.7/84.4 (619), unsized_param 76.7/80.7 (316), where_clause
-///   78.1/80.9 (694).
+/// - kinds: struct 94.8/96.1 (293) [94.1; 85.9], enum 90.3/95.7 (145) [93.5; 80.9], union 90.8/96.3
+///   (69) [90.4; 84.4], trait 73.4/77.9 (312) [72.7; 66.3], inherent impl 80.1/87.3 (115) [81.4;
+///   72.7], trait impl 58.6/69.1 (54) [63.0; 55.4], module 71.6/79.8 (81) [68.9; 71.6];
+/// - scopes: `enter_mod` 89.4/93.8 (124) [89.9; 75.0], `enter_generics` 87.8/93.8 (33) [90.5; 61.0],
+///   `enter_trait` 70.7/81.6 (27) [67.9; 64.4], `enter_impl` 100/100 (34) [100; 100];
+/// - constructs (`gen::CONSTRUCTS`, the items that have it, not the modules): gat 47.5/58.0 (46)
+///   [50.8; 43.3], const_param 77.5/80.6 (442) [76.5; 72.0], impl_trait_arg 61.3/67.4 (160) [58.9;
+///   54.3], param_default 85.6/88.0 (165) [82.2; 79.8], binder 75.3/79.0 (222) [73.4; 67.0],
+///   dyn_object 79.3/83.0 (394) [78.7; 73.3], fn_pointer 77.0/81.6 (327) [78.5; 70.9], assoc_const
+///   63.6/72.4 (183) [69.6; 57.4], lifetime_param 81.1/85.0 (597) [80.7; 75.9], unsized_param
+///   77.6/81.3 (275) [76.7; 71.6], where_clause 77.6/81.4 (651) [78.1; 70.7].
 ///
-/// A floor is about 10 points below the lowest (more for the kinds with the fewest items, whose rate
-/// varies most: the trait impl, the module, `enter_trait`), so that another seed or a short run does
-/// not trip it, but a regression of a kind or of a construct does: a Leaker that rejects every
-/// trait with a generic associated type, every const parameter, every `impl Trait` argument or every
-/// default is at 0% for it, and the old generator (module 10%, trait 39%, inherent and trait impl
-/// 41%) was far below. A construct is checked when a run has three times the `MIN_SAMPLES` of it.
+/// A floor is 10 points below the lowest, rounded down (`enter_trait` would be 60 and the module 61,
+/// and they stay at 50 and 58: they have the fewest items, whose rate varies most). They are within
+/// 3 points of the floors before the shapes, but `assoc_const` (59 -> 53). What the Leaker still
+/// rejects there is not forced: bounds that name a leaked type, `Self::A`, the bare traits of the
+/// prelude. The lowest of 16 seeds is a noisy number at 50 items a seed (a spread of 6 points):
+/// with `strict_anchors` off, the shape of wave 3A that the Leaker rejects in some settings, the
+/// pooled rates are the same (trait impl 69.3, assoc_const 73.5) and the lowest are 63.0 and 67.6.
+///
+/// A floor of this table would fail the opt-in run of `values` (its bodies have relative paths that
+/// the Leaker rejects: the trait is accepted 64.3% at the lowest, 67.7% pooled), so that run has
+/// `VALUES_FLOORS`, which are the lower of the two, measured the same way.
+/// A construct is checked when a run has three times the `MIN_SAMPLES` of it.
 /// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them.
 const FLOORS: &[(&str, f64)] = &[
     ("struct", 84.0),
-    ("enum", 83.0),
+    ("enum", 80.0),
     ("union", 80.0),
-    ("trait", 62.0),
-    ("impl-inherent", 71.0),
-    ("impl-trait", 50.0),
+    ("trait", 63.0),
+    ("impl-inherent", 70.0),
+    ("impl-trait", 48.0),
     ("mod", 58.0),
     // The items analyzed through a scope (`gen::SCOPES`), by the name of its API.
-    ("enter_mod", 80.0),
-    ("enter_generics", 80.0),
+    ("enter_mod", 79.0),
+    ("enter_generics", 77.0),
     ("enter_trait", 50.0),
     ("enter_impl", 90.0),
     // The items that have a construct (`gen::CONSTRUCTS`).
-    ("gat", 40.0),
-    ("const_param", 66.0),
-    ("impl_trait_arg", 48.0),
-    ("param_default", 72.0),
-    ("binder", 63.0),
-    ("dyn_object", 68.0),
-    ("fn_pointer", 68.0),
-    ("assoc_const", 59.0),
-    ("lifetime_param", 70.0),
-    ("unsized_param", 66.0),
-    ("where_clause", 68.0),
+    ("gat", 37.0),
+    ("const_param", 67.0),
+    ("impl_trait_arg", 51.0),
+    ("param_default", 75.0),
+    ("binder", 65.0),
+    ("dyn_object", 69.0),
+    ("fn_pointer", 67.0),
+    ("assoc_const", 53.0),
+    ("lifetime_param", 71.0),
+    ("unsized_param", 67.0),
+    ("where_clause", 67.0),
+];
+
+/// The floors of the run with `values` (`TYPE_LEAK_PROP_FEATURES=values`), 10 points below the lowest
+/// over the seeds 1 to 16 at 60 cases, rounded down, where that is lower than `FLOORS`; the items
+/// that have a forced shape are left out as in `FLOORS` (8.0% of the items analyzed, with the
+/// glob imports and the `macro_rules!` of `unreadable_value`). The bodies, constants and defaults
+/// have relative paths that the Leaker rejects (`value_path`) and a relative `use`, which are no
+/// forced shape. The lowest accepted share / pooled: struct 90.4/92.5, enum 88.2/92.8, union
+/// 86.1/93.4, trait 64.3/67.7, inherent impl 75.5/80.8, trait impl 59.0/65.3, module 53.3/67.2,
+/// `enter_mod` 87.2/90.7, `enter_generics` 83.7/91.1, `enter_trait` 62.1/72.5, gat 40.9/49.3,
+/// const_param 66.4/69.2, impl_trait_arg 52.5/58.0, param_default 73.7/76.8, binder 64.2/70.6,
+/// dyn_object 72.7/74.7, fn_pointer 72.2/73.4, assoc_const 56.6/61.4, lifetime_param 75.4/77.9,
+/// unsized_param 68.7/73.1, where_clause 72.2/74.6. The module stays at 49, the floor it had (59.3
+/// at the lowest then; modules have no forced shape, and the pooled rate is the same, 67.6 and
+/// 67.2: 85 items a seed). The run with `relative_std` is above `FLOORS` everywhere (the lowest:
+/// trait 73.7, gat 50.0, assoc_const 68.1, impl_trait_arg 58.4), and needs none of its own.
+const VALUES_FLOORS: &[(&str, f64)] = &[
+    ("struct", 80.0),
+    ("enum", 78.0),
+    ("union", 76.0),
+    ("trait", 54.0),
+    ("impl-inherent", 65.0),
+    ("impl-trait", 49.0),
+    ("mod", 49.0),
+    ("enter_mod", 77.0),
+    ("enter_generics", 73.0),
+    ("enter_trait", 52.0),
+    ("enter_impl", 90.0),
+    ("gat", 30.0),
+    ("const_param", 56.0),
+    ("impl_trait_arg", 42.0),
+    ("param_default", 63.0),
+    ("binder", 54.0),
+    ("dyn_object", 62.0),
+    ("fn_pointer", 62.0),
+    ("assoc_const", 46.0),
+    ("lifetime_param", 65.0),
+    ("unsized_param", 58.0),
+    ("where_clause", 62.0),
 ];
 
 /// The fewest analyzed items of a kind for its floor to count (a short run has too few of the
@@ -2837,8 +3585,20 @@ const CONSTRUCT_SAMPLES: usize = 3;
 /// The least share of the type positions of the accepted items whose rewritten type was compared
 /// with the original (the rest has an elided lifetime or `impl Trait`), in percent:
 /// `TYPE_LEAK_PROP_MIN_CHECKED`. Without it the oracle could silently check nothing. Measured:
-/// 93.5% to 93.8% over the seeds 1, 2, 3 and 7 at 60 cases.
+/// 90.6% to 91.1% over the seeds 1 to 16 at 60 cases (93.5% to 93.8% before the types with an
+/// elided lifetime and a macro in an array length, which have no witness).
 const MIN_CHECKED: f64 = 85.0;
+
+/// The least number of times, over a run with at least 100 items invoked with `inst`, that an
+/// instantiation passes an argument that holds a lifetime to a signature that relies on elision
+/// (`use_summary()`, `gen::ELIDED_PARAM_PERCENT`): the shape of F69. Without it a generator that
+/// stopped making the shape would leave the check vacuous. Measured at 60 cases: 23 to 49 over the
+/// seeds 1 to 16.
+const MIN_ELIDED_LIFETIME_ARGS: usize = 1;
+
+/// The same for the instantiations that pass the argument to a signature that has an entry in its
+/// inputs, which the copy replaced (F70). Measured at 60 cases: 2 to 19 over the seeds 1 to 16.
+const MIN_ELIDED_ENTRY_LIFETIME_ARGS: usize = 1;
 
 #[derive(Debug, PartialEq)]
 struct Floors {
@@ -2852,7 +3612,24 @@ impl Floors {
     /// `N` (every kind) and `kind=N`: `"0"` turns the floors off, `"30,mod=5"` is 30% but 5% for
     /// a module.
     fn parse(spec: &str, min_samples: usize, min_checked: f64) -> Result<Floors, String> {
+        Floors::parse_for(spec, min_samples, min_checked, false)
+    }
+
+    /// [`Floors::parse()`] for a run that has `values` or not: with it the floors are the lower of
+    /// `FLOORS` and `VALUES_FLOORS`.
+    fn parse_for(
+        spec: &str,
+        min_samples: usize,
+        min_checked: f64,
+        values: bool,
+    ) -> Result<Floors, String> {
         let mut by_kind: BTreeMap<&'static str, f64> = FLOORS.iter().copied().collect();
+        if values {
+            for (kind, floor) in VALUES_FLOORS {
+                let ours = by_kind.get_mut(kind).expect("a floor of FLOORS");
+                *ours = ours.min(*floor);
+            }
+        }
         for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             let (kind, value) = match token.split_once('=') {
                 Some((kind, value)) => (Some(kind.trim()), value.trim()),
@@ -2894,10 +3671,11 @@ impl Floors {
 
     fn from_env() -> Floors {
         let spec = std::env::var("TYPE_LEAK_PROP_MIN_ACCEPT").unwrap_or_default();
-        Floors::parse(
+        Floors::parse_for(
             &spec,
             env_or("TYPE_LEAK_PROP_MIN_SAMPLES", MIN_SAMPLES),
             env_or("TYPE_LEAK_PROP_MIN_CHECKED", MIN_CHECKED),
+            gen::Flags::from_env().values,
         )
         .unwrap_or_else(|e| panic!("TYPE_LEAK_PROP_MIN_ACCEPT: {}", e))
     }
@@ -2977,6 +3755,150 @@ impl Floors {
     }
 }
 
+/// The errors that the Leaker carries to the crate `tlp_e_NNN` (`gen::Case::errors_referrer`,
+/// `prop.rs: carry()`), where the macro reads them back from tokens, checks that they are the Leaker's,
+/// lets `LeakerResult::allow()` drop some by the number of its invocation, and reports the others with
+/// `ErrorItem::emit()`: the crate does not compile, and its diagnostics are what remains.
+///
+/// - each diagnostic is one of the Leaker's errors of the case (its first line is the message, or the
+///   start of it: the report writes a message on one line);
+/// - the macros read as many errors as the Leaker's reports have, and reported as many as the crate has
+///   diagnostics.
+///
+/// The macro fails by itself (`CARRY:`) if the errors differ after the round trip, if `allow()` does
+/// not drop what it should, or if `emit()` and `to_compile_error()` differ: it is then a diagnostic
+/// that is none of the Leaker's.
+fn carry_failures(
+    build: &Build,
+    cases: &[(usize, &Case)],
+    reports: &BTreeMap<(usize, usize), Report>,
+    skipped: &[usize],
+) -> Vec<Failure> {
+    let clean = |text: &str| text.replace(['\n', '|', '\u{1f}', '\u{1d}'], " ");
+    let mut failures = Vec::new();
+    let mut diagnostics = 0;
+    let mut leaker_errors = 0;
+    for &(i, _) in cases.iter().filter(|(i, _)| !skipped.contains(i)) {
+        let messages: Vec<String> = reports
+            .iter()
+            .filter(|((case, _), _)| *case == i)
+            .flat_map(|(_, report)| report.rejections.iter().map(|e| clean(&e.message)))
+            .collect();
+        leaker_errors += messages.len();
+        for diag in build.diags.iter().filter(|d| d.package == errors_name(i)) {
+            diagnostics += 1;
+            let first = diag.rendered.lines().next().unwrap_or("");
+            let first = clean(first.strip_prefix("error: ").unwrap_or(first));
+            if !messages.iter().any(|m| m.starts_with(&first)) {
+                failures.push(Failure {
+                    stage: None,
+                    code: diag.code.clone(),
+                    case: i,
+                    item: None,
+                    class: "CARRY: a diagnostic of the crate of the carried errors is none of the Leaker's errors",
+                    text: diag.rendered.clone(),
+                });
+            }
+        }
+    }
+    let sum = |what: &str| -> usize {
+        build
+            .counts
+            .iter()
+            .filter(|c| c.what == what)
+            .map(|c| c.n)
+            .sum()
+    };
+    let (read, reported) = (sum("carry_errors"), sum("carry_reported"));
+    let mismatch = if read != leaker_errors {
+        Some(format!(
+            "the macros read {} carried errors, the Leaker's reports have {}",
+            read, leaker_errors
+        ))
+    } else if reported != diagnostics {
+        Some(format!(
+            "the macros reported {} errors, the crates have {} diagnostics",
+            reported, diagnostics
+        ))
+    } else {
+        None
+    };
+    if let Some(text) = mismatch {
+        failures.push(Failure {
+            stage: None,
+            code: String::new(),
+            case: cases.first().map_or(0, |(i, _)| *i),
+            item: None,
+            class: "CARRY: the errors that the Leaker carried and the ones the crate reported are not those counted",
+            text,
+        });
+    }
+    failures
+}
+
+/// The copies that the Referrer's macros made at an instantiation of the generics of the item (`inst`)
+/// and inside a module and a block that declare names (`shadow`), as they counted them (`Count`): the
+/// items invoked with each, the items where the check ran, and what it compared (positions at the
+/// arguments, entries hidden by a declaration). The problems are the checks that ran nowhere although
+/// many items asked for them: a macro that does nothing would pass.
+fn use_summary(cases: &[(usize, &Case)], build: &Build) -> (String, Vec<String>) {
+    let mut text = String::new();
+    let mut problems = Vec::new();
+    for (what, flag, noun) in [
+        ("inst", ", inst(", "positions compared at the arguments"),
+        (
+            "inst_elided",
+            ", inst(",
+            "lifetime arguments passed to a signature that relies on elision",
+        ),
+        (
+            "inst_elided_entry",
+            ", inst(",
+            "of those, passed to one with an entry in its inputs that the copy replaced (F70)",
+        ),
+        ("shadow", ", shadow(", "entries hidden by a declaration"),
+    ] {
+        let asked: usize = cases
+            .iter()
+            .map(|(_, case)| case.referrer.matches(flag).count())
+            .sum();
+        let counts: Vec<&Count> = build.counts.iter().filter(|c| c.what == what).collect();
+        let ran = counts.len();
+        let total: usize = counts.iter().map(|c| c.n).sum();
+        let with: usize = counts.iter().filter(|c| c.n > 0).count();
+        writeln!(
+            text,
+            "  copies with `{}`: {} items invoked, the check ran for {}, with something to compare for {}; {}: {}",
+            what, asked, ran, with, noun, total
+        )
+        .unwrap();
+        // The shapes of F69 and F70 (below) depend on what the generator made: a run of one case may
+        // have none, and a run of many is held to a least number.
+        let made_on_purpose = matches!(what, "inst_elided" | "inst_elided_entry");
+        if asked >= 10 && with == 0 && !made_on_purpose {
+            problems.push(format!(
+                "`{}` was asked of {} items and compared nothing: the macro does not do it",
+                what, asked
+            ));
+        }
+        // The shapes of F69 and F70 are made on purpose (`gen::ELIDED_PARAM_PERCENT`,
+        // `ELIDED_ENTRY_PERCENT`): over many items, some instantiation must pass a lifetime into such
+        // a signature, or the run does not test it.
+        let least = match what {
+            "inst_elided" => MIN_ELIDED_LIFETIME_ARGS,
+            "inst_elided_entry" => MIN_ELIDED_ENTRY_LIFETIME_ARGS,
+            _ => 0,
+        };
+        if least > 0 && asked >= 100 && total < least {
+            problems.push(format!(
+                "{} items were invoked with `inst` and only {} {} (at least {}): the generator or the macro misses the shape",
+                asked, total, noun, least
+            ));
+        }
+    }
+    (text, problems)
+}
+
 /// The modes of the Referrers (`gen::Trust`) over the analyzed items: how many items have each, the
 /// optional entries they have by the crates they name, and how many the mode trusts (written as they
 /// are in the copy, with no Repeater impl) or replaces. `decoy`: the items copied in the Referrer's
@@ -3054,8 +3976,8 @@ fn summarize(
     .unwrap();
     writeln!(
         s,
-        "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6}",
-        "kind", "generated", "accepted", "rejected", "accepted%", "floor"
+        "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6}",
+        "kind", "generated", "accepted", "rejected", "accepted%", "all%", "floor"
     )
     .unwrap();
     for kind in KINDS
@@ -3086,15 +4008,21 @@ fn summarize(
         };
         writeln!(
             s,
-            "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6}",
-            kind, g, a, r, rate, floor
+            "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6}",
+            kind,
+            g,
+            a,
+            r,
+            rate,
+            stats.all_rate(kind),
+            floor
         )
         .unwrap();
     }
     writeln!(
         s,
-        "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6}",
-        "construct", "analyzed", "accepted", "rejected", "accepted%", "floor"
+        "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6}",
+        "construct", "analyzed", "accepted", "rejected", "accepted%", "all%", "floor"
     )
     .unwrap();
     for name in CONSTRUCTS {
@@ -3112,12 +4040,13 @@ fn summarize(
         };
         writeln!(
             s,
-            "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6}",
+            "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6}",
             name,
             a + r,
             a,
             r,
             rate,
+            stats.all_rate(name),
             floor
         )
         .unwrap();
@@ -3152,6 +4081,58 @@ fn summarize(
     }
     for (name, n) in &stats.families {
         writeln!(s, "  explained rejection errors: {:>4}x {}", n, name).unwrap();
+    }
+    for ((reason, kind), n) in &stats.error_kinds {
+        writeln!(
+            s,
+            "  rejection errors by Reason and kind of cause: {:>4}x {} ({})",
+            n, reason, kind
+        )
+        .unwrap();
+    }
+    for (tag, what) in SHAPE_TAGS {
+        if let Some((accepted, rejected)) = stats.shapes.get(tag) {
+            writeln!(
+                s,
+                "  shape {:<34} {:>4} analyzed, {:>4} accepted, {:>4} rejected; {}",
+                what,
+                accepted + rejected,
+                accepted,
+                rejected,
+                forced_class(tag)
+            )
+            .unwrap();
+            let by: Vec<String> = stats
+                .shape_rejected
+                .iter()
+                .filter(|((t, _), _)| t == tag)
+                .map(|((_, name), n)| format!("{} {}", name, n))
+                .collect();
+            if !by.is_empty() {
+                writeln!(s, "  shape rejections {:<26} {}", what, by.join(", ")).unwrap();
+            }
+        }
+    }
+    writeln!(
+        s,
+        "  items left out of the acceptance floors (they have a forced shape): {} of {} analyzed, with {} forced shapes",
+        stats.left_out,
+        stats.analyzed,
+        stats.forced_seen()
+    )
+    .unwrap();
+    for shape in FORCED {
+        let count = stats.forced.get(shape.tag).copied().unwrap_or_default();
+        writeln!(
+            s,
+            "  forced shape {:<34} {:>4} items, {:>4} rejected for its reason, {:>4} rejected for another, {:>4} accepted",
+            shape.what(),
+            count.accepted + count.other + count.rejected,
+            count.rejected,
+            count.other,
+            count.accepted
+        )
+        .unwrap();
     }
     let allowed: usize = stats.allowed.values().sum();
     if allowed + stats.accept_failed > 0 {
@@ -3767,8 +4748,11 @@ fn random_items_leak_across_crates() {
         }
     }
 
-    // The documented failures of the copies of accepted items make the build fail too.
+    // The documented failures of the copies of accepted items make the build fail too, and so do the
+    // errors that the crates of the carried errors report (`carry_failures()` checks them).
+    let carried_only = build.diags.iter().all(|d| d.package.starts_with("tlp_e_"));
     if !build.success
+        && !carried_only
         && failures.is_empty()
         && documented.is_empty()
         && results.values().all(RuleResult::is_empty)
@@ -3782,14 +4766,25 @@ fn random_items_leak_across_crates() {
 
     // Every rejection has a reason that is known, and an item that has its shape.
     for ((i, id), report) in &reports {
-        if report.accepted {
-            continue;
-        }
         let item = generated[*i]
             .items
             .iter()
             .find(|item| item.id == *id)
             .unwrap();
+        // A forced shape is rejected, for its reason.
+        for (class, text) in forced_problems(item, report) {
+            failures.push(Failure {
+                stage: None,
+                code: String::new(),
+                case: *i,
+                item: Some(*id),
+                class,
+                text,
+            });
+        }
+        if report.accepted {
+            continue;
+        }
         let mut tags = item.tags.clone();
         if item.kind == "mod" || item.scope == "mod" {
             tags.insert(gen::TAG_MODULE_SCOPE.to_string());
@@ -3839,6 +4834,9 @@ fn random_items_leak_across_crates() {
             }
         }
     }
+    let mut skipped: Vec<usize> = leaker_failed.clone();
+    skipped.extend(&unbuilt);
+    failures.extend(carry_failures(&build, &selected, &reports, &skipped));
     let mut stats = Stats::collect(&selected, &reports);
     stats.documented = documented;
     let mut summary = summarize(&stats, &floors, &run, features, flags);
@@ -3865,7 +4863,17 @@ fn random_items_leak_across_crates() {
         ));
     }
     eprintln!("{}", summary);
-    let floor_problems = floors.problems(&stats);
+    let mut floor_problems = floors.problems(&stats);
+    floor_problems.extend(stats.forced_check_problems());
+    let (use_text, use_problems) = use_summary(&selected, &build);
+    let use_text = format!(
+        "{}  errors carried to the crate that reports them: {} read, {} reported (the rest dropped by `allow()`)\n",
+        use_text,
+        build.counts.iter().filter(|c| c.what == "carry_errors").map(|c| c.n).sum::<usize>(),
+        build.counts.iter().filter(|c| c.what == "carry_reported").map(|c| c.n).sum::<usize>(),
+    );
+    eprintln!("{}", use_text);
+    floor_problems.extend(use_problems);
 
     if !failures.is_empty() || !floor_problems.is_empty() {
         let mut message = format!(
@@ -3977,6 +4985,7 @@ mod checks {
             executables: HashMap::new(),
             artifacts: HashSet::new(),
             stderr: "cargo said".into(),
+            counts: Vec::new(),
         }
     }
 
@@ -4116,6 +5125,23 @@ mod checks {
     }
 
     #[test]
+    fn the_run_with_values_has_floors_that_are_not_above_the_others() {
+        let plain = Floors::parse("", MIN_SAMPLES, MIN_CHECKED).unwrap();
+        let values = Floors::parse_for("", MIN_SAMPLES, MIN_CHECKED, true).unwrap();
+        for (kind, floor) in &plain.by_kind {
+            assert!(values.by_kind[kind] <= *floor, "{}", kind);
+        }
+        assert!(values.by_kind["trait"] < plain.by_kind["trait"]);
+        // The same names, and the command line still overrides them.
+        let names = |table: &'static [(&'static str, f64)]| {
+            table.iter().map(|(k, _)| *k).collect::<Vec<&'static str>>()
+        };
+        assert_eq!(names(FLOORS), names(VALUES_FLOORS));
+        let floors = Floors::parse_for("trait=70", MIN_SAMPLES, MIN_CHECKED, true).unwrap();
+        assert_eq!(floors.by_kind["trait"], 70.0);
+    }
+
+    #[test]
     fn a_leaker_that_rejects_every_trait_with_a_generic_associated_type_fails_the_run() {
         let mut stats = stats_of(&[("struct", 90, 10), ("trait", 90, 10)]);
         stats.construct_rejected.insert("gat", 60);
@@ -4128,10 +5154,11 @@ mod checks {
             .insert("gat", MIN_SAMPLES * CONSTRUCT_SAMPLES - 1);
         assert!(defaults().problems(&stats).is_empty());
         // The floor is a minimum: at it, it holds.
-        stats.construct_accepted.insert("gat", 40);
-        stats.construct_rejected.insert("gat", 60);
+        let floor = FLOORS.iter().find(|(k, _)| *k == "gat").unwrap().1 as usize;
+        stats.construct_accepted.insert("gat", floor);
+        stats.construct_rejected.insert("gat", 100 - floor);
         assert!(defaults().problems(&stats).is_empty());
-        stats.construct_rejected.insert("gat", 61);
+        stats.construct_rejected.insert("gat", 100 - floor + 1);
         assert_eq!(defaults().problems(&stats).len(), 1);
         // Every construct has a floor of its own.
         for name in CONSTRUCTS {
@@ -4174,6 +5201,8 @@ mod checks {
                 .iter()
                 .flat_map(|(_, case)| case.items.iter())
                 .filter(|item| item.kind != "mod" && item.tags.contains(&tag));
+            // The items with a forced shape are left out of the floors.
+            let items = items.filter(|item| forced_of(item).is_empty());
             let (accepted, rejected) = items.fold((0, 0), |(a, r), item| {
                 if item.id % 3 != 0 {
                     (a + 1, r)
@@ -4350,8 +5379,15 @@ mod checks {
             );
             a.is_some() && a == b
         };
-        // Both reasons of a generic whose bound names a `Self` that cannot be leaked.
-        assert!(same("DeniedSelfInBounds", "NestedSelfInBounds"));
+        // `NestedSelfInBounds` is explained by its own shape, `DeniedSelfInBounds` is not.
+        assert!(!same("DeniedSelfInBounds", "NestedSelfInBounds"));
+        assert_eq!(
+            family(&rejection_of("NestedSelfInBounds", "", "Wrap<Self, T>")).map(|f| f.tags),
+            Some(vec![
+                gen::TAG_NESTED_SELF_BOUNDS.to_string(),
+                gen::TAG_NESTED_SELF_TEXT.to_string()
+            ])
+        );
         for reason in [
             "SelfInTraitPredicate",
             "SelfInImplSelfType",
@@ -4365,24 +5401,20 @@ mod checks {
                 reason
             );
         }
-        // A message that looks like a known reason does not make another reason one.
+        // A message that looks like a known reason does not make another reason one: the `Reason`
+        // decides.
         assert_eq!(
             by_reason(
                 "SelfWithoutMeaning",
                 "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked type",
                 "Wrap < T >"
             ),
-            None
+            Some(vec![gen::TAG_SELF_NO_MEANING.to_string()])
         );
-        // The reasons that nothing is generated for, and a reason nobody listed.
-        for reason in [
-            "SelfWithoutMeaning",
-            "Unreadable",
-            "SelfInDefault",
-            "UnnameableSelf",
-            "",
-            "Strange",
-        ] {
+        // The reasons that nothing is generated for (`UnnameableSelf` needs an item nested in a scope
+        // that has a `Self` of its own and generics that bound it: no valid item is that, only a
+        // macro that nests scopes), and a reason nobody listed.
+        for reason in ["UnnameableSelf", "", "Strange"] {
             assert_eq!(by_reason(reason, "any words", "Self"), None, "{}", reason);
         }
         assert_eq!(tags_of("use absolute path: 'Strange'", "Strange"), None);
@@ -4450,8 +5482,8 @@ mod checks {
         assert!(unexplained(&tags(&["bare:?Sized"]), &sized).is_empty());
         // A reason that is not in the list.
         let unknown = report(vec![rejection_of(
-            "SelfWithoutMeaning",
-            "`Self` has no meaning here",
+            "UnnameableSelf",
+            "`Self` has no name here",
             "Self",
         )]);
         let problems = unexplained(&tags(&["bound_cycle"]), &unknown);
@@ -4463,7 +5495,7 @@ mod checks {
         // Every error counts: one that is explained does not explain the other.
         let two = report(vec![
             rejection("use absolute path: 'Default'", "Default"),
-            rejection_of("SelfWithoutMeaning", "`Self` has no meaning here", "Self"),
+            rejection_of("UnnameableSelf", "`Self` has no name here", "Self"),
         ]);
         assert_eq!(unexplained(&tags(&["bare:Default"]), &two).len(), 1);
         // A rejection with no error (the report was not read) is not explained either.
@@ -4567,6 +5599,189 @@ mod checks {
         );
         error.note = "no bound named".to_string();
         assert_eq!(unexplained(&item_tags, &rejected(vec![error])).len(), 1);
+    }
+
+    /// An `UnprovableBound` as the Leaker reports it for an entry whose context keeps a bound that
+    /// names its generic through a path that may be an alias of a projection: the type in the
+    /// predicate, and in the note the generic and the bound.
+    fn hidden(tokens: &str, generic: &str, bound: &str) -> Rejection {
+        Rejection {
+            message: format!(
+                "`{}` is in a bound or where predicate, and a bound of its generics names `{}` in the arguments of `{}`, which may hide a projection",
+                tokens, generic, bound
+            ),
+            tokens: tokens.to_string(),
+            note: format!(
+                "`Self` is the self type of the impl, which the copy writes with its leaked types as paths through the Repeater, and the bound `{g} : 'a + Iterator<Item = u8> + {b}` of their generics names `{g}` in the arguments of the bound `{b}`, whose path may be a type alias of a projection that another bound of `{g}` equates, which the Leaker cannot tell from a struct: rustc normalizes it in the impl of the Repeater, but not yet in the environment (E0277)",
+                g = generic,
+                b = bound
+            ),
+            reason: "UnprovableBound".to_string(),
+            kind: "Type".to_string(),
+        }
+    }
+
+    /// Seed 22 (case 26, item 14; case 41, item 3): `Self` or `Self::A` in a predicate, and a bound
+    /// of a generic with an equation of an associated type that names the generic in the arguments
+    /// of a path (`BIt<U>`, `B2<T, B0>`). The Leaker cannot tell an alias from a struct, so it
+    /// rejects both. The item must have written the generic and the bound, with the entry.
+    #[test]
+    fn a_bound_that_names_its_generic_in_a_path_is_explained_by_the_bound_the_item_wrote() {
+        let in_impl = "#[@ATTR@(id = 14, scope = \"impl\")]\n\
+            impl<'a, T, U: ::core::default::Default + 'a + ::core::iter::Iterator<Item = u8>, V> S12_1<'a, T, U, V> \
+            where V: ::core::fmt::Debug, U: Fn(::tlp_l_026::base::BIt<U>) -> u8, crate::base::B1<U>: Default {\n\
+            pub fn m14_3(&self) where V: ::core::ops::Fn(&Self) -> u8, R1<V>: ::core::default::Default { loop {} }\n}";
+        let bit = "Fn(::tlp_l_026::base::BIt<U>) -> u8";
+        let payload = |generic: &str, bound: &str| {
+            format!("{}{}|{}", gen::TAG_HIDDEN_AT, generic, gen::norm(bound))
+        };
+        // The settings of the seed's case: the crate's own paths are allowed.
+        let own_crate = |krate: &str| gen::Config {
+            krate: krate.to_string(),
+            allow_crate: true,
+            ..strict_config()
+        };
+        let item_tags = tags_of_text(own_crate("tlp_l_026"), in_impl);
+        let hidden_tags: Vec<&String> = item_tags
+            .iter()
+            .filter(|tag| tag.starts_with(gen::TAG_HIDDEN_AT))
+            .collect();
+        assert_eq!(hidden_tags, vec![&payload("U", bit)]);
+        let error = hidden("Self", "U", "Fn(::tlp_l_026::base::BIt<U>) -> u8");
+        assert!(unexplained(&item_tags, &rejected(vec![error.clone()])).is_empty());
+        // The Leaker prints the tokens with spaces.
+        let spaced = hidden("Self", "U", "Fn(:: tlp_l_026 :: base :: BIt < U >) -> u8");
+        assert!(unexplained(&item_tags, &rejected(vec![spaced])).is_empty());
+
+        // The trait of the other seed: an equation in a where predicate of the trait, the entry
+        // `Self::A1` in a predicate of a method.
+        let in_trait = "pub trait Tr3_1<'a, 'b, 'c, T: ::core::fmt::Debug + 'b> where T: \
+            ::core::ops::Fn(&'b ::tlp_l_041::base::B2<T, ::tlp_l_041::base::B0>) -> u8, T: \
+            Iterator<Item = ::core::cell::Cell<(::tlp_l_041::base::B0, usize)>> {\n\
+            type A1: ::core::fmt::Debug;\n\
+            fn m3_3<'x, 'y: 'x>(&self, a0: &'b Self::A0) where T: ::core::convert::Into<Self::A1>;\n}";
+        let b2 = "::core::ops :: Fn(&'b::tlp_l_041::base::B2<T, ::tlp_l_041::base::B0>) -> u8";
+        let trait_tags = tags_of_text(own_crate("tlp_l_041"), in_trait);
+        assert!(trait_tags.contains(&payload("T", b2)), "{:?}", trait_tags);
+        let error = hidden("Self :: A1", "T", b2);
+        assert!(unexplained(&trait_tags, &rejected(vec![error])).is_empty());
+
+        // The generic or the bound that the note names is not the one the item wrote.
+        for wrong in [
+            hidden("Self", "V", bit),
+            hidden("Self", "U", "Fn(::tlp_l_026::base::BIt<V>) -> u8"),
+            hidden("Self", "U", "Fn(::tlp_l_026::base::B1<U>) -> u8"),
+        ] {
+            let problems = unexplained(&item_tags, &rejected(vec![wrong]));
+            assert_eq!(problems.len(), 1, "{:?}", problems);
+            assert!(
+                problems[0].starts_with("NO SHAPE THAT GIVES IT"),
+                "{:?}",
+                problems
+            );
+        }
+        // A tag for a cycle explains no such error, and the plain shapes are not the tag.
+        let cycle_tags = tags(&[
+            "bound_cycle",
+            "self_in_predicate",
+            &format!("bound_cycle=U|{}", gen::norm(bit)),
+        ]);
+        assert_eq!(
+            unexplained(&cycle_tags, &rejected(vec![hidden("Self", "U", bit)])).len(),
+            1
+        );
+        // A note that does not say it is a bound that hides a projection is a cycle: the tag does not
+        // explain it.
+        let mut cycle = hidden("Self", "U", bit);
+        cycle.note = cycle.note.replace(HIDDEN_NOTE, "which names a leaked type");
+        assert_eq!(unexplained(&item_tags, &rejected(vec![cycle])).len(), 1);
+    }
+
+    /// The tag needs what the Leaker needs: an equation of the generic, and an entry that keeps the
+    /// bound in a predicate (`Self`, or the self type of the impl).
+    #[test]
+    fn a_hidden_bound_is_tagged_with_the_equation_and_the_entry_it_needs() {
+        let hidden_tags = |text: &str| -> Vec<String> {
+            gen::hidden_bounds_in(text)
+                .into_iter()
+                .map(|(generic, bound)| format!("{}|{}", generic, bound))
+                .collect()
+        };
+        let item = |bounds: &str, predicate: &str| {
+            format!(
+                "pub trait Tr<U: {}> {{ fn m(&self) where {}; }}",
+                bounds, predicate
+            )
+        };
+        let wrote = vec!["U|Fn(BIt<U>)->u8".to_string()];
+        // The equation and `Self` in a predicate.
+        let both = item(
+            "Iterator<Item = u8> + Fn(BIt<U>) -> u8",
+            "U: AsRef<Self::A>",
+        );
+        assert_eq!(hidden_tags(&both), wrote);
+        // Without the equation, or without the entry, the Leaker has nothing to reject.
+        let none = item("Fn(BIt<U>) -> u8", "U: AsRef<Self::A>");
+        assert!(hidden_tags(&none).is_empty());
+        let none = item("Iterator<Item = u8> + Fn(BIt<U>) -> u8", "U: Clone");
+        assert!(hidden_tags(&none).is_empty());
+        // `Self: Sized` is no entry.
+        let none = item("Iterator<Item = u8> + Fn(BIt<U>) -> u8", "Self: Sized");
+        assert!(hidden_tags(&none).is_empty());
+        // A trait of the crate fixes an associated type too (a supertrait may equate one), unless it
+        // names the generic in its arguments; a trait of the standard library does not.
+        let crate_trait = item("::k::base::BItem + Fn(BIt<U>) -> u8", "U: AsRef<Self::A>");
+        assert_eq!(hidden_tags(&crate_trait), wrote);
+        for fixes_nothing in ["::k::base::Tr<U>", "Clone", "::core::fmt::Debug", "'a"] {
+            let none = item(
+                &format!("{} + Fn(BIt<U>) -> u8", fixes_nothing),
+                "U: AsRef<Self::A>",
+            );
+            assert!(hidden_tags(&none).is_empty(), "{}", fixes_nothing);
+        }
+        // The equation of an enclosing scope: a predicate of the method equates the generic.
+        let outer = "pub trait Tr<U: Fn(BIt<U>) -> u8> { fn m(&self) where U: Iterator<Item = u8>, R1<Self>: Default; }";
+        assert_eq!(hidden_tags(outer), wrote);
+        // The self type of the impl, written in a predicate.
+        let impl_self =
+            "impl<U: Iterator<Item = u8> + Fn(BIt<U>) -> u8> R1<U> where R1<U>: Default { }";
+        assert_eq!(hidden_tags(impl_self), wrote);
+        let other =
+            "impl<U: Iterator<Item = u8> + Fn(BIt<U>) -> u8> R1<U> where R2<U>: Default { }";
+        assert!(hidden_tags(other).is_empty());
+        // Another path with the name (`self::R1<U>`, `R10<U>`) is not the self type.
+        let other = "impl<U: Iterator<Item = u8> + Fn(BIt<U>) -> u8> R1<U> where self::R1<U>: Default, R10<U>: Default { }";
+        assert!(hidden_tags(other).is_empty());
+        // Only a bound that names the generic in a path may hide a projection.
+        for bound in [
+            "Fn(&U) -> u8",
+            "Fn((U, u8)) -> u8",
+            "Fn(R0) -> u8",
+            "From<U>",
+            "Fn(::core::option::Option<U>) -> u8",
+            "Fn(&dyn Tr<U>) -> u8",
+            "Fn(fn(U)) -> u8",
+            "Iterator<Item = BIt<U>>",
+        ] {
+            let none = item(
+                &format!("Iterator<Item = u8> + {}", bound),
+                "U: AsRef<Self::A>",
+            );
+            assert!(hidden_tags(&none).is_empty(), "{}", bound);
+        }
+        for bound in [
+            "Fn(<U as Iterator>::Item) -> u8",
+            "Fn(U::Item) -> u8",
+            "Fn(W<::core::option::Option<U>>) -> u8",
+            "for<'h> Fn(&'h W<U>) -> &'h u8",
+            "PartialEq<W<U>>",
+        ] {
+            let found = item(
+                &format!("Iterator<Item = u8> + {}", bound),
+                "U: AsRef<Self::A>",
+            );
+            assert_eq!(hidden_tags(&found).len(), 1, "{}", bound);
+        }
     }
 
     /// The item of seed 21 (case 11, item 3): the bound names the types of the module in a binder, in
@@ -4929,12 +6144,495 @@ mod checks {
         );
     }
 
+    /// The `>` of an arrow closes no bracket: a predicate on a type that holds a function pointer is a
+    /// clause (its tag was missing, and the rejection it gives unexplained).
+    #[test]
+    fn a_predicate_with_an_arrow_in_brackets_is_a_clause() {
+        let text = "pub trait Tr<U: Iterator> where ::core::marker::PhantomData<unsafe extern \"C\" fn() -> U::Item>: ::core::clone::Clone, U: Clone {\n}";
+        let clauses = gen::bound_clauses(text);
+        assert!(
+            clauses.iter().any(|(bounded, bounds)| bounded
+                .starts_with("::core::marker::PhantomData<unsafe")
+                && bounds == "::core::clone::Clone"),
+            "{:?}",
+            clauses
+        );
+    }
+
+    /// Every shape of `SHAPE_TAGS` is generated in a few cases (`unreadable_value` needs `values`), so
+    /// the run reaches the reason or the cause it is for, and the text of what it writes is valid
+    /// enough for the tag to be read back from it.
+    #[test]
+    fn the_shapes_of_the_rare_reasons_are_generated() {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for flags in [
+            Flags::default(),
+            Flags {
+                values: true,
+                ..Flags::default()
+            },
+        ] {
+            for seed in 0..30 {
+                let case = generate_with(seed, 0, 8, Features::parse(""), flags);
+                for item in &case.items {
+                    seen.extend(item.tags.iter().cloned());
+                    // A tag that a text gives is read back from the text.
+                    if item.tags.contains(gen::TAG_WIDE_CONST) {
+                        assert!(item.source.contains("K") || item.source.contains("const "));
+                    }
+                }
+            }
+        }
+        for (tag, what) in SHAPE_TAGS {
+            assert!(
+                seen.contains(*tag),
+                "no item has the shape {} ({})",
+                tag,
+                what
+            );
+        }
+        // And every forced shape is in some item, which the Leaker is then asked to reject.
+        for forced in FORCED {
+            assert!(
+                seen.contains(forced.tag),
+                "no item has the forced shape {}",
+                forced.tag
+            );
+        }
+    }
+
+    /// A generated item with the tags and settings given, for the checks of the forced shapes.
+    fn item_with(
+        kind: &'static str,
+        scope: &'static str,
+        allow_self: bool,
+        names: &[&str],
+    ) -> gen::Item {
+        gen::Item {
+            id: 0,
+            kind,
+            module: Vec::new(),
+            trust: gen::Trust::None,
+            allow_self,
+            scope,
+            contents: vec![kind],
+            tags: tags(names),
+            source: "pub struct S;".to_string(),
+        }
+    }
+
+    fn report_with(accepted: bool, errors: Vec<Rejection>) -> Report {
+        Report {
+            kind: "struct".into(),
+            accepted,
+            rejections: errors,
+            ..Default::default()
+        }
+    }
+
+    fn error_of(reason: &str, kind: &str, tokens: &str) -> Rejection {
+        Rejection {
+            reason: reason.to_string(),
+            kind: kind.to_string(),
+            tokens: tokens.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The forced shapes that a text gives are read from the text of the item itself, and not from a
+    /// shape that the Leaker may accept: a bound `T: AsRef<Self>`, an impl of the trait that has the
+    /// predicate, a macro or a type of another crate by an absolute path.
+    #[test]
+    fn the_forced_shapes_are_read_from_the_text_of_the_item() {
+        let forced = gen::forced_in;
+        let trait_with = |generics: &str, clause: &str| {
+            format!(
+                "#[@ATTR@(id = 1)]\npub trait Tr1_1{} {} {{\nfn m(&self);\n}}\n",
+                generics, clause
+            )
+        };
+        assert_eq!(
+            forced(&trait_with("<T>", "where R1<Self>: Default, T: Clone")),
+            [gen::FORCED_SELF_IN_TRAIT_PRED]
+        );
+        assert_eq!(
+            forced(&trait_with(
+                "<T>",
+                "where T: Clone, super::base::B1<Self>: Default"
+            )),
+            [gen::FORCED_SELF_IN_TRAIT_PRED]
+        );
+        for (generics, clause) in [
+            ("<T: AsRef<Self>>", ""),
+            ("<T>", "where T: AsRef<Self>"),
+            ("<T>", "where Self: Sized, T: Clone"),
+            ("<T>", "where ::std::vec::Vec<Self>: Default"),
+            ("<T>", "where Self::A0: Clone"),
+            ("<T>", "where <Self as Tr1_1<T>>::A0: Clone"),
+            ("<T>", "where T: Into<R1<Self>>"),
+        ] {
+            assert_eq!(
+                forced(&trait_with(generics, clause)),
+                Vec::<&str>::new(),
+                "{} {}",
+                generics,
+                clause
+            );
+        }
+        // The impl of such a trait writes the predicate too, and is no shape of its own.
+        assert!(
+            forced("impl<T> ::k::m0::Tr1_1<T> for u8 where R1<Self>: Default {\n}\n").is_empty()
+        );
+
+        let impl_of = |text: &str| {
+            format!(
+                "#[@ATTR@(id = 2)]\n{} {{\npub fn m(&self) {{ loop {{}} }}\n}}\n",
+                text
+            )
+        };
+        for text in [
+            "impl<T: AsRef<Self>> R1<T>",
+            "impl<T: Clone + AsRef<Self>, U> self::R1<T, U>",
+            "impl<T> super::base::B1<T> where T: AsRef<Self>",
+            "impl<'a, T: Clone, U> ::k::m0::Tr<'a, U> for R2<U, T> where U: AsRef<Self>",
+        ] {
+            assert_eq!(
+                forced(&impl_of(text)),
+                [gen::FORCED_IMPL_HEADER_SELF],
+                "{}",
+                text
+            );
+        }
+        for text in [
+            "impl<T: Clone> R1<T>",
+            "impl<T: AsRef<Self>> ::k::base::B1<T>",
+            "impl<E: AsRef<Self>> ::k::m0::Tr for (::core::cell::Cell<bool>, E)",
+            "impl<E: AsRef<Self>, T> R1<T>",
+            "impl<T: AsRef<Self>> &'static unsafe fn(i32)",
+        ] {
+            assert!(forced(&impl_of(text)).is_empty(), "{}", text);
+        }
+
+        assert_eq!(
+            forced("pub struct S1_1 { pub f0: [u8; two!()] }"),
+            [gen::FORCED_MACRO_PATH]
+        );
+        assert!(forced("pub struct S1_1 { pub f0: [u8; ::k::two!()] }").is_empty());
+        assert_eq!(forced("fn m(&self, ae: Rl<'_>);"), [gen::FORCED_ELIDED_ARG]);
+        assert_eq!(
+            forced("fn m(&self, ae: super::base::Bl<'_>);"),
+            [gen::FORCED_ELIDED_ARG]
+        );
+        assert!(forced("fn m(&self, ae: ::k::base::Bl<'_>);").is_empty());
+        assert!(forced("fn m(&self, a0: Rl<'a>, ae: ::k::base::Bl<'_>);").is_empty());
+        assert!(forced("fn m(&self, a0: Rl<'_>);").is_empty());
+        assert_eq!(
+            forced("pub enum E1_1 { V0 = (RLEN as isize) + 0, V1 = (3) + 100 }"),
+            [gen::FORCED_RELATIVE_DISCRIMINANT]
+        );
+        assert_eq!(
+            forced("pub enum E1_1 { V0 = (super::super::base::BLEN as isize) + 0 }"),
+            [gen::FORCED_RELATIVE_DISCRIMINANT]
+        );
+        assert!(forced(
+            "pub enum E1_1 { V0 = (::k::base::BLEN as isize) + 0, V1 = (::core::mem::size_of::<*const R1>() as isize) + 100 }"
+        )
+        .is_empty());
+    }
+
+    /// The generated items have the forced tags only where their own text gives them, and an impl
+    /// takes none from its type or its trait.
+    #[test]
+    fn the_forced_tags_of_the_generated_items_are_read_from_their_text() {
+        let mut checked = 0;
+        for seed in 0..20 {
+            let case = generate_with(seed, 0, 8, Features::parse(""), Flags::default());
+            for item in &case.items {
+                let from_text: BTreeSet<String> = gen::forced_in(&item.source)
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                let has: BTreeSet<String> = item
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.starts_with(gen::TAG_FORCED))
+                    .cloned()
+                    .collect();
+                // A module has the tags of its items, which its own text has too.
+                assert_eq!(has, from_text, "{}", item.source);
+                checked += usize::from(!has.is_empty());
+            }
+        }
+        assert!(checked > 5, "{} items have a forced tag", checked);
+    }
+
+    /// The classification of `SHAPE_TAGS` into forced, forced in part and not forced.
+    #[test]
+    fn the_shape_tags_are_classified() {
+        assert_eq!(forced_class(gen::TAG_NESTED_SELF_BOUNDS), "forced");
+        assert_eq!(forced_class(gen::TAG_SELF_NO_MEANING), "forced");
+        assert_eq!(
+            forced_class(gen::TAG_SELF_IN_TRAIT_PRED),
+            "forced in part (forced:self_in_trait_predicate)"
+        );
+        assert_eq!(forced_class(gen::TAG_NESTED_SELF_OPTION), "not forced");
+        assert_eq!(forced_class(gen::TAG_MACRO_CALL), "not forced");
+        // Every forced shape is counted by a shape of the table.
+        for forced in FORCED {
+            assert!(
+                SHAPE_TAGS.iter().any(|(tag, _)| *tag == forced.shape),
+                "{}",
+                forced.tag
+            );
+        }
+        // And the tag of a part that the text gives is a `gen::FORCED_*` tag.
+        for forced in FORCED {
+            assert!(
+                forced.tag == forced.shape || forced.tag.starts_with(gen::TAG_FORCED),
+                "{}",
+                forced.tag
+            );
+        }
+    }
+
+    /// The item with a forced shape that the Leaker accepts fails the run, and so does one that it
+    /// rejects with no error that the shape needs; one rejected for the reason of the shape passes.
+    #[test]
+    fn an_accepted_forced_item_fails_and_a_rejected_one_passes() {
+        let nested = item_with("struct", "mod", true, &[gen::TAG_NESTED_SELF_BOUNDS]);
+        let accepted = report_with(true, Vec::new());
+        let problems = forced_problems(&nested, &accepted);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].0, FORCED_ACCEPTED);
+        assert!(problems[0].1.contains(gen::TAG_NESTED_SELF_BOUNDS));
+        assert!(problems[0].1.contains("NestedSelfInBounds"));
+        assert!(problems[0].1.contains("accepted"));
+
+        let right = report_with(
+            false,
+            vec![
+                error_of("RelativePath", "Type", "Rl"),
+                error_of("NestedSelfInBounds", "Type", "R1 < Self, T >"),
+            ],
+        );
+        assert!(forced_problems(&nested, &right).is_empty());
+        let wrong = report_with(false, vec![error_of("RelativePath", "Type", "Rl")]);
+        let problems = forced_problems(&nested, &wrong);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].0, FORCED_OTHER);
+        assert!(problems[0].1.contains("RelativePath"), "{}", problems[0].1);
+        // An item with no forced shape is not asked.
+        let plain = item_with("struct", "mod", true, &[gen::TAG_NESTED_SELF_OPTION]);
+        assert!(forced_problems(&plain, &accepted).is_empty());
+        assert!(forced_problems(&plain, &wrong).is_empty());
+    }
+
+    /// What decides whether an error is the one that a shape needs: the cause, the tokens, the
+    /// `allow_self` of the item, its tags; and the scopes where nothing is forced.
+    #[test]
+    fn the_error_that_a_forced_shape_needs_is_told_by_its_cause_tokens_and_the_item() {
+        // `Rl<'_>`: a relative path of the kind `Type` that holds the elided lifetime.
+        let elided = item_with("trait", "", true, &[gen::FORCED_ELIDED_ARG]);
+        let ok = report_with(false, vec![error_of("RelativePath", "Type", "Rl < '_ >")]);
+        assert!(forced_problems(&elided, &ok).is_empty());
+        for other in [
+            error_of("RelativePath", "Type", "Rl < 'x >"),
+            error_of("RelativePath", "Trait", "Rl < '_ >"),
+            error_of("MaybeConst", "Type", "Rl < '_ >"),
+        ] {
+            let report = report_with(false, vec![other]);
+            assert_eq!(forced_problems(&elided, &report).len(), 1);
+        }
+        // A bare macro: the cause is a macro; a constant: an expression.
+        let two = item_with("struct", "", true, &[gen::FORCED_MACRO_PATH]);
+        let report = report_with(false, vec![error_of("RelativePath", "Macro", "two !")]);
+        assert!(forced_problems(&two, &report).is_empty());
+        let report = report_with(false, vec![error_of("RelativePath", "Expr", "RLEN")]);
+        assert_eq!(forced_problems(&two, &report).len(), 1);
+        // Without `allow_self` the `Self` of a bound cannot be leaked: another reason says it.
+        let denied = report_with(
+            false,
+            vec![error_of("DeniedSelfInBounds", "Type", "S1_1 < T >")],
+        );
+        let header = report_with(
+            false,
+            vec![error_of("SelfInImplSelfType", "Type", "S1_1 < T >")],
+        );
+        let allowing = item_with("impl-inherent", "", true, &[gen::FORCED_IMPL_HEADER_SELF]);
+        let denying = item_with("impl-inherent", "", false, &[gen::FORCED_IMPL_HEADER_SELF]);
+        assert!(forced_problems(&allowing, &header).is_empty());
+        assert_eq!(forced_problems(&allowing, &denied).len(), 1);
+        assert!(forced_problems(&denying, &denied).is_empty());
+        assert_eq!(forced_problems(&denying, &header).len(), 1);
+        // A predicate on a type that names `Self` is a cycle first if a bound of the generics names a
+        // leaked type; the error is still the one about that type.
+        let predicate = report_with(
+            false,
+            vec![error_of(
+                "UnprovableBound",
+                "Type",
+                "super :: base :: B1 < Self >",
+            )],
+        );
+        let plain = item_with("trait", "", true, &[gen::FORCED_SELF_IN_TRAIT_PRED]);
+        let cyclic = item_with(
+            "trait",
+            "",
+            true,
+            &[gen::FORCED_SELF_IN_TRAIT_PRED, gen::TAG_BOUND_CYCLE],
+        );
+        assert_eq!(forced_problems(&plain, &predicate).len(), 1);
+        assert!(forced_problems(&cyclic, &predicate).is_empty());
+        let elsewhere = report_with(
+            false,
+            vec![error_of("UnprovableBound", "Type", "Self :: A0")],
+        );
+        assert_eq!(forced_problems(&cyclic, &elsewhere).len(), 1);
+        // `enter_impl` visits the self type and the trait's arguments only: nothing is forced, even if
+        // the item is accepted; `enter_trait` and a module do not read bodies.
+        let through_impl = item_with("impl-trait", "impl", true, &[gen::FORCED_MACRO_PATH]);
+        assert!(forced_of(&through_impl).is_empty());
+        assert!(forced_problems(&through_impl, &report_with(true, Vec::new())).is_empty());
+        let body = |kind, scope| item_with(kind, scope, true, &[gen::TAG_UNREADABLE]);
+        assert_eq!(forced_of(&body("struct", "")).len(), 1);
+        assert_eq!(forced_of(&body("trait", "")).len(), 1);
+        assert!(forced_of(&body("trait", "trait")).is_empty());
+        assert!(forced_of(&body("mod", "")).is_empty());
+    }
+
+    /// The floors count the items with no forced shape; the table of all the items counts them too,
+    /// and the summary says how many were left out.
+    #[test]
+    fn the_floors_leave_out_the_items_with_a_forced_shape() {
+        let mut cases: Vec<Case> = (0..3)
+            .map(|i| generate_with(case_seed(1, i), i, 8, Features::parse(""), Flags::default()))
+            .collect();
+        // The items have no forced shape but the one that the structs get, an elided lifetime.
+        let mut forced_items = 0;
+        for case in &mut cases {
+            for item in &mut case.items {
+                for forced in FORCED {
+                    item.tags.remove(forced.tag);
+                }
+                if item.kind == "struct" {
+                    item.tags.insert(gen::FORCED_ELIDED_ARG.to_string());
+                    item.tags.insert(gen::TAG_ELIDED_ARG.to_string());
+                    item.scope = "";
+                    forced_items += 1;
+                }
+            }
+        }
+        assert!(forced_items > 5);
+        let selected: Vec<(usize, &Case)> = cases.iter().enumerate().collect();
+        let report_for = |item: &gen::Item, accepted: bool| Report {
+            kind: item.kind.to_string(),
+            accepted,
+            positions: 4,
+            checked: 4,
+            rejections: if accepted {
+                Vec::new()
+            } else {
+                vec![error_of("RelativePath", "Type", "Rl < '_ >")]
+            },
+            ..Default::default()
+        };
+        // The Leaker accepts everything but the forced items.
+        let mut reports = BTreeMap::new();
+        for (i, case) in &selected {
+            for item in &case.items {
+                reports.insert((*i, item.id), report_for(item, item.kind != "struct"));
+            }
+        }
+        let stats = Stats::collect(&selected, &reports);
+        assert_eq!(stats.left_out, forced_items);
+        assert_eq!(stats.rejected_of("struct"), 0);
+        assert_eq!(stats.accepted_of("struct"), 0);
+        assert_eq!(stats.total_accepted(), stats.analyzed - forced_items);
+        let (a, r) = stats.all["struct"];
+        assert_eq!((a, r), (0, forced_items));
+        assert_eq!(stats.all_rate("struct"), "0%");
+        assert_eq!(stats.all_rate("enum"), "100%");
+        let count = stats.forced[gen::FORCED_ELIDED_ARG];
+        assert_eq!(
+            count,
+            ForcedCount {
+                accepted: 0,
+                other: 0,
+                rejected: forced_items
+            }
+        );
+        assert!(defaults().problems(&stats).is_empty());
+        // A rejected struct that has no forced shape counts in the floors as before.
+        let mut reports = BTreeMap::new();
+        for (i, case) in &selected {
+            for item in &case.items {
+                reports.insert((*i, item.id), report_for(item, item.kind != "struct"));
+            }
+        }
+        let mut plain = Vec::new();
+        for case in &mut cases {
+            let item = case.items.iter_mut().find(|i| i.kind == "struct").unwrap();
+            item.tags.remove(gen::FORCED_ELIDED_ARG);
+            plain.push(item.id);
+        }
+        let selected: Vec<(usize, &Case)> = cases.iter().enumerate().collect();
+        let stats = Stats::collect(&selected, &reports);
+        assert_eq!(stats.left_out, forced_items - plain.len());
+        assert_eq!(stats.rejected_of("struct"), plain.len());
+        // The summary says how many were left out, and counts each forced shape.
+        let run = Run {
+            seed: 1,
+            cases: 3,
+            items: 8,
+            features: String::new(),
+            accept: false,
+            stages: false,
+            only: None,
+        };
+        let summary = summarize(
+            &stats,
+            &defaults(),
+            &run,
+            Features::default(),
+            Flags::default(),
+        );
+        assert!(summary.contains(&format!(
+            "items left out of the acceptance floors (they have a forced shape): {} of {}",
+            stats.left_out, stats.analyzed
+        )));
+        assert!(summary.contains("forced shape '_ in a path"));
+        assert!(summary.contains("all%"));
+        assert!(summary.contains("; forced in part (forced:elided_arg)"));
+    }
+
+    /// An accepted forced item is counted as a failure, not as an accepted item, and a run with too
+    /// few forced shapes, which checks nothing, fails.
+    #[test]
+    fn the_check_of_the_forced_shapes_cannot_pass_with_none() {
+        let mut stats = Stats {
+            analyzed: 300,
+            ..Default::default()
+        };
+        assert_eq!(stats.forced_check_problems().len(), 1);
+        stats.left_out = 300 / FORCED_SHARE;
+        assert!(stats.forced_check_problems().is_empty());
+        stats.left_out -= 1;
+        assert_eq!(stats.forced_check_problems().len(), 1);
+        // A short run is not asked.
+        let short = Stats {
+            analyzed: FORCED_MIN_ANALYZED - 1,
+            ..Default::default()
+        };
+        assert!(short.forced_check_problems().is_empty());
+    }
+
     /// The structs, enums and unions of `self_bound_adts` (F41, F42) are generated, nested in
     /// `enter_mod`, and the Leaker must accept them: no reason explains their rejection.
     #[test]
     fn the_adts_with_a_bound_that_names_their_self_are_generated() {
         let count = |features: Features, tag: &str| -> (usize, usize) {
             let (mut found, mut types) = (0, 0);
+            let (mut option_on, mut option_off) = (0, 0);
             for seed in 0..12 {
                 let case = generate_with(seed, 0, 6, features, Flags::default());
                 for item in &case.items {
@@ -4951,12 +6649,25 @@ mod checks {
                             .leaker
                             .lines()
                             .find(|line| line.contains(&format!("(id = {},", item.id)));
-                        assert_eq!(
-                            attr.map_or(false, |a| a.contains("nested_self_entries = true,")),
-                            features.nested_self_entries
-                        );
+                        // Half of the items have the option, if the feature is on, and the tag of
+                        // the type that names `Self` says which half.
+                        let option =
+                            attr.map_or(false, |a| a.contains("nested_self_entries = true,"));
+                        assert!(features.nested_self_entries || !option);
+                        assert!(!(option && item.tags.contains(gen::TAG_NESTED_SELF_BOUNDS)));
+                        assert!(!(!option && item.tags.contains(gen::TAG_NESTED_SELF_OPTION)));
+                        option_on += usize::from(option);
+                        option_off += usize::from(!option);
                     }
                 }
+            }
+            if features.nested_self_entries {
+                assert!(
+                    option_on > 0 && option_off > 0,
+                    "{} {}",
+                    option_on,
+                    option_off
+                );
             }
             (found, types)
         };
@@ -5055,6 +6766,44 @@ mod checks {
         assert_eq!(report.rejections[0].reason, "");
     }
 
+    /// The ordinary Referrer's crate has each copy in a module of its own, and the crate of the carried
+    /// errors has one macro of each item; the flags of the invocation are those of the item.
+    #[test]
+    fn each_copy_has_a_module_of_its_own_and_each_item_a_macro_of_carried_errors() {
+        let (mut inst, mut shadow) = (0, 0);
+        for seed in 0..12 {
+            let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
+            for item in &case.items {
+                let call = format!("tlp_l_000::__tl_prop_{}!(", item.id);
+                let lines: Vec<&str> = case
+                    .referrer
+                    .lines()
+                    .filter(|line| line.contains(&call))
+                    .collect();
+                assert_eq!(lines.len(), 1, "{}", case.referrer);
+                assert!(
+                    lines[0].starts_with(&format!("pub mod c{} {{ ", item.id))
+                        && lines[0].ends_with(" }"),
+                    "{}",
+                    lines[0]
+                );
+                // A module has none of the flags: its copy is one module.
+                let flags = lines[0].contains(", inst(") || lines[0].contains(", shadow(");
+                assert!(!(flags && item.kind == "mod"), "{}", lines[0]);
+                inst += usize::from(lines[0].contains(", inst("));
+                shadow += usize::from(lines[0].contains(", shadow("));
+                let carry = format!("tlp_l_000::__tl_carry_{}!(carry(", item.id);
+                let carried = case
+                    .errors_referrer
+                    .lines()
+                    .filter(|line| line.contains(&carry))
+                    .count();
+                assert_eq!(carried, 1, "{}", case.errors_referrer);
+            }
+        }
+        assert!(inst > 0 && shadow > 0, "{} {}", inst, shadow);
+    }
+
     /// The second Referrer's crate of the accept mode invokes each item once, in the module it is
     /// in (the same place of the module tree as in the Leaker's crate), with the same imports.
     #[test]
@@ -5146,7 +6895,11 @@ mod checks {
                     // Only the macros differ: the modules and imports are those of the accepted items.
                     // The mode of the Referrer is the rule's, which the attribute of the copy says,
                     // so the invocation does not.
-                    let mut accepted = case.accept_referrer.replace("__tl_prop_", &prefix);
+                    // (The accepted items that the Leaker carries drop their errors: `allow(all)`.)
+                    let mut accepted = case
+                        .accept_referrer
+                        .replace("__tl_prop_", &prefix)
+                        .replace(", allow(all)", "");
                     for trust in gen::Trust::ALL {
                         accepted = accepted.replace(&format!(", trust({})", trust.name()), "");
                     }
@@ -5682,9 +7435,9 @@ mod checks {
     #[test]
     fn features_can_be_turned_off_as_well_as_on() {
         let default = Features::parse("");
-        assert!(default.nested_self_entries && !default.strict_anchors);
-        let changed = Features::parse("-nested_self_entries, strict_anchors");
-        assert!(!changed.nested_self_entries && changed.strict_anchors);
+        assert!(default.nested_self_entries && default.strict_anchors);
+        let changed = Features::parse("-nested_self_entries, -strict_anchors");
+        assert!(!changed.nested_self_entries && !changed.strict_anchors);
         // The others stay as they are.
         assert!(changed.nested_self && !changed.inferred_outlives);
         let all = Features::parse("all");

@@ -607,6 +607,28 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9132, __tl_report_9132!()),
             ok("trait", 2, 5, 5),
         ),
+        // the same, not declared again: the use site that leaves the default out completes it (F65)
+        (
+            9224,
+            reported(9224, __tl_report_9224!()),
+            ok("trait", 1, 3, 3),
+        ),
+        // a braced const parameter in a type that is no entry, at a use site (F66)
+        (
+            9225,
+            reported(9225, __tl_report_9225!()),
+            ok("struct", 1, 3, 3),
+        ),
+        (
+            9226,
+            reported(9226, __tl_report_9226!()),
+            ok("struct", 1, 3, 3),
+        ),
+        (
+            9227,
+            reported(9227, __tl_report_9227!()),
+            ok("struct", 1, 4, 4),
+        ),
         // the default of a parameter of a struct and an enum nested in a module, when a bound of
         // an earlier parameter names their `Self`: the entry has no `Self`
         (
@@ -1122,12 +1144,11 @@ fn an_absolute_type_that_names_the_own_self_is_the_copys_in_a_strict_copy() {
 
 /// The default of a parameter of a trait nested in a module, when a generic has a bound that names
 /// the trait's own `Self` (`trait SelfDefault<T: AsRef<Self>, U = Defd<T>>`). The entry `Defd<T>` is
-/// for the implementors of the trait, and the Visitor left the default as written (`Defd<T>`, a
-/// relative path that the Referrer's crate cannot resolve). A default exists only in a declaration,
-/// so the Referrer's crate declares the copy (`SelfDefaultCopy`), with the default written through
-/// the host, a type that implements the Leaker's trait: `<Host as Repeater<(T, ()), ID, 0>>::Type`.
-/// The default cannot pass the defaulted parameter (`(T, U)`) to the Repeater, which names itself
-/// (E0128), so it passes `()`: the host implements the Leaker's trait for any `U`.
+/// for any type that the bound holds for, as it is for the trait itself, and the Visitor left the
+/// default as written (`Defd<T>`, a relative path that the Referrer's crate cannot resolve) when it
+/// was for the implementors of the trait. A default exists only in a declaration, so the Referrer's
+/// crate declares the copy (`SelfDefaultCopy`), with the default written through the host, a type
+/// that has the bound.
 ///
 /// An impl of the copy that leaves the parameter out takes the default, and its method has the
 /// type of the original, `Defd<Owner>`: rustc compares the signature with the trait's (E0053), so
@@ -2462,4 +2483,212 @@ fn a_type_whose_own_path_conflicts_is_written_as_it_is_and_the_types_in_it_are_l
     );
     fn denied<T: l::DeniedSelfFlat>() {}
     denied::<r::Host9219>();
+}
+
+/// Flat recovery: the types in a type written as it is that hold the lifetime of a method are
+/// written as they are too. `Two<Leaf, *mut Held<'b>>` is the only input of `f` that names `'b`
+/// (`UnconstrainedLifetime`), and `Held<'b>` in it is leaked as an entry, so the copy had `'b` in a
+/// projection only: early-bound where the trait of the Leaker's crate has it late-bound (E0195 in
+/// the impl of the host). Each type on every way to the lifetime that is leaked whole is an error,
+/// and written as it is, `Leaf` alone is an entry. The host implements the trait of the Leaker's
+/// crate.
+#[test]
+fn the_types_that_hold_a_method_lifetime_in_a_type_written_as_it_is_are_written_as_they_are() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    assert_eq!(
+        reported(9221, __tl_report_9221!()),
+        allowed("trait", 1, 6, 6),
+        "{}",
+        __tl_report_9221!()
+    );
+    let causes = |text: &'static str| -> Vec<(String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                (fields[3].to_string(), squash(fields[1]))
+            })
+            .collect()
+    };
+    let unconstrained = |causes: &[&str]| -> Vec<(String, String)> {
+        causes
+            .iter()
+            .map(|cause| ("UnconstrainedLifetime".to_string(), cause.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        causes(__tl_errors_9221!()),
+        unconstrained(&[
+            "Two<Leaf,*mutHeld<'b>>",
+            "Held<'b>",
+            "Two<Two<Leaf,Held<'c>>,Leaf>",
+            "Two<Leaf,Held<'c>>",
+            "Held<'c>",
+            "Two<Held<'d>,*mutHeld<'d>>",
+            "Held<'d>",
+            "Held<'d>",
+        ])
+    );
+    fn hosts<T: l::NestedMethodLifetime>() {}
+    hosts::<r::Host9221>();
+
+    // An optional entry on the way to the lifetime is written as it is for a strict Referrer too.
+    assert_eq!(
+        reported(9222, __tl_report_9222!()),
+        allowed("trait", 1, 2, 2),
+        "{}",
+        __tl_report_9222!()
+    );
+    assert_eq!(
+        causes(__tl_errors_9222!()),
+        unconstrained(&[
+            "Two<Leaf,::type_leak_test_leaker::kinds::Wrap<Held<'b>>>",
+            "Held<'b>",
+        ])
+    );
+    fn strict_hosts<T: l::NestedOptionalLifetime>() {}
+    strict_hosts::<r::Host9222>();
+}
+
+/// F64: `Wrap<Self>` in a predicate of a trait, and `Wrap<V>` in the predicate of a method that
+/// equates the `Item` of a generic of the trait, next to a bound of the trait that names the
+/// generic through a type alias (`U: Fn(WIt<U>)`, `WIt<U>` is `<U as Iterator>::Item`). The
+/// Repeater's impl of the entry needs the bound, which rustc proves in the environment of the copy
+/// only as written, not normalized (E0277 "expected an `Fn(u8)` closure, found `U`", in the impl
+/// of the host in the Referrer's crate, which does not build). The Leaker cannot tell the alias
+/// from a struct, so it rejects both entries, and the Referrer's macro expands to nothing.
+#[test]
+fn a_bound_that_names_its_generic_through_an_alias_is_rejected_where_the_entry_keeps_it() {
+    use type_leak_test_leaker::*;
+
+    let headline = |ty: &str, generic: &str| {
+        format!(
+            "`{}` is in a bound or where predicate, and a bound of its generics names `{}` in the \
+             arguments of `Fn (::type_leak_test_leaker::kinds::WIt<{}>) -> u8`, which may hide a \
+             projection",
+            ty, generic, generic
+        )
+    };
+    assert_eq!(
+        reported(9223, __tl_report_9223!()),
+        rejected(
+            "trait",
+            &squash(&format!(
+                "{} {}",
+                headline("Wrap<Self>", "U"),
+                headline("Wrap<V>", "V")
+            ))
+        ),
+        "{}",
+        __tl_report_9223!()
+    );
+}
+
+/// F67: a trait object bounded by the lifetime of a method (`Box<dyn Fn(Rel) + 'x>`) is the only
+/// input that holds it, in the arguments of a type of a crate that the Leaker does not allow
+/// (`Vec`, `Option`, a tuple, a second `Box`). The Leaker made the box an entry beside the type
+/// around it, so the copy had `'x` in a projection only: early-bound where the trait has it
+/// late-bound (E0195 in the impl of the host, in `tests/crates/referrer`, where it is invoked as
+/// `strict`). Every optional type on the way to the lifetime is written as it is now, and the only
+/// entry is `Rel`. The host implements the trait of the Leaker's crate.
+#[test]
+fn the_optional_types_around_an_object_bounded_by_a_method_lifetime_are_written_as_they_are() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(
+        reported(9228, __tl_report_9228!()),
+        ok("trait", 1, 2, 2),
+        "{}",
+        __tl_report_9228!()
+    );
+    assert_eq!(
+        reported(9229, __tl_report_9229!()),
+        ok("trait", 1, 6, 6),
+        "{}",
+        __tl_report_9229!()
+    );
+    fn in_vec<T: l::ObjectInVec>() {}
+    in_vec::<r::Host9228>();
+    fn under_types<T: l::ObjectUnderTypes>() {}
+    under_types::<r::Host9229>();
+}
+
+/// F68: the self type of an impl is a type of the Leaker's crate by an absolute path (`OptSelf<0>`,
+/// an optional entry), a bound of a generic names an optional type and another `Self`, and a
+/// predicate is on an entry that uses the generic (`Wrap<X>: Default`). The check that keeps the
+/// self type from being an entry looked at the first unstable bound only, which was the one that
+/// names the optional type, so a strict Referrer replaced the self type and had E0277 in the copy
+/// (in `tests/crates/referrer`, where it is invoked as `strict`). The self type is no entry now,
+/// and every copy writes it as it is.
+#[test]
+fn an_optional_self_type_that_a_bound_names_is_written_as_it_is() {
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9230, __tl_report_9230!()),
+        ok("impl-inherent", 1, 2, 2),
+        "{}",
+        __tl_report_9230!()
+    );
+}
+
+/// F69: the copy is used at an instantiation that gives the type parameter a type with a lifetime
+/// (`&'static str`, `(&'static str, u8)`, ..), where it is in the inputs of a function pointer or
+/// `Fn(..)` whose output has an elided lifetime: `fn(&Cell<[T; 1]>) -> &u8` of a struct, `&dyn
+/// Fn(&T) -> &u8` and `fn(&T) -> &u8` in the arguments of a trait's method, and the default of a
+/// parameter (`U = fn(&T) -> &u8`) that `Referrer::complete_args()` completes. The use site wrote
+/// the argument into them and the inputs had two lifetimes, so rustc could not tell which one the
+/// output has (E0106, in `tests/crates/referrer`, where they are invoked with `inst(..)` and
+/// `lifetime_args`). It names the lifetime with a binder now: the copies compare equal to the
+/// original at the arguments.
+#[test]
+fn an_elided_output_is_named_where_the_use_site_gives_a_type_with_a_lifetime() {
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9231, __tl_report_9231!()),
+        ok("struct", 1, 4, 4),
+        "{}",
+        __tl_report_9231!()
+    );
+    assert_eq!(
+        reported(9232, __tl_report_9232!()),
+        ok("trait", 1, 3, 2),
+        "{}",
+        __tl_report_9232!()
+    );
+    assert_eq!(
+        reported(9233, __tl_report_9233!()),
+        ok("struct", 1, 4, 4),
+        "{}",
+        __tl_report_9233!()
+    );
+}
+
+/// F70: the same where an entry is in the inputs: `Vec<T>` of `::std`, an optional entry, in `fn(&Vec<T>)
+/// -> &u8` and in the `Fn(..)` of a trait object. A strict Referrer replaces it, and the path through
+/// the Repeater that `entry_args()` writes names the lifetime that the use site gives `T`
+/// (`&'static str`, ..): the inputs had two lifetimes, and rustc could not tell which one the output
+/// has (E0106, in `tests/crates/referrer`, where they are invoked as `strict`, with `inst(..)` and
+/// `lifetime_args`). The Visitor names the elided lifetime after `type_fn` has written the path.
+#[test]
+fn an_elided_output_is_named_where_the_entry_that_replaces_a_type_names_a_lifetime() {
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9234, __tl_report_9234!()),
+        ok("struct", 2, 2, 2),
+        "{}",
+        __tl_report_9234!()
+    );
+    assert_eq!(
+        reported(9235, __tl_report_9235!()),
+        ok("struct", 2, 2, 2),
+        "{}",
+        __tl_report_9235!()
+    );
 }

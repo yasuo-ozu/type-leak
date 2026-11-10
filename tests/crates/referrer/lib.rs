@@ -217,6 +217,17 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9183!(path = ::type_leak_test_leaker::kinds);
     // The bound of another generic is not left out: the Leaker rejects it (it expands to nothing).
     type_leak_test_leaker::__tl_prop_9181!(path = ::type_leak_test_leaker::kinds);
+    // A bound that names its generic through an alias stays in the context of an entry that names
+    // `Self`, and where a method equates the `Item`: the Leaker rejects the entries in a predicate
+    // (it expands to nothing, as the copy fails to build).
+    type_leak_test_leaker::__tl_prop_9223!(path = ::type_leak_test_leaker::kinds);
+    // The copy is used at an instantiation that leaves the defaults out and passes a const
+    // parameter by its own name (F65, F66): the use site completes the arguments and writes the
+    // braced const parameters once.
+    type_leak_test_leaker::__tl_prop_9224!(path = ::type_leak_test_leaker::kinds, inst(2));
+    type_leak_test_leaker::__tl_prop_9225!(path = ::type_leak_test_leaker::kinds, inst(2));
+    type_leak_test_leaker::__tl_prop_9226!(path = ::type_leak_test_leaker::kinds, inst(2));
+    type_leak_test_leaker::__tl_prop_9227!(path = ::type_leak_test_leaker::kinds, inst(2));
     // `Self: 'x` is no reason to keep the bound that is left out (F47).
     type_leak_test_leaker::__tl_prop_9200!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9201!(path = ::type_leak_test_leaker::kinds);
@@ -271,6 +282,24 @@ pub mod kinds {
     // An optional entry that holds a method lifetime is copied as written, by a strict Referrer too
     // (F18): the path of this crate resolves here.
     type_leak_test_leaker::__tl_prop_9194!(path = ::type_leak_test_leaker::kinds, strict);
+    // The types of `::std` around a trait object bounded by a method lifetime are written as they
+    // are, and the lifetime stays in an input (F67).
+    type_leak_test_leaker::__tl_prop_9228!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9229!(path = ::type_leak_test_leaker::kinds, strict);
+    // The optional self type of an impl is written as it is, though a strict Referrer replaces
+    // the optional entries: a bound that names `Self` is next to one that names an optional type
+    // (F68).
+    type_leak_test_leaker::__tl_prop_9230!(path = ::type_leak_test_leaker::kinds, strict);
+    // The copy is used at an instantiation that gives the type parameter a type with a lifetime,
+    // where it is in the inputs of a function pointer or `Fn(..)` whose output has an elided
+    // lifetime: the use site names that lifetime (F69). The last leaves the default out.
+    type_leak_test_leaker::__tl_prop_9231!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9232!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9233!(path = ::type_leak_test_leaker::kinds, inst(2), lifetime_args);
+    // The same where an entry is in the inputs, which the strict Referrer replaces: the path through
+    // the Repeater names the lifetime (F70).
+    type_leak_test_leaker::__tl_prop_9234!(path = ::type_leak_test_leaker::kinds, strict, inst(1), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9235!(path = ::type_leak_test_leaker::kinds, strict, inst(1), lifetime_args);
 }
 
 /// Items that the Leaker rejects and accepts with `LeakerResult::allow()` of the causes of their
@@ -325,6 +354,9 @@ pub mod accepted {
     // Flat recovery: the types in what is written as it is are entries.
     type_leak_test_leaker::__tl_prop_9219!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9220!(path = ::type_leak_test_leaker::kinds, accept);
+    // The types in a type written as it is that hold a lifetime of a method are written as they are.
+    type_leak_test_leaker::__tl_prop_9221!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9222!(path = ::type_leak_test_leaker::kinds, strict, accept);
 
     // The traits of two items analyzed together: `f` keeps the type as written, `Held` and `Wrap`
     // are named here (F48).

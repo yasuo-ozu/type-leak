@@ -134,13 +134,19 @@ impl UseSite {
     /// written (`t: T` in `impl Tr<u8> for ..`). A trait object with several bounds that a reference
     /// or pointer points to gets the parentheses it needs (`&'a (dyn Debug + 'a)`). A generic with
     /// no argument stays as it is, and `Self` in a macro is replaced, other tokens of it are not.
+    ///
+    /// A function pointer or `Fn(..)` whose output takes an elided lifetime from the one lifetime of
+    /// its inputs keeps it where an argument adds lifetimes to them: the elided lifetime gets a
+    /// `for<'__tl_s0>` binder (`fn(&U) -> &u8` with `&'static str` is `for<'__tl_s0>
+    /// fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8`). A lifetime that a path hides cannot be named.
     #[must_use]
     pub fn substitute(&self, ty: &Type) -> Type {
         let is_self = matches!(&self.self_ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
-        SubstituteSite {
-            params: SubstituteParams::of(&self.root_params, &self.completed_args),
-            self_ty: (!is_self).then(|| &self.self_ty),
-        }
+        SubstituteSite::new(
+            SubstituteParams::of(&self.root_params, &self.completed_args),
+            (!is_self).then(|| &self.self_ty),
+            ty,
+        )
         .fold_type(ty.clone())
     }
 }

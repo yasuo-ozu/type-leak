@@ -24,6 +24,12 @@
 //! `left_out_bounds()`), so it is not unstable. The `T::Item` that a bound of another generic names
 //! (`U: Fn(T::Item)`), and one that an equation of a method defines, still are.
 //!
+//! The bounds that the context keeps whole (an entry that names `Self`, or writes out the self type
+//! of its scope) are not left out, so a bound of `T` that names `T` in the arguments of its path
+//! (`T: Iterator<Item = u8> + Fn(X<T>)`) stays, and `X` may be a type alias of the projection that
+//! the equation fixes, which the Leaker cannot tell from a struct: such a bound is unstable too, if
+//! an equation of `T` is in scope (`hidden_projection()`).
+//!
 //! A where predicate that is not a bound of a generic (`Vec<T::Item>: Default`, `u8:
 //! Into<T::Item>`) is proved by an impl, so it names no unstable bound as far as a leaked type,
 //! `Self` or an associated type of an impl goes. It is not so for the `T::Item` that a predicate in
@@ -31,8 +37,11 @@
 //! normalizes it with that predicate, which names the type whose impl needs the predicate, so the
 //! impl overflows (E0275) while it proves its own predicate.
 
-use crate::util::{ident_name, tidy_str, unwrap_type_group};
+use crate::context::{binds_assoc, bound_text, bounded_ident, hiding_bounds};
+use crate::util::{ident_name, tidy_str, token_names, unwrap_type_group};
 use proc_macro2::TokenStream;
+use std::collections::HashSet;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
@@ -62,6 +71,10 @@ pub(crate) enum Why {
     SelfAssoc(String),
     /// It names a projection that rustc normalizes, shown as written.
     Projection(String),
+    /// A bound of the generic `generic`, shown as written, names `generic` in the arguments of
+    /// its path (`Fn(X<T>)`), and an equation of `generic` is in scope: `X` may be a type alias
+    /// of the projection that it fixes.
+    Hidden { generic: String, bound: String },
 }
 
 impl Why {
@@ -83,6 +96,15 @@ impl Why {
                  generic, defines it), but not yet in the environment (E0277, E0271, E0275)",
                 tidy_str(path)
             ),
+            Why::Hidden { generic, bound } => format!(
+                "names `{}` in the arguments of the bound `{}`, whose path may be a type alias of \
+                 a projection that another bound of `{}` equates, which the Leaker cannot tell \
+                 from a struct: rustc normalizes it in the impl of the Repeater, but not yet in \
+                 the environment (E0277)",
+                generic,
+                tidy_str(bound),
+                generic
+            ),
         }
     }
 
@@ -93,6 +115,11 @@ impl Why {
             Why::SelfAssoc(path) | Why::Projection(path) => {
                 format!("write the bound without `{}`", tidy_str(path))
             }
+            Why::Hidden { generic, bound } => format!(
+                "write the bound `{}` without a path that names `{}`",
+                tidy_str(bound),
+                generic
+            ),
         }
     }
 
@@ -101,8 +128,129 @@ impl Why {
         match self {
             Why::SelfType => "`Self`, which is a leaked type".to_string(),
             Why::SelfAssoc(path) | Why::Projection(path) => format!("`{}`", tidy_str(path)),
+            Why::Hidden { generic, bound } => format!(
+                "`{}` in the arguments of `{}`, which may hide a projection",
+                generic,
+                tidy_str(bound)
+            ),
         }
     }
+}
+
+/// Returns the first bound of a type parameter of `generics` (the generics of a context) that may
+/// hide a projection of the parameter: one that names it in the arguments of its path, if another
+/// bound of it fixes an associated type, or `equated` has it (see [`equated_generics()`]). See
+/// `hiding_bounds()`, the rule that the context follows to leave such a bound out.
+pub(crate) fn hidden_projection(
+    generics: &Generics,
+    equated: &HashSet<String>,
+) -> Option<Unstable> {
+    for param in &generics.params {
+        let param = match param {
+            GenericParam::Type(param) => param,
+            _ => continue,
+        };
+        let name = ident_name(&param.ident);
+        let predicates: Vec<&PredicateType> = generics
+            .where_clause
+            .iter()
+            .flat_map(|where_clause| &where_clause.predicates)
+            .filter_map(|predicate| match predicate {
+                WherePredicate::Type(predicate)
+                    if bounded_ident(&predicate.bounded_ty).as_deref() == Some(&name) =>
+                {
+                    Some(predicate)
+                }
+                _ => None,
+            })
+            .collect();
+        let bounds: Vec<&TypeParamBound> = param
+            .bounds
+            .iter()
+            .chain(predicates.iter().flat_map(|predicate| &predicate.bounds))
+            .collect();
+        let hiding = hiding_bounds(&bounds, &name, equated.contains(&name))
+            .into_iter()
+            .find(|bound| may_hide(bound, &name));
+        let hiding = match hiding {
+            Some(hiding) => hiding,
+            None => continue,
+        };
+        let text = bound_text(hiding);
+        let has = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
+            bounds.iter().any(|bound| bound_text(bound) == text)
+        };
+        let bound = match predicates.iter().find(|predicate| has(&predicate.bounds)) {
+            Some(predicate) if !has(&param.bounds) => quote!(#predicate),
+            _ => quote!(#param),
+        };
+        return Some(Unstable {
+            bound,
+            why: Instability::Named(Why::Hidden {
+                generic: name,
+                bound: text,
+            }),
+        });
+    }
+    None
+}
+
+/// Returns `true` if the path of `bound` has a path in its arguments that names `name` and may be
+/// a type alias of a projection of it: not `name` itself (`From<T>`), a type that syntax builds
+/// (`&T`, `(T,)`), nor an absolute path of the standard library (`::core::option::Option<T>`),
+/// which are no aliases of a projection of `T`. A path inside them still counts.
+fn may_hide(bound: &TypeParamBound, name: &str) -> bool {
+    struct Hides<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast, 'a> Visit<'ast> for Hides<'a> {
+        fn visit_type_path(&mut self, i: &'ast TypePath) {
+            let mut names = HashSet::new();
+            token_names(quote!(#i), &mut names);
+            let bare = i.qself.is_none() && i.path.is_ident(self.name);
+            let std = i.qself.is_none()
+                && i.path.leading_colon.is_some()
+                && i.path.segments.first().map_or(false, |seg| {
+                    matches!(ident_name(&seg.ident).as_str(), "core" | "std" | "alloc")
+                });
+            if names.contains(self.name) && !bare && !std {
+                self.found = true;
+            }
+            syn::visit::visit_type_path(self, i)
+        }
+    }
+    let mut hides = Hides { name, found: false };
+    if let TypeParamBound::Trait(bound) = bound {
+        for seg in &bound.path.segments {
+            hides.visit_path_arguments(&seg.arguments);
+        }
+    }
+    hides.found
+}
+
+/// The names of the generics that an equation fixes an associated type of (`T: Iterator<Item =
+/// u8>`), in the bounds of `params` and in `predicates`.
+pub(crate) fn equated_generics<'a>(
+    params: impl Iterator<Item = &'a GenericParam>,
+    predicates: impl Iterator<Item = &'a WherePredicate>,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for param in params {
+        if let GenericParam::Type(param) = param {
+            if param.bounds.iter().any(binds_assoc) {
+                names.insert(ident_name(&param.ident));
+            }
+        }
+    }
+    for predicate in predicates {
+        if let WherePredicate::Type(predicate) = predicate {
+            if predicate.bounds.iter().any(binds_assoc) {
+                names.extend(bounded_ident(&predicate.bounded_ty));
+            }
+        }
+    }
+    names
 }
 
 /// Finds the first associated type in a node that rustc normalizes (see the module).

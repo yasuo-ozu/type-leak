@@ -1,5 +1,6 @@
 //! Encoding generic parameters and arguments into types.
 
+use crate::elided::{fold_bare_fn, fold_bound, Names, Site};
 use crate::util::{parenthesize_pointee, unwrap_type_group, ReplaceSelf};
 use proc_macro2::Span;
 use std::collections::HashMap;
@@ -77,9 +78,12 @@ pub(crate) fn complete_generics_args<'a>(
     ) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
     use syn::fold::Fold;
+    let mut substitute = SubstituteParams::default();
+    substitute.names.reserve(params);
     let mut lifetime_args = Vec::new();
     let mut other_args = Vec::new();
     for arg in iter {
+        substitute.names.reserve(arg);
         match arg {
             GenericArgument::Lifetime(_) => lifetime_args.push(arg),
             GenericArgument::Type(_) | GenericArgument::Const(_) => other_args.push(arg),
@@ -88,7 +92,6 @@ pub(crate) fn complete_generics_args<'a>(
     }
     let mut lifetime_args = lifetime_args.into_iter();
     let mut other_args = other_args.into_iter();
-    let mut substitute = SubstituteParams::default();
     let mut completed = Vec::<GenericArgument>::new();
     for (index, param) in params.iter().enumerate() {
         match param {
@@ -586,6 +589,9 @@ pub(crate) struct SubstituteParams {
     types: HashMap<Ident, Type>,
     consts: HashMap<Ident, Expr>,
     lifetimes: HashMap<Lifetime, Lifetime>,
+    /// The lifetimes that the copy of a signature binds, if the arguments add lifetimes to its
+    /// inputs.
+    names: Names,
 }
 
 impl SubstituteParams {
@@ -596,6 +602,10 @@ impl SubstituteParams {
         args: &[GenericArgument],
     ) -> Self {
         let mut substitute = Self::default();
+        substitute.names.reserve(params);
+        for arg in args {
+            substitute.names.reserve(arg);
+        }
         for (param, arg) in params.iter().zip(args) {
             match (param, arg) {
                 (
@@ -630,9 +640,10 @@ impl SubstituteParams {
         }
     }
 
-    /// The value that `expr` is the const parameter of, in braces.
+    /// The value that `expr` is the const parameter of, in braces. `expr` may be braced already
+    /// (`{ N }`): the value is braced once, as rustc rejects `{ { M } }` for a generic `M`.
     fn const_value(&self, expr: &Expr) -> Option<Expr> {
-        match expr {
+        match unwrap_block(expr) {
             Expr::Path(ExprPath {
                 qself: None, path, ..
             }) => {
@@ -682,6 +693,19 @@ impl syn::fold::Fold for SubstituteParams {
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
         self.lifetime(lifetime)
     }
+    // The elided lifetime of a signature is named where an argument adds lifetimes to its inputs.
+    fn fold_type_bare_fn(&mut self, i: TypeBareFn) -> TypeBareFn {
+        fold_bare_fn(self, i)
+    }
+    fn fold_trait_bound(&mut self, i: TraitBound) -> TraitBound {
+        fold_bound(self, i)
+    }
+}
+
+impl Site for SubstituteParams {
+    fn names(&mut self) -> &mut Names {
+        &mut self.names
+    }
 }
 
 /// Writes a type at a use site: the substitution of `params`, and `Self` replaced by `self_ty`, in
@@ -691,7 +715,14 @@ pub(crate) struct SubstituteSite<'a> {
     pub(crate) self_ty: Option<&'a Type>,
 }
 
-impl SubstituteSite<'_> {
+impl<'a> SubstituteSite<'a> {
+    /// Writes `ty`, or a part of it, at a site: `params`, and `Self` replaced by `self_ty` if any.
+    pub(crate) fn new(mut params: SubstituteParams, self_ty: Option<&'a Type>, ty: &Type) -> Self {
+        params.names.reserve(ty);
+        params.names.reserve(self_ty);
+        Self { params, self_ty }
+    }
+
     /// `T::A` for a type parameter `T` that has an argument is `<arg>::A`.
     fn projection_of_parameter(&mut self, ty: &Type) -> Option<Type> {
         let path = match ty {
@@ -758,6 +789,18 @@ impl syn::fold::Fold for SubstituteSite<'_> {
             Some(self_ty) => ReplaceSelf { self_ty }.fold_macro(mac),
             None => mac,
         }
+    }
+    fn fold_type_bare_fn(&mut self, i: TypeBareFn) -> TypeBareFn {
+        fold_bare_fn(self, i)
+    }
+    fn fold_trait_bound(&mut self, i: TraitBound) -> TraitBound {
+        fold_bound(self, i)
+    }
+}
+
+impl Site for SubstituteSite<'_> {
+    fn names(&mut self) -> &mut Names {
+        &mut self.params.names
     }
 }
 

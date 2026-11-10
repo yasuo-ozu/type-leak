@@ -1832,3 +1832,54 @@ fn f09_fn_pointer_self_predicate_print_in_the_generics_of_an_entry() {
         assert!(seen, "the entry `Rel<Self>` has no where predicate");
     }
 }
+
+#[test]
+fn test_a_braced_const_parameter_is_braced_once_by_the_substitutions() {
+    use syn::fold::Fold;
+    let to_string = |ty: &Type| quote!(#ty).to_string();
+    let params: Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
+    // `{ { M } }` is rejected by rustc for a generic `M`: a braced use of the parameter is a
+    // braced use of the argument, not a block around it.
+    let cases: [(&str, &str, &str); 8] = [
+        ("[u8; { N }]", "M", "[u8; { M }]"),
+        ("Rel<{ N }>", "M", "Rel<{ M }>"),
+        ("[u8; N]", "M", "[u8; { M }]"),
+        ("Rel<N>", "M", "Rel<M>"),
+        ("[u8; { N }]", "{ M }", "[u8; { M }]"),
+        ("[u8; { N }]", "3", "[u8; { 3 }]"),
+        ("Rel<{ N }>", "{ 1 + 1 }", "Rel<{ 1 + 1 }>"),
+        ("[u8; { { N } }]", "M", "[u8; { M }]"),
+    ];
+    for (written, arg, expected) in cases {
+        let ty: Type = syn::parse_str(written).unwrap();
+        let args: Vec<GenericArgument> = vec![syn::parse_str(arg).unwrap()];
+        let expected: Type = syn::parse_str(expected).unwrap();
+        let mut params_only = SubstituteParams::of(&params, &args);
+        assert_eq!(
+            to_string(&params_only.fold_type(ty.clone())),
+            to_string(&expected),
+            "{} with {}",
+            written,
+            arg
+        );
+        let mut site = SubstituteSite {
+            params: SubstituteParams::of(&params, &args),
+            self_ty: None,
+        };
+        assert_eq!(
+            to_string(&site.fold_type(ty)),
+            to_string(&expected),
+            "{} at a site with {}",
+            written,
+            arg
+        );
+    }
+    // A block that does not hold the parameter alone is walked as before.
+    let args: Vec<GenericArgument> = vec![parse_quote!(M)];
+    let mut site = SubstituteSite {
+        params: SubstituteParams::of(&params, &args),
+        self_ty: None,
+    };
+    let ty: Type = parse_quote!([u8; { N + 1 }]);
+    assert_eq!(to_string(&site.fold_type(ty)), "[u8 ; { ({ M }) + 1 }]");
+}

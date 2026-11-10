@@ -1275,6 +1275,17 @@ pub fn prop_leak_noop(
     item
 }
 
+/// The errors that the Leaker carries to another crate, which reports them: `__tl_carry_<id>!` of
+/// `tests/prop_cross_crate.rs`. See `prop::carry()`.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __prop_carry(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match prop::carry(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 /// The Referrer's side of `tests/prop_cross_crate.rs`, invoked through the `macro_rules!` that
 /// `prop_leak` exports.
 #[doc(hidden)]

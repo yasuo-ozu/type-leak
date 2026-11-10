@@ -4,7 +4,9 @@ use crate::allow::{Allow, Place as AllowPlace};
 use crate::analysis::{PartItem, SignatureFacts, SignatureMark};
 use crate::context::{Context, ContextId, Enclosing, Gat, ModuleInfo, Scope, SelfRequirement};
 use crate::crates::absolute_paths;
-use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
+use crate::elided::{
+    name_elided_in_bare_fn, name_elided_in_bound, Elision, Names, SelfWriter, WrittenNames,
+};
 use crate::encode::{check_root_args, complete_generics_args, param_as_arg, EncodeError};
 use crate::error::Cause;
 use crate::graph::TypeKey;
@@ -124,10 +126,12 @@ enum Defaults {
     /// the scope declares, and a default cannot name `Self` in a struct, an enum or a union.
     WithoutSelf,
     /// The generics of a trait nested in the visited syntax, while they are visited. The Leaker
-    /// has either analyzed the default of such a trait with the `Self` of the trait
+    /// has analyzed the default of such a trait without `Self`, as it does for a scope that it
+    /// enters ([`Leaker::enter_trait()`](crate::Leaker::enter_trait)), unless the default names
+    /// `Self` (`Rhs = Self`): then with the `Self` of the trait
     /// ([`View::visit_item()`](crate::View::visit_item), the items of
-    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)), or, if the macro entered the trait
-    /// with [`Leaker::enter_trait()`](crate::Leaker::enter_trait), without it.
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). An earlier Leaker analyzed every
+    /// such default with it.
     OwnTrait,
     /// Visiting a default of `OwnTrait`: an entry analyzed without `Self` is preferred, else the
     /// one of the trait's `Self` (written by `Visitor::with_nested_self()`).
@@ -672,7 +676,10 @@ impl Referrer {
     /// module of `context` are looked up, and those of no module: a default that names an item of
     /// the module (`U = Rel2<T>` with `Rel2` imported there) is one. A const default is used as
     /// written, so one that names an item of the Leaker's scope (`= MY_CONST`) does not resolve in
-    /// the Referrer: give such an argument explicitly. Panics if `context` is not in
+    /// the Referrer: give such an argument explicitly. A default is written as
+    /// [`UseSite::substitute()`](crate::UseSite::substitute) writes a type, and the elided lifetime
+    /// of a signature that the path of `type_fn` gives lifetimes is named as
+    /// [`Referrer::visitor()`] does it (`'__tl_s0`, as at a use site). Panics if `context` is not in
     /// [`contexts()`](Referrer::contexts).
     pub fn complete_args<'a>(
         &self,
@@ -716,10 +723,19 @@ impl Referrer {
                     },
                 );
                 let ty = substitute.fold_type(ty);
+                // The site's generics are not known: a lifetime that the type, the arguments or the
+                // parameters name is not a fresh name.
+                let mut names = Names::default();
+                names.reserve(&ty);
+                names.reserve(params);
+                for arg in completed {
+                    names.reserve(arg);
+                }
                 Ok(Resolve {
                     leaked,
                     completed,
                     type_fn: &mut type_fn,
+                    names,
                 }
                 .fold_type(ty))
             },
@@ -788,6 +804,12 @@ impl Referrer {
     ///   nested in that of `context`, found by name. For a module, visit its items: a `mod` that
     ///   no module of the context is named like is also taken as the module itself, but not one
     ///   that is.
+    ///
+    /// If `type_fn` writes lifetimes into the inputs of a function pointer or `Fn(..)` whose output
+    /// takes its elided lifetime from the one lifetime of its inputs (the arguments of a site that
+    /// holds `&'static str`), the visitor names that lifetime with a fresh binder (`for<'__tl_e0>
+    /// fn(&'__tl_e0 ..) -> &'__tl_e0 u8`). A lifetime that a path hides is not named, nor is an
+    /// elided lifetime that `type_fn` wrote itself.
     ///
     /// The Visitor borrows the Referrer, so `type_fn` may use it ([`Referrer::entry_args()`]), and
     /// several Visitors may share one Referrer.
@@ -994,22 +1016,42 @@ impl Referrer {
                 // Before the binder is in scope: the one it gets names the lifetime that elision
                 // gives, which `Self` written as a type with lifetimes would break.
                 if let Some(replace) = self.replace_self {
-                    name_elided_in_bare_fn(replace.self_ty, &self.scopes[..], &mut i);
+                    let mut writer = SelfWriter {
+                        self_ty: replace.self_ty,
+                        scopes: &self.scopes[..],
+                    };
+                    name_elided_in_bare_fn(&mut writer, &mut i);
                 }
+                // What the original relies on, found before an entry is written: the path that
+                // replaces it may name lifetimes in the inputs (the arguments of the site).
+                let elision = Elision::of_bare_fn(&i);
                 let depth = self.scopes.len();
                 self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
-                let i = syn::fold::fold_type_bare_fn(self, i);
+                let mut i = syn::fold::fold_type_bare_fn(self, i);
                 self.scopes.truncate(depth);
+                if let Some(elision) = elision {
+                    let mut names = WrittenNames::new(&self.scopes[..], &i);
+                    elision.name_written_bare_fn(&mut names, &mut i);
+                }
                 i
             }
             fn fold_trait_bound(&mut self, mut i: TraitBound) -> TraitBound {
                 if let Some(replace) = self.replace_self {
-                    name_elided_in_bound(replace.self_ty, &self.scopes[..], &mut i);
+                    let mut writer = SelfWriter {
+                        self_ty: replace.self_ty,
+                        scopes: &self.scopes[..],
+                    };
+                    name_elided_in_bound(&mut writer, &mut i);
                 }
+                let elision = Elision::of_bound(&i);
                 let depth = self.scopes.len();
                 self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
-                let i = syn::fold::fold_trait_bound(self, i);
+                let mut i = syn::fold::fold_trait_bound(self, i);
                 self.scopes.truncate(depth);
+                if let Some(elision) = elision {
+                    let mut names = WrittenNames::new(&self.scopes[..], &i);
+                    elision.name_written_bound(&mut names, &mut i);
+                }
                 i
             }
         }
@@ -1045,6 +1087,8 @@ struct Resolve<'a, F> {
     leaked: Vec<(Type, usize)>,
     completed: &'a [GenericArgument],
     type_fn: &'a mut F,
+    /// The lifetimes that a signature binds where `type_fn` wrote lifetimes into its inputs.
+    names: Names,
 }
 
 impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for Resolve<'a, F> {
@@ -1066,6 +1110,29 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
             Some((leaked, ix)) => (self.type_fn)(leaked, ix, self.completed),
             None => syn::fold::fold_type(self, ty),
         }
+    }
+
+    // The placeholder is no lifetime, so the original's elision is read before `type_fn` writes
+    // the path that replaces it.
+    fn fold_type_bare_fn(&mut self, i: TypeBareFn) -> TypeBareFn {
+        let elision = Elision::of_bare_fn(&i);
+        let mut i = syn::fold::fold_type_bare_fn(self, i);
+        if let Some(elision) = elision {
+            // The signatures inside have been named: those names are taken too.
+            self.names.reserve(&i);
+            elision.name_written_bare_fn(&mut self.names, &mut i);
+        }
+        i
+    }
+
+    fn fold_trait_bound(&mut self, i: TraitBound) -> TraitBound {
+        let elision = Elision::of_bound(&i);
+        let mut i = syn::fold::fold_trait_bound(self, i);
+        if let Some(elision) = elision {
+            self.names.reserve(&i);
+            elision.name_written_bound(&mut self.names, &mut i);
+        }
+        i
     }
 }
 
@@ -1272,7 +1339,9 @@ where
     ///
     /// The default of a parameter of the outermost item (`trait Tr<T: AsRef<Self>, U = Rel<T>>`) is
     /// looked up without `Self`, so a leaked type in it goes to `type_fn`; if a bound of an earlier
-    /// parameter names `Self`, `type_fn` picks the host that has the bound in the copy.
+    /// parameter names `Self`, `type_fn` picks the host that has the bound in the copy. So does the
+    /// default of a trait nested in the visited syntax, unless it names `Self`
+    /// ([`with_nested_self()`](Visitor::with_nested_self)).
     ///
     /// A `self_ty` with lifetimes (`::p::S<'a>`) would give `fn(&Self) -> &u8` more input lifetimes
     /// (E0106), so the visitor names the elided one with a fresh binder
@@ -1300,10 +1369,11 @@ where
     ///   the Leaker's module), which the copy cannot name as `Self`: it declares an `S` of its own.
     ///   Write it from [`NestedSelf::ident`], [`NestedSelf::modules`] and the path of the module in
     ///   the Leaker's crate. An impl needs no such type: its `Self` is its self type as written.
-    /// - [`SelfRequirement::Bound`] (trait): a host that implements it, also for the default of a
-    ///   parameter (`trait Tr<T: AsRef<Self>, U = Rel<T>>`). The arguments of the Repeater include
-    ///   the defaulted parameter, which a declaration cannot name in its own default (E0128): pass
-    ///   a type for it with [`UseSite::substituting()`](crate::UseSite::substituting).
+    /// - [`SelfRequirement::Bound`] (trait): a host that implements it, also for a default that
+    ///   names `Self` (`trait Tr<T, U = Rel<Self>>`). The arguments of the Repeater include the
+    ///   defaulted parameter, which a declaration cannot name in its own default (E0128): pass a
+    ///   type for it with [`UseSite::substituting()`](crate::UseSite::substituting). A default that
+    ///   does not (`U = Rel<T>`, with `T: AsRef<Self>` or not) goes to `type_fn`.
     /// - [`SelfRequirement::Any`] (a struct, enum or union whose generic has a bound that names
     ///   `Self`: `Rel<T>` with `T: AsRef<Self>`): any type that the bound holds for. Pass the
     ///   copy's own `Self` (what `UseSite::identity()` has), not the Leaker's type (E0277). With
@@ -1629,8 +1699,13 @@ where
         // trait path the Leaker could not leak is copied as written, with the types in it.
         let part = self.is_part_node(|| bound_cause(i), &i.path);
         if let Some(self_ty) = self.self_ty.as_ref().filter(|_| !self.own_self) {
-            name_elided_in_bound(self_ty, &self.scopes[..], i);
+            let mut writer = SelfWriter {
+                self_ty,
+                scopes: &self.scopes[..],
+            };
+            name_elided_in_bound(&mut writer, i);
         }
+        let elision = Elision::of_bound(i);
         let depth = self.scopes.len();
         self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
         if part {
@@ -1639,18 +1714,23 @@ where
             syn::visit_mut::visit_trait_bound_mut(self, i);
         }
         self.scopes.truncate(depth);
+        if let Some(elision) = elision {
+            let mut names = WrittenNames::new(&self.scopes[..], &*i);
+            elision.name_written_bound(&mut names, i);
+        }
     }
     fn visit_type_param_mut(&mut self, i: &mut TypeParam) {
         if matches!(self.defaults, Defaults::Plain | Defaults::OwnTraitDefault) {
             return syn::visit_mut::visit_type_param_mut(self, i);
         }
         if self.defaults == Defaults::OwnTrait {
-            // The default of a trait nested in the visited syntax: the Leaker has analyzed it with
-            // the `Self` of the trait (`View::visit_item()`), unless the macro entered the trait
-            // itself (`Leaker::enter_trait()`), which analyzes it without. An entry of either is
-            // found, the one without `Self` first (it is what `complete_args()` uses, and it does
-            // not name the parameters after the default), and the other is written like any entry
-            // of the trait's `Self`: `Visitor::with_nested_self()`, or left as written without it.
+            // The default of a trait nested in the visited syntax: the Leaker has analyzed it
+            // without `Self`, as it does for a scope that it enters (`Leaker::enter_trait()`),
+            // unless the default names `Self` (or an earlier Leaker did): then with the `Self` of
+            // the trait (`View::visit_item()`). An entry of either is found, the one without
+            // `Self` first (it is what `complete_args()` uses, and it does not name the parameters
+            // after the default), and the other is written like any entry of the trait's `Self`:
+            // `Visitor::with_nested_self()`, or left as written without it.
             let default = i.default.take();
             syn::visit_mut::visit_type_param_mut(self, i);
             i.default = default;
