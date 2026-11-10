@@ -951,6 +951,19 @@ pub(crate) fn is_bare_self(ty: &Type) -> bool {
     )
 }
 
+/// Returns `true` if `ty` is `Self::A` or `<Self as Tr>::A`: an associated type of `Self`.
+pub(crate) fn is_self_projection(ty: &Type) -> bool {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => {
+            self_head(path).is_some() && path.segments.len() > 1
+        }
+        Type::Path(TypePath {
+            qself: Some(qself), ..
+        }) => is_bare_self(&qself.ty),
+        _ => false,
+    }
+}
+
 /// The name of the generic that a where predicate's bounded type is, if it is a bare name.
 pub(crate) fn bounded_ident(ty: &Type) -> Option<String> {
     match unwrap_type_group(ty) {
@@ -1183,7 +1196,8 @@ pub(crate) struct ReplaceSelf<'a> {
 
 impl<'a> ReplaceSelf<'a> {
     /// Replaces each `Self`. One that a `::` follows is `<host>`, as an expression needs, unless
-    /// the host is a path with no arguments.
+    /// the host is a path with no arguments. A `::` has its first colon `Joint`: `Self: ::p::Tr`
+    /// and `Self : : X` have an `Alone` one, and rustc and syn read no path in them.
     pub(crate) fn replace_tokens(&self, tokens: TokenStream) -> TokenStream {
         use proc_macro2::{Group, Spacing, TokenTree};
         let plain_host = matches!(

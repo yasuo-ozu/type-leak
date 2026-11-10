@@ -5,11 +5,12 @@ use crate::unstable::{bound_text, hiding_bounds, trait_bounds};
 use crate::util::{
     binder_lifetimes, bound_mentions_self, bounded_ident, canonical_bounds, first_self_in_generics,
     generic_param_mentions_self, generic_param_name, has_lifetime, ident_name, is_bare_self,
-    is_lifetime_param, is_named, is_type_param_named, lifetime_name, names_in, plain_self_head,
-    projection, projection_head, push_once, same_lifetime, same_name, self_in_param,
-    self_in_predicate, sorted_by_tokens, tidy, token_names, tokens_text, type_contains,
-    type_mentions_self, type_names, unwrap_type_group, where_clause, where_predicate_mentions_self,
-    without_default, without_self_bounds, ReplaceSelf, SelfMentions, Unraw,
+    is_lifetime_param, is_named, is_self_projection, is_type_param_named, lifetime_name, names_in,
+    plain_self_head, projection, projection_head, push_once, same_lifetime, same_name,
+    self_in_param, self_in_predicate, sorted_by_tokens, tidy, token_names, tokens_text,
+    type_contains, type_mentions_self, type_names, unwrap_type_group, where_clause,
+    where_predicate_mentions_self, without_default, without_self_bounds, ReplaceSelf, SelfMentions,
+    Unraw,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -967,6 +968,9 @@ impl Context {
         if mentions_self && !free_self {
             names.extend(self_names.iter().cloned());
         }
+        // `Self` and `Self::A` are not replaced where they are written: the copy resolves them by
+        // what declares `Self`, which the bounds of a method do not change.
+        let inner = !(is_bare_self(ty) || is_self_projection(ty));
         let mut gather = Gather {
             scopes,
             self_req,
@@ -974,7 +978,7 @@ impl Context {
             params: BTreeMap::new(),
             predicates: BTreeMap::new(),
             substituted: Vec::new(),
-            left_out: LeftOut::new(whole),
+            left_out: LeftOut::new(whole, inner),
         };
         if let Some(from) = scopes.len().checked_sub(1) {
             push_names(&mut gather.work, scopes, from, names);
@@ -1286,6 +1290,27 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
     }
 }
 
+/// Returns `true` if `predicate` of `scopes[at]` bounds a generic in scope there or an associated
+/// type of one (`T`, `T::Item`, `<T as Tr>::Item`, `'a`), which only the environment proves.
+fn bounds_generic(scopes: &[Scope], at: usize, predicate: &WherePredicate) -> bool {
+    let head = match predicate {
+        WherePredicate::Type(predicate) => match unwrap_type_group(&predicate.bounded_ty) {
+            Type::Path(TypePath {
+                qself: Some(qself), ..
+            }) => bounded_ident(&qself.ty),
+            Type::Path(TypePath { qself: None, path }) if path.leading_colon.is_none() => path
+                .segments
+                .first()
+                .filter(|seg| seg.arguments.is_none())
+                .map(|seg| ident_name(&seg.ident)),
+            _ => None,
+        },
+        WherePredicate::Lifetime(predicate) => Some(lifetime_name(&predicate.lifetime)),
+        _ => None,
+    };
+    head.map_or(false, |head| declared_at(scopes, at, &head).is_some())
+}
+
 /// The generics and where predicates that `Context::compute_with()` gathers from the scopes.
 struct Gather<'a> {
     scopes: &'a [Scope],
@@ -1333,9 +1358,9 @@ impl<'a> Gather<'a> {
         }
     }
 
-    /// Takes the generic `name`, the parameter `pos` of `scopes[ix]`, and the where predicates of
-    /// that scope that belong to it, and puts the names they write on `work`. Returns `true` if
-    /// they mention `Self`.
+    /// Takes the generic `name`, the parameter `pos` of `scopes[ix]`, and the where predicates
+    /// that belong to it, of that scope and of the scopes inside it, and puts the names they write
+    /// on `work`. Returns `true` if they mention `Self`.
     fn take(
         &mut self,
         ix: usize,
@@ -1364,34 +1389,50 @@ impl<'a> Gather<'a> {
         push_names(&mut self.work, scopes, ix, names);
         let mut found_self = generic_param_mentions_self(&param);
         self.params.insert((ix, pos), param);
-        for (k, predicate) in scopes[ix].predicates.iter().enumerate() {
-            if self.predicates.contains_key(&(ix, k)) {
+        for at in ix..self.left_out.reach(scopes, ix) {
+            // A scope inside (a method) sees the generic, unless it declares one of the name.
+            if declared_at(scopes, at, name) != Some((ix, pos)) {
                 continue;
             }
-            // The bounds of a generic that the context leaves out are not its predicates.
-            let predicate = &match self.left_out.without(scopes, ix, predicate) {
-                Some(predicate) => predicate,
-                None => continue,
-            };
-            let mut names = names_in(predicate);
-            // A predicate on a generic of the scope is a bound of it, as `canonicalize()` makes
-            // it: it is in the context of what uses that generic, not of what its arguments
-            // name. So `T: Iterator<Item = Rel<'a>>` is no more in the context of `Rel<'a>`
-            // than the inline bound is, which the Referrer sees. Any other predicate belongs to
-            // each generic it names.
-            let belongs = match bounded_generic(predicate) {
-                Some(bounded) if scopes[ix].declares(&bounded) => bounded == name,
-                _ => names.contains(name),
-            };
-            if belongs {
-                let mut predicate = predicate.clone();
-                if let Some(outer) = outer.filter(|_| where_predicate_mentions_self(&predicate)) {
-                    predicate = self.substitute(outer, &predicate)?;
-                    names = names_in(&predicate);
+            // The predicates are written for the `Self` of their own scope.
+            let outer = self.foreign(at);
+            for (k, predicate) in scopes[at].predicates.iter().enumerate() {
+                // A scope inside adds its bounds of the generics around it (`T: Clone`, `T::Item:
+                // Clone`), which the type may need. Its predicates on other types (`Rel<T>:
+                // Default`) are conditions of its own item, which the copy keeps.
+                if self.predicates.contains_key(&(at, k))
+                    || (at > ix && !bounds_generic(scopes, at, predicate))
+                {
+                    continue;
                 }
-                push_names(&mut self.work, scopes, ix, names);
-                found_self |= where_predicate_mentions_self(&predicate);
-                self.predicates.insert((ix, k), predicate);
+                // The bounds of a generic that the context leaves out are not its predicates.
+                let predicate = &match self.left_out.without(scopes, at, predicate) {
+                    Some(predicate) => predicate,
+                    None => continue,
+                };
+                let mut names = names_in(predicate);
+                // A predicate on a generic is a bound of it, as `canonicalize()` makes it: it is
+                // in the context of what uses that generic, not of what its arguments name. So
+                // `T: Iterator<Item = Rel<'a>>` is no more in the context of `Rel<'a>` than the
+                // inline bound is, which the Referrer sees. Any other predicate belongs to each
+                // generic it names.
+                let bounded = bounded_generic(predicate)
+                    .and_then(|bounded| declared_at(scopes, at, &bounded));
+                let belongs = match bounded {
+                    Some(bounded) => bounded == (ix, pos),
+                    None => names.contains(name),
+                };
+                if belongs {
+                    let mut predicate = predicate.clone();
+                    if let Some(outer) = outer.filter(|_| where_predicate_mentions_self(&predicate))
+                    {
+                        predicate = self.substitute(outer, &predicate)?;
+                        names = names_in(&predicate);
+                    }
+                    push_names(&mut self.work, scopes, at, names);
+                    found_self |= where_predicate_mentions_self(&predicate);
+                    self.predicates.insert((at, k), predicate);
+                }
             }
         }
         Ok(found_self)
@@ -1416,6 +1457,8 @@ impl<'a> Gather<'a> {
 /// except for the generics that [`Whole`] keeps.
 struct LeftOut {
     whole: Whole,
+    /// The scopes inside the one that declares a generic bound it too.
+    inner: bool,
     cache: HashMap<(usize, String), HashSet<String>>,
 }
 
@@ -1438,10 +1481,20 @@ impl Whole {
 }
 
 impl LeftOut {
-    fn new(whole: Whole) -> Self {
+    fn new(whole: Whole, inner: bool) -> Self {
         Self {
             whole,
+            inner,
             cache: HashMap::new(),
+        }
+    }
+
+    /// The end of the scopes whose predicates bound a generic of `scopes[ix]`.
+    fn reach(&self, scopes: &[Scope], ix: usize) -> usize {
+        if self.inner {
+            scopes.len()
+        } else {
+            ix + 1
         }
     }
 
@@ -1449,32 +1502,35 @@ impl LeftOut {
     /// leaves out.
     fn of(&mut self, scopes: &[Scope], ix: usize, name: &str) -> &HashSet<String> {
         let kept = self.whole.keeps(name);
+        let reach = self.reach(scopes, ix);
         self.cache.entry((ix, name.to_string())).or_insert_with(|| {
             if kept {
                 HashSet::new()
             } else {
-                left_out_bounds(&scopes[ix], name)
+                left_out_bounds(&scopes[..reach], ix, name)
             }
         })
     }
 
-    /// `predicate` of `scopes[ix]` without the bounds of the generic it bounds that the context
+    /// `predicate` of `scopes[at]` without the bounds of the generic it bounds that the context
     /// leaves out: `None` if nothing is left.
     fn without(
         &mut self,
         scopes: &[Scope],
-        ix: usize,
+        at: usize,
         predicate: &WherePredicate,
     ) -> Option<WherePredicate> {
         let (bounded, predicate_type) = match predicate {
             WherePredicate::Type(predicate_type) => (
-                bounded_ident(&predicate_type.bounded_ty).filter(|name| scopes[ix].declares(name)),
+                bounded_ident(&predicate_type.bounded_ty).and_then(|name| {
+                    declared_at(scopes, at, &name).map(|(declared, _)| (declared, name))
+                }),
                 predicate_type,
             ),
             _ => return Some(predicate.clone()),
         };
         let left_out = match bounded {
-            Some(name) => self.of(scopes, ix, &name),
+            Some((declared, name)) => self.of(scopes, declared, &name),
             None => return Some(predicate.clone()),
         };
         if left_out.is_empty() {
@@ -1496,12 +1552,12 @@ impl LeftOut {
     }
 }
 
-/// The texts of the bounds of the type parameter `name` of `scope` that its context leaves out
-/// (see [`hiding_bounds()`]). The leaked type may need one (`struct Rel<T: Fn(X<T>)>`): then
-/// rustc rejects the Repeater's impl (E0277).
-fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
+/// The texts of the bounds of the type parameter `name` of `scopes[ix]` that its context leaves
+/// out (see [`hiding_bounds()`]), with the bounds that the scopes inside write for it. The leaked
+/// type may need one (`struct Rel<T: Fn(X<T>)>`): then rustc rejects the Repeater's impl (E0277).
+fn left_out_bounds(scopes: &[Scope], ix: usize, name: &str) -> HashSet<String> {
     let mut bounds: Vec<&TypeParamBound> = Vec::new();
-    for param in scope.params() {
+    for param in scopes[ix].params() {
         match param {
             GenericParam::Type(param) if ident_name(&param.ident) == name => {
                 bounds.extend(param.bounds.iter())
@@ -1509,7 +1565,12 @@ fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
             _ => (),
         }
     }
-    for predicate in scope.predicates() {
+    let sees =
+        |at: &usize| declared_at(scopes, *at, name).map(|(declared, _)| declared) == Some(ix);
+    for predicate in (ix..scopes.len())
+        .filter(sees)
+        .flat_map(|at| scopes[at].predicates())
+    {
         match predicate {
             WherePredicate::Type(predicate)
                 if bounded_ident(&predicate.bounded_ty).as_deref() == Some(name) =>

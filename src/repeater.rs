@@ -683,7 +683,7 @@ impl Projection {
                 (Some(_), ImplSelf::Marker(_)) => unreachable!("rejected by check_marker()"),
                 (None, ImplSelf::Marker(marker)) => (marker.clone(), marker.clone(), None),
                 (requirement, ImplSelf::Param(ident)) => {
-                    let ident = self_param(entry_ty, context, ident);
+                    let ident = self_param(entry_ty, context, ident, &self.path);
                     // Any type that the bounds hold for (`SelfRequirement::Any`), or any type at
                     // all: the parameter has no bound of its own.
                     let bound = match requirement {
@@ -757,9 +757,10 @@ impl Projection {
 }
 
 /// The parameter that stands for `Self` in the impl of an entry of the type `ty` and the context
-/// `context`: `ident`, unless the type, the generics of the context or its bound use that name
-/// (E0403, or taken for that generic), else the first of `ident0`, `ident1`, .. that they do not.
-fn self_param(ty: &Type, context: &Context, ident: &Ident) -> Ident {
+/// `context`: `ident`, unless the type, the generics of the context, its bound or the start of the
+/// path `repeater` use that name (E0403, or taken for that generic), else the first of `ident0`,
+/// `ident1`, .. that they do not.
+fn self_param(ty: &Type, context: &Context, ident: &Ident, repeater: &Path) -> Ident {
     let generics = &context.generics;
     let where_clause = &generics.where_clause;
     let bound = match &context.self_ty {
@@ -768,7 +769,17 @@ fn self_param(ty: &Type, context: &Context, ident: &Ident) -> Ident {
     };
     // Every identifier counts, those of the tokens of a macro too. A lifetime has its own
     // names, as `'__S`.
-    let used = names_in(quote!(#ty #generics #where_clause #bound));
+    let mut used = names_in(quote!(#ty #generics #where_clause #bound));
+    // The parameter hides a module that the path of the Repeater starts with. A path that starts
+    // with `::` names a crate, which a parameter does not hide.
+    if repeater.leading_colon.is_none() {
+        used.extend(
+            repeater
+                .segments
+                .first()
+                .map(|first| ident_name(&first.ident)),
+        );
+    }
     let base = ident_name(ident);
     if !used.contains(&base) {
         return ident.clone();

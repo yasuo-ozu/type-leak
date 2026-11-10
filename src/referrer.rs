@@ -1914,6 +1914,9 @@ impl Referrer {
     //      predicate (`Self: 'x`) keeps whole the bounds of the generics that the description of
     //      `Self` names (`Tr<T>`) and leaves out those of the others (15 kept all), which the
     //      Referrer computes for a copy.
+    //    - The context of an entry has the bounds that a scope inside the item (a method, a generic
+    //      associated type) writes on a generic of the item (`fn m(&self, a: Cl<T>) where T:
+    //      Clone` gives `<T: Clone>`), which the Referrer computes for a copy.
     //    - A `LeakerResult` writes its errors after the Referrer as `@ [ {error} .. ]`, in one
     //      bracket group, so that a brace group after it is left to the caller.
     //    - An entry carries no list of the crates it names (15 wrote `@[a, b]` before its type)

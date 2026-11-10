@@ -72,6 +72,11 @@ type_leak_test_leaker::s::Assoc!(impl Assoc for Concrete => 0 {
 type_leak_test_leaker::s::Clash9248!(impl<T> Clash9248<T> for Concrete => 0 {
     type Item = u8;
 });
+// The Repeater of the trait is at `__S::Repeater`, which the macro names from here (F117).
+use type_leak_test_leaker::__S;
+type_leak_test_leaker::s::Shadow9278!(impl Shadow9278 for Concrete => 0 {
+    type Item = u32;
+});
 type_leak_test_leaker::s::Out!(impl<'x, T> Out<'x, T> for Concrete => 0);
 type_leak_test_leaker::s::DynRoot!(impl<'x> DynRoot<'x> for Concrete => 0);
 type_leak_test_leaker::s::Q!(impl<I: ::core::iter::Iterator> Q<I> for Concrete => 0);
@@ -307,6 +312,20 @@ pub mod kinds {
     // The root of a `use` in a block in an array length is read: the arrays are the entries
     // (F113).
     type_leak_test_leaker::__tl_prop_9274!(path = ::type_leak_test_leaker::kinds);
+    // In a value, the root of a `use` is no name that the same `use` brings: the item is rejected
+    // and expands to nothing, as its import could not be resolved here (F114).
+    type_leak_test_leaker::__tl_prop_9275!(path = ::type_leak_test_leaker::kinds);
+    // A relative macro in a const argument of a bound is an error: the item is rejected and expands
+    // to nothing, as the macro could not be found here (F115).
+    type_leak_test_leaker::__tl_prop_9276!(path = ::type_leak_test_leaker::kinds);
+    // A built-in attribute in a block in an array length is not read: `Rel` is the entry (F116).
+    type_leak_test_leaker::__tl_prop_9277!(path = ::type_leak_test_leaker::kinds);
+    // The bounds that a method writes for a generic of its trait are in the contexts of its entries
+    // (F119).
+    type_leak_test_leaker::__tl_prop_9279!(path = ::type_leak_test_leaker::kinds);
+    // A relative derive in a block in a value is an error: the item is rejected and expands to
+    // nothing, as the derive could not be found here (F120).
+    type_leak_test_leaker::__tl_prop_9280!(path = ::type_leak_test_leaker::kinds);
     // The `Self` of an item in the default of a type parameter is the item's own (F102).
     type_leak_test_leaker::__tl_prop_9265!(path = ::type_leak_test_leaker::kinds);
     // The argument of a generic associated type replaces its parameter in its where clause (F89).

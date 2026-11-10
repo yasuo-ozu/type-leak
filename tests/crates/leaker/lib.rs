@@ -14,6 +14,13 @@ extern crate self as type_leak_test_leaker;
 // The Repeater, with const slots to encode const generics of any primitive type.
 type_leak_test_macro::define_repeater!(pub Repeater);
 
+/// A second Repeater, in a module named like the parameter that the Repeater's impls declare for
+/// the implementor (`s::Shadow9278`, fixture 9278).
+#[allow(non_snake_case)]
+pub mod __S {
+    type_leak_test_macro::define_repeater!(pub Repeater);
+}
+
 /// A type of the root of the crate named like a generic (`crate::U`, `kinds::PathsLikeGeneric`).
 pub struct U(pub u8);
 
@@ -348,6 +355,9 @@ pub mod m {
 pub mod s {
     use type_leak_test_macro::leak;
 
+    // The Repeater of `Shadow9278` is named through it.
+    use crate::__S;
+
     pub use crate::m::Inner;
 
     #[derive(Debug, PartialEq)]
@@ -439,6 +449,31 @@ pub mod s {
         type Item = u8;
         fn f(&self, s: __S) -> Wrap<(u8, __S)> {
             Wrap((9, s))
+        }
+    }
+
+    /// 9278 (F117): the Repeater is `__S::Repeater` (the module of the crate's root, brought in
+    /// here and by the Referrer's crate), and the impls of its entries declare the parameter for
+    /// the implementor: `impl<__S: ?Sized> __S::Repeater<..> for __S` hid the module (E0405); the
+    /// parameter is now `__S0`. `Wrap<(Self::Item, u8)>` needs `Self`, `Wrap<u16>` does not.
+    #[leak(
+        helper = crate::__macro,
+        repeater = __S::Repeater,
+        module = crate::s,
+    )]
+    pub trait Shadow9278 {
+        type Item;
+        fn f(&self) -> Wrap<(Self::Item, u8)>;
+        fn g(&self) -> Wrap<u16>;
+    }
+
+    impl Shadow9278 for Inner {
+        type Item = u32;
+        fn f(&self) -> Wrap<(u32, u8)> {
+            Wrap((1, 2))
+        }
+        fn g(&self) -> Wrap<u16> {
+            Wrap(3)
         }
     }
 
@@ -2542,6 +2577,113 @@ pub mod kinds {
         }],
     );
 
+    // F114 (`tests/findings/findings.rs`): in a value, the root of a `use` is no name that the same
+    // `use` brings. It fails to build on the code before the fix.
+
+    /// The module that the value of `UseSelfInValue::N` imports, which the Referrer's crate does not
+    /// have.
+    pub mod rel9275 {
+        pub const N: usize = 3;
+    }
+
+    /// F114: the default of `N` imports `rel9275` with `use rel9275::{self}`. The Leaker took the
+    /// root for the name that the `use` brings, a local, and accepted the item; the copy in the
+    /// Referrer's crate could not resolve the import (E0432). It is rejected now: the Referrer's
+    /// macro expands to nothing.
+    #[prop_leak(id = 9275, scope = "nested", redeclare = true, values = true)]
+    pub trait UseSelfInValue {
+        const N: usize = {
+            use rel9275::{self};
+            rel9275::N
+        };
+    }
+
+    // F115 (`tests/findings/findings.rs`): a relative macro in a const argument of a bound is an
+    // error. It fails to build on the code before the fix.
+
+    /// A trait with a const parameter, named by an absolute path that both crates resolve.
+    pub trait Tr9276<const N: usize> {}
+
+    /// A macro of this crate, which the Referrer's crate does not have.
+    macro_rules! rel9276 {
+        () => {
+            3
+        };
+    }
+
+    /// F115: the const argument of the bound of `T` calls `rel9276!` by a relative path. The Leaker
+    /// did not report it, and the copy in the Referrer's crate could not find the macro. It is
+    /// rejected now: the Referrer's macro expands to nothing.
+    #[prop_leak(id = 9276)]
+    pub struct MacroInConstArgument<T: ::type_leak_test_leaker::kinds::Tr9276<{ rel9276!() }>>(
+        pub T,
+    );
+
+    // F116 (`tests/findings/findings.rs`): the path of a built-in attribute in a block in a type is
+    // not read. It fails on the code before the fix.
+
+    /// F116: the block of the length has a closure, which keeps the array from being leaked whole,
+    /// and items with built-in attributes and derives. The Leaker read `allow` as a relative path
+    /// (`use absolute path: 'allow'`) and rejected the item, so the Referrer's crate lacked its
+    /// copy. `Rel` is the entry, and the copy writes the length as it is. `Clone` and `Copy` are
+    /// allowed by `prelude`, and `Debug` is written by the path of its trait (F120: a derive of the
+    /// prelude is read like any name, and `Debug` is no name that `prelude` allows).
+    #[prop_leak(id = 9277, prelude = true)]
+    pub struct BuiltinAttributeInLength(
+        pub  [Rel; {
+            let _c = || 1;
+            #[allow(dead_code)]
+            #[derive(Clone, Copy, ::core::fmt::Debug)]
+            struct Z;
+            #[inline]
+            const fn three() -> usize {
+                3
+            }
+            three()
+        }],
+    );
+
+    // F119 (`tests/findings/findings.rs`): the context of an entry has the bounds that a method
+    // writes for a generic of its trait. It fails to build on the code before the fix.
+
+    /// A type of this crate that needs a bound of its generic.
+    pub struct Cl9279<T: Clone>(pub T);
+
+    /// F119: `Cl9279<T>` is an argument of methods whose where clauses bound `T` (the trait does
+    /// not). The contexts of the entries left those bounds out: the Repeater's impl of `Cl9279<T>`
+    /// had no `T: Clone`, and this crate did not build (E0277). Each method gives an entry, with
+    /// its own bounds.
+    #[prop_leak(id = 9279, prelude = true)]
+    pub trait MethodPredicate9279<T> {
+        fn m(&self, a: Cl9279<T>)
+        where
+            T: Clone;
+
+        fn n(&self, a: Cl9279<T>)
+        where
+            T: Clone + Default;
+    }
+
+    // F120 (`tests/findings/findings.rs`): the attributes in a value are read. It fails to build on
+    // the code before the fix.
+
+    /// The derive of the standard library `Debug`, under a name that the Referrer's crate does not
+    /// have.
+    use ::core::fmt::Debug as Dbg9280;
+
+    /// F120: the default of `N` derives a trait by `Dbg9280`, a relative name. The Leaker did not read
+    /// the attributes of a value, and accepted the item; the copy in the Referrer's crate could not
+    /// find the derive. It is rejected now: the Referrer's macro expands to nothing.
+    #[prop_leak(id = 9280, scope = "nested", redeclare = true, values = true)]
+    pub trait DeriveInValue {
+        const N: usize = {
+            #[allow(dead_code)]
+            #[derive(Dbg9280)]
+            struct Z;
+            3
+        };
+    }
+
     // F102 (`tests/findings/findings.rs`): the `Self` of an item in the default of a type parameter
     // is its own. It fails to build on the code before the fix.
 
@@ -2663,12 +2805,12 @@ pub mod kinds {
     // the code before the fix.
 
     /// F64: the bounds of the generics name them through the alias `WIt`, which the Leaker cannot
-    /// tell from a struct. `Wrap<Self>` in the predicate of `m` keeps `U: Fn(WIt<U>)` whole, and
-    /// `Wrap<V>` in the predicate of `n`, next to the equation of `V` there, has `V: Fn(WIt<V>)`:
-    /// rustc proves neither in the environment of the copy (E0277 "expected an `Fn(u8)` closure,
-    /// found `U`"). The Leaker rejects both, so the Referrer's macro expands to nothing. The rule
-    /// of the Leaker allows the alias, as it does where the crate has rules of its own for its
-    /// paths.
+    /// tell from a struct. `Wrap<Self>` in the predicate of `m` keeps `U: Fn(WIt<U>)` whole: rustc
+    /// does not prove it in the environment of the copy (E0277 "expected an `Fn(u8)` closure, found
+    /// `U`"). The Leaker rejects it, so the Referrer's macro expands to nothing. `Wrap<V>` in the
+    /// predicate of `n` is accepted since F119: the equation of `V` there is in its context, so
+    /// `V: Fn(WIt<V>)` is left out (F26). The rule of the Leaker allows the alias, as it does where
+    /// the crate has rules of its own for its paths.
     #[prop_leak(
         id = 9223,
         prelude = true,

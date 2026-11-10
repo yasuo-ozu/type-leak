@@ -25,9 +25,9 @@ use crate::util::{
     absolute_example, binder_declares, binder_lifetimes, bound_cause, bounded_ident,
     declared_names, first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime, has_lifetime_bound, ident_name,
-    is_bare_self, is_lifetime_param, is_named, is_primitive_name, is_std_crate_path,
-    is_type_param_named, is_whole_reference, lifetime_name, names_in, or_list, path_type,
-    plain_self_head, push_once, same_lifetime, same_name, self_head, self_in_param,
+    is_bare_self, is_lifetime_param, is_named, is_primitive_name, is_self_projection,
+    is_std_crate_path, is_type_param_named, is_whole_reference, lifetime_name, names_in, or_list,
+    path_type, plain_self_head, push_once, same_lifetime, same_name, self_head, self_in_param,
     self_in_predicate, selves_in_generics, tidy, tokens_text, trait_head, trait_object_of,
     type_mentions_self, unwrap_type_group, where_clause, where_predicate_mentions_self,
     without_arguments, without_default, without_defaults,
@@ -121,6 +121,8 @@ struct Must {
     /// The relative path it is, as the cause of its kind without its arguments, if it is one (not
     /// a lifetime, not `Self`): an entry of [`ErrorItem::paths`].
     path: Option<Cause>,
+    /// What to write instead, if the error of the cause is to say more than the absolute path.
+    help: Option<String>,
 }
 
 /// The causes that stop a type from being leaked whole, in order of appearance. Under a soft cause
@@ -527,6 +529,12 @@ struct Position {
     /// The names that the blocks of the expression around declare: a path that starts with one
     /// means the same wherever the copy is written.
     locals: ValueScopes,
+    /// The paths that are read for the attributes in the expression of a type or of a const
+    /// argument being visited ([`attribute_paths()`]), by the address of the path of each attribute.
+    attributes: Option<HashMap<usize, Vec<AttributePath>>>,
+    /// A const argument outside a type (of a bound) is being visited: a relative macro in it is an
+    /// error, as nothing is leaked whole there.
+    in_const_arg: bool,
     /// In a receiver (`self: Box<Self>`), where rustc accepts only `Self` and types dereferencing
     /// to it: no type in it is optional.
     in_receiver: bool,
@@ -811,6 +819,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         must.sort_by_key(|must| must.depth);
         CheckResult {
             is_own: must.first().map_or(false, |must| must.depth == depth),
+            help: must.first().and_then(|must| must.help.clone()),
             ..CheckResult::conflict(
                 must.into_iter().map(|must| must.cause.clone()).collect(),
                 self.impossibles.since(impossible_start).cloned().collect(),
@@ -840,6 +849,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         }
         if !must.is_empty() {
             result.is_own = must.first().map_or(false, |must| must.depth == depth);
+            result.help = must.first().and_then(|must| must.help.clone());
             result.must = must.iter().map(|must| must.cause.clone()).collect();
         }
         result.paths = self.own_paths(must_start, depth);
@@ -931,6 +941,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             cause: must,
             covered: false,
             path,
+            help: None,
         });
         self.frame.min_depth = self.frame.min_depth.min(self.position.type_depth);
     }
@@ -1653,6 +1664,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             cause: Cause::Type(ty.clone()),
             covered: false,
             path: None,
+            help: None,
         });
         inner.min_depth = inner.min_depth.min(at);
         if elision.owner > 0 {
@@ -3329,19 +3341,6 @@ fn self_in_environment_bounds(context: &Context) -> Option<Cause> {
     })
 }
 
-/// Returns `true` if `ty` is `Self::A` or `<Self as Tr>::A`: an associated type of `Self`.
-fn is_self_projection(ty: &Type) -> bool {
-    match unwrap_type_group(ty) {
-        Type::Path(TypePath { qself: None, path }) => {
-            self_head(path).is_some() && path.segments.len() > 1
-        }
-        Type::Path(TypePath {
-            qself: Some(qself), ..
-        }) => is_bare_self(&qself.ty),
-        _ => false,
-    }
-}
-
 /// The type parameters of `generics` that have a default: index, name and default.
 fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)> {
     generics
@@ -3469,6 +3468,33 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             }
         }
         syn::visit::visit_path(self, i)
+    }
+
+    /// Reads a path that an attribute in an expression names ([`attribute_paths()`]): a path in a
+    /// type, or an error if it is relative in a const argument of a bound, where nothing is leaked
+    /// whole.
+    fn read_attribute_path(&mut self, read: AttributePath) {
+        let asked = Cause::Unknown(read.path.clone());
+        if self.position.type_depth == 0 {
+            let written = Cause::expr_path(&read.path);
+            if !self.is_local(&read.path, &asked) && self.is_relative_path(&asked) {
+                self.push_error(CheckResult {
+                    help: read.help,
+                    paths: vec![asked.bare()],
+                    ..CheckResult::conflict(
+                        vec![written.clone()],
+                        vec![written],
+                        Reason::RelativePath,
+                    )
+                });
+            }
+            return;
+        }
+        let start = self.musts.len();
+        self.visit_path_of(&read.path, &asked, &Cause::type_path(&read.path));
+        if let Some(must) = self.musts.get_mut(start) {
+            must.help = read.help;
+        }
     }
 
     /// Returns `true` if `path`, asked about as `asked`, starts with a name that a block around
@@ -3627,19 +3653,10 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
         self.visit_item(item)
     }
 
-    /// Reads each root of the `use` `i` as a path of the expression around is read. A root does
-    /// not resolve through the names that `i` brings (`use rel::{self}`), which the innermost
-    /// scope of `Position::locals` declares: they are hidden meanwhile.
+    /// Reads each root of the `use` `i` as a path of the expression around is read, without the
+    /// names that `i` brings ([`ValueScopes::hide_own_names()`]).
     fn read_use(&mut self, i: &ItemUse) {
-        let own = declared_names(&Item::Use(i.clone()));
-        let hidden: Vec<String> = match self.position.locals.scopes.last_mut() {
-            Some(scope) => own
-                .iter()
-                .map(ident_name)
-                .filter(|name| scope.items.remove(name))
-                .collect(),
-            None => Vec::new(),
-        };
+        let hidden = self.position.locals.hide_own_names(i);
         for root in use_tree_roots(&i.tree) {
             let path = Path {
                 leading_colon: i.leading_colon,
@@ -3656,9 +3673,7 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             }
             self.visit_path_of(&path, &asked, &written);
         }
-        for name in hidden {
-            self.position.locals.declare(name);
-        }
+        self.position.locals.restore(hidden);
     }
 
     /// Visits the type macro `i` (`m`), which cannot be analyzed: it is leaked whole.
@@ -4254,12 +4269,43 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_path(&mut self, i: &Path) {
+        // The path of an attribute is not read, but the paths that it makes the analysis read.
+        let address = i as *const Path as usize;
+        let attribute = (self.position.attributes.as_ref()).and_then(|paths| paths.get(&address));
+        if let Some(reads) = attribute.cloned() {
+            for read in reads {
+                self.read_attribute_path(read);
+            }
+            return;
+        }
         // A mention of `Self` in it is read as one in a type.
         self.visit_path_of(i, &Cause::Unknown(i.clone()), &Cause::type_path(i))
     }
 
     fn visit_macro(&mut self, i: &Macro) {
         let cause = Cause::Macro(i.path.clone());
+        // A const argument of a bound is not leaked whole: a relative macro is written as it is.
+        // `macro_rules!` declares one.
+        let declares = i
+            .path
+            .get_ident()
+            .map_or(false, |ident| is_named(ident, "macro_rules"));
+        if self.position.type_depth == 0
+            && self.position.in_const_arg
+            && !declares
+            && self.is_relative_path(&cause)
+        {
+            self.push_error(CheckResult {
+                headline: Some(macro_headline(&i.path)),
+                help: Some(macro_help(&i.path)),
+                paths: vec![cause.bare()],
+                ..CheckResult::conflict(
+                    vec![cause.clone()],
+                    vec![cause.clone()],
+                    Reason::RelativePath,
+                )
+            });
+        }
         self.visit_path_of(&i.path, &cause, &cause)
     }
 
@@ -4330,10 +4376,19 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         if self.position.type_depth > 0 && outer.is_none() {
             self.position.expr_owner = Some(self.position.type_depth);
         }
+        // The attributes in the outermost expression of a type or a const argument are read here.
+        let reads_attributes = self.position.attributes.is_none()
+            && (self.position.type_depth > 0 || self.position.in_const_arg);
+        if reads_attributes {
+            self.position.attributes = Some(attributes_in(i));
+        }
         let enclosing = std::mem::take(&mut self.position.enclosing);
         self.walk_expr(i);
         self.position.enclosing = enclosing;
         self.position.expr_owner = outer;
+        if reads_attributes {
+            self.position.attributes = None;
+        }
     }
 
     fn visit_angle_bracketed_generic_arguments(&mut self, i: &AngleBracketedGenericArguments) {
@@ -4380,7 +4435,15 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 // syn parses a bare identifier that may be a const as a type (see `ambiguous_arg`).
                 self.position.hints.ambiguous_arg = is_bare_ident(ty);
             }
+            let const_arg = self.position.type_depth == 0
+                && matches!(
+                    arg,
+                    GenericArgument::Const(_) | GenericArgument::AssocConst(_)
+                );
+            let outer = self.position.in_const_arg;
+            self.position.in_const_arg |= const_arg;
             self.visit_generic_argument(arg);
+            self.position.in_const_arg = outer;
         }
     }
 
@@ -5479,6 +5542,27 @@ impl ValueScopes {
         }
     }
 
+    /// Hides from the innermost scope, which declares them, the names that the `use` `i` brings:
+    /// its roots do not resolve through them (`use rel::{self}`). Returns them for `restore()`.
+    fn hide_own_names(&mut self, i: &ItemUse) -> Vec<String> {
+        let scope = match self.scopes.last_mut() {
+            Some(scope) => scope,
+            None => return Vec::new(),
+        };
+        declared_names(&Item::Use(i.clone()))
+            .iter()
+            .map(ident_name)
+            .filter(|name| scope.items.remove(name))
+            .collect()
+    }
+
+    /// Declares again the names that `hide_own_names()` hid.
+    fn restore(&mut self, hidden: Vec<String>) {
+        for name in hidden {
+            self.declare(name);
+        }
+    }
+
     /// Returns `true` if a scope declares `name` as an item.
     fn declares_item(&self, name: &str) -> bool {
         self.scopes.iter().any(|scope| scope.items.contains(name))
@@ -5614,10 +5698,8 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
     /// Like `reject()`. `entry`: the path of `cause`, for
     /// [`ErrorItem::paths`](crate::ErrorItem::paths).
     fn reject_as(&mut self, cause: Cause, entry: Option<Cause>, help: Option<String>) {
-        // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
-        // type is shown by its path alone.
         let headline = match &cause {
-            Cause::Macro(_) => Some(format!("use absolute path: '{}!'", tidy(&cause.shown()))),
+            Cause::Macro(path) => Some(macro_headline(path)),
             _ => None,
         };
         let mut note = format!("it is in {}, which the copy writes as it is", self.what);
@@ -5664,6 +5746,13 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
     fn declare_item(&mut self, item: &Item) {
         for name in declared_names(item) {
             self.declare(&name);
+        }
+    }
+
+    /// Reads the attributes of a node whose visit here does not walk them.
+    fn attributes(&mut self, attrs: &[Attribute]) {
+        for attr in attrs {
+            self.visit_attribute(attr);
         }
     }
 
@@ -5823,7 +5912,19 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
 }
 
 impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
-    fn visit_attribute(&mut self, _: &'ast Attribute) {}
+    /// The paths of an attribute are checked as those of the value ([`attribute_paths()`]): the
+    /// copy writes it as it is, so a custom attribute or derive must resolve there.
+    fn visit_attribute(&mut self, i: &'ast Attribute) {
+        for read in attribute_paths(&i.meta) {
+            let cause = Cause::expr_path(&read.path);
+            if !self.is_known(&cause) {
+                self.reject(cause, read.help);
+            }
+        }
+        if let Meta::NameValue(meta) = &i.meta {
+            self.visit_expr(&meta.value);
+        }
+    }
 
     fn visit_visibility(&mut self, _: &'ast Visibility) {}
 
@@ -5837,10 +5938,12 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_expr_path(&mut self, i: &'ast ExprPath) {
+        self.attributes(&i.attrs);
         self.qualified(i.qself.as_ref(), &i.path)
     }
 
     fn visit_expr_struct(&mut self, i: &'ast ExprStruct) {
+        self.attributes(&i.attrs);
         self.qualified(i.qself.as_ref(), &i.path);
         for field in &i.fields {
             self.visit_field_value(field);
@@ -5851,6 +5954,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_pat_struct(&mut self, i: &'ast PatStruct) {
+        self.attributes(&i.attrs);
         self.qualified(i.qself.as_ref(), &i.path);
         for field in &i.fields {
             self.visit_field_pat(field);
@@ -5858,6 +5962,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_pat_tuple_struct(&mut self, i: &'ast PatTupleStruct) {
+        self.attributes(&i.attrs);
         self.qualified(i.qself.as_ref(), &i.path);
         for elem in &i.elems {
             self.visit_pat(elem);
@@ -5907,6 +6012,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
 
     /// A name in a pattern is a binding ([`is_binding()`]) or a path.
     fn visit_pat_ident(&mut self, i: &'ast PatIdent) {
+        self.attributes(&i.attrs);
         if is_binding(i) {
             self.bind(&i.ident);
         } else {
@@ -5944,6 +6050,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
 
     /// The initializer does not see the bindings of the pattern.
     fn visit_local(&mut self, i: &'ast Local) {
+        self.attributes(&i.attrs);
         if let Some(init) = &i.init {
             self.visit_expr(&init.expr);
             if let Some((_, diverge)) = &init.diverge {
@@ -5954,6 +6061,11 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_item(&mut self, i: &'ast Item) {
+        // The roots of a `use` are read without the names it brings.
+        let hidden = match i {
+            Item::Use(item) => self.names.hide_own_names(item),
+            _ => Vec::new(),
+        };
         // The item sees the items around it, and the generics of its own, not the bindings.
         let outer = std::mem::replace(&mut self.names.barrier, self.names.scopes.len());
         // The types of an item that a block declares are read, not leaked.
@@ -5965,6 +6077,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
         self.self_items += usize::from(has_self);
         self.scoped(|walk| match i {
             Item::Use(item) => {
+                walk.attributes(&item.attrs);
                 if has_glob(&item.tree) {
                     walk.cannot_read(
                         quote!(#item),
@@ -5973,16 +6086,20 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
                 }
                 walk.use_roots(&item.tree, item.leading_colon.is_some());
             }
-            Item::Macro(item) => walk.cannot_read(
-                quote!(#item),
-                "a macro in item position may declare any name",
-            ),
+            Item::Macro(item) => {
+                walk.attributes(&item.attrs);
+                walk.cannot_read(
+                    quote!(#item),
+                    "a macro in item position may declare any name",
+                )
+            }
             Item::Verbatim(tokens) => walk.cannot_read(tokens.clone(), "syn does not parse it"),
             _ => syn::visit::visit_item(walk, i),
         });
         self.self_items -= usize::from(has_self);
         self.reads -= 1;
         self.names.barrier = outer;
+        self.names.restore(hidden);
     }
 
     fn visit_item_mod(&mut self, i: &'ast ItemMod) {
@@ -6003,6 +6120,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_expr_closure(&mut self, i: &'ast ExprClosure) {
+        self.attributes(&i.attrs);
         self.scoped(|walk| {
             // `for<'a> |x: &'a u8| ..` declares a lifetime that only the closure knows.
             for param in i.lifetimes.iter().flat_map(|binder| &binder.lifetimes) {
@@ -6020,6 +6138,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
 
     /// The bindings of the pattern are those of the guard and the body.
     fn visit_arm(&mut self, i: &'ast Arm) {
+        self.attributes(&i.attrs);
         self.scoped(|walk| {
             walk.visit_pat(&i.pat);
             if let Some((_, guard)) = &i.guard {
@@ -6031,6 +6150,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
 
     /// The bindings of `if let` are those of the first branch.
     fn visit_expr_if(&mut self, i: &'ast ExprIf) {
+        self.attributes(&i.attrs);
         self.scoped(|walk| {
             walk.visit_expr(&i.cond);
             walk.visit_block(&i.then_branch);
@@ -6041,6 +6161,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_expr_while(&mut self, i: &'ast ExprWhile) {
+        self.attributes(&i.attrs);
         self.scoped(|walk| {
             walk.visit_expr(&i.cond);
             walk.visit_block(&i.body);
@@ -6048,11 +6169,13 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     }
 
     fn visit_expr_let(&mut self, i: &'ast ExprLet) {
+        self.attributes(&i.attrs);
         self.visit_expr(&i.expr);
         self.visit_pat(&i.pat);
     }
 
     fn visit_expr_for_loop(&mut self, i: &'ast ExprForLoop) {
+        self.attributes(&i.attrs);
         self.visit_expr(&i.expr);
         self.scoped(|walk| {
             walk.visit_pat(&i.pat);
@@ -6196,6 +6319,133 @@ fn has_glob(tree: &UseTree) -> bool {
         UseTree::Group(g) => g.items.iter().any(has_glob),
         UseTree::Name(_) | UseTree::Rename(_) => false,
     }
+}
+
+/// The attributes that rustc defines and no crate can shadow: their paths are not read. `default`
+/// is the helper of the `Default` derive, which is read by its own name.
+const BUILTIN_ATTRIBUTES: &[&str] = &[
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "cfg",
+    "doc",
+    "inline",
+    "cold",
+    "must_use",
+    "repr",
+    "deprecated",
+    "non_exhaustive",
+    "track_caller",
+    "default",
+];
+
+/// The tools whose attributes rustc knows (`rustfmt::skip`, `clippy::..`).
+const BUILTIN_TOOLS: &[&str] = &["rustfmt", "clippy"];
+
+/// The derives of the prelude of every edition, with the absolute path to write for each: the
+/// derive is the trait's name, and it resolves through the path of the trait.
+const PRELUDE_DERIVES: &[(&str, &str)] = &[
+    ("Clone", "::core::clone::Clone"),
+    ("Copy", "::core::marker::Copy"),
+    ("Debug", "::core::fmt::Debug"),
+    ("Default", "::core::default::Default"),
+    ("Eq", "::core::cmp::Eq"),
+    ("Hash", "::core::hash::Hash"),
+    ("Ord", "::core::cmp::Ord"),
+    ("PartialEq", "::core::cmp::PartialEq"),
+    ("PartialOrd", "::core::cmp::PartialOrd"),
+];
+
+/// A path that an attribute makes the analysis read, as a relative path of unknown kind.
+#[derive(Clone)]
+struct AttributePath {
+    path: Path,
+    /// What to write instead of the path, where it is a derive of the prelude.
+    help: Option<String>,
+}
+
+/// The paths that the analysis reads for each attribute in `expr` ([`attribute_paths()`]), by the
+/// address of the path of the attribute.
+fn attributes_in(expr: &Expr) -> HashMap<usize, Vec<AttributePath>> {
+    struct Attributes(HashMap<usize, Vec<AttributePath>>);
+    impl<'ast> Visit<'ast> for Attributes {
+        fn visit_attribute(&mut self, i: &'ast Attribute) {
+            let address = i.meta.path() as *const Path as usize;
+            self.0.insert(address, attribute_paths(&i.meta));
+            syn::visit::visit_attribute(self, i)
+        }
+    }
+    let mut attributes = Attributes(HashMap::new());
+    attributes.visit_expr(expr);
+    attributes.0
+}
+
+/// The paths that the analysis reads for the attribute `meta`: those that [`builtin_attribute()`]
+/// gives, else its own path.
+fn attribute_paths(meta: &Meta) -> Vec<AttributePath> {
+    builtin_attribute(meta).unwrap_or_else(|| {
+        vec![AttributePath {
+            path: meta.path().clone(),
+            help: None,
+        }]
+    })
+}
+
+/// If the attribute `meta` is built in, the paths that are read in place of its own: those that a
+/// `derive` names, and the attributes of a `cfg_attr` that are not built in. `None` for another
+/// attribute, or one whose arguments do not parse: its own path is read.
+fn builtin_attribute(meta: &Meta) -> Option<Vec<AttributePath>> {
+    let path = meta.path();
+    let first = &path.segments.first()?.ident;
+    if path.leading_colon.is_some() {
+        return None;
+    }
+    if path.segments.len() > 1 {
+        let tool = BUILTIN_TOOLS.iter().any(|tool| is_named(first, tool));
+        return Some(Vec::new()).filter(|_| tool);
+    }
+    if BUILTIN_ATTRIBUTES.iter().any(|name| is_named(first, name)) {
+        return Some(Vec::new());
+    }
+    let list = match meta {
+        Meta::List(list) => list,
+        _ => return None,
+    };
+    if is_named(first, "derive") {
+        let derives =
+            (list.parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)).ok()?;
+        Some(
+            derives
+                .into_iter()
+                .map(|path| AttributePath {
+                    help: derive_help(&path),
+                    path,
+                })
+                .collect(),
+        )
+    } else if is_named(first, "cfg_attr") {
+        let attributes = list.parse_args_with(cfg_attr_attributes).ok()?;
+        Some(attributes.iter().flat_map(attribute_paths).collect())
+    } else {
+        None
+    }
+}
+
+/// The help for the derive `path`, if it is one of the prelude: its absolute path.
+fn derive_help(path: &Path) -> Option<String> {
+    let ident = path.get_ident()?;
+    (PRELUDE_DERIVES.iter())
+        .find(|(name, _)| is_named(ident, name))
+        .map(|(name, absolute)| format!("use `{}` instead of `{}`", absolute, name))
+}
+
+/// The attributes of `cfg_attr(predicate, attributes..)`.
+fn cfg_attr_attributes(input: ParseStream) -> Result<Punctuated<Meta, Token![,]>> {
+    input.parse::<Meta>()?;
+    input.parse::<Token![,]>()?;
+    Punctuated::parse_terminated(input)
 }
 
 /// The arguments of a macro call as expressions: `a, b` or `a; n` (`vec![0; n]`).
@@ -6368,6 +6618,12 @@ fn captured_names(format: &str) -> Vec<String> {
             && name.chars().next().map_or(false, |c| !c.is_ascii_digit())
     });
     names
+}
+
+/// The headline of the error of the relative macro `path` where it is written as it is: it names
+/// the macro with its `!`, whereas the path of a macro in a type is shown by its path alone.
+fn macro_headline(path: &Path) -> String {
+    format!("use absolute path: '{}!'", tidy(&quote!(#path)))
 }
 
 /// What to write for the relative macro `path`: the absolute path of a macro of the standard

@@ -158,6 +158,20 @@ fn a_generic_named_like_the_parameter_of_the_implementor() {
     assert_eq!(got, Wrap((9, 5)));
 }
 
+/// Fixture 9278 (F117): the Repeater of `Shadow9278` is at `__S::Repeater`, a module named like the
+/// parameter that the impls of its entries declare for the implementor. The Leaker's crate does not
+/// build with `impl<__S: ?Sized> __S::Repeater<..> for __S` (E0405); the Referrer's crate names the
+/// module through its own `use` and implements the trait for `Concrete`.
+#[test]
+fn a_repeater_in_a_module_named_like_the_parameter_of_the_implementor() {
+    use type_leak_test_leaker::s::{Shadow9278, Wrap};
+    let c = Concrete(Inner);
+    let f: Wrap<(u32, u8)> = <Concrete as Shadow9278>::f(&c);
+    assert_eq!(f, Wrap((1, 2)));
+    let g: Wrap<u16> = <Concrete as Shadow9278>::g(&c);
+    assert_eq!(g, Wrap(3));
+}
+
 /// Fixture 9252 (F90): `Proj9252<T: Iterator>` has `T::Item` in a signature, and the Referrer's
 /// crate implements it for `::std::vec::IntoIter<u8>`. `<IntoIter<u8>>::Item`, which the macro wrote
 /// before the fix, is E0223 ("ambiguous associated type") there.
@@ -668,6 +682,34 @@ fn every_item_kind_is_leaked_across_crates() {
         // entry (the copy of the second, where nothing else names the import, could not resolve
         // `rel9274`).
         (9274, __tl_report_9274!(), ok("struct", 2, 2, 2)),
+        // F114: in a value, the root of a `use` is no name that the same `use` brings: the item is
+        // rejected (the copy could not resolve `rel9275`).
+        (
+            9275,
+            __tl_report_9275!(),
+            rejected("trait", "useabsolutepath:'rel9275'"),
+        ),
+        // F115: a relative macro in a const argument of a bound is an error: the item is rejected
+        // (the copy could not find `rel9276!`).
+        (
+            9276,
+            __tl_report_9276!(),
+            rejected("struct", "useabsolutepath:'rel9276!'"),
+        ),
+        // F116: a built-in attribute in a block in the length of an array is not read: `Rel` is the
+        // entry (the Leaker rejected the item, at `allow`).
+        (9277, __tl_report_9277!(), ok("struct", 1, 1, 1)),
+        // F119: the bounds that the methods write for the generic of the trait are in the contexts
+        // of the entries: one for each method (the Repeater's impl lacked `T: Clone`, and the
+        // Leaker's crate did not build).
+        (9279, __tl_report_9279!(), ok("trait", 2, 2, 2)),
+        // F120: a relative derive in a block in a value is an error: the item is rejected (the copy
+        // could not find `Dbg9280`).
+        (
+            9280,
+            __tl_report_9280!(),
+            rejected("trait", "useabsolutepath:'Dbg9280'"),
+        ),
         // F102: the `Self` of a struct in a block in the default of a type parameter is its own: the
         // Leaker rejected the default (`SelfInDefault`).
         (9265, __tl_report_9265!(), ok("struct", 1, 2, 2)),
@@ -2293,13 +2335,14 @@ fn the_types_that_hold_a_method_lifetime_in_a_type_written_as_it_is_are_written_
     strict_hosts::<r::Host9222>();
 }
 
-/// F64: `Wrap<Self>` in a predicate of a trait, and `Wrap<V>` in the predicate of a method that
-/// equates the `Item` of a generic of the trait, next to a bound of the trait that names the
-/// generic through a type alias (`U: Fn(WIt<U>)`, `WIt<U>` is `<U as Iterator>::Item`). The
-/// Repeater's impl of the entry needs the bound, which rustc proves in the environment of the copy
-/// only as written, not normalized (E0277 "expected an `Fn(u8)` closure, found `U`", in the impl
-/// of the host in the Referrer's crate, which does not build). The Leaker cannot tell the alias
-/// from a struct, so it rejects both entries, and the Referrer's macro expands to nothing.
+/// F64: `Wrap<Self>` in a predicate of a trait, next to a bound of the trait that names the generic
+/// through a type alias (`U: Fn(WIt<U>)`, `WIt<U>` is `<U as Iterator>::Item`). The Repeater's
+/// impl of the entry needs the bound, which rustc proves in the environment of the copy only as
+/// written, not normalized (E0277 "expected an `Fn(u8)` closure, found `U`", in the impl of the
+/// host in the Referrer's crate, which does not build). The Leaker cannot tell the alias from a
+/// struct, so it rejects the entry, and the Referrer's macro expands to nothing. `Wrap<V>` in the
+/// predicate of the method that equates the `Item` of `V` is accepted since F119: the equation is a
+/// bound of `V` in its context, so the bound that names the alias is left out (F26).
 #[test]
 fn a_bound_that_names_its_generic_through_an_alias_is_rejected_where_the_entry_keeps_it() {
     use type_leak_test_leaker::*;
@@ -2314,14 +2357,7 @@ fn a_bound_that_names_its_generic_through_an_alias_is_rejected_where_the_entry_k
     };
     assert_eq!(
         reported(9223, __tl_report_9223!()),
-        rejected(
-            "trait",
-            &squash(&format!(
-                "{} {}",
-                headline("Wrap<Self>", "U"),
-                headline("Wrap<V>", "V")
-            ))
-        ),
+        rejected("trait", &squash(&headline("Wrap<Self>", "U"))),
         "{}",
         __tl_report_9223!()
     );
