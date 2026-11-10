@@ -321,7 +321,7 @@ fn the_rules_chain_and_a_rule_may_count() {
         let ty = referrer.expand(
             common::entry_id(&referrer, ix),
             parse_quote!(::foo::X),
-            |_, ix| parse_quote!(P<#ix>),
+            |_, ix, _| parse_quote!(P<#ix>),
         );
         (ix, text(&ty))
     };

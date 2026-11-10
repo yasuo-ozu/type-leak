@@ -23,8 +23,9 @@
 //! - The Repeater is a trait of crate A (`repo::Repeater`, at its root). It cannot be in the
 //!   proc-macro crate (which exports only macros), and it cannot be in a third crate: crate A
 //!   implements it for any `Self` (`impl<S: ?Sized> Repeater<..> for S`), which the orphan rule
-//!   allows only for a local trait. The macros write the Repeater with its arguments through
-//!   `RepeaterSlots::trait_path()` and `projection()`, not by hand.
+//!   allows only for a local trait. The macros write the Repeater impls with `ToTokens` of
+//!   `RepeaterImpl` (which writes the `KEY` itself) and the projection with
+//!   `repeater_projection()`, not by hand.
 //! - Crate B cannot be given the Referrer by crate A directly, because crate A does not know the
 //!   input of B's macro. So crate A defines a `macro_rules!` which B calls; it adds what only A
 //!   knows (`$crate::Repeater`, the id, the Referrer, the top-level `ContextId`, the trait) to the
@@ -34,10 +35,10 @@
 //!   hash of the name of the crate and of the trait. A proc macro does not know the path of the
 //!   item, and it needs only a number that no other exported trait of the crate has. It is written
 //!   into both the impls and the macro of A, so both sides agree.
-//! - The Repeater impls are written for all the entries (`Referrer::iter()`): crate B's macro
-//!   replaces every one. A type of another crate (`::foo::X`) is an entry too; to have the copy
-//!   write it as it is, give the Leaker `Rules::external_crates()` (the crate must be the same
-//!   crate on both sides).
+//! - The Repeater impls are written for all the entries (`LeakerResult::repeater_impls()`): crate
+//!   B's macro replaces every one. A type of another crate (`::foo::X`) is an entry too; to have
+//!   the copy write it as it is, give the Leaker `Rules::external_crates()` (the crate must be the
+//!   same crate on both sides).
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -51,8 +52,8 @@ use syn::{
     ItemTrait, Path, PathArguments, Token, TraitItem, Type,
 };
 use type_leak::{
-    array_const, ContextId, EncodeError, ErrorItem, ImplSelf, Leaker, Referrer, RepeaterSlots,
-    UseSite,
+    array_const, encode_generics_args_with_params, repeater_projection, ContextId, EncodeError,
+    ErrorItem, ImplSelf, Leaker, Referrer, UseSite,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -68,35 +69,33 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     //    needs it to rewrite a copy. `true` lets a type that names `Self` be leaked whole.
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&item_trait, true);
-    let referrer = match leaker.result().finish() {
-        Ok(referrer) => referrer,
-        Err(errors) => return report(&errors).into(),
-    };
+    let result = leaker.result();
+    if !result.errors().is_empty() {
+        return report(result.errors()).into();
+    }
 
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
     //    the entries mean what they mean in the trait.
     let id = id_of(&item_trait);
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let self_param: syn::Ident = parse_quote!(__S);
     let mut impls: Vec<ItemImpl> = vec![];
-    for ix in 0..referrer.iter().count() {
-        let r = match referrer.repeater_impl(ix, ImplSelf::Param(&self_param), array_const) {
-            Ok(r) => r,
+    let repeater_impls =
+        match result.repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const) {
+            Ok(impls) => impls,
             Err(error) => {
                 return syn::Error::new(error.span(), error)
                     .to_compile_error()
                     .into()
             }
         };
-        let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (self_ty, ty) = (&r.self_ty, &r.ty);
-        let repeater = slots.trait_path(&r.args, id, ix);
-        impls.push(parse_quote! {
-            impl #impl_generics #repeater for #self_ty #where_clause {
-                type Type = #ty;
-            }
-        });
+    // `ToTokens` writes each impl with its `KEY`.
+    for r in repeater_impls {
+        impls.push(parse_quote!(#r));
     }
+
+    // The Referrer goes to crate B.
+    let referrer = result.into_referrer();
 
     // 3. The macro that crate B calls. `$crate` is crate A, whatever the name B gives it.
     let macro_name = format_ident!("__tl_{}", item_trait.ident);
@@ -227,7 +226,6 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
         trait_path,
         wrapper,
     } = finish;
-    let slots = RepeaterSlots::new(repeater);
     let name = &wrapper.ident;
     let inner = match wrapper.fields.iter().next() {
         Some(field) if wrapper.fields.len() == 1 => &field.ty,
@@ -252,9 +250,12 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     let (impl_generics, trait_path, site) = match &explicit {
         Some(args) => {
             // Arguments the copy omits take the defaults of the trait.
-            let completed = referrer.complete_args(top_level, &generics.params, args, |_, _, _| {
-                unreachable!("the traits of this example have no default that names a leaked type")
-            });
+            let completed =
+                referrer.complete_args(top_level, &generics.params, args, |_, _, _, _| {
+                    unreachable!(
+                        "the traits of this example have no default that names a leaked type"
+                    )
+                });
             let args = enc(completed)?;
             (
                 quote!(),
@@ -285,13 +286,23 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                 let mut sig = method.sig.clone();
                 // 3. Replace each leaked type with its path through the Repeater. The visitor
                 //    needs the whole signature, and the `ContextId` of the trait.
-                let mut visitor = referrer.visitor(top_level, |_leaked, ix| {
-                    // The arguments of the Repeater, as written at this site. The paths come out
-                    // as the impls of crate A have them, because both use `Referrer`.
-                    let args = referrer
-                        .entry_args(ix, &site, array_const)
+                let mut visitor = referrer.visitor(top_level, |_leaked, ix, context| {
+                    // The arguments of the Repeater, as written at this site: those of the site
+                    // for the generics of the entry, encoded. The paths come out as the impls of
+                    // crate A have them, because both encode the generics of the same context.
+                    let self_ty: Type = parse_quote!(Self);
+                    let args = site
+                        .generic_args(&context.generics)
+                        .and_then(|args| {
+                            encode_generics_args_with_params(
+                                &args,
+                                &context.generics.params,
+                                Some((&self_ty, &context.self_outlives)),
+                                array_const,
+                            )
+                        })
                         .expect("the arguments can be encoded");
-                    slots.projection(&parse_quote!(Self), &args, id, ix)
+                    repeater_projection(&repeater, &self_ty, &args, id, ix)
                 });
                 visitor.visit_signature_mut(&mut sig);
                 if explicit.is_some() {
@@ -357,6 +368,6 @@ struct Written<'a>(&'a UseSite);
 
 impl VisitMut for Written<'_> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        *ty = self.0.substitute(ty);
+        *ty = self.0.substitute(ty, None);
     }
 }

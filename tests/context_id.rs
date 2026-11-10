@@ -339,7 +339,7 @@ fn ids_of_dropped_contexts_are_gaps() {
     );
     // The ids are those of the Leaker, not renumbered.
     assert_eq!(s(&common::entry(&referrer, 2).generics), "< U >");
-    for (_, context) in referrer.iter() {
+    for (_, _, context) in referrer.iter() {
         assert_eq!(context.self_ty.as_ref(), None);
         assert_eq!(common::in_module(context), None);
     }
@@ -408,10 +408,10 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
     type Lookup = fn(&Referrer, ContextId);
     let lookups: [(&str, Lookup); 2] = [
         ("visitor", |referrer, context| {
-            let _ = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+            let _ = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
         }),
         ("expand", |referrer, context| {
-            let _ = referrer.expand(context, parse_quote!(Rel), |_, ix| parse_quote!(P<#ix>));
+            let _ = referrer.expand(context, parse_quote!(Rel), |_, ix, _| parse_quote!(P<#ix>));
         }),
     ];
     for (shape, referrer) in &shapes {
@@ -449,10 +449,10 @@ fn the_contexts_that_exist_do_not_panic() {
     // The control of the tests above: the same calls on a context of the Referrer.
     let (referrer, _) = gap_referrer();
     for context in common::context_ids(&referrer) {
-        let _ = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
-        let _ = referrer.expand(context, parse_quote!(Rel0), |_, ix| parse_quote!(P<#ix>));
+        let _ = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
+        let _ = referrer.expand(context, parse_quote!(Rel0), |_, ix, _| parse_quote!(P<#ix>));
     }
-    for (_, context) in referrer.iter() {
+    for (_, _, context) in referrer.iter() {
         assert_eq!(context.self_ty.as_ref(), None);
         assert!(context.self_outlives.as_slice().is_empty());
         assert_eq!(common::in_module(context), None);
@@ -472,21 +472,21 @@ fn lookups_work_with_gaps() {
     let rewritten = referrer.expand(
         top_level,
         parse_quote!((Rel1, T)),
-        |_, ix| parse_quote!(P<#ix>),
+        |_, ix, _| parse_quote!(P<#ix>),
     );
     let expected: Type = parse_quote!((P<1usize>, T));
     assert_eq!(s(&rewritten), s(&expected));
     let rewritten = referrer.expand(
         top_level,
         parse_quote!(Wrap<U>),
-        |_, ix| parse_quote!(P<#ix>),
+        |_, ix, _| parse_quote!(P<#ix>),
     );
     let expected: Type = parse_quote!(P<2usize>);
     assert_eq!(s(&rewritten), s(&expected));
     assert_eq!(
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (s(ty), s(generics)))
             .collect::<Vec<_>>(),
         [
@@ -500,7 +500,7 @@ fn lookups_work_with_gaps() {
     let mut item: ItemStruct =
         parse_quote! { struct S<T, U> { a: Rel0, b: (Rel1, T), c: Wrap<U> } };
     referrer
-        .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
+        .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_struct_mut(&mut item);
     let expected: ItemStruct =
         parse_quote! { struct S<T, U> { a: P<0usize>, b: (P<1usize>, T), c: P<2usize> } };
@@ -511,7 +511,7 @@ fn lookups_work_with_gaps() {
         fn f<U>() { struct Wrap<X>(X); let _a: Wrap<U>; let _b: Rel0; }
     };
     referrer
-        .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
+        .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_fn_mut(&mut item);
     let expected: ItemFn = parse_quote! {
         fn f<U>() { struct Wrap<X>(X); let _a: Wrap<U>; let _b: P<0usize>; }
@@ -642,7 +642,8 @@ fn serialization_with_gaps_keeps_the_requirements() {
          # 8 mod {{ path = [a , b] , parent = 0 }} ; () mod 8 ; (Rel3)",
         version()
     );
-    let referrer: Referrer = parse_str(&text).unwrap();
+    let result: LeakerResult = parse_str(&text).unwrap();
+    let referrer = result.clone().into_referrer();
     assert_eq!(ids(&referrer), [0, 1, 4, 6, 8, 9]);
     assert_eq!(referrer.to_token_stream().to_string(), text);
     assert_eq!(
@@ -655,7 +656,7 @@ fn serialization_with_gaps_keeps_the_requirements() {
     assert_eq!(common::entry_id(&referrer, 3), c9);
     // The entries 0 to 3 are in the contexts 1, 4, 6 and 9.
     assert_eq!(common::in_module(common::entry(&referrer, 0)), Some(c0));
-    assert_eq!(common::entry_module_path(&referrer, 0), Some(vec![]));
+    assert_eq!(common::entry_module_path(&result, 0), Some(vec![]));
     assert_eq!(common::in_module(common::entry(&referrer, 1)), None);
     assert_eq!(s(&common::entry(&referrer, 1).generics), "< T >");
     assert_eq!(s(&common::entry(&referrer, 2).generics), "");
@@ -670,12 +671,12 @@ fn serialization_with_gaps_keeps_the_requirements() {
     assert_eq!(common::entry(&referrer, 3).self_ty.as_ref(), None);
     assert_eq!(common::in_module(common::entry(&referrer, 3)), Some(c8));
     assert_eq!(
-        common::entry_module_path(&referrer, 3),
+        common::entry_module_path(&result, 3),
         Some(vec![parse_quote!(a), parse_quote!(b)])
     );
     // The module of an entry is a module's own context, which has the id of the module.
     assert!(matches!(
-        common::entry_module(&referrer, 3),
+        common::entry_module(&result, 3),
         Some(ModuleScope::Itself { id, parent: Some(parent), .. }) if id == c8 && parent == c0
     ));
 
@@ -692,8 +693,10 @@ fn serialization_with_gaps_keeps_the_requirements() {
     assert_eq!(top_level, id(0));
     assert_eq!(ids(&referrer), [0, 2]);
     let (with_self, without) = (
-        referrer.iter().position(|(ty, _)| s(ty) == "Rel < Self >"),
-        referrer.iter().position(|(ty, _)| s(ty) == "RelB"),
+        referrer
+            .iter()
+            .position(|(_, ty, _)| s(ty) == "Rel < Self >"),
+        referrer.iter().position(|(_, ty, _)| s(ty) == "RelB"),
     );
     let (with_self, without) = (with_self.unwrap(), without.unwrap());
     assert_eq!(common::entry_id(&referrer, with_self), top_level);
@@ -709,7 +712,7 @@ fn serialization_with_gaps_keeps_the_requirements() {
     );
     let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
     assert_eq!(parsed, referrer);
-    for ((_, context), (_, read)) in referrer.iter().zip(parsed.iter()) {
+    for ((_, _, context), (_, _, read)) in referrer.iter().zip(parsed.iter()) {
         assert_eq!(read.self_ty.as_ref(), context.self_ty.as_ref());
     }
 }
@@ -730,7 +733,8 @@ fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
     };
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     let ix = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Rel < T >")
         .unwrap();
@@ -745,8 +749,15 @@ fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
         "< 'a , T , const N : usize >"
     );
     let marker: Type = parse_quote!(crate::Marker);
-    let r = referrer
-        .repeater_impl(ix, ImplSelf::Marker(&marker), array_const)
+    let r = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Marker(&marker),
+            array_const,
+        )
+        .unwrap()
+        .nth(ix)
         .unwrap();
     assert_eq!(s(&r.generics), "< 'a , T >");
 }
@@ -770,7 +781,7 @@ fn check_serialized_ids(shape: &str, referrer: &Referrer, returned: &[ContextId]
     let last = ids.last().unwrap().index();
     for n in 0..=last + 2 {
         let readable = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = referrer.visitor(id(n), |_, ix| parse_quote!(P<#ix>));
+            let _ = referrer.visitor(id(n), |_, ix, _| parse_quote!(P<#ix>));
         }))
         .is_ok();
         assert_eq!(ids.contains(&id(n)), readable, "{}: the id {}", shape, n);
@@ -872,7 +883,8 @@ fn the_ids_read_from_the_serialized_form_agree_with_the_referrer() {
     let mut leaker = Leaker::new();
     let root = leaker.intern_mod(&module);
     let (hinted, ()) = leaker.enter_mod("h", [], |view| view.visit_type(&parse_quote!(Rel2)));
-    let modules = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let modules = result.clone().finish().unwrap();
     let text = modules.to_token_stream().to_string();
     assert!(text.contains("mod { path = [] }"), "{}", text);
     assert!(text.contains("mod { hint = \"h\" }"), "{}", text);
@@ -883,7 +895,7 @@ fn the_ids_read_from_the_serialized_form_agree_with_the_referrer() {
     let listed = common::context_ids(&modules);
     let mut own: BTreeSet<ContextId> = BTreeSet::new();
     for ix in 0..modules.iter().count() {
-        match common::entry_module(&modules, ix) {
+        match common::entry_module(&result, ix) {
             Some(ModuleScope::Itself { id, .. }) => {
                 assert_eq!(common::in_module(common::entry(&modules, ix)), Some(id));
                 assert!(listed.contains(&id), "the entry {}", ix);

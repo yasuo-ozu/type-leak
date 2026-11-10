@@ -567,7 +567,7 @@ fn the_qualified_path_in_the_arguments_of_what_conflicts_is_leaked() {
     let entries: Vec<String> = result
         .into_referrer()
         .iter()
-        .map(|(ty, _)| ty.to_token_stream().to_string())
+        .map(|(_, ty, _)| ty.to_token_stream().to_string())
         .collect();
     assert_eq!(entries, ["< Rel as m :: Tr < u8 > > :: X"]);
 }
@@ -601,7 +601,7 @@ fn a_path_in_a_value_is_an_expression_and_its_arguments_are_leaked() {
     let entries: Vec<String> = result
         .into_referrer()
         .iter()
-        .map(|(ty, _)| ty.to_token_stream().to_string())
+        .map(|(_, ty, _)| ty.to_token_stream().to_string())
         .collect();
     // The type of the constant is leaked too.
     assert_eq!(entries, ["Arg", "u8"]);

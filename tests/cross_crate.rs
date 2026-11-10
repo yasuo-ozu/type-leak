@@ -1,7 +1,7 @@
 //! Uses `type-leak` across crate boundaries through a proc macro, as a downstream crate would.
 //!
 //! - `tests/crates/macro`: the proc macro using `type-leak` (`Leaker`, `Referrer` and
-//!   `RepeaterSlots`).
+//!   `slot_const()`).
 //! - `tests/crates/leaker`: the Leaker's crate, defining traits with relative types.
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
 //!   forward to `Inner`, and copying items of every kind (struct, enum, union, impl, module, trait)
@@ -14,7 +14,8 @@
 //! one from it), so a rewrite which does not give the original type fails the build of this test.
 //! The tests here read what the macros reported and what they wrote.
 
-use type_leak::repeater_key;
+use syn::parse_quote;
+use type_leak::{repeater_key, EntryId};
 use type_leak_test_leaker::m::{
     Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault, RelType,
 };
@@ -242,6 +243,7 @@ fn squash(text: &str) -> String {
 
 /// The `KEY` of the entry `nth` of the Leaker `id`, as the tokens write it (and `squash()` leaves it).
 fn key_text(id: u64, nth: usize) -> String {
+    let nth: EntryId = parse_quote!(#nth);
     format!("{}u128", repeater_key(id, nth))
 }
 
@@ -253,7 +255,8 @@ const fn key(id: u64, nth: usize) -> u128 {
 #[test]
 fn the_const_key_is_the_key_of_the_library() {
     for (id, nth) in [(0, 0), (7, 3), (9209, 2), (u64::MAX, usize::MAX)] {
-        assert_eq!(key(id, nth), repeater_key(id, nth));
+        let entry: EntryId = parse_quote!(#nth);
+        assert_eq!(key(id, nth), repeater_key(id, entry));
     }
 }
 
@@ -1559,8 +1562,8 @@ fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_no
 
 /// `coinduction`'s shape: `enter_impl(.., false, ..)` with `visit_path_arguments()`, the
 /// Repeater's impls for a marker (`ImplSelf::Marker`) of the entries, and the Referrer's copy of the self type, the trait and its
-/// arguments with `Referrer::visitor(context, ..)` and `entry_args(ix, &UseSite::identity(),
-/// ..)`. The Referrer's crate checks the copy: each type is the original (a witness), and rustc finds
+/// arguments with `Referrer::visitor(context, ..)` and `encode_generics_args_with_params()` at
+/// `UseSite::identity()`. The Referrer's crate checks the copy: each type is the original (a witness), and rustc finds
 /// the Leaker's impl of the trait for the rewritten self type.
 #[test]
 fn the_scope_api_with_a_marker() {
@@ -1628,7 +1631,9 @@ fn the_scope_api_with_a_marker() {
 }
 
 /// `newer-type`'s shape: `Self` is allowed, and the Repeater's impl of an entry that names it is for
-/// the self type (`ImplSelf::Param`), whereas the one that does not is for the marker.
+/// the self type (`ImplSelf::Param`). A marker is refused then (the call of `repeater_impls()`
+/// fails), so the impl of the one that does not is for a parameter, which the marker is accepted
+/// for.
 #[test]
 fn the_scope_api_with_self() {
     assert_eq!(
@@ -1658,7 +1663,7 @@ fn the_scope_api_with_self() {
                 key_text(7002, 0)
             ),
             format!(
-                "impl<T:::core::clone::Clone>crate::Repeater<(T,),{}>forM7002",
+                "impl<T:::core::clone::Clone,__S:?::core::marker::Sized>crate::Repeater<(T,),{}>for__S",
                 key_text(7002, 1)
             ),
         ]

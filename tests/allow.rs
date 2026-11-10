@@ -300,7 +300,7 @@ fn an_error_in_an_inner_scope_is_recovered_and_recorded_once() {
             parse_quote!(Rel<T>),
             parse_quote!(::core::marker::PhantomData<dyn RelTr>),
         ];
-        let mut visitor = referrer.visitor(inner, |_, ix| parse_quote!(Entry<#ix>));
+        let mut visitor = referrer.visitor(inner, |_, ix, _| parse_quote!(Entry<#ix>));
         for ty in &mut copy {
             visitor.visit_type_mut(ty);
         }
@@ -560,7 +560,7 @@ fn an_entry_whose_bounds_name_a_self_without_meaning_is_copied_whole() {
             parse_quote!(Other<U>),
             parse_quote!(::p::Opt<T>),
         ];
-        let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(Entry<#ix>));
+        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(Entry<#ix>));
         for ty in &mut copy {
             visitor.visit_type_mut(ty);
         }
@@ -1267,7 +1267,7 @@ fn referrer_of<A: Allow>(config: A, item: &ItemTrait) -> (Referrer, ContextId) {
 fn rewritten(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> ItemTrait {
     let mut copy = item.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(Entry<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
         .visit_item_trait_mut(&mut copy);
     copy
 }
@@ -1376,7 +1376,7 @@ fn an_item_beside_the_conflict_in_the_same_context_is_still_replaced() {
     assert_eq!(parts_of(&referrer).len(), 1);
     let mut copy = st.clone();
     referrer
-        .visitor(in_struct, |_, ix| parse_quote!(Entry<#ix>))
+        .visitor(in_struct, |_, ix, _| parse_quote!(Entry<#ix>))
         .visit_item_struct_mut(&mut copy);
     let expected: ItemStruct = parse_quote!(
         struct S {
@@ -1497,7 +1497,7 @@ fn a_silent_correction_is_no_error_of_its_own_and_a_signature_makes_it_a_part() 
     assert!(parts_of(&referrer).is_empty());
     let mut copy: Vec<Type> = vec![parse_quote!(Rel), parse_quote!(Wrap<Self>)];
     let mut visitor = referrer
-        .visitor(context, |_, ix| parse_quote!(Entry<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
         .with_self(parse_quote!(Host));
     for ty in &mut copy {
         visitor.visit_type_mut(ty);
@@ -1534,7 +1534,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
         let entries = listed(&referrer);
         let mut copy = ty;
         referrer
-            .visitor(context, |_, ix| parse_quote!(Entry<#ix>))
+            .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
             .visit_type_mut(&mut copy);
         (entries, copy)
     };
@@ -1675,7 +1675,7 @@ fn a_part_of_a_module_is_left_as_written_in_that_module_only() {
     assert_eq!(parts.len(), 2);
     assert_ne!(parts[0], parts[1]);
     let mut items = item.content.unwrap().1;
-    let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(Entry<#ix>));
+    let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(Entry<#ix>));
     for item in &mut items {
         visitor.visit_item_mut(item);
     }
@@ -1743,7 +1743,7 @@ fn self_is_replaced_in_a_part_when_the_caller_asks() {
     let (referrer, context) = referrer_of(Rules::new(), &item);
     let mut copy = item.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(Entry<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
         .with_self(parse_quote!(__S))
         .visit_item_trait_mut(&mut copy);
     // `Self` is replaced inside the part, which is otherwise as written, and the entry is replaced.
@@ -1759,7 +1759,7 @@ fn self_is_replaced_in_a_part_when_the_caller_asks() {
 fn expand_leaves_a_part_as_written() {
     let item = elided_and_bare();
     let (referrer, context) = referrer_of(Rules::new(), &item);
-    let replace = |_: Type, ix: usize| -> Type { parse_quote!(Entry<#ix>) };
+    let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(Entry<#ix>) };
     let part: Type = parse_quote!(::p::Elided<'_, dyn RelTr>);
     assert_eq!(referrer.expand(context, part.clone(), replace), part);
     let other: Type = parse_quote!(::core::marker::PhantomData<dyn RelTr>);
@@ -1959,7 +1959,7 @@ fn a_part_with_an_anchor_is_left_as_written_only_inside_a_type_that_matches_it()
         ))
         .unwrap()
     };
-    let replace = |_: Type, ix: usize| -> Type { parse_quote!(Entry<#ix>) };
+    let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(Entry<#ix>) };
     let anchor: Type = parse_quote!(::p::Elided<'_, dyn RelTr>);
     let other: Type = parse_quote!(::core::marker::PhantomData<dyn RelTr>);
     // The anchor has the context of the type that is visited: the part is left as written in it,

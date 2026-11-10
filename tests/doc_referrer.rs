@@ -1,11 +1,13 @@
 //! Tests of the behavior of the `Referrer` API that its docs used to show as examples.
 
+mod common;
+
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
-/// `iter()` has a type of another crate too, and `repeater_impl()` writes an impl for each entry.
+/// `iter()` has a type of another crate too, and `repeater_impls()` writes an impl for each entry.
 #[test]
 fn iter_has_the_types_of_other_crates_and_each_entry_gets_a_repeater_impl() {
     let mut leaker = Leaker::new();
@@ -18,15 +20,18 @@ fn iter_has_the_types_of_other_crates_and_each_entry_gets_a_repeater_impl() {
         ),
         true,
     );
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    result.clone().finish().unwrap();
     // One impl for each entry, the one of another crate too.
     let param: Ident = parse_quote!(__S);
-    let impls: Vec<RepeaterImpl> = (0..referrer.iter().count())
-        .map(|ix| {
-            referrer
-                .repeater_impl(ix, ImplSelf::Param(&param), array_const)
-                .unwrap()
-        })
+    let impls: Vec<RepeaterImpl> = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Param(&param),
+            array_const,
+        )
+        .unwrap()
         .collect();
     assert_eq!(impls.len(), 2);
 }
@@ -46,7 +51,7 @@ fn context_self_is_bound_for_self_in_a_trait_and_none_otherwise() {
     );
     let referrer = leaker.result().finish().unwrap();
     // `Wrap<Self>` is written for the implementors of the trait. `Rel` is for any type.
-    for (ty, context) in referrer.iter() {
+    for (_, ty, context) in referrer.iter() {
         if *ty == parse_quote!(Wrap<Self>) {
             assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
         } else {
@@ -98,7 +103,9 @@ fn has_self_is_true_if_some_entry_needs_self() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
-    assert!(referrer.bucket_self(0, 7).is_none());
+    assert!(referrer
+        .bucket_self(common::entry_id_at(&referrer, 0), 7)
+        .is_none());
     assert!(referrer.has_self());
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
     assert!(parsed.has_self());
@@ -114,7 +121,9 @@ fn has_self_is_true_if_some_entry_needs_self() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
-    assert!((0..referrer.iter().count()).all(|ix| referrer.bucket_self(ix, 7).is_some()));
+    assert!(referrer
+        .iter()
+        .all(|(ix, _, _)| referrer.bucket_self(ix, 7).is_some()));
     assert!(!referrer.has_self());
 }
 
@@ -136,7 +145,7 @@ fn complete_args_fills_the_defaulted_parameter() {
             top_level,
             &tr.generics.params,
             &args.args,
-            |_, ix, _| parse_quote!(Leaked<#ix>),
+            |_, ix, _, _| parse_quote!(Leaked<#ix>),
         )
         .unwrap();
     let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(Leaked<0usize>)];
@@ -157,7 +166,7 @@ fn outermost_generics_as_leakers_replaces_despite_other_bounds() {
     let mut leaker = Leaker::new();
     let context = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    let replace = |_: Type, ix: usize| -> Type { parse_quote!(Leaked<#ix>) };
+    let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(Leaked<#ix>) };
 
     // The copy declares `T` with another bound than the trait did.
     let item: ItemImpl = parse_quote!(
@@ -199,17 +208,21 @@ fn with_self_replaces_self_with_the_marker_host() {
     let mut leaker = Leaker::new();
     let context = leaker.intern_trait(&tr, true);
     let mut sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>) -> Self::Out);
-    let slots = RepeaterSlots::new(parse_quote!(Repeater));
-    leaker
-        .result()
-        .finish()
-        .unwrap()
-        .visitor(context, |_, ix| {
-            slots.projection(&parse_quote!(Marker<__S>), &parse_quote!(()), 7, ix)
+    let repeater: Path = parse_quote!(Repeater);
+    let referrer = leaker.result().finish().unwrap();
+    referrer
+        .visitor(context, |_, ix, _| {
+            repeater_projection(
+                &repeater,
+                &parse_quote!(Marker<__S>),
+                &parse_quote!(()),
+                7,
+                ix,
+            )
         })
         .with_self(parse_quote!(__S))
         .visit_signature_mut(&mut sig);
-    let key = repeater_key(7, 0);
+    let key = repeater_key(7, common::entry_id_at(&referrer, 0));
     let expected: Signature =
         parse_quote!(fn f(&self, x: <Marker<__S> as Repeater<(), #key>>::Type) -> <__S>::Out);
     assert_eq!(sig, expected);
@@ -237,17 +250,23 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
         attrs: vec![],
         items: vec![Item::Struct(item)],
     };
-    let slots = RepeaterSlots::new(parse_quote!(Repeater));
+    let repeater: Path = parse_quote!(Repeater);
     let unit: Type = parse_quote!(());
     referrer
-        .visitor(module, |_, ix| slots.projection(&unit, &unit, 7, ix))
-        .with_nested_self(|nested, _leaked, ix| {
+        .visitor(module, |_, ix, _| {
+            repeater_projection(&repeater, &unit, &unit, 7, ix)
+        })
+        .with_nested_self(|nested, _leaked, ix, _| {
             let ident = nested.ident.as_ref().unwrap();
             let host = parse_quote!(::leaker::m::#ident<T>);
-            slots.projection(&host, &unit, 7, ix)
+            repeater_projection(&repeater, &host, &unit, 7, ix)
         })
         .visit_file_mut(&mut file);
-    let (key0, key1) = (repeater_key(7, 0), repeater_key(7, 1));
+    let (ix0, ix1) = (
+        common::entry_id_at(&referrer, 0),
+        common::entry_id_at(&referrer, 1),
+    );
+    let (key0, key1) = (repeater_key(7, ix0), repeater_key(7, ix1));
     let expected: File = parse_quote! {
         struct S<T> {
             a: <() as Repeater<(), #key0>>::Type,
@@ -267,22 +286,22 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
     let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
-    let referrer = leaker.result().finish().unwrap();
-    let (_, context) = referrer.iter().next().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
+    let (_, _, context) = referrer.iter().next().unwrap();
     assert!(matches!(context.self_ty, Some(SelfRequirement::Any)));
 
     // The Leaker's crate: the impl is for any type `__S` that `T: AsRef<__S>` holds for.
-    let slots = RepeaterSlots::new(parse_quote!(Repeater));
+    let repeater: Path = parse_quote!(Repeater);
     let param: Ident = parse_quote!(__S);
-    let r = referrer
-        .repeater_impl(0, ImplSelf::Param(&param), slots.const_fn())
+    let r = result
+        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+        .unwrap()
+        .next()
         .unwrap();
-    let (generics, ty) = (&r.generics, &r.ty);
-    let repeater = slots.trait_path(&r.args, 7, 0);
-    let imp: ItemImpl = parse_quote! {
-        impl #generics #repeater for __S { type Type = #ty; }
-    };
-    let key = repeater_key(7, 0);
+    // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
+    let key = repeater_key(7, r.entry);
+    let imp: ItemImpl = parse_quote!(#r);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S: ?::core::marker::Sized>
             Repeater<(T,), #key> for __S
@@ -299,15 +318,17 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .visitor(module, |_, ix| {
-            slots.projection(&parse_quote!(()), &parse_quote!(()), 7, ix)
+        .visitor(module, |_, ix, _| {
+            repeater_projection(&repeater, &parse_quote!(()), &parse_quote!(()), 7, ix)
         })
-        .with_nested_self(|_nested, _leaked, ix| {
-            let args = referrer
-                .entry_args(ix, &UseSite::identity(), slots.const_fn())
-                .unwrap();
-            match &referrer.iter().nth(ix).unwrap().1.self_ty {
-                Some(SelfRequirement::Any) => slots.projection(&parse_quote!(Self), &args, 7, ix),
+        .with_nested_self(|_nested, _leaked, ix, context| {
+            let args =
+                common::repeater_args(context, &UseSite::identity(), None, slot_const(&repeater))
+                    .unwrap();
+            match &context.self_ty {
+                Some(SelfRequirement::Any) => {
+                    repeater_projection(&repeater, &parse_quote!(Self), &args, 7, ix)
+                }
                 _ => unimplemented!("the Leaker's type, from `nested`"),
             }
         })
@@ -344,8 +365,8 @@ fn nested_self_keeps_an_absolute_self_type_as_written_when_optional_entries_are_
         items: vec![Item::Struct(item)],
     };
     referrer
-        .visitor(module, |_leaked, ix| parse_quote!(Entry<#ix>))
-        .with_nested_self(|_nested, _leaked, ix| parse_quote!(LeakersType<#ix>))
+        .visitor(module, |_leaked, ix, _| parse_quote!(Entry<#ix>))
+        .with_nested_self(|_nested, _leaked, ix, _| parse_quote!(LeakersType<#ix>))
         .visit_file_mut(&mut file);
     let expected: File = parse_quote! {
         struct Node<T> {
@@ -382,8 +403,8 @@ fn a_leaker_that_allows_the_crates_makes_no_entry_of_their_types() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .visitor(module, |_leaked, ix| parse_quote!(Entry<#ix>))
-        .with_nested_self(|_nested, _leaked, ix| parse_quote!(LeakersType<#ix>))
+        .visitor(module, |_leaked, ix, _| parse_quote!(Entry<#ix>))
+        .with_nested_self(|_nested, _leaked, ix, _| parse_quote!(LeakersType<#ix>))
         .visit_file_mut(&mut file);
     let expected: File = parse_quote! {
         struct Node<T> {

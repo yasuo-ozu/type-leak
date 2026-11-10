@@ -264,7 +264,7 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
             .finish()
             .unwrap()
             .iter()
-            .map(|(ty, _)| quote!(#ty).to_string())
+            .map(|(_, ty, _)| quote!(#ty).to_string())
             .collect();
         entries.sort();
         entries
@@ -748,7 +748,7 @@ fn a_bad_value_is_an_error_of_its_scope_and_the_one_around_it() {
     let entries: Vec<String> = result
         .into_referrer()
         .iter()
-        .map(|(ty, _)| quote!(#ty).to_string())
+        .map(|(_, ty, _)| quote!(#ty).to_string())
         .collect();
     assert_eq!(entries, ["Other < u8 >", "Wrap < u8 >"]);
 }
@@ -807,7 +807,7 @@ fn the_types_are_leaked_as_ever() {
             .finish()
             .unwrap()
             .iter()
-            .map(|(ty, _)| quote!(#ty).to_string())
+            .map(|(_, ty, _)| quote!(#ty).to_string())
             .collect()
     }
     let without = Rules::new().primitive().prelude();

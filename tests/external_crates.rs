@@ -464,15 +464,16 @@ fn result_with_foo() -> (LeakerResult, ContextId) {
 
 /// `ty` as the Referrer expands it, with every entry replaced by `P<ix>`.
 fn expand(referrer: &Referrer, context: ContextId, ty: Type) -> String {
-    let ty = referrer.expand(context, ty, |_, ix| parse_quote!(P<#ix>));
+    let ty = referrer.expand(context, ty, |_, ix, _| parse_quote!(P<#ix>));
     quote!(#ty).to_string()
 }
 
-/// The index of the entry `ty`.
-fn index_of(referrer: &Referrer, ty: &str) -> usize {
-    common::types(referrer)
+/// The id of the entry `ty`.
+fn index_of(referrer: &Referrer, ty: &str) -> EntryId {
+    let n = common::types(referrer)
         .position(|t| squash(quote!(#t)) == ty)
-        .unwrap_or_else(|| panic!("no entry `{}`", ty))
+        .unwrap_or_else(|| panic!("no entry `{}`", ty));
+    common::entry_id_at(referrer, n)
 }
 
 /// `allow()` drops errors only: `finish()` and `into_referrer()` give the Referrer of the result for
@@ -576,10 +577,10 @@ fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
     assert_eq!(referrer.iter().count(), 2);
     assert!(referrer
         .iter()
-        .all(|(_, context)| context.self_ty.is_some()));
+        .all(|(_, _, context)| context.self_ty.is_some()));
     let mut copy = item.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut copy);
     let expected: ItemTrait = parse_quote!(
         trait T {
@@ -609,7 +610,7 @@ fn referrer_visitor_keeps_what_type_fn_returns() {
     referrer
         .visitor(
             context,
-            |ty, ix| {
+            |ty, ix, _| {
                 if ix == foo {
                     ty
                 } else {
@@ -623,7 +624,7 @@ fn referrer_visitor_keeps_what_type_fn_returns() {
     assert!(s.contains("P <"), "{}", s);
     // A `type_fn` that returns `P<ix>` replaces both.
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut replaced);
     let s = quote!(#replaced).to_string();
     assert!(!s.contains(":: foo"), "{}", s);

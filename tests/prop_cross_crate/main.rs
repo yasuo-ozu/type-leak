@@ -316,7 +316,7 @@
 //!
 //! # Other checks of the macro
 //!
-//! - The helpers agree: `repeater_impl()` declares the generics of the context of its entry
+//! - The helpers agree: `repeater_impls()` declares the generics of the context of its entry
 //!   without the bounds its arguments encode, and the parameter of the implementor, `is_empty()`
 //!   and `iter()` say the same, and the module of its impl (`RepeaterImpl::module`) is the
 //!   `Itself` of the module its context is in (`HELPERS DISAGREE`).

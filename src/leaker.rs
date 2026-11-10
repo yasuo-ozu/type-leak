@@ -6,11 +6,15 @@ use crate::analyze::{declared_names, AnalyzeVisitor, Finished, ModuleNames, Scop
 #[cfg(doc)]
 use crate::context::SelfRequirement;
 use crate::context::{Context, ContextId, Contexts, Gat, ModuleScope};
+use crate::encode::EncodeError;
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
 use crate::graph::{is_whole_reference, sorted_entries, NodeKey, TypeGraph};
+#[cfg(doc)]
+use crate::referrer::EntryId;
 use crate::referrer::Referrer;
+use crate::repeater::{ImplSelf, RepeaterImpl};
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -44,7 +48,7 @@ use template_quote::{quote, ToTokens};
 /// assert_eq!(referrer.iter().count(), 2);
 /// // The context of `Wrap<T>` has the generic `T`.
 /// let wrap: Type = parse_quote!(Wrap<T>);
-/// let (_, context) = referrer.iter().find(|(ty, _)| **ty == wrap).unwrap();
+/// let (_, _, context) = referrer.iter().find(|(_, ty, _)| **ty == wrap).unwrap();
 /// assert_eq!(context.generics.params.len(), 1);
 /// ```
 ///
@@ -323,7 +327,7 @@ impl<A: Allow> Leaker<A> {
     /// let mut leaker = Leaker::new();
     /// leaker.intern_trait(&item, true);
     /// let referrer = leaker.result().finish().unwrap();
-    /// let (_, context) = referrer.iter().next().unwrap();
+    /// let (_, _, context) = referrer.iter().next().unwrap();
     /// assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
     /// ```
     pub fn intern_trait(&mut self, item: &ItemTrait, allow_self: bool) -> ContextId {
@@ -591,6 +595,114 @@ impl LeakerResult {
         } else {
             Err(self.errors)
         }
+    }
+
+    /// Describes the Repeater impl of each entry: its generics, trait path and type.
+    ///
+    /// It is the Leaker's side that writes the impls: write one for every entry, in
+    /// [`RepeaterImpl::module`] if it is `Some`. The items come in the order of the entries
+    /// ([`Referrer::iter()`]), each with its [`EntryId`] in [`RepeaterImpl::entry`], which the
+    /// Repeater's `KEY` ([`repeater_key()`](crate::repeater_key)) and [`Referrer::bucket_self()`]
+    /// take.
+    ///
+    /// `repeater` is the path of the Repeater trait; it becomes [`RepeaterImpl::path`], with the
+    /// first argument. `id` is the Leaker's id: the one that the copy's side passes to
+    /// [`repeater_projection()`](crate::repeater_projection) and
+    /// [`Referrer::bucket_self()`]. `ToTokens` of the item writes the impl with the `KEY`
+    /// ([`repeater_key(id, entry)`](crate::repeater_key)), and [`ImplSelf::Bucket`] chooses the
+    /// type from the same `id`. `target` says what every impl is for ([`ImplSelf`]); `const_fn` is
+    /// as in [`encode_generics_args_with_params()`](crate::encode_generics_args_with_params), but
+    /// gets the parameter itself (`N`) as `value`.
+    ///
+    /// The call fails, before any item, with the first of these:
+    ///
+    /// - [`EncodeError::NeedsSelf`], for [`ImplSelf::Marker`], if some entry names `Self`, or its
+    ///   context's generics do. The error has the first such entry.
+    /// - The first error of `const_fn`. It is called once for each const parameter of each entry,
+    ///   in the order of the entries and of the parameters.
+    ///
+    /// The items do not fail. They are made one at a time as you iterate, and call `const_fn`
+    /// again, so it must give the same answer for the same parameter every time: if it fails for a
+    /// parameter that it accepted in the call, the iterator panics.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use template_quote::{quote, ToTokens};
+    /// let tr: ItemTrait = parse_quote! {
+    ///     trait Tr<T> { type Out; fn f(&self) -> Wrap<T, Self::Out>; }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_trait(&tr, true);
+    /// let result = leaker.result();
+    ///
+    /// let repeater: Path = parse_quote!(crate::Repeater);
+    /// let param: Ident = parse_quote!(__S);
+    /// let target = ImplSelf::Param(&param);
+    /// let mut impls = result
+    ///     .repeater_impls(&repeater, 7, target, slot_const(&repeater))
+    ///     .unwrap();
+    /// let r = impls.next().unwrap();
+    /// assert!(impls.next().is_none());
+    ///
+    /// // `path` has no `KEY`, and `ToTokens` writes the one of the id 7.
+    /// assert_eq!(r.path, parse_quote!(crate::Repeater<(T,)>));
+    /// let key = repeater_key(7, r.entry);
+    ///
+    /// // `Self::Out` names `Self`: the implementor is bound by the trait, and replaces it.
+    /// let expected: ItemImpl = parse_quote! {
+    ///     impl<T, __S: ?::core::marker::Sized + Tr<T>>
+    ///         crate::Repeater<(T,), #key> for __S
+    ///     {
+    ///         type Type = Wrap<T, <__S>::Out>;
+    ///     }
+    /// };
+    /// assert_eq!(parse2::<ItemImpl>(quote!(#r)).unwrap(), expected);
+    /// ```
+    ///
+    /// An entry that names `Self` has no impl for a marker, so the call fails:
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let tr: ItemTrait = parse_quote! {
+    ///     trait Tr<T> { type Out; fn f(&self) -> Wrap<T, Self::Out>; }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_trait(&tr, true);
+    /// let result = leaker.result();
+    ///
+    /// let repeater: Path = parse_quote!(crate::Repeater);
+    /// let marker: Type = parse_quote!(crate::Marker);
+    /// let target = ImplSelf::Marker(&marker);
+    /// let impls = result.repeater_impls(&repeater, 7, target, slot_const(&repeater));
+    /// assert!(matches!(impls, Err(EncodeError::NeedsSelf(_))));
+    /// ```
+    pub fn repeater_impls<'a>(
+        &'a self,
+        repeater: &'a Path,
+        id: u64,
+        target: ImplSelf<'a>,
+        mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError> + 'a,
+    ) -> std::result::Result<impl Iterator<Item = RepeaterImpl> + 'a, EncodeError> {
+        let count = self.referrer.iter().count();
+        for ix in 0..count {
+            self.referrer.check_marker(ix, target)?;
+        }
+        for ix in 0..count {
+            self.referrer.check_consts(ix, target, &mut const_fn)?;
+        }
+        Ok((0..count).map(move |ix| {
+            self.referrer
+                .repeater_impl(repeater, id, ix, target, &mut const_fn)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "`const_fn` of `repeater_impls()` failed for the entry {} after it had \
+                         not failed in the call: {}",
+                        ix, error
+                    )
+                })
+        }))
     }
 }
 

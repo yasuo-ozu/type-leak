@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    to_syn_error, Allow, ContextId, ErrorItem, Leaker, Options, Referrer, Rules, SelfRequirement,
+    to_syn_error, Allow, Context, ContextId, EntryId, ErrorItem, Leaker, Options, Referrer, Rules,
+    SelfRequirement,
 };
 
 fn s(x: &impl ToTokens) -> String {
@@ -141,8 +142,8 @@ fn intern_struct() {
     assert_eq!(entries(&reduced), entries(&referrer));
     // `expand()` replaces a leaked type by what the callback returns for its index, and nothing
     // else (the entries are sorted by tokens: the tuple, `MyType1`, `MyType4`).
-    let mut f = |_, ix: usize| -> Type {
-        let ix = syn::Index::from(ix);
+    let mut f = |_, ix: EntryId, _: &Context| -> Type {
+        let ix = syn::Index::from(ix.index());
         parse_quote!(::path::to::Implementor<#ix>)
     };
     assert_eq!(
@@ -351,7 +352,8 @@ fn intern_mod() {
     );
     let mut leaker = Leaker::new();
     let module = leaker.intern_mod(&item);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -364,7 +366,7 @@ fn intern_mod() {
     // The module of each: the analyzed one for the first two (its path is `[]`), and `inner`.
     let paths: Vec<Vec<String>> = (0..4)
         .map(|ix| {
-            common::entry_module_path(&referrer, ix)
+            common::entry_module_path(&result, ix)
                 .unwrap()
                 .iter()
                 .map(|i| i.to_string())
@@ -609,7 +611,7 @@ fn test_finish_reduces_and_accumulates() {
         .finish()
         .unwrap()
         .iter()
-        .map(|(t, _)| quote!(#t).to_string())
+        .map(|(_, t, _)| quote!(#t).to_string())
         .collect();
     assert_eq!(leaked, strings(&["A", "B"]));
 }
@@ -627,7 +629,7 @@ fn test_finish_order_is_deterministic() {
             leaker.result().finish().unwrap()
         }
         .iter()
-        .map(|(t, _)| quote!(#t).to_string())
+        .map(|(_, t, _)| quote!(#t).to_string())
         .collect()
     };
     let first = finish();
@@ -1087,7 +1089,7 @@ fn test_bodies_are_not_analyzed() {
             .finish()
             .unwrap()
             .iter()
-            .map(|(t, _)| quote!(#t).to_string())
+            .map(|(_, t, _)| quote!(#t).to_string())
             .collect::<BTreeSet<_>>(),
         ["RelC", "RelS", "RelRet"]
             .iter()

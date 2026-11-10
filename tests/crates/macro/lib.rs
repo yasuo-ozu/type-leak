@@ -18,10 +18,10 @@
 //!
 //! The generics each leaked type uses (those of the trait and those of its methods, see
 //! [`Context::generics`]) are encoded into the Repeater's trait arguments with
-//! [`RepeaterSlots`], so the Repeater (defined by [`repeater_definition()`]) is the only item
+//! [`slot_const()`], so the Repeater (defined by [`repeater_definition()`]) is the only item
 //! shared by the Leaker and the Referrer. The lifetime bounds in them (`T: 'a`) are encoded too
 //! (`&'a T`), so the Repeater's implementations declare the generics without them
-//! ([`Referrer::repeater_impl()`]).
+//! ([`LeakerResult::repeater_impls()`]).
 //!
 //! In the Referrer's crate, `MyTrait!` implements `MyTrait` for a wrapper by forwarding each
 //! method to the field `.0`, with the types in the signatures rewritten by the [`Referrer`]:
@@ -141,33 +141,57 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
     }
 }
 
-/// Checks that `Referrer::bucket_self()` of the `ix`-th entry is `None` exactly where the impl for
-/// a marker type fails with `EncodeError::NeedsSelf`.
-pub(crate) fn check_bucket_self(
+/// Checks the contract of the call of `LeakerResult::repeater_impls()` for `ImplSelf::Marker(..)`
+/// (`marked`): it fails with `EncodeError::NeedsSelf`, for the first entry that needs `Self`,
+/// exactly when `Referrer::bucket_self()` is `None` for some entry, and when it succeeds,
+/// `bucket_self()` is a type for every entry.
+pub(crate) fn check_bucket_self<I>(
     referrer: &Referrer,
-    ix: usize,
     id: u64,
-    slots: &RepeaterSlots,
+    marked: std::result::Result<I, EncodeError>,
 ) -> Result<()> {
-    let marker: Type = parse_quote!(__Marker);
-    let r = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), slots.const_fn());
-    let ty = referrer.iter().nth(ix).unwrap().0;
-    let no_bucket = referrer.bucket_self(ix, id).is_none();
-    if matches!(r, Err(EncodeError::NeedsSelf(_))) != no_bucket {
-        return Err(Error::new(
-            Span::call_site(),
-            format!(
-                "`Referrer::bucket_self({}, {})` is {}, but `NeedsSelf` of the impl for a marker is not: {}",
-                ix,
-                id,
-                if no_bucket { "None" } else { "a type" },
-                quote!(#ty)
-            ),
-        ));
-    }
-    match r {
-        Err(EncodeError::NeedsSelf(_)) | Ok(_) => Ok(()),
-        Err(e) => Err(e.into()),
+    let first = referrer
+        .iter()
+        .map(|(ix, _, _)| ix)
+        .find(|ix| referrer.bucket_self(*ix, id).is_none());
+    match (marked, first) {
+        (Ok(_), None) => Ok(()),
+        (Ok(_), Some(ix)) => {
+            let ty = entry_type(referrer, ix);
+            Err(Error::new(
+                Span::call_site(),
+                format!(
+                    "`Referrer::bucket_self({}, {})` is None, but `NeedsSelf` of the call for a marker is not: {}",
+                    ix,
+                    id,
+                    quote!(#ty)
+                ),
+            ))
+        }
+        (Err(EncodeError::NeedsSelf(ty)), first) => match first {
+            Some(ix) if *entry_type(referrer, ix) == *ty => Ok(()),
+            Some(ix) => {
+                let expected = entry_type(referrer, ix);
+                Err(Error::new(
+                    Span::call_site(),
+                    format!(
+                        "`NeedsSelf` of the call for a marker is for `{}`, but the first entry that needs `Self` is {}: {}",
+                        quote!(#ty),
+                        ix,
+                        quote!(#expected)
+                    ),
+                ))
+            }
+            None => Err(Error::new(
+                Span::call_site(),
+                format!(
+                    "`Referrer::bucket_self(.., {})` is a type for every entry, but the call for a marker fails with `NeedsSelf`: {}",
+                    id,
+                    quote!(#ty)
+                ),
+            )),
+        },
+        (Err(error), _) => Err(error.into()),
     }
 }
 
@@ -408,10 +432,35 @@ pub(crate) fn in_module(context: &Context) -> Option<ContextId> {
     }
 }
 
-/// The context of the `ix`-th entry.
-pub(crate) fn entry_context(referrer: &Referrer, ix: usize) -> &Context {
-    referrer.iter().nth(ix).unwrap().1
+/// The first argument of the Repeater for an entry with `context`, as written at `site`: the
+/// arguments of `site` for the generics of the context (`UseSite::generic_args()`), encoded by
+/// `encode_generics_args_with_params()`. `self_ty` is what `Self: 'a` names (`None`: `Self`).
+pub(crate) fn repeater_args(
+    context: &Context,
+    site: &UseSite,
+    self_ty: Option<&Type>,
+    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    let args = site.generic_args(&context.generics)?;
+    let default: Type = parse_quote!(Self);
+    encode_generics_args_with_params(
+        &args,
+        &context.generics.params,
+        Some((self_ty.unwrap_or(&default), &context.self_outlives)),
+        const_fn,
+    )
 }
+
+/// The context of the entry `ix`.
+pub(crate) fn entry_context(referrer: &Referrer, ix: EntryId) -> &Context {
+    referrer.iter().nth(ix.index()).unwrap().2
+}
+
+/// The type of the entry `ix`.
+pub(crate) fn entry_type(referrer: &Referrer, ix: EntryId) -> &Type {
+    referrer.iter().nth(ix.index()).unwrap().1
+}
+
 
 /// The path of a module from its root (`ModuleScope::Itself::path`), from `RepeaterImpl::module`.
 pub(crate) fn module_path(module: &Option<ModuleScope>) -> Option<&[Ident]> {
@@ -503,7 +552,7 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     };
     let got: std::result::Result<Vec<String>, String> = match leaker.result().finish() {
         Ok(referrer) => {
-            let mut types: Vec<String> = referrer.iter().map(|(ty, _)| type_string(ty)).collect();
+            let mut types: Vec<String> = referrer.iter().map(|(_, ty, _)| type_string(ty)).collect();
             types.sort();
             Ok(types)
         }
@@ -549,10 +598,11 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
     let assertions = leaker.assertions();
     leaker.reduce_roots();
-    let referrer = leaker
-        .result()
-        .finish()
-        .map_err(|errors| to_syn_error(&errors))?;
+    let result = leaker.result();
+    if !result.errors().is_empty() {
+        return Err(to_syn_error(result.errors()));
+    }
+    let referrer = result.clone().into_referrer();
 
     let LeakArgs {
         helper,
@@ -563,27 +613,34 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let id = trait_id(module, &item_trait.ident);
     let trait_ident = &item_trait.ident;
     let vis = &item_trait.vis;
-    let slots = RepeaterSlots::new(repeater.clone());
 
     // The Repeater's implementation of each entry declares exactly the generics the type uses, and
     // encodes them. If the type mentions `Self`, it is implemented for the implementor of the
     // trait (bounded by the trait with its parameters) or for the type `Self` is: that is what
-    // `Referrer::repeater_impl()` describes, with the consts encoded by the slots.
+    // `LeakerResult::repeater_impls()` describes, with the consts encoded by the slots.
     let mut repeater_impls = TokenStream::new();
     let self_param: Ident = parse_quote!(__S);
-    for ix in 0..referrer.iter().count() {
-        let r = referrer
-            .repeater_impl(ix, ImplSelf::Param(&self_param), slots.const_fn())
-            .map_err(Error::from)?;
-        check_bucket_self(&referrer, ix, id, &slots)?;
-        let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-        let (self_ty, ty) = (&r.self_ty, &r.ty);
-        let trait_path = slots.trait_path(&r.args, id, ix);
-        repeater_impls.extend(quote! {
-            impl #impl_generics #trait_path for #self_ty #where_clause {
-                type Type = #ty;
-            }
-        });
+    let check_marker: Type = parse_quote!(__Marker);
+    let params = result
+        .repeater_impls(
+            repeater,
+            id,
+            ImplSelf::Param(&self_param),
+            slot_const(repeater),
+        )
+        .map_err(Error::from)?;
+    check_bucket_self(
+        &referrer,
+        id,
+        result.repeater_impls(
+            repeater,
+            id,
+            ImplSelf::Marker(&check_marker),
+            slot_const(repeater),
+        ),
+    )?;
+    for r in params {
+        repeater_impls.extend(r.to_token_stream());
     }
 
     let mac_name = Ident::new(
@@ -929,7 +986,6 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         self_ty,
         items,
     } = input;
-    let slots = RepeaterSlots::new(repeater.clone());
     let id: u64 = id.base10_parse()?;
     let params = &item_trait.generics.params;
     let trait_params: Vec<GenericArgument> = params
@@ -941,12 +997,12 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     let mut copies = TokenStream::new();
     for mut item in items {
         // `Self` is what the context says: the implementor of the trait.
-        let mut visitor = referrer.visitor(context, |_leaked, ix| {
+        let mut visitor = referrer.visitor(context, |_leaked, ix, entry| {
             let projection = (|| -> Result<Type> {
-                let site =
-                    UseSite::substituting(params, &trait_params).with_self(self_in_copy.clone());
-                let encoded = referrer.entry_args(ix, &site, slots.const_fn())?;
-                Ok(slots.projection(&self_in_copy, &encoded, id, ix))
+                let site = UseSite::substituting(params, &trait_params);
+                let encoded =
+                    repeater_args(entry, &site, Some(&self_in_copy), slot_const(&repeater))?;
+                Ok(repeater_projection(&repeater, &self_in_copy, &encoded, id, ix))
             })();
             projection.unwrap_or_else(|e| {
                 error = Some(e);
@@ -991,22 +1047,23 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     } = input;
     let params = &item_trait.generics.params;
     let trait_ident = &item_trait.ident;
-    let slots = RepeaterSlots::new(repeater.clone());
     let id: u64 = id.base10_parse()?;
 
     // The projection to the leaked type `ix`: the Repeater is encoded with the arguments of the
     // generics the type uses, which are those of the trait or are in scope with the same names (the
     // generics of the method).
-    let projection = |ix: usize,
+    let projection = |ix: EntryId,
+                      context: &Context,
                       root_params: &Punctuated<GenericParam, Token![,]>,
                       root_args: &[GenericArgument]|
      -> Result<Type> {
-        let encoded = referrer.entry_args(
-            ix,
+        let encoded = repeater_args(
+            context,
             &UseSite::substituting(root_params, root_args),
-            slots.const_fn(),
+            None,
+            slot_const(&repeater),
         )?;
-        Ok(slots.projection(&parse_quote!(Self), &encoded, id, ix))
+        Ok(repeater_projection(&repeater, &parse_quote!(Self), &encoded, id, ix))
     };
 
     // Complete the arguments: an omitted argument takes the default, which is rewritten in the
@@ -1014,10 +1071,10 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     // are encoded as in the Leaker.
     let mut encode_error = None;
     let completed = referrer
-        .complete_args(context, params, &trait_args.args, |_leaked, ix, prefix| {
+        .complete_args(context, params, &trait_args.args, |_leaked, ix, entry, prefix| {
             let before: Punctuated<GenericParam, Token![,]> =
                 params.iter().take(prefix.len()).cloned().collect();
-            projection(ix, &before, prefix).unwrap_or_else(|e| {
+            projection(ix, entry, &before, prefix).unwrap_or_else(|e| {
                 encode_error = Some(e);
                 parse_quote!(())
             })
@@ -1049,8 +1106,8 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
 
     // Projections to the leaked types. The generics of a method are in scope with the same names.
     let mut projections = Vec::new();
-    for ix in 0..referrer.iter().count() {
-        projections.push(projection(ix, params, &completed)?);
+    for (ix, _, entry) in referrer.iter() {
+        projections.push(projection(ix, entry, params, &completed)?);
     }
 
     let mut methods = TokenStream::new();
@@ -1077,8 +1134,9 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         let mut sig = trait_fn.sig.clone();
         // The context of the trait says what `Self` is (the implementor) and which generics are in
         // scope.
-        let mut visitor =
-            referrer.visitor(context, |_leaked, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>));
+        let mut visitor = referrer.visitor(context, |_leaked, ix, _| {
+            parse_quote!(__TypeLeakTestPlaceholder<#ix>)
+        });
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
         Resolve {

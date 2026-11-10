@@ -809,7 +809,8 @@ pub mod scoped {
     }
 
     // `newer-type`: `Self` is the self type, and `Wrap<Self>` is an entry of it (the Repeater's impl
-    // is for the self type, `ImplSelf::Param`), next to `Rel<T>` (the impl is for the marker).
+    // is for the self type, `ImplSelf::Param`), next to `Rel<T>`. A marker is refused then, so the
+    // impl of `Rel<T>` is for a parameter, and the copy writes the marker as its owner.
     scope_leak! {
         id = 7002, marker = M7002, allow_self = true,
         impl<T: ::core::clone::Clone> crate::scoped::Tr<Wrap<Self>, Rel<T>>
@@ -1377,11 +1378,13 @@ pub mod kinds {
     pub struct Marker9210;
 
     /// The impls of the entries that name no `Self`, nor do their generics, are for a marker type of
-    /// this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type. The trait is the item
-    /// itself (not nested in a module), so its default `Defd<T>` does not name `Self` while the
-    /// bound of `T` does (`Context::self_ty` is `None`): the entry is for the implementor of the
-    /// trait, which is the host in the copy. For the marker it would bound `T: AsRef<Marker9210>`,
-    /// which the types that the Referrer's crate uses for `T` do not satisfy
+    /// this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type, if no entry needs
+    /// `Self`. The trait has entries that do (`Wrap<Self>`), so the call for a marker fails and
+    /// every impl is for a parameter, which accepts the marker as the owner in the copy. The trait
+    /// is the item itself (not nested in a module), so its default `Defd<T>` does not name `Self`
+    /// while the bound of `T` does (`Context::self_ty` is `None`): the entry is for the implementor
+    /// of the trait, which is the host in the copy. For the marker it would bound `T:
+    /// AsRef<Marker9210>`, which the types that the Referrer's crate uses for `T` do not satisfy
     /// (`impl MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
     #[prop_leak(
         id = 9210,
@@ -2623,15 +2626,17 @@ pub mod kinds {
         pub cl: ClConcrete<U>,
     }
 
-    /// A type with const parameters of the two types that `RepeaterSlots` puts where no other goes.
+    /// A type with const parameters of the two types that `encode_slot_const()` puts where no other
+    /// goes.
     pub struct Keyed<const N: u64, const M: u128>;
 
     /// The marker type of 9236.
     pub struct Marker9236;
 
-    /// 9236: const generics of type `u64` and `u128` in the arguments of the Repeater. `RepeaterSlots`
-    /// puts a `u128` into the `KEY` argument (with the id and the index, `repeater_key()`) and a
-    /// `u64` into the slot `U64`, so the entries use one, the other and both.
+    /// 9236: const generics of type `u64` and `u128` in the arguments of the Repeater.
+    /// `encode_slot_const()` puts a `u128` into the `KEY` argument (with the id and the index,
+    /// `repeater_key()`) and a `u64` into the slot `U64`, so the entries use one, the other and
+    /// both.
     #[prop_leak(
         id = 9236,
         allow_self = false,

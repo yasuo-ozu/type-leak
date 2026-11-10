@@ -92,7 +92,7 @@ fn leaked_by<A: Allow>(leaker: Leaker<A>, item: ItemTrait) -> Vec<(String, Strin
     let referrer = analyze_with(leaker, &item).unwrap_or_else(|e| panic!("{}", to_syn_error(&e)));
     referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect()
 }
@@ -650,7 +650,7 @@ fn the_copy_is_rewritten_to_the_type_holding_the_binder() {
     );
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1163,7 +1163,7 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     let referrer = analyze(&item).unwrap();
     let found: Vec<_> = referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect();
     assert_eq!(
@@ -1185,7 +1185,7 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
         analyze(&item)
             .unwrap()
             .iter()
-            .map(|(ty, _)| s(ty))
+            .map(|(_, ty, _)| s(ty))
             .collect::<Vec<_>>(),
         ["(u8 , Parser , Rel2)"]
     );
@@ -1199,7 +1199,7 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     let (referrer, context) = analyze_in(leaker(), &item).unwrap();
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |ty, _| {
+        &mut referrer.visitor(context, |ty, _, _| {
             let ty = s(&ty);
             parse_quote!(P<#ty>)
         }),
@@ -1234,7 +1234,7 @@ fn the_copy_keeps_the_trait_object_holding_the_anchor() {
     );
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1656,7 +1656,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut replaced,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1686,7 +1686,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
         let referrer = leaker.result().finish().unwrap();
         let mut copy = item.clone();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {
@@ -1753,7 +1753,7 @@ mod elided {
         let referrer = analyze(&item).unwrap_or_else(|e| panic!("{}: {}", s(&item), messages(&e)));
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (s(ty), s(generics)))
             .collect()
     }
@@ -2295,7 +2295,7 @@ mod elided {
         );
         let mut copy = item.clone();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {
@@ -2331,7 +2331,7 @@ mod elided {
                 .finish()
                 .unwrap()
                 .iter()
-                .map(|(ty, _)| s(ty))
+                .map(|(_, ty, _)| s(ty))
                 .collect::<Vec<_>>(),
             ["dyn Fn (& Rel < T >) -> & u8"]
         );

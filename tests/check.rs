@@ -232,7 +232,7 @@ fn test_check_allowed_paths_with_generic_args() {
         .finish()
         .unwrap()
         .iter()
-        .map(|(t, _)| template_quote::quote!(#t).to_string())
+        .map(|(_, t, _)| template_quote::quote!(#t).to_string())
         .collect();
     assert_eq!(leaked, vec!["RelType".to_string()].into_iter().collect());
 }

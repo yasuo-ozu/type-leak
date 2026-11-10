@@ -1,6 +1,8 @@
 //! Examples moved out of the docs of the Leaker, the LeakerResult and `Allow`: each test
 //! is the longer example of a public item.
 
+mod common;
+
 use syn::*;
 use type_leak::*;
 
@@ -68,13 +70,21 @@ fn intern_mod_does_not_leak_the_names_the_module_declares() {
     };
     let mut leaker = Leaker::new();
     leaker.intern_mod(&item);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // `Local` is declared in `m`: it is not leaked.
     assert_eq!(referrer.iter().count(), 2);
     // The Repeater impl of `Outside2` is written in `inner`.
     let param: Ident = parse_quote!(__S);
-    let r = referrer
-        .repeater_impl(1, ImplSelf::Param(&param), array_const)
+    let r = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Param(&param),
+            array_const,
+        )
+        .unwrap()
+        .nth(1)
         .unwrap();
     match &r.module {
         Some(ModuleScope::Itself {
@@ -170,7 +180,7 @@ fn result_lists_the_types_of_other_crates_last() {
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     // `Rel` depends on the context. `::foo::X` names another crate: it comes after.
-    let found: Vec<&Type> = referrer.iter().map(|(ty, _)| ty).collect();
+    let found: Vec<&Type> = referrer.iter().map(|(_, ty, _)| ty).collect();
     assert_eq!(found, [&parse_quote!(Rel), &parse_quote!(::foo::X)]);
 }
 
@@ -206,13 +216,13 @@ fn allow_changes_no_entry() {
     let replaced: Type = parse_quote!(Replaced);
     let referrer = result.clone().finish().unwrap();
     assert_eq!(
-        referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
+        referrer.expand(context, ty.clone(), |_, _, _| replaced.clone()),
         replaced
     );
     let result = result.allow(Rules::new().external_crates());
     let referrer = result.finish().unwrap();
     assert_eq!(
-        referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
+        referrer.expand(context, ty.clone(), |_, _, _| replaced.clone()),
         replaced
     );
     // A Leaker that has the rule finds no entry, so the copy writes the type as it is.
@@ -221,7 +231,7 @@ fn allow_changes_no_entry() {
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(
-        referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
+        referrer.expand(context, ty.clone(), |_, _, _| replaced.clone()),
         ty
     );
 }
@@ -260,13 +270,13 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     let mut copy = item.clone();
-    let slots = RepeaterSlots::new(parse_quote!(Repeater));
+    let repeater: Path = parse_quote!(Repeater);
     referrer
-        .visitor(context, |_, ix| {
-            slots.projection(&parse_quote!(()), &parse_quote!(()), 7, ix)
+        .visitor(context, |_, ix, _| {
+            repeater_projection(&repeater, &parse_quote!(()), &parse_quote!(()), 7, ix)
         })
         .visit_item_trait_mut(&mut copy);
-    let key = repeater_key(7, 0);
+    let key = repeater_key(7, common::entry_id_at(&referrer, 0));
     let expected: ItemTrait = parse_quote! {
         trait Tr {
             const N: usize = ::core::mem::size_of::<<() as Repeater<(), #key>>::Type>();
@@ -303,21 +313,21 @@ fn nested_self_entries_accepts_self_in_a_nested_type_with_a_self_bound() {
 
     let mut leaker = Leaker::from_config(Rules::new(), Options::new().nested_self_entries());
     nested(&mut leaker);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // The entry is for any type that the bound holds for, with `Self` as its implementor.
-    let (_, context) = referrer.iter().next().unwrap();
+    let (_, _, context) = referrer.iter().next().unwrap();
     assert!(matches!(context.self_ty, Some(SelfRequirement::Any)));
-    let slots = RepeaterSlots::new(parse_quote!(Repeater));
+    let repeater: Path = parse_quote!(Repeater);
     let param: Ident = parse_quote!(__S);
-    let r = referrer
-        .repeater_impl(0, ImplSelf::Param(&param), slots.const_fn())
+    let r = result
+        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+        .unwrap()
+        .next()
         .unwrap();
-    let (generics, ty) = (&r.generics, &r.ty);
-    let repeater = slots.trait_path(&r.args, 7, 0);
-    let imp: ItemImpl = parse_quote! {
-        impl #generics #repeater for __S { type Type = #ty; }
-    };
-    let key = repeater_key(7, 0);
+    // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
+    let key = repeater_key(7, r.entry);
+    let imp: ItemImpl = parse_quote!(#r);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), #key> for __S {
             type Type = Rel2<__S, T>;

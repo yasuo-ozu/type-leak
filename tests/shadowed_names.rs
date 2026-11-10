@@ -74,7 +74,7 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
         in_module,
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (text(ty), text(&generics)))
             .collect::<Vec<_>>()
     );
@@ -86,15 +86,17 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
 fn replace(
     referrer: &Referrer,
     context: ContextId,
-    visit: impl FnOnce(&mut Visitor<'_, &mut dyn FnMut(Type, usize) -> Type>),
+    visit: impl FnOnce(&mut Visitor<'_, &mut dyn FnMut(Type, EntryId, &Context) -> Type>),
 ) -> BTreeSet<usize> {
     let found = RefCell::new(BTreeSet::new());
-    let mut type_fn = |_: Type, ix: usize| -> Type {
-        found.borrow_mut().insert(ix);
+    let mut type_fn = |_: Type, ix: EntryId, _: &Context| -> Type {
+        found.borrow_mut().insert(ix.index());
         parse_quote!(Replaced<#ix>)
     };
-    let mut visitor =
-        referrer.visitor(context, &mut type_fn as &mut dyn FnMut(Type, usize) -> Type);
+    let mut visitor = referrer.visitor(
+        context,
+        &mut type_fn as &mut dyn FnMut(Type, EntryId, &Context) -> Type,
+    );
     visit(&mut visitor);
     drop(visitor);
     found.into_inner()
@@ -471,7 +473,7 @@ fn every_entry_that_names_a_generic_of_the_name_of_a_declared_item_is_found() {
                     all_entries(&referrer),
                     "the visitor misses an entry of {}\n  entries: {:?}",
                     source,
-                    referrer.iter().map(|(ty, context)| (ty, &context.generics))
+                    referrer.iter().map(|(_, ty, context)| (ty, &context.generics))
                         .map(|(ty, generics)| (text(ty), text(&generics)))
                         .collect::<Vec<_>>()
                 );
@@ -646,7 +648,7 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
         Ok(referrer) => Outcome::Accepted {
             entries: referrer
                 .iter()
-                .map(|(ty, context)| (ty, &context.generics))
+                .map(|(_, ty, context)| (ty, &context.generics))
                 .map(|(ty, generics)| {
                     (
                         unprefixed(&text(ty)),

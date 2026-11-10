@@ -6,8 +6,8 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    array_const, repeater_key, ContextId, ImplSelf, Leaker, ModuleScope, Referrer, RepeaterSlots,
-    SelfRequirement, UseSite,
+    array_const, repeater_key, repeater_projection, Context, ContextId, EntryId, ImplSelf, Leaker,
+    LeakerResult, ModuleScope, Referrer, SelfRequirement, UseSite,
 };
 
 /// The tag of the format of a serialized Referrer, which it starts with.
@@ -28,7 +28,7 @@ fn rewrite(types: proc_macro2::TokenStream, item: Item) -> String {
 /// Rewrites `item`, a copy in the scope `context`, with `referrer`, replacing the `ix`-th leaked
 /// type with `P<ix>`.
 fn rewrite_with(referrer: Referrer, context: ContextId, mut item: Item) -> String {
-    let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+    let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
     visitor.visit_item_mut(&mut item);
     quote!(#item).to_string()
 }
@@ -378,7 +378,7 @@ fn test_contexts() {
     let ty = referrer.expand(
         context0,
         parse_quote!(::p::Q<RelA>),
-        |_, ix| parse_quote!(P<#ix>),
+        |_, ix, _| parse_quote!(P<#ix>),
     );
     assert_eq!(quote!(#ty).to_string(), quote!(#expected_ty).to_string());
 
@@ -530,7 +530,7 @@ fn test_outermost_generics_as_leakers() {
     let referrer = leaker.result().finish().unwrap();
     let rewrite = |item: &Item, outermost_as_leakers: bool| {
         let mut item = item.clone();
-        let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
         if outermost_as_leakers {
             visitor = visitor.with_outermost_generics_as_leakers();
         }
@@ -584,9 +584,17 @@ fn test_outermost_generics_as_leakers() {
 
 /// The Referrer of the trait, and its top-level context: the scope of its copies.
 fn referrer_of(tr: ItemTrait) -> (Referrer, ContextId) {
+    let (result, context) = result_of(tr);
+    (result.into_referrer(), context)
+}
+
+/// The result of the analysis of the trait (it has no error), and its top-level context.
+fn result_of(tr: ItemTrait) -> (LeakerResult, ContextId) {
     let mut leaker = type_leak::Leaker::new();
     let context = leaker.intern_trait(&tr, true);
-    (leaker.result().finish().unwrap(), context)
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    (result, context)
 }
 
 #[test]
@@ -640,7 +648,7 @@ fn test_has_self() {
 
 #[test]
 fn test_repeater_impl_replaces_self() {
-    let (referrer, context) = referrer_of(parse_quote! {
+    let (result, context) = result_of(parse_quote! {
         trait Tr {
             fn a(&self) -> Rel<Self>;
             fn b(&self) -> Wrap<Self::Item>;
@@ -652,12 +660,17 @@ fn test_repeater_impl_replaces_self() {
             fn h(&self, a: Rel6<[u8; Self::N]>);
         }
     });
+    let referrer = result.clone().into_referrer();
     let marker: Ident = parse_quote!(__S);
-    let items: Vec<(String, String)> = (0..referrer.iter().count())
-        .map(|ix| {
-            let r = referrer
-                .repeater_impl(ix, ImplSelf::Param(&marker), array_const)
-                .unwrap();
+    let items: Vec<(String, String)> = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Param(&marker),
+            array_const,
+        )
+        .unwrap()
+        .map(|r| {
             // The implementor, `__S`, is the last parameter of the impl.
             let mut generics = r.generics;
             let mut params: Vec<GenericParam> = generics.params.into_iter().collect();
@@ -698,7 +711,7 @@ fn test_repeater_impl_replaces_self() {
     assert!(common::types(&referrer).any(|ty| quote!(#ty).to_string() == "Rel < Self >"));
     let mut sig: Signature = parse_quote!(fn a(&self) -> Rel<Self>);
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut sig);
     let expected: Signature = parse_quote!(fn a(&self) -> P<0usize>);
     assert_eq!(quote!(#sig).to_string(), quote!(#expected).to_string());
@@ -714,7 +727,7 @@ fn test_visitor_with_self() {
     // Without `with_self`, `Self` is kept, but for the entries that name it.
     let mut plain = sig.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut plain);
     let expected: Signature = parse_quote!(fn f(&self, x: P<0usize>, y: P<1usize>) -> Self::Out);
     assert_eq!(quote!(#plain).to_string(), quote!(#expected).to_string());
@@ -724,8 +737,8 @@ fn test_visitor_with_self() {
     let mut rewritten = sig.clone();
     let mut received = Vec::new();
     referrer
-        .visitor(context, |ty, ix| {
-            received.push((quote!(#ty).to_string(), ix));
+        .visitor(context, |ty, ix, _| {
+            received.push((quote!(#ty).to_string(), ix.index()));
             // Not rewritten again, though it mentions `Self`.
             parse_quote!(<Marker<Self> as R<#ix>>::Type)
         })
@@ -749,7 +762,7 @@ fn test_visitor_with_self() {
     // The receiver with an explicit type is kept as well.
     let mut sig: Signature = parse_quote!(fn f(self: Box<Self>) -> Rel<Self>);
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .with_self(parse_quote!(__S))
         .visit_signature_mut(&mut sig);
     let expected: Signature = parse_quote!(fn f(self: Box<Self>) -> P<0usize>);
@@ -761,7 +774,7 @@ fn rewrite_with_self(tr: &ItemTrait, self_ty: Type, sig: Signature) -> String {
     let (referrer, context) = referrer_of(tr.clone());
     let mut sig = sig;
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .with_self(self_ty)
         .visit_signature_mut(&mut sig);
     quote!(#sig).to_string()
@@ -922,7 +935,7 @@ fn test_nested_items_define_their_own_self() {
     // it is not replaced by `with_self`. The rest is as before.
     let mut rewritten = item.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .with_self(parse_quote!(__S))
         .visit_item_trait_mut(&mut rewritten);
     let expected: ItemTrait = parse_quote! {
@@ -955,7 +968,7 @@ fn test_nested_items_define_their_own_self() {
     };
     for with_self in [true, false] {
         let mut copy = item.clone();
-        let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
         if with_self {
             visitor = visitor.with_self(parse_quote!(__S));
         }
@@ -994,7 +1007,7 @@ fn test_module_items_do_not_shadow_submodules() {
         items,
     };
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_file_mut(&mut file);
     // `Rel` of `m` is declared there, and the one of `m::inner` is rewritten.
     let expected: File = parse_quote! {
@@ -1048,7 +1061,7 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
     };
     let mut sig = method.sig.clone();
     parsed
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut sig);
     assert_eq!(
         quote!(#sig).to_string(),
@@ -1076,6 +1089,7 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
 fn malformed_serialized_referrers_are_errors() {
     let tag = tag();
     let parse = |text: &str| parse_str::<Referrer>(&format!("\"{}\" {}", tag, text));
+    let parse_result = |text: &str| parse_str::<LeakerResult>(&format!("\"{}\" {}", tag, text));
     let integer = "expected integer literal";
     let declared = "the context 0 is declared already: expected its entries `( .. )`";
     let not_a_module = "the context 0 is not a module (it is not declared as `mod { .. }`)";
@@ -1225,9 +1239,10 @@ fn malformed_serialized_referrers_are_errors() {
         assert!(parsed.is_ok(), "{}: {:?}", text, parsed.err());
     }
     // The fields of a module are optional, and may be in any order.
-    let parsed =
-        parse("4 mod { parent = 1 , hint = \"x\" } ; () mod {} ; () mod 0 ; (A) mod 1 ; (B)")
-            .unwrap();
+    let parsed = parse_result(
+        "4 mod { parent = 1 , hint = \"x\" } ; () mod {} ; () mod 0 ; (A) mod 1 ; (B)",
+    )
+    .unwrap();
     assert_eq!(common::entry_module_hint(&parsed, 0).as_deref(), Some("x"));
     assert_eq!(common::entry_module_path(&parsed, 1), None);
     assert_eq!(common::entry_module_hint(&parsed, 1), None);
@@ -1246,17 +1261,17 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     let (mut with_args, mut plain) = (tr.clone(), tr.clone());
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    let mut first = referrer.visitor(top_level, |_, ix| {
-        let args = referrer
-            .entry_args(ix, &UseSite::identity(), array_const)
-            .unwrap();
-        slots.projection(&parse_quote!(Self), &args, 7, ix)
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let mut first = referrer.visitor(top_level, |_, ix, context| {
+        // The Referrer is usable here, as the context is.
+        assert!(referrer.bucket_self(ix, 7).is_some());
+        let args = common::repeater_args(context, &UseSite::identity(), None, array_const).unwrap();
+        repeater_projection(&repeater, &parse_quote!(Self), &args, 7, ix)
     });
-    let mut second = referrer.visitor(top_level, |_, ix| parse_quote!(P<#ix>));
+    let mut second = referrer.visitor(top_level, |_, ix, _| parse_quote!(P<#ix>));
     first.visit_item_trait_mut(&mut with_args);
     second.visit_item_trait_mut(&mut plain);
-    let key = repeater_key(7, 0);
+    let key = repeater_key(7, common::entry_id_at(&referrer, 0));
     let expected: ItemTrait = parse_quote!(
         trait Tr<T> {
             fn f(&self, t: T) -> <Self as crate::Repeater<(T,), #key>>::Type;
@@ -1283,8 +1298,8 @@ fn s(x: &impl ToTokens) -> String {
 }
 
 /// Rewrites each leaked type to `P<index>`.
-fn replace(_: Type, ix: usize) -> Type {
-    let ix = proc_macro2::Literal::usize_unsuffixed(ix);
+fn replace(_: Type, ix: EntryId, _: &Context) -> Type {
+    let ix = proc_macro2::Literal::usize_unsuffixed(ix.index());
     parse_quote!(P<#ix>)
 }
 
@@ -1321,12 +1336,13 @@ fn two_rels() -> ItemMod {
 fn two_rels_referrer() -> (Referrer, ContextId, ContextId) {
     let mut leaker = Leaker::new();
     let m = leaker.intern_mod(&two_rels());
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let in_inner = (0..2).find(|&ix| module_of(&referrer, ix) != m).unwrap();
     let inner = module_of(&referrer, in_inner);
     assert_eq!(
-        common::entry_module_path(&referrer, in_inner),
+        common::entry_module_path(&result, in_inner),
         Some(vec![parse_quote!(inner)])
     );
     (referrer, m, inner)
@@ -1503,7 +1519,8 @@ fn a_scope_in_a_module_is_in_that_module() {
         })
         .0
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_ne!(module, scope);
     // `Wrap<T>` is the entry of the scope's generics, which are in the module `m`: the module's own
     // context.
@@ -1516,7 +1533,7 @@ fn a_scope_in_a_module_is_in_that_module() {
         Some(module)
     );
     assert!(matches!(
-        common::entry_module(&referrer, wrap),
+        common::entry_module(&result, wrap),
         Some(ModuleScope::Itself { id, .. }) if id == module
     ));
     let mut sig: Signature = parse_quote!(fn f(x: Wrap<T>, y: Rel));

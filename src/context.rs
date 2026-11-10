@@ -165,7 +165,7 @@ impl Scope {
 ///     let mut leaker = Leaker::new();
 ///     intern(&mut leaker);
 ///     let referrer = leaker.result().finish().unwrap();
-///     let (_, context) = referrer.iter().next().unwrap();
+///     let (_, _, context) = referrer.iter().next().unwrap();
 ///     context.self_ty.clone()
 /// }
 /// let tr: ItemTrait = parse_quote!(trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; });
@@ -243,7 +243,9 @@ pub enum SelfRequirement {
     ///
     /// The impl is generic over `__S`, which takes the place of `Self` in the bounds and has no
     /// bound of its own. `__S` is `?Sized` unless a bound or the type may need `Sized`. A marker
-    /// type cannot be used: [`ImplSelf::Marker`](crate::ImplSelf::Marker) fails with
+    /// type cannot be used: the call of
+    /// [`repeater_impls()`](crate::LeakerResult::repeater_impls) for
+    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) fails with
     /// [`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf).
     ///
     /// ```ignore
@@ -752,7 +754,7 @@ impl ModuleScope {
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // The context of the entry `Rel<Self::A, T>`.
-/// let (_entry, context) = referrer.iter().next().unwrap();
+/// let (_, _entry, context) = referrer.iter().next().unwrap();
 /// assert_eq!(context.generics.to_token_stream().to_string(), "< T >");
 /// assert!(matches!(&context.self_ty, Some(SelfRequirement::Bound(_))));
 /// assert_eq!(context.module, None);

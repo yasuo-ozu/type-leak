@@ -1,5 +1,5 @@
-//! Tests for the Repeater definition, `RepeaterSlots` and `array_const()`, and for the errors of the
-//! encoders and of the helpers that encode (`EncodeError`): their text, the conversion to
+//! Tests for the Repeater definition, `encode_slot_const()` and `array_const()`, and for the errors
+//! of the encoders and of the helpers that encode (`EncodeError`): their text, the conversion to
 //! `syn::Error`, and the `std::error::Error` impls. The encoders themselves, and the text of
 //! `UnsupportedConstType`, `UnexpectedArgument` and `MissingArgument`, are tested in
 //! `src/encode/tests.rs`. The spans of the errors are checked in `tests/crates/spans`, which
@@ -70,7 +70,7 @@ fn the_repeater_definition_has_the_documented_shape() {
     );
 
     // Each primitive fills its own slot, after the defaults of the slots before it.
-    let slots = RepeaterSlots::new(parse_quote!(R));
+    let repeater: Path = parse_quote!(R);
     let defaults = [
         "false", "'\\0'", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
     ];
@@ -101,7 +101,7 @@ fn the_repeater_definition_has_the_documented_shape() {
         .unwrap();
         let value: Expr = parse_str(value).unwrap();
         assert_eq!(
-            slots.encode_const(&value, &ty).unwrap(),
+            encode_slot_const(&repeater, &value, &ty).unwrap(),
             expected,
             "{}",
             quote!(#ty)
@@ -110,29 +110,22 @@ fn the_repeater_definition_has_the_documented_shape() {
     // `u128` uses `KEY`, `usize` the length of an array, and the others are not supported (see
     // `the_text_of_every_variant`).
     assert_eq!(
-        slots
-            .encode_const(&parse_quote!(5), &parse_quote!(u128))
-            .unwrap(),
+        encode_slot_const(&repeater, &parse_quote!(5), &parse_quote!(u128)).unwrap(),
         parse_quote!(*const dyn R<(), 5, Type = ()>)
     );
     assert_eq!(
-        slots
-            .encode_const(&parse_quote!(5), &parse_quote!(usize))
-            .unwrap(),
+        encode_slot_const(&repeater, &parse_quote!(5), &parse_quote!(usize)).unwrap(),
         parse_quote!([(); 5])
     );
 }
 
-/// `RepeaterSlots::repeater()` is the path it was made with, and `const_fn()` is `encode_const()`
-/// on the type of the parameter: as `Referrer::entry_args()` and `repeater_impl()` take it, for
-/// every const type, and with the error of an unsupported one.
+/// `slot_const()` is `encode_slot_const()` on the type of the parameter: as
+/// `encode_generics_args_with_params()` and `LeakerResult::repeater_impls()` take it, for every const type, and
+/// with the error of an unsupported one.
 #[test]
-fn the_slots_give_their_path_and_the_const_fn() {
-    let path: Path = parse_quote!(crate::Repeater);
-    let slots = RepeaterSlots::new(path.clone());
-    assert_eq!(slots.repeater(), &path);
-
-    let mut const_fn = slots.const_fn();
+fn slot_const_is_encode_slot_const_on_the_type_of_the_parameter() {
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let mut const_fn = slot_const(&repeater);
     for (param, value) in [
         (parse_quote!(const B: bool), "true"),
         (parse_quote!(const C: char), "'x'"),
@@ -145,7 +138,7 @@ fn the_slots_give_their_path_and_the_const_fn() {
         let value: Expr = parse_str(value).unwrap();
         assert_eq!(
             const_fn(&value, &param).unwrap(),
-            slots.encode_const(&value, &param.ty).unwrap(),
+            encode_slot_const(&repeater, &value, &param.ty).unwrap(),
             "{}",
             quote!(#param)
         );
@@ -165,9 +158,14 @@ fn the_slots_give_their_path_and_the_const_fn() {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    let args = referrer
-        .entry_args(0, &UseSite::identity(), slots.const_fn())
-        .unwrap();
+    let ix = common::entry_id_at(&referrer, 0);
+    let args = common::repeater_args(
+        common::entry(&referrer, ix.index()),
+        &UseSite::identity(),
+        None,
+        slot_const(&repeater),
+    )
+    .unwrap();
     assert_eq!(
         args,
         parse_quote!((*const dyn crate::Repeater<(), 0, B, Type = ()>, [(); N]))
@@ -177,7 +175,7 @@ fn the_slots_give_their_path_and_the_const_fn() {
 #[test]
 fn test_const_args_are_braced_when_needed() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
 
     // A multi-segment path (written with or without braces) must be braced to be parsed as a
     // const argument; a literal or a single identifier is not.
@@ -189,24 +187,20 @@ fn test_const_args_are_braced_when_needed() {
         (quote!({ FOO }), quote!(FOO)),
         (quote!(-3), quote!(-3)),
     ] {
-        let ty = slots
-            .encode_const(&parse2(value).unwrap(), &i32_ty)
-            .unwrap();
+        let ty = encode_slot_const(&repeater, &parse2(value).unwrap(), &i32_ty).unwrap();
         let expected: Type = parse_quote! {
             *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, #expected, Type = ()>
         };
         assert_eq!(to_string(&ty), to_string(&expected));
     }
     let u128_ty: Type = parse_quote!(u128);
-    let ty = slots
-        .encode_const(&parse_quote!({ m::FOO }), &u128_ty)
-        .unwrap();
+    let ty = encode_slot_const(&repeater, &parse_quote!({ m::FOO }), &u128_ty).unwrap();
     let expected: Type = parse_quote!(*const dyn crate::Repeater<(), { m::FOO }, Type = ()>);
     assert_eq!(to_string(&ty), to_string(&expected));
 }
 
 /// `array_const()` encodes a `usize` const as an array length, with the braces that a value needs,
-/// and any other type is an error (`RepeaterSlots` encodes it).
+/// and any other type is an error (`encode_slot_const()` encodes it).
 #[test]
 fn array_const_encodes_usize_consts_only() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
@@ -226,10 +220,8 @@ fn array_const_encodes_usize_consts_only() {
         other => panic!("{:?}", other),
     }
     // The slots encode it.
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    assert!(slots
-        .encode_const(&parse_quote!(true), &bool_param.ty)
-        .is_ok());
+    let repeater: Path = parse_quote!(crate::Repeater);
+    assert!(encode_slot_const(&repeater, &parse_quote!(true), &bool_param.ty).is_ok());
 }
 
 /// `repeater_key()` puts the id in the high half and the index in the low half, so two entries
@@ -238,26 +230,31 @@ fn array_const_encodes_usize_consts_only() {
 fn the_repeater_key_has_the_id_above_the_index() {
     use std::collections::HashSet;
     use type_leak::repeater_key;
-    assert_eq!(repeater_key(0, 0), 0);
-    assert_eq!(repeater_key(0, 5), 5);
-    assert_eq!(repeater_key(1, 0), 1 << 64);
-    assert_eq!(repeater_key(7, 3), (7 << 64) | 3);
-    assert_eq!(repeater_key(u64::MAX, 0), u128::from(u64::MAX) << 64);
-    assert_eq!(repeater_key(0, u64::MAX as usize), u128::from(u64::MAX));
-    assert_eq!(repeater_key(u64::MAX, u64::MAX as usize), u128::MAX);
+    // The `EntryId` with the number `n`, which only `Parse` makes.
+    let entry = |n: usize| -> EntryId { parse_quote!(#n) };
+    assert_eq!(repeater_key(0, entry(0)), 0);
+    assert_eq!(repeater_key(0, entry(5)), 5);
+    assert_eq!(repeater_key(1, entry(0)), 1 << 64);
+    assert_eq!(repeater_key(7, entry(3)), (7 << 64) | 3);
+    assert_eq!(repeater_key(u64::MAX, entry(0)), u128::from(u64::MAX) << 64);
+    assert_eq!(
+        repeater_key(0, entry(u64::MAX as usize)),
+        u128::from(u64::MAX)
+    );
+    assert_eq!(repeater_key(u64::MAX, entry(u64::MAX as usize)), u128::MAX);
     let ids = [0, 1, 2, 255, 1 << 32, u64::MAX - 1, u64::MAX];
     let nths = [0, 1, 2, 255, 1 << 31, u32::MAX as usize];
     let keys: HashSet<u128> = ids
         .iter()
-        .flat_map(|&id| nths.iter().map(move |&nth| repeater_key(id, nth)))
+        .flat_map(|&id| nths.iter().map(move |&nth| repeater_key(id, entry(nth))))
         .collect();
     assert_eq!(keys.len(), ids.len() * nths.len());
 }
 
 // ── the errors ───────────────────────────────────────────────────────────────────────────────
 
-fn slots() -> RepeaterSlots {
-    RepeaterSlots::new(parse_quote!(crate::Repeater))
+fn repeater() -> Path {
+    parse_quote!(crate::Repeater)
 }
 
 /// The error of encoding the arguments in `args` for the parameters in `generics`: completing
@@ -271,7 +268,7 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
         context,
         &generics.params,
         &args.args,
-        |_, _, _| unreachable!(),
+        |_, _, _, _| unreachable!(),
     ) {
         Ok(completed) => completed,
         Err(error) => return error,
@@ -285,13 +282,13 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    referrer
-        .entry_args(
-            0,
-            &UseSite::substituting(&generics.params, &completed),
-            slots().const_fn(),
-        )
-        .unwrap_err()
+    common::repeater_args(
+        common::entry(&referrer, 0),
+        &UseSite::substituting(&generics.params, &completed),
+        None,
+        slot_const(&repeater()),
+    )
+    .unwrap_err()
 }
 
 /// The error of encoding `generics` itself: the const parameter of the first one.
@@ -305,25 +302,30 @@ fn params_error(generics: &str) -> EncodeError {
             _ => None,
         })
         .unwrap();
-    slots()
-        .encode_const(&parse_quote!(N), &param.ty)
-        .unwrap_err()
+    encode_slot_const(&repeater(), &parse_quote!(N), &param.ty).unwrap_err()
 }
 
-/// The error of the Repeater impl of the entry `Wrap<T, Self>` for a marker, which cannot name
-/// `Self`. The source says where the entry is written.
+/// The error of `repeater_impls()` for a marker, which cannot name `Self`: the entry `Wrap<T,
+/// Self>`. The source says where the entry is written.
 fn needs_self_error(source: &str) -> EncodeError {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
-    let referrer = leaker.result().finish().unwrap();
-    let wrap = common::types(&referrer)
-        .position(|ty| template_quote::quote!(#ty).to_string() == "Wrap < T , Self >")
-        .unwrap();
+    let result = leaker.result();
     let marker: Type = parse_quote!(crate::Marker);
-    referrer
-        .repeater_impl(wrap, ImplSelf::Marker(&marker), array_const)
-        .unwrap_err()
+    // The call fails for the first entry that names `Self`, which is `Wrap<T, Self>` here.
+    let error = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Marker(&marker),
+            array_const,
+        )
+        .err()
+        .unwrap();
+    assert!(matches!(&error, EncodeError::NeedsSelf(ty)
+        if template_quote::quote!(#ty).to_string() == "Wrap < T , Self >"));
+    error
 }
 
 const NEEDS_SELF_SOURCE: &str = "trait Tr<'a, T> {\n    fn f(&self) -> Wrap<T, Self>;\n}";

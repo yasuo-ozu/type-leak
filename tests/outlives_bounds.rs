@@ -13,7 +13,9 @@ mod common;
 
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{array_const, ContextId, ImplSelf, Leaker, Options, Referrer, Rules};
+use type_leak::{
+    array_const, Context, ContextId, EntryId, ImplSelf, Leaker, Options, Referrer, Rules,
+};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -38,7 +40,7 @@ fn leaked_allowing_crates(item: ItemTrait) -> Vec<(String, String)> {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -254,7 +256,7 @@ fn a_trait_object_requires_its_arguments_to_outlive_too() {
 fn with_self_outlives(referrer: &Referrer) -> Vec<(String, String, Vec<String>)> {
     referrer
         .iter()
-        .map(|(ty, context)| {
+        .map(|(_, ty, context)| {
             let generics = &context.generics;
             (
                 s(ty),
@@ -536,7 +538,7 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
             visitor.visit_item_trait_mut(&mut copy);
             s(&copy)
         };
-        let replace = |_: Type, ix: usize| -> Type { parse_quote!(P<#ix>) };
+        let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(P<#ix>) };
         // The copy declares the generics of the trait as they are: it is the scope itself.
         let copy = rewrite(&mut referrer.visitor(context, replace));
         assert!(!copy.contains("Rel"), "{}", copy);
@@ -556,14 +558,14 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     let referrer = leaker.result().finish().unwrap();
     let mut sig: Signature = parse_quote!(fn f<'a, T: ::core::clone::Clone>(x: Rel<'a, T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut sig,
     );
     assert!(s(&sig).contains("Rel"), "{}", s(&sig));
     // The one without the bound, for a path which implies none, is not the entry which has it.
     let mut sig: Signature = parse_quote!(fn f<'a, T>(x: Rel<'a, T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut sig,
     );
     assert!(s(&sig).contains("Rel"), "{}", s(&sig));
@@ -575,13 +577,13 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     let referrer = leaker.result().finish().unwrap();
     let mut sig: Signature = parse_quote!(fn f<'a, T>(x: &'a Rel<T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut sig,
     );
     assert!(!s(&sig).contains("Rel"), "{}", s(&sig));
     let mut sig: Signature = parse_quote!(fn f<'a, T: ::core::clone::Clone>(x: &'a Rel<T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut sig,
     );
     assert!(s(&sig).contains("Rel"), "{}", s(&sig));
@@ -605,14 +607,22 @@ fn the_bounds_survive_serialization() {
 }
 
 /// The generics of the first entry of a trait with the Repeater's implementation declaring them
-/// (`repeater_impl()`), and those the trait arguments encode (`context_generics()`).
+/// (`repeater_impls()`), and those the trait arguments encode (`context_generics()`).
 fn impl_and_context(item: ItemTrait) -> (String, String) {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     let marker: Type = parse_quote!(crate::Marker);
-    let r = referrer
-        .repeater_impl(0, ImplSelf::Marker(&marker), array_const)
+    let r = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Marker(&marker),
+            array_const,
+        )
+        .unwrap()
+        .next()
         .unwrap();
     let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
     (
@@ -741,11 +751,13 @@ mod ancestors {
     use syn::visit_mut::VisitMut;
     use syn::*;
     use template_quote::{quote, ToTokens};
-    use type_leak::{Allow, ContextId, Leaker, Options, Referrer, Rules, SelfRequirement};
+    use type_leak::{
+        Allow, Context, ContextId, EntryId, Leaker, Options, Referrer, Rules, SelfRequirement,
+    };
 
     /// Replaces an entry by `P<ix>`, as a macro replaces it by its path through the Repeater.
-    fn p(_: Type, ix: usize) -> Type {
-        let ix = proc_macro2::Literal::usize_unsuffixed(ix);
+    fn p(_: Type, ix: EntryId, _: &Context) -> Type {
+        let ix = proc_macro2::Literal::usize_unsuffixed(ix.index());
         parse_quote!(P<#ix>)
     }
 
@@ -779,7 +791,7 @@ mod ancestors {
     fn contexts_of(referrer: &Referrer, ty: &str) -> Vec<String> {
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .filter(|(leaked, _)| s(leaked) == ty)
             .map(|(_, generics)| s(&quote!(#generics #{&generics.where_clause})))
             .collect()
@@ -1196,7 +1208,7 @@ mod ancestors {
         let referrer = referrer_of(&tr);
         let found: Vec<(String, Vec<String>)> = referrer
             .iter()
-            .map(|(_, context)| {
+            .map(|(_, _, context)| {
                 assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
                 (
                     s(&context.generics.params),
@@ -1240,7 +1252,7 @@ mod ancestors {
     fn entry(referrer: &Referrer, ty: &str, generics: &str) -> usize {
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .position(|(leaked, g)| {
                 s(leaked) == ty && s(&quote!(#g #{&g.where_clause})) == generics
             })
@@ -1977,7 +1989,8 @@ mod self_outlives {
     use syn::*;
     use template_quote::{quote, ToTokens};
     use type_leak::{
-        array_const, Context, ContextId, ImplSelf, Leaker, Referrer, SelfRequirement, UseSite,
+        array_const, Context, ContextId, ImplSelf, Leaker, LeakerResult, Referrer, SelfRequirement,
+        UseSite,
     };
 
     /// The tag of the format of a serialized Referrer, which it starts with.
@@ -2001,7 +2014,7 @@ mod self_outlives {
     /// contexts are in the order of their first entry.
     fn outlives(referrer: &Referrer) -> Vec<(Vec<String>, Vec<String>)> {
         let mut contexts: Vec<&Context> = Vec::new();
-        for (_, context) in referrer.iter() {
+        for (_, _, context) in referrer.iter() {
             if !contexts.contains(&context) {
                 contexts.push(context);
             }
@@ -2011,8 +2024,8 @@ mod self_outlives {
             .map(|found| {
                 let types = referrer
                     .iter()
-                    .filter(|(_, other)| *other == found)
-                    .map(|(ty, _)| s(ty))
+                    .filter(|(_, _, other)| *other == found)
+                    .map(|(_, ty, _)| s(ty))
                     .collect();
                 let outlives = found.self_outlives.iter().map(|l| l.to_string()).collect();
                 (types, outlives)
@@ -2185,7 +2198,8 @@ mod self_outlives {
         let item: ItemStruct = parse_quote! { struct MyStruct<'a, T> { f: &'a Rel<Self> } };
         let mut leaker = Leaker::new();
         leaker.intern_struct(&item, true);
-        let referrer = leaker.result().finish().unwrap();
+        let result = leaker.result();
+        let referrer = result.clone().finish().unwrap();
         match common::entry(&referrer, 0).self_ty.as_ref() {
             Some(SelfRequirement::Type(ty)) => assert_eq!(s(ty), "MyStruct < 'a , T >"),
             other => panic!("{:?}", other),
@@ -2197,8 +2211,15 @@ mod self_outlives {
         // The encoding in the implementation `impl<'a, T> Repeater<(&'a (), T, &'a Self), ..> for
         // MyStruct<'a, T>`; and `T: 'a` follows from it (`MyStruct<'a, T>: 'a`).
         let param: Ident = parse_quote!(__S);
-        let encoded = referrer
-            .repeater_impl(0, ImplSelf::Param(&param), array_const)
+        let encoded = result
+            .repeater_impls(
+                &parse_quote!(crate::Repeater),
+                7,
+                ImplSelf::Param(&param),
+                array_const,
+            )
+            .unwrap()
+            .next()
             .unwrap()
             .args;
         let expected: Type = parse_quote!((&'a (), T, &'a Self));
@@ -2208,8 +2229,13 @@ mod self_outlives {
             Some(SelfRequirement::Type(ty)) => ty,
             _ => unreachable!(),
         };
-        let site = UseSite::identity().with_self(self_ty.clone());
-        let encoded = referrer.entry_args(0, &site, array_const).unwrap();
+        let encoded = common::repeater_args(
+            common::entry(&referrer, 0),
+            &UseSite::identity(),
+            Some(self_ty),
+            array_const,
+        )
+        .unwrap();
         let expected: Type = parse_quote!((&'a (), T, &'a MyStruct<'a, T>));
         assert_eq!(s(&encoded), s(&expected));
     }
@@ -2264,7 +2290,8 @@ mod self_outlives {
         )
         .parse()
         .unwrap();
-        let parsed: Referrer = parse2(tokens).unwrap();
+        let result: LeakerResult = parse2(tokens).unwrap();
+        let parsed = result.clone().into_referrer();
         assert_eq!(
             common::entry(&parsed, 0).self_outlives.as_slice(),
             lifetimes(&["'a"])
@@ -2275,7 +2302,7 @@ mod self_outlives {
         ));
         let module = common::in_module(common::entry(&parsed, 0)).unwrap();
         assert_eq!(module.index(), 0);
-        assert_eq!(common::entry_module_path(&parsed, 0), Some(vec![]));
+        assert_eq!(common::entry_module_path(&result, 0), Some(vec![]));
         // A Referrer serialized before the clause existed has none.
         let tokens: proc_macro2::TokenStream =
             format!("\"{}\" Self : Tr ; (Rel < Self >)", version)
@@ -2316,7 +2343,7 @@ mod self_outlives {
             // a generic of the trait, which the signature does not declare).
             let mut copy = tr.clone();
             referrer
-                .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
+                .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
                 .visit_item_trait_mut(&mut copy);
             let text = s(&copy);
             assert_eq!(text.matches("P < ").count(), 4, "{}", text);
@@ -2324,7 +2351,7 @@ mod self_outlives {
             // Taking the generics of the trait as those of the context agrees.
             let mut copy = tr.clone();
             referrer
-                .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
+                .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
                 .with_outermost_generics_as_leakers()
                 .visit_item_trait_mut(&mut copy);
             let text = s(&copy);
@@ -2645,10 +2672,10 @@ mod self_outlives {
         let visitor = |ix| -> Type { parse_quote!(P<#ix>) };
         match how {
             "declared" => referrer
-                .visitor(top_level, |_, ix| visitor(ix))
+                .visitor(top_level, |_, ix, _| visitor(ix))
                 .visit_item_trait_mut(&mut copy),
             "leakers" => referrer
-                .visitor(top_level, |_, ix| visitor(ix))
+                .visitor(top_level, |_, ix, _| visitor(ix))
                 .with_outermost_generics_as_leakers()
                 .visit_item_trait_mut(&mut copy),
             other => panic!("{}", other),
@@ -2726,7 +2753,7 @@ mod self_outlives {
             // `expand()` takes the generics and `Self` of the context. A lifetime of a method is not
             // among them, so the entry that has it is not found there: visit the method instead.
             let ty = common::types(&referrer).next().unwrap().clone();
-            let expanded = referrer.expand(top_level, ty.clone(), |_, ix| parse_quote!(P<#ix>));
+            let expanded = referrer.expand(top_level, ty.clone(), |_, ix, _| parse_quote!(P<#ix>));
             if tr.generics.params.is_empty() {
                 assert_eq!(s(&expanded), s(&ty), "{}", s(&tr));
             } else {

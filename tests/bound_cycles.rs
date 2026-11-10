@@ -63,7 +63,7 @@ fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }

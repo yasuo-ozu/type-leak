@@ -11,10 +11,21 @@ use template_quote::quote;
 
 /// Encodes the const argument `value` of a `usize` parameter as the array type `[(); value]`.
 ///
-/// It is the `const_fn` of [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
-/// [`Referrer::entry_args()`](crate::Referrer::entry_args) if every const parameter is `usize`.
-/// Any other type is an [`EncodeError::UnsupportedConstType`]: use
-/// [`RepeaterSlots`](crate::RepeaterSlots).
+/// It is the `const_fn` of [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls)
+/// and [`encode_generics_args_with_params()`] if every const parameter is `usize`.
+/// Any other type is an [`EncodeError::UnsupportedConstType`], which fails the call of
+/// `repeater_impls()`: use [`slot_const()`](crate::slot_const).
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let param: ConstParam = parse_quote!(const N: usize);
+/// assert_eq!(array_const(&parse_quote!(3), &param).unwrap(), parse_quote!([(); 3]));
+/// // `bool` has no array length.
+/// let param: ConstParam = parse_quote!(const B: bool);
+/// let result = array_const(&parse_quote!(true), &param);
+/// assert!(matches!(result, Err(EncodeError::UnsupportedConstType(_))));
+/// ```
 pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type, EncodeError> {
     match const_param_primitive(&param.ty) {
         Some("usize") => {
@@ -27,11 +38,76 @@ pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type
     }
 }
 
-/// Encodes the arguments that a copy gives to the generics of an entry: the counterpart of
-/// `encode_generics_params_with()` for `params`.
+/// Returns the first argument of the Repeater for an entry: a tuple type made from the arguments
+/// of the entry's generics.
 ///
-/// The arguments are completed by `complete_generics_args()`, and `const_fn` encodes each const.
-pub(crate) fn encode_generics_args_with_params<'a, 'b>(
+/// `iter` are the arguments for `params`, one for each by position and kind, as
+/// [`UseSite::generic_args()`](crate::UseSite::generic_args) writes them; `params` are the
+/// generics of the entry (`Context::generics`, see [`Referrer::iter()`](crate::Referrer::iter)).
+/// It is [`RepeaterImpl::args`](crate::RepeaterImpl::args) with the arguments of a use. The tuple
+/// has an element for each parameter, then the encoded lifetime bounds:
+///
+/// - a lifetime `'a` is `&'a ()`, and a type is itself (`*const T` for a `?Sized` parameter);
+/// - a const is encoded by `const_fn(value, param)`: pass [`array_const`](crate::array_const), or
+///   for the slots of [`repeater_definition()`](crate::repeater_definition)
+///   [`slot_const(&repeater)`](crate::slot_const);
+/// - each bound of a generic on a lifetime (`T: 'a`) is `&'a T`, and so is `Self: 'a`, from
+///   `self_outlives` (`Context::self_outlives`): pass the type that stands for `Self` here
+///   (`Self`, or the host) and the lifetimes. `None` writes no such bounds.
+///
+/// Fails with [`EncodeError::MissingArgument`] if `iter` has too few arguments, with
+/// [`EncodeError::UnboundedTraitObject`] if an argument is a trait object without the lifetime
+/// bound the entry needs, and with the error of `const_fn`.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let tr: ItemTrait = parse_quote! {
+///     trait Tr<'a, T: 'a, const N: usize> { fn f(&self, x: &'a Wrap<T, N>) -> Rel; }
+/// };
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&tr, true);
+/// let referrer = leaker.result().finish().unwrap();
+/// let wrap: Type = parse_quote!(&'a Wrap<T, N>);
+/// let (_, _, context) = referrer.iter().find(|(_, ty, _)| **ty == wrap).unwrap();
+/// let self_ty: Type = parse_quote!(Self);
+/// let outlives = Some((&self_ty, &context.self_outlives[..]));
+///
+/// // In the scope of the trait, as in a default method: every generic by its own name.
+/// let args = UseSite::identity().generic_args(&context.generics).unwrap();
+/// let ty = encode_generics_args_with_params(&args, &context.generics.params, outlives, array_const);
+/// assert_eq!(ty.unwrap(), parse_quote!((&'a (), T, [(); N], &'a T)));
+///
+/// // In `impl Tr<'static, u8, 3> for Host`: the arguments of the trait.
+/// let trait_args: Vec<GenericArgument> =
+///     vec![parse_quote!('static), parse_quote!(u8), parse_quote!(3)];
+/// let site = UseSite::substituting(&tr.generics.params, &trait_args);
+/// let args = site.generic_args(&context.generics).unwrap();
+/// let ty = encode_generics_args_with_params(&args, &context.generics.params, outlives, array_const);
+/// assert_eq!(ty.unwrap(), parse_quote!((&'static (), u8, [(); 3], &'static u8)));
+///
+/// // Too few arguments.
+/// let err = encode_generics_args_with_params(&args[..1], &context.generics.params, None, array_const);
+/// assert!(matches!(err, Err(EncodeError::MissingArgument(_))));
+///
+/// // `Self: 'a` is `&'a Self`: the entry `&'a Wrap<Self>` needs it. Name the host at a site where
+/// // `Self` is not available.
+/// let tr: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&tr, true);
+/// let referrer = leaker.result().finish().unwrap();
+/// let (_, _, context) = referrer.iter().next().unwrap();
+/// let args = UseSite::identity().generic_args(&context.generics).unwrap();
+/// for (self_ty, expected) in [
+///     (parse_quote!(Self), parse_quote!((&'a (), &'a Self))),
+///     (parse_quote!(Host), parse_quote!((&'a (), &'a Host))),
+/// ] {
+///     let outlives = Some((&self_ty, &context.self_outlives[..]));
+///     let ty = encode_generics_args_with_params(&args, &context.generics.params, outlives, array_const);
+///     assert_eq!(ty.unwrap(), expected);
+/// }
+/// ```
+pub fn encode_generics_args_with_params<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
     self_outlives: Option<(&Type, &[Lifetime])>,
@@ -487,8 +563,9 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
     }
 }
 
-/// Why the generics of an entry cannot be encoded: the error of `Referrer::repeater_impl()`,
-/// `Referrer::entry_args()` and `Referrer::complete_args()`.
+/// Why the generics of an entry cannot be encoded: the error of the call of
+/// `LeakerResult::repeater_impls()`, of [`encode_generics_args_with_params()`] and of
+/// `Referrer::complete_args()`.
 ///
 /// It converts into a `syn::Error` at the offending tokens.
 ///
@@ -498,11 +575,12 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 /// let tr: ItemTrait = parse_quote!(trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; });
 /// let mut leaker = Leaker::new();
 /// leaker.intern_trait(&tr, true);
-/// let referrer = leaker.result().finish().unwrap();
+/// let result = leaker.result();
 ///
-/// // `array_const` encodes `const N: usize` only.
+/// // `array_const` encodes `const N: usize` only, so the call fails.
 /// let target = ImplSelf::Param(&parse_quote!(__S));
-/// let err = referrer.repeater_impl(0, target, array_const).unwrap_err();
+/// let repeater: Path = parse_quote!(crate::Repeater);
+/// let err = result.repeater_impls(&repeater, 7, target, array_const).err().unwrap();
 /// assert!(matches!(&err, EncodeError::UnsupportedConstType(ty) if **ty == parse_quote!(bool)));
 /// let error: syn::Error = err.into();
 /// assert_eq!(error.to_string(), "unsupported type of const parameter: 'bool'");
@@ -519,9 +597,8 @@ pub enum EncodeError {
     /// The argument of a type parameter with a lifetime bound is a trait object without one
     /// (`dyn Tr`). Write it, e.g. `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
-    /// An entry that names `Self`, or whose context's generics do, was asked for
-    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker). Use
-    /// [`ImplSelf::Param`](crate::ImplSelf::Param).
+    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) was given and an entry names `Self`, or its
+    /// context's generics do. Use [`ImplSelf::Param`](crate::ImplSelf::Param).
     NeedsSelf(Box<Type>),
 }
 

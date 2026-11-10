@@ -42,8 +42,8 @@ fn complete_calls(
 ) -> Result<(Vec<String>, Vec<Call>)> {
     let mut calls = Vec::new();
     let completed = referrer
-        .complete_args(top_level(referrer), params, given, |ty, ix, prefix| {
-            calls.push((s(&ty), ix, prefix.iter().map(s).collect()));
+        .complete_args(top_level(referrer), params, given, |ty, ix, _, prefix| {
+            calls.push((s(&ty), ix.index(), prefix.iter().map(s).collect()));
             parse_quote!(<Self as R<#ix>>::Type)
         })
         .map_err(Error::from)?;
@@ -118,13 +118,13 @@ fn test_default_requirements() {
     );
     assert!(referrer
         .iter()
-        .all(|(_, context)| context.self_ty.is_none()));
+        .all(|(_, _, context)| context.self_ty.is_none()));
 
     // The round trip keeps the requirements.
     let tokens = quote!(#referrer);
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    for ((_, read), (_, context)) in parsed.iter().zip(referrer.iter()) {
+    for ((_, _, read), (_, _, context)) in parsed.iter().zip(referrer.iter()) {
         assert_eq!(s(&read.generics), s(&context.generics));
         assert_eq!(
             s(&read.generics.where_clause),
@@ -146,7 +146,7 @@ fn test_default_is_analyzed_with_the_parameters_before_it() {
     assert_eq!(
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
             .collect::<Vec<_>>(),
         [("Rel < T >".to_string(), "< T >".to_string())]
@@ -160,7 +160,7 @@ fn test_default_is_analyzed_with_the_parameters_before_it() {
     assert_eq!(
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
             .collect::<Vec<_>>(),
         [
@@ -278,8 +278,8 @@ fn test_defaults_of_several_calls_are_shared() {
             top_tr,
             &tr.generics.params,
             &args(parse_quote!(<u8>)),
-            |ty, ix, prefix| {
-                assert_eq!(ix, 2);
+            |ty, ix, _, prefix| {
+                assert_eq!(ix.index(), 2);
                 let before: punctuated::Punctuated<GenericParam, Token![,]> = tr
                     .generics
                     .params
@@ -287,7 +287,7 @@ fn test_defaults_of_several_calls_are_shared() {
                     .take(prefix.len())
                     .cloned()
                     .collect();
-                UseSite::substituting(&before, prefix).substitute(&ty)
+                UseSite::substituting(&before, prefix).substitute(&ty, None)
             },
         )
         .unwrap();
@@ -302,8 +302,8 @@ fn test_defaults_of_several_calls_are_shared() {
             top_tr,
             &tr.generics.params,
             &args(parse_quote!(<u8>)),
-            |ty, ix, prefix| {
-                replaced.push((s(&ty), ix, prefix.len()));
+            |ty, ix, _, prefix| {
+                replaced.push((s(&ty), ix.index(), prefix.len()));
                 parse_quote!(P)
             },
         )
@@ -428,8 +428,8 @@ fn test_complete_args_substitutes_the_copied_part_only() {
             top_level(&referrer),
             &tr.generics.params,
             &args(parse_quote!(<Rel<u8>>)),
-            |ty, ix, prefix| {
-                assert_eq!(ix, 0);
+            |ty, ix, _, prefix| {
+                assert_eq!(ix.index(), 0);
                 assert_eq!(s(&ty), "Rel < T >");
                 assert_eq!(prefix.len(), 1);
                 parse_quote!(P<#(#prefix),*>)
@@ -451,7 +451,7 @@ fn test_complete_args_substitutes_the_copied_part_only() {
             top_level(&referrer),
             &tr.generics.params,
             &args(parse_quote!(<u8>)),
-            |_, _, _| parse_quote!(<T as Proj>::Type),
+            |_, _, _, _| parse_quote!(<T as Proj>::Type),
         )
         .unwrap();
     assert_eq!(

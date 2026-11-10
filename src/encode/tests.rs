@@ -3,7 +3,7 @@
 //! encoders and of the Referrer that tests used to call, written over the encoders of this crate.
 
 use super::*;
-use crate::RepeaterSlots;
+use crate::{encode_slot_const, slot_const};
 
 fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
     encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
@@ -56,7 +56,7 @@ fn encode_generics_args_to_ty_with_self<'a, 'b>(
     })
 }
 
-/// The encoders with the const parameters encoded by the slots.
+/// The encoders with the const parameters encoded by the slots of the Repeater at this path.
 trait Slotted {
     fn encode_generics_params_to_ty<'a>(
         &self,
@@ -82,12 +82,12 @@ trait Slotted {
     ) -> std::result::Result<Type, EncodeError>;
 }
 
-impl Slotted for RepeaterSlots {
+impl Slotted for Path {
     fn encode_generics_params_to_ty<'a>(
         &self,
         iter: impl IntoIterator<Item = &'a GenericParam>,
     ) -> std::result::Result<Type, EncodeError> {
-        self.params(iter, None)
+        slot_params(self, iter, None)
     }
     fn encode_generics_params_to_ty_with_self<'a>(
         &self,
@@ -95,14 +95,14 @@ impl Slotted for RepeaterSlots {
         self_ty: &Type,
         self_outlives: &[Lifetime],
     ) -> std::result::Result<Type, EncodeError> {
-        self.params(iter, Some((self_ty, self_outlives)))
+        slot_params(self, iter, Some((self_ty, self_outlives)))
     }
     fn encode_generics_args_to_ty<'a>(
         &self,
         iter: impl IntoIterator<Item = &'a GenericArgument>,
         params: &Punctuated<GenericParam, Token![,]>,
     ) -> std::result::Result<Type, EncodeError> {
-        encode_generics_args_with_params(iter, params, None, self.const_fn())
+        encode_generics_args_with_params(iter, params, None, slot_const(self))
     }
     fn encode_generics_args_to_ty_with_self<'a>(
         &self,
@@ -115,32 +115,30 @@ impl Slotted for RepeaterSlots {
             iter,
             params,
             Some((self_ty, self_outlives)),
-            self.const_fn(),
+            slot_const(self),
         )
     }
 }
 
-impl RepeaterSlots {
-    fn params<'a>(
-        &self,
-        iter: impl IntoIterator<Item = &'a GenericParam>,
-        self_outlives: Option<(&Type, &[Lifetime])>,
-    ) -> std::result::Result<Type, EncodeError> {
-        encode_generics_params_with(iter, self_outlives, |ConstParam { ident, ty, .. }| {
-            self.encode_const(&parse_quote!(#ident), ty)
-        })
-    }
+fn slot_params<'a>(
+    repeater: &Path,
+    iter: impl IntoIterator<Item = &'a GenericParam>,
+    self_outlives: Option<(&Type, &[Lifetime])>,
+) -> std::result::Result<Type, EncodeError> {
+    encode_generics_params_with(iter, self_outlives, |ConstParam { ident, ty, .. }| {
+        encode_slot_const(repeater, &parse_quote!(#ident), ty)
+    })
 }
 
 #[test]
 fn test_repeater_slots() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
 
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let generics: Generics = parse_quote! {
         <'a, T, const N: usize, const X: u128, const B: bool, const I: i32, const M: usize = N>
     };
-    let ty = slots
+    let ty = repeater
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     let expected: Type = parse_quote!((
@@ -157,7 +155,7 @@ fn test_repeater_slots() {
     // Arguments: a bare const `B`, a negative literal, a skipped binding, and an omitted default
     // referring to a preceding parameter (redundant braces are removed).
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, 3, 7, B, -5, Item = u8>);
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     let expected: Type = parse_quote!((
@@ -172,7 +170,7 @@ fn test_repeater_slots() {
     assert_eq!(to_string(&ty), to_string(&expected));
 
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, { 1 + 2 }, 7, true, 0>);
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     let expected: Type = parse_quote!((
@@ -188,17 +186,17 @@ fn test_repeater_slots() {
 
     // Errors: a missing lifetime, an extra lifetime, a missing argument without a default.
     let args: AngleBracketedGenericArguments = parse_quote!(<u8, 3, 7, B, -5>);
-    let err = slots
+    let err = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap_err();
     assert_eq!(err.to_string(), "missing generic argument for ''a'");
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, 'static, u8, 3, 7, B, -5>);
-    let err = slots
+    let err = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap_err();
     assert_eq!(err.to_string(), "unexpected generic argument: ''static'");
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
-    let err = slots
+    let err = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap_err();
     assert_eq!(
@@ -206,7 +204,7 @@ fn test_repeater_slots() {
         "missing generic argument for 'const N : usize'"
     );
     let generics: Generics = parse_quote!(<const N: MyIdx>);
-    let err = slots
+    let err = repeater
         .encode_generics_params_to_ty(&generics.params)
         .unwrap_err();
     assert_eq!(
@@ -215,12 +213,12 @@ fn test_repeater_slots() {
     );
 
     // No generics, and a single generic (a one-element tuple).
-    let ty = slots
+    let ty = repeater
         .encode_generics_params_to_ty(&Generics::default().params)
         .unwrap();
     assert_eq!(to_string(&ty), to_string(&parse_quote!(())));
     let generics: Generics = parse_quote!(<T>);
-    let ty = slots
+    let ty = repeater
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     assert_eq!(to_string(&ty), to_string(&parse_quote!((T,))));
@@ -229,11 +227,11 @@ fn test_repeater_slots() {
 #[test]
 fn test_defaults_substitute_const_type_arguments() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     // `N` in `IntoIter<u8, N>` is parsed as a type argument.
     let generics: Generics = parse_quote!(<const N: usize, U = ::core::array::IntoIter<u8, N>>);
     let args: AngleBracketedGenericArguments = parse_quote!(<3>);
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     let expected: Type = parse_quote!(([(); 3], ::core::array::IntoIter<u8, 3>));
@@ -316,8 +314,8 @@ fn test_lifetime_bounds_are_encoded_after_the_parameters() {
     let expected: Type = parse_quote!((&'a (), &'b (), T, U, V, [(); N], &'a &'b (), &'a T, &'b T));
     let ty = encode_generics_params_to_ty(&generics.params);
     assert_eq!(to_string(&ty), to_string(&expected));
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    let ty = slots
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let ty = repeater
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -330,7 +328,7 @@ fn test_lifetime_bounds_are_encoded_after_the_parameters() {
     );
     let expected: Type = parse_quote!((&'a (), T, ::my_crate::ConstBool<B>, &'a T));
     assert_eq!(to_string(&ty), to_string(&expected));
-    let ty = slots
+    let ty = repeater
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     let expected: Type = parse_quote!((
@@ -356,7 +354,7 @@ fn test_lifetime_bounds_are_encoded_after_the_parameters() {
 #[test]
 fn test_lifetime_bounds_are_substituted_by_the_arguments() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + 'b, const N: usize, U = Vec<T>>);
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, 'x, u8, 3>);
     let expected: Type = parse_quote!((
@@ -369,7 +367,7 @@ fn test_lifetime_bounds_are_substituted_by_the_arguments() {
         &'static u8,
         &'x u8
     ));
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -383,7 +381,7 @@ fn test_lifetime_bounds_are_substituted_by_the_arguments() {
 
     // The arguments may be any types, and the lifetimes of the Referrer's generics.
     let args: AngleBracketedGenericArguments = parse_quote!(<'p, 'q, ::p::W<&'p u8>, N, ()>);
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     let expected: Type = parse_quote!((
@@ -409,10 +407,10 @@ fn test_lifetime_bounds_are_substituted_by_the_arguments() {
     ] {
         let generics: Generics = generics;
         let args = args_of(&generics);
-        let params = slots
+        let params = repeater
             .encode_generics_params_to_ty(&generics.params)
             .unwrap();
-        let replaced = slots
+        let replaced = repeater
             .encode_generics_args_to_ty(&args, &generics.params)
             .unwrap();
         assert_eq!(to_string(&params), to_string(&replaced));
@@ -449,7 +447,7 @@ fn args_of(generics: &Generics) -> Vec<GenericArgument> {
 #[test]
 fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let generics: Generics = parse_quote!(<'a, T: ?Sized + 'a>);
     // `&'a dyn Tr` is `&'a (dyn Tr + 'a)`, whereas it is `dyn Tr + 'static` in the other
     // elements, so the encoding would not be that of the generics.
@@ -460,7 +458,7 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
     ] {
         let arg: Type = arg;
         let args: AngleBracketedGenericArguments = parse_quote!(<'x, #arg>);
-        let err = slots
+        let err = repeater
             .encode_generics_args_to_ty(&args.args, &generics.params)
             .unwrap_err();
         assert!(
@@ -482,7 +480,7 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
     for arg in [parse_quote!(dyn Tr + 'static), parse_quote!((dyn Tr + 'y))] {
         let arg: Type = arg;
         let args: AngleBracketedGenericArguments = parse_quote!(<'x, #arg>);
-        let ty = slots
+        let ty = repeater
             .encode_generics_args_to_ty(&args.args, &generics.params)
             .unwrap();
         let object = match &arg {
@@ -497,7 +495,7 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
     // Without a bound on the parameter, any argument is fine.
     let generics: Generics = parse_quote!(<'a, T: ?Sized>);
     let args: AngleBracketedGenericArguments = parse_quote!(<'x, dyn Tr>);
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     assert_eq!(
@@ -511,7 +509,7 @@ fn test_free_encoders_with_self() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
     let usize_const =
         |ConstParam { ident, .. }: &ConstParam| -> Type { parse_quote!([(); #ident]) };
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let a: Lifetime = parse_quote!('a);
     let b: Lifetime = parse_quote!('b);
 
@@ -562,7 +560,7 @@ fn test_free_encoders_with_self() {
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
 
-    // The free functions and `RepeaterSlots` are the same encoder: they agree wherever the
+    // The free functions and `encode_slot_const()` are the same encoder: they agree wherever the
     // const parameters are encoded in the same way (`usize` is `[(); N]` for both).
     for generics in [
         parse_quote!(<'a, 'b: 'a, T: 'a + 'b, const N: usize>),
@@ -587,7 +585,7 @@ fn test_free_encoders_with_self() {
                 usize_const,
             )
             .unwrap();
-            let slotted = slots
+            let slotted = repeater
                 .encode_generics_params_to_ty_with_self(&generics.params, &self_ty, &lifetimes)
                 .unwrap();
             assert_eq!(to_string(&free), to_string(&slotted));
@@ -599,7 +597,7 @@ fn test_free_encoders_with_self() {
                 |expr, _| parse_quote!([(); #expr]),
             )
             .unwrap();
-            let slotted = slots
+            let slotted = repeater
                 .encode_generics_args_to_ty_with_self(&args, &generics.params, &self_ty, &lifetimes)
                 .unwrap();
             assert_eq!(to_string(&free), to_string(&slotted));
@@ -782,7 +780,7 @@ fn expected_ty(tokens: proc_macro2::TokenStream) -> String {
 fn limit_plain_encoders_usize_only() {
     // `encode_generics_params_to_ty()` and `encode_generics_args_to_ty_with()` with a `[(); N]` callback encode const generics as
     // array lengths, which must be `usize`. For other types they produce `[(); B]` or
-    // `[(); true]`, which rustc rejects; `RepeaterSlots` must be used instead.
+    // `[(); true]`, which rustc rejects; `encode_slot_const()` must be used instead.
     let generics: Generics = parse2(quote!(<const B: bool>)).unwrap();
     let ty = encode_generics_params_to_ty(&generics.params);
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); B],))));
@@ -794,15 +792,15 @@ fn limit_plain_encoders_usize_only() {
     .unwrap();
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); true],))));
 
-    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
-    let ty = slots
+    let repeater: Path = parse2(quote!(crate::Repeater)).unwrap();
+    let ty = repeater
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     assert_eq!(
         ty_string(&ty),
         expected_ty(quote!((*const dyn crate::Repeater<(), 0, B, Type = ()>,)))
     );
-    let ty = slots
+    let ty = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     assert_eq!(
@@ -815,7 +813,7 @@ fn limit_plain_encoders_usize_only() {
 
 // ── Referrers ────────────────────────────────────────────────────────────────
 
-use crate::{Context, ContextId, Leaker, ModuleScope, Referrer};
+use crate::{Context, ContextId, EntryId, Leaker, LeakerResult, ModuleScope, Referrer};
 use proc_macro2::TokenStream;
 
 /// The helper of the Referrer that tests used to call.
@@ -833,7 +831,7 @@ impl ReferrerExt for Referrer {
         self_ty: &'a Type,
     ) -> Box<dyn Iterator<Item = (Type, Generics)> + 'a> {
         use syn::fold::Fold;
-        Box::new(self.iter().map(move |(ty, context)| {
+        Box::new(self.iter().map(move |(_, ty, context)| {
             let mut folder = crate::util::ReplaceSelf { self_ty };
             (
                 folder.fold_type(ty.clone()),
@@ -845,12 +843,17 @@ impl ReferrerExt for Referrer {
 
 /// The context of the `ix`-th entry.
 fn context_of(referrer: &Referrer, ix: usize) -> &Context {
-    referrer.iter().nth(ix).unwrap().1
+    referrer.iter().nth(ix).unwrap().2
 }
 
 /// The type of the `ix`-th entry.
 fn entry_ty(referrer: &Referrer, ix: usize) -> &Type {
-    referrer.iter().nth(ix).unwrap().0
+    referrer.iter().nth(ix).unwrap().1
+}
+
+/// The `EntryId` of the `n`-th entry, counted from 0 (`Referrer::iter()` gives it).
+fn entry_id_at(referrer: &Referrer, n: usize) -> EntryId {
+    referrer.iter().nth(n).unwrap().0
 }
 
 /// The module that a context is in (not its own, `Itself`).
@@ -875,8 +878,8 @@ fn lifetimes(list: &[&str]) -> Vec<Lifetime> {
     list.iter().map(|l| parse_str(l).unwrap()).collect()
 }
 
-fn slots() -> RepeaterSlots {
-    RepeaterSlots::new(parse_quote!(crate::Repeater))
+fn repeater() -> Path {
+    parse_quote!(crate::Repeater)
 }
 
 #[test]
@@ -891,37 +894,37 @@ fn the_encoders_encode_it_after_the_lifetime_bounds() {
     // The Repeater's implementation for the implementor `__S`: the parameters, the bounds and then
     // `&'a __S`.
     let marker: Type = parse_quote!(__S);
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_params_to_ty_with_self(&generics.params, &marker, outlives)
         .unwrap();
     let expected: Type = parse_quote!((&'a (), T, &'a T, &'a __S));
     assert_eq!(s(&encoded), s(&expected));
     // Without it, the encoding is that of the generics alone.
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     let expected: Type = parse_quote!((&'a (), T, &'a T));
     assert_eq!(s(&encoded), s(&expected));
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_params_to_ty_with_self(&generics.params, &marker, &[])
         .unwrap();
     assert_eq!(s(&encoded), s(&expected));
     // At the use site, with the arguments substituted, and `Self` being the implementor.
     let args: Vec<GenericArgument> = vec![parse_quote!('q), parse_quote!(u8)];
     let self_ty: Type = parse_quote!(Self);
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_args_to_ty_with_self(&args, &generics.params, &self_ty, outlives)
         .unwrap();
     let expected: Type = parse_quote!((&'q (), u8, &'q u8, &'q Self));
     assert_eq!(s(&encoded), s(&expected));
     let args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_args_to_ty_with_self(&args, &generics.params, &self_ty, outlives)
         .unwrap();
     let expected: Type = parse_quote!((&'static (), u8, &'static u8, &'static Self));
     assert_eq!(s(&encoded), s(&expected));
     // A lifetime which is not a parameter is skipped, like a bound by one.
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_params_to_ty_with_self(&generics.params, &marker, &lifetimes(&["'z"]))
         .unwrap();
     let expected: Type = parse_quote!((&'a (), T, &'a T));
@@ -984,7 +987,7 @@ fn a_written_bound_is_encoded_and_never_declared() {
         "< 'a , T > where __S : :: core :: marker :: Sized"
     );
     // It is encoded as `&'a __S`, as the implied one is.
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_params_to_ty_with_self(&context.generics.params, &marker, outlives)
         .unwrap();
     let expected: Type = parse_quote!((&'a (), T, &'a T, &'a __S));
@@ -1012,7 +1015,7 @@ fn without_encoded_bounds_removes_what_the_encoders_encode() {
     }
     // The encoders encode exactly the bounds which are removed: the elements after the
     // parameters are as many as the bounds dropped.
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let count = |generics: &Generics| -> usize {
         generics
             .params
@@ -1048,7 +1051,7 @@ fn without_encoded_bounds_removes_what_the_encoders_encode() {
         );
         // Nothing is left to encode once they are removed.
         assert_eq!(extra(&declared), 0, "{}", s(&declared));
-        let slotted = slots
+        let slotted = repeater
             .encode_generics_params_to_ty(&generics.params)
             .unwrap();
         assert_eq!(
@@ -1070,7 +1073,7 @@ fn the_generics_of_a_top_level_context_are_declared_as_they_are() {
     let referrer = leaker.result().finish().unwrap();
     let all = referrer
         .iter()
-        .position(|(ty, _)| s(ty) == "All < 'a , T >")
+        .position(|(_, ty, _)| s(ty) == "All < 'a , T >")
         .unwrap();
     let generics = &context_of(&referrer, all).generics;
     assert_eq!(s(generics), "< 'a , T >");
@@ -1111,7 +1114,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     // The entry `All` has the generics of the trait: the context of it is the top-level one.
     let all = referrer
         .iter()
-        .position(|(ty, _)| s(ty) == "All < 'a , N , T , U >")
+        .position(|(_, ty, _)| s(ty) == "All < 'a , N , T , U >")
         .unwrap();
     // The generics are in the canonical form: sorted by kind and name, without defaults.
     assert_eq!(
@@ -1142,7 +1145,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
             parsed_top_level,
             &tr.generics.params,
             &args.args,
-            |_, _, _| unreachable!(),
+            |_, _, _, _| unreachable!(),
         )
         .unwrap();
     let site = UseSite::substituting(&tr.generics.params, &completed);
@@ -1160,7 +1163,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     assert_eq!(s(&on_referrer_side), s(&expected));
 
     // The arguments fit the context of every entry.
-    for (_, context) in parsed.iter() {
+    for (_, _, context) in parsed.iter() {
         site.generic_args(&context.generics).unwrap();
     }
 }
@@ -1178,7 +1181,7 @@ fn config() -> Rules {
 }
 
 /// Analyzes a whole item the way a downstream macro does.
-fn analyze(item: &Item) -> (Referrer, ContextId) {
+fn analyze_result(item: &Item) -> (LeakerResult, ContextId) {
     let mut leaker = Leaker::from_config(config(), Options::new());
     let context = match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
@@ -1189,11 +1192,14 @@ fn analyze(item: &Item) -> (Referrer, ContextId) {
         Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     };
-    let referrer = leaker
-        .result()
-        .finish()
-        .unwrap_or_else(|e| panic!("{}: {}", s(item), messages(&e)));
-    (referrer, context)
+    let result = leaker.result();
+    assert!(
+        result.errors().is_empty(),
+        "{}: {}",
+        s(item),
+        messages(result.errors())
+    );
+    (result, context)
 }
 
 fn generics_of(item: &Item) -> Generics {
@@ -1284,7 +1290,7 @@ fn with_where(generics: &Generics) -> String {
 fn by_hand(referrer: &Referrer, ix: usize, self_param: &Ident) -> (Generics, Type, Type, Type) {
     let marker: Type = parse_quote!(#self_param);
     let replaced: Vec<(Type, Generics)> = referrer.iter_with_self(&marker).collect();
-    let (ty, context) = referrer.iter().nth(ix).unwrap();
+    let (_, ty, context) = referrer.iter().nth(ix).unwrap();
     let generics = &context.generics;
     let (ty, generics) = match context.self_ty.as_ref() {
         Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
@@ -1294,7 +1300,7 @@ fn by_hand(referrer: &Referrer, ix: usize, self_param: &Ident) -> (Generics, Typ
         Some(SelfRequirement::Type(_)) => parse_quote!(Self),
         _ => marker.clone(),
     };
-    let encoded = slots()
+    let encoded = repeater()
         .encode_generics_params_to_ty_with_self(
             &generics.params,
             &self_in_impl,
@@ -1363,7 +1369,7 @@ fn args_by_hand(
     let args = UseSite::substituting(root_params, root_args)
         .generic_args(&context.generics)
         .unwrap();
-    slots()
+    repeater()
         .encode_generics_args_to_ty_with_self(
             &args,
             &context.generics.params,
@@ -1392,11 +1398,15 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
     let self_param: Ident = parse_quote!(__S);
     let mut checked = 0;
     for item in samples() {
-        let (referrer, _) = analyze(&item);
-        for ix in 0..referrer.iter().count() {
-            let r = referrer
-                .repeater_impl(ix, ImplSelf::Param(&self_param), slots().const_fn())
-                .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
+        let (result, _) = analyze_result(&item);
+        let referrer = result.clone().into_referrer();
+        let target = ImplSelf::Param(&self_param);
+        let repeater = repeater();
+        let impls = result
+            .repeater_impls(&repeater, 7, target, slot_const(&repeater))
+            .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
+        for (ix, r) in impls.enumerate() {
+            assert_eq!(r.entry, entry_id_at(&referrer, ix), "{}", s(&item));
             let (generics, self_ty, args, ty) = by_hand(&referrer, ix, &self_param);
             let what = format!("{}: {}", s(&item), s(entry_ty(&referrer, ix)));
             assert_eq!(
@@ -1426,45 +1436,72 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
     assert!(checked > 20, "{}", checked);
 }
 
+/// The first argument of the Repeater for the entry `n` at `site`, with `self_ty` for `Self: 'a`:
+/// the two steps that a macro writes (`UseSite::generic_args()`, the encoder).
+fn args_at(
+    referrer: &Referrer,
+    n: usize,
+    site: &UseSite,
+    self_ty: &Type,
+    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    let context = context_of(referrer, n);
+    let args = site.generic_args(&context.generics)?;
+    encode_generics_args_with_params(
+        &args,
+        &context.generics.params,
+        Some((self_ty, &context.self_outlives)),
+        const_fn,
+    )
+}
+
 #[test]
-fn entry_args_is_what_a_macro_writes_by_hand() {
+fn the_encoder_is_what_a_macro_writes_by_hand() {
     let host: Type = parse_quote!(Host<u8>);
     let mut checked = 0;
     for item in samples() {
-        let (referrer, _) = analyze(&item);
+        let (result, _) = analyze_result(&item);
+        let referrer = result.clone().into_referrer();
         let generics = generics_of(&item);
         let root_args = arguments_for(&generics);
-        for ix in 0..referrer.iter().count() {
-            let what = format!("{}: {}", s(&item), s(entry_ty(&referrer, ix)));
-            let slots = slots();
+        for n in 0..referrer.iter().count() {
+            let what = format!("{}: {}", s(&item), s(entry_ty(&referrer, n)));
+            let repeater = repeater();
             // Substituted, with a `Self`.
-            let site = UseSite::substituting(&generics.params, &root_args).with_self(host.clone());
-            let got = referrer.entry_args(ix, &site, slots.const_fn()).unwrap();
-            let expected = args_by_hand(&referrer, ix, &generics.params, &root_args, &host);
+            let site = UseSite::substituting(&generics.params, &root_args);
+            let got = args_at(&referrer, n, &site, &host, slot_const(&repeater)).unwrap();
+            let expected = args_by_hand(&referrer, n, &generics.params, &root_args, &host);
             assert_eq!(s(&got), s(&expected), "{}", what);
             // In the scope of the analysis (nothing substituted), with the default `Self`.
-            let got = referrer
-                .entry_args(ix, &UseSite::identity(), slots.const_fn())
-                .unwrap();
-            let expected =
-                args_by_hand(&referrer, ix, &Punctuated::new(), &[], &parse_quote!(Self));
+            let got = args_at(
+                &referrer,
+                n,
+                &UseSite::identity(),
+                &parse_quote!(Self),
+                slot_const(&repeater),
+            )
+            .unwrap();
+            let expected = args_by_hand(&referrer, n, &Punctuated::new(), &[], &parse_quote!(Self));
             assert_eq!(s(&got), s(&expected), "{}", what);
             // The same as the impl, for the generics by their own names.
             let param: Ident = parse_quote!(__S);
-            let r = referrer
-                .repeater_impl(ix, ImplSelf::Param(&param), slots.const_fn())
+            let r = result
+                .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+                .unwrap()
+                .nth(n)
                 .unwrap();
-            let self_in_impl = match context_of(&referrer, ix).self_ty.as_ref() {
+            let self_in_impl = match context_of(&referrer, n).self_ty.as_ref() {
                 Some(SelfRequirement::Type(_)) => parse_quote!(Self),
                 _ => parse_quote!(#param),
             };
-            let got = referrer
-                .entry_args(
-                    ix,
-                    &UseSite::identity().with_self(self_in_impl),
-                    slots.const_fn(),
-                )
-                .unwrap();
+            let got = args_at(
+                &referrer,
+                n,
+                &UseSite::identity(),
+                &self_in_impl,
+                slot_const(&repeater),
+            )
+            .unwrap();
             assert_eq!(s(&got), s(&r.args), "{}", what);
             checked += 1;
         }
@@ -1473,7 +1510,7 @@ fn entry_args_is_what_a_macro_writes_by_hand() {
 }
 
 #[test]
-fn entry_args_to_ty_has_no_closure() {
+fn encode_args_to_ty_has_no_closure() {
     // `encode_generics_args_to_ty()` is `encode_generics_params_to_ty()` for arguments.
     let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, const N: usize, U: ?Sized>);
     let args: Vec<GenericArgument> = vec![
@@ -1604,9 +1641,9 @@ fn param_arg(param: &GenericParam) -> GenericArgument {
 /// tuple element, which the encoder does for the generics it is given.
 #[test]
 fn f01_unsized_type_param_encoding_of_written_generics() {
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater: Path = parse_quote!(crate::Repeater);
     let check = |generics: &Generics, expected: Option<&str>, what: &str| {
-        let encoded = slots
+        let encoded = repeater
             .encode_generics_params_to_ty(&generics.params)
             .unwrap_or_else(|e| panic!("{}: `{}`: {}", what, string(generics), e));
         assert_eq!(
@@ -1623,7 +1660,7 @@ fn f01_unsized_type_param_encoding_of_written_generics() {
         }
         // The Referrer passes each parameter by its own name: the same encoding.
         let args: Vec<GenericArgument> = generics.params.iter().map(param_arg).collect();
-        let on_referrer_side = slots
+        let on_referrer_side = repeater
             .encode_generics_args_to_ty(&args, &generics.params)
             .unwrap();
         assert_eq!(string(&on_referrer_side), string(&encoded), "{}", what);
@@ -1663,7 +1700,7 @@ fn f01_unsized_type_param_encoding_of_written_generics() {
     let generics: Generics = parse_quote!(<T: ?Sized, U: ?Sized, V>);
     let args: AngleBracketedGenericArguments =
         parse_quote!(<str, dyn Tr + Send + 'static, [u8; 2]>);
-    let encoded = slots
+    let encoded = repeater
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     let expected: Type = parse_quote!((*const str, *const (dyn Tr + Send + 'static), [u8; 2]));

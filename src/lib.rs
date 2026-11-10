@@ -14,7 +14,6 @@ mod elided;
 mod encode;
 mod error;
 mod graph;
-mod helpers;
 mod leaker;
 mod referrer;
 mod repeater;
@@ -27,10 +26,12 @@ pub use syn;
 pub use crate::allow::{Allow, Place, Rules};
 pub use crate::analysis::CheckResult;
 pub use crate::context::{Context, ContextId, Gat, ModuleScope, SelfRequirement};
-pub use crate::encode::{array_const, EncodeError};
+pub use crate::encode::{array_const, encode_generics_args_with_params, EncodeError};
 pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};
-pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};
 pub use crate::leaker::{Leaker, LeakerResult, Options};
-pub use crate::referrer::{NestedSelf, Referrer, Visitor};
-pub use crate::repeater::{repeater_definition, repeater_key, RepeaterSlots};
+pub use crate::referrer::{EntryId, NestedSelf, Referrer, UseSite, Visitor};
+pub use crate::repeater::{
+    encode_slot_const, repeater_definition, repeater_key, repeater_projection, repeater_trait_path,
+    slot_const, ImplSelf, RepeaterImpl,
+};
 pub use crate::view::View;

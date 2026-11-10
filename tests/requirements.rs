@@ -7,7 +7,8 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    ContextId, EncodeError, Leaker, Reason, Referrer, SelfRequirement, UseSite, Visitor,
+    Context, ContextId, EncodeError, EntryId, Leaker, Reason, Referrer, SelfRequirement, UseSite,
+    Visitor,
 };
 
 /// The tag of the format of a serialized Referrer, which it starts with.
@@ -42,7 +43,7 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -587,7 +588,7 @@ fn self_in_the_bounds_of_the_generics() {
             .finish()
             .unwrap()
             .iter()
-            .map(|(ty, _)| s(ty))
+            .map(|(_, ty, _)| s(ty))
             .collect::<Vec<_>>(),
         ["Rel"]
     );
@@ -638,13 +639,16 @@ fn generic_args_of_the_root_and_local_generics() {
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }
 
-fn rewrite<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<'_, F>, sig: &str) -> String {
+fn rewrite<F: FnMut(Type, EntryId, &Context) -> Type>(
+    mut visitor: Visitor<'_, F>,
+    sig: &str,
+) -> String {
     let mut sig: Signature = parse_str(sig).unwrap();
     visitor.visit_signature_mut(&mut sig);
     s(&sig)
 }
 
-fn placeholder(_: Type, ix: usize) -> Type {
+fn placeholder(_: Type, ix: EntryId, _: &Context) -> Type {
     parse_quote!(P<#ix>)
 }
 

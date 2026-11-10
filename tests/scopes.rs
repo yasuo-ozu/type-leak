@@ -69,7 +69,7 @@ fn ident(name: &str) -> Ident {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect()
 }
@@ -88,9 +88,9 @@ fn self_of(referrer: &Referrer, ix: usize) -> String {
 }
 
 /// The path of the module of the `ix`-th entry.
-fn module_path_of(referrer: &Referrer, ix: usize) -> Option<Vec<String>> {
+fn module_path_of(result: &LeakerResult, ix: usize) -> Option<Vec<String>> {
     Some(
-        common::entry_module_path(referrer, ix)?
+        common::entry_module_path(result, ix)?
             .iter()
             .map(|i| i.to_string())
             .collect(),
@@ -223,7 +223,8 @@ fn a_module_declares_its_names_and_the_module() {
     let (module, ()) = leaker.enter_mod("my_module", [ident("S")], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // `S` is declared in the module, so it is not leaked, and nor is `self::S`.
     assert_eq!(
         entries(&referrer),
@@ -235,10 +236,10 @@ fn a_module_declares_its_names_and_the_module() {
             Some(module)
         );
         assert_eq!(
-            common::entry_module_hint(&referrer, ix).as_deref(),
+            common::entry_module_hint(&result, ix).as_deref(),
             Some("my_module")
         );
-        assert_eq!(common::entry_module_path(&referrer, ix), None);
+        assert_eq!(common::entry_module_path(&result, ix), None);
     }
     assert!(common::context_ids(&referrer)
         .into_iter()
@@ -246,11 +247,9 @@ fn a_module_declares_its_names_and_the_module() {
     // The hint is for debugging: any `Display` does.
     let mut leaker = Leaker::new();
     leaker.enter_mod(7, [], |view| view.visit_type(&parse_quote!(Rel)));
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(
-        common::entry_module_hint(&referrer, 0).as_deref(),
-        Some("7")
-    );
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    assert_eq!(common::entry_module_hint(&result, 0).as_deref(), Some("7"));
 }
 
 #[test]
@@ -637,7 +636,8 @@ fn a_module_in_a_module_in_a_scope() {
         view.enter_mod("inner", [], |view| view.visit_type(&parse_quote!(Rel3)))
             .0
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // The type of an external crate is an entry that does not depend on a module.
     let found: Vec<(String, String, String, Option<ContextId>)> = (0..referrer.iter().count())
         .map(|ix| {
@@ -678,17 +678,14 @@ fn a_module_in_a_module_in_a_scope() {
     };
     let (in_outer, in_inner) = (at("Rel < T >"), at("Rel3"));
     assert_eq!(
-        common::entry_module_hint(&referrer, in_outer).as_deref(),
+        common::entry_module_hint(&result, in_outer).as_deref(),
         Some("outer")
     );
     assert_eq!(
-        common::entry_module_hint(&referrer, in_inner).as_deref(),
+        common::entry_module_hint(&result, in_inner).as_deref(),
         Some("inner")
     );
-    assert_eq!(
-        common::entry_module_parent(&referrer, in_inner),
-        Some(outer)
-    );
+    assert_eq!(common::entry_module_parent(&result, in_inner), Some(outer));
     assert_ne!(outer, inner);
 }
 
@@ -703,7 +700,8 @@ fn nested_modules_are_numbered_and_kept() {
                 .0
         })
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // The module of each entry is the one it is written in, and each is a module of the Referrer.
     let at = |text: &str| {
         common::types(&referrer)
@@ -721,11 +719,11 @@ fn nested_modules_are_numbered_and_kept() {
             Some(module)
         );
         assert_eq!(
-            common::entry_module_hint(&referrer, ix).as_deref(),
+            common::entry_module_hint(&result, ix).as_deref(),
             Some(hint)
         );
         // A module entered by a scope has a hint, and no path.
-        assert_eq!(common::entry_module_path(&referrer, ix), None);
+        assert_eq!(common::entry_module_path(&result, ix), None);
     }
     // They are numbered in the order they are entered, from the outermost.
     assert_eq!((outer, inner, deeper), (id(0), id(1), id(2)));
@@ -1227,9 +1225,10 @@ fn module_path_and_hint() {
     let mut leaker = Leaker::new();
     let root = leaker.intern_mod(&m);
     let (hinted, ()) = leaker.enter_mod("hinted", [], |view| view.visit_type(&parse_quote!(Rel)));
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     let paths: Vec<Option<Vec<String>>> = (0..referrer.iter().count())
-        .map(|ix| module_path_of(&referrer, ix))
+        .map(|ix| module_path_of(&result, ix))
         .collect();
     assert_eq!(
         paths,
@@ -1244,10 +1243,10 @@ fn module_path_and_hint() {
     // The module analyzed is the first, and the ones which have no entry are not kept (`m` has
     // one, as it is the top-level context).
     assert_eq!(common::in_module(common::entry(&referrer, 0)), Some(root));
-    assert_eq!(common::entry_module_hint(&referrer, 0), None);
+    assert_eq!(common::entry_module_hint(&result, 0), None);
     assert_eq!(common::in_module(common::entry(&referrer, 3)), Some(hinted));
     assert_eq!(
-        common::entry_module_hint(&referrer, 3).as_deref(),
+        common::entry_module_hint(&result, 3).as_deref(),
         Some("hinted")
     );
     // A context of an entry is not a module.
@@ -1265,7 +1264,8 @@ fn the_visitor_enters_the_module_by_its_id() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let copy = |module: ContextId| {
-        let mut visitor = referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
+        let mut visitor =
+            referrer.visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap());
         let mut item: ItemStruct = parse_quote!(
             struct C {
                 y: Rel,
@@ -1300,7 +1300,7 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
     });
     let referrer = leaker.result().finish().unwrap();
     let copy = |item: &ItemMod, module: ContextId| {
-        let mut visitor = referrer.visitor(module, |_, _| parse_quote!(P));
+        let mut visitor = referrer.visitor(module, |_, _, _| parse_quote!(P));
         let mut item = item.clone();
         visitor.visit_item_mod_mut(&mut item);
         s(&item)
@@ -1356,9 +1356,11 @@ fn modules_are_serialized() {
         view.visit_type(&parse_quote!(Rel2));
         view.enter_mod("nested", [], |view| view.visit_type(&parse_quote!(Rel3)));
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     let tokens = referrer.to_token_stream();
     let parsed: Referrer = parse2(tokens.clone()).unwrap();
+    let parsed_result: LeakerResult = parse2(tokens.clone()).unwrap();
     assert_eq!(parsed, referrer);
     assert_eq!(parsed.to_token_stream().to_string(), tokens.to_string());
     // The modules, their paths and hints, and what depends on them are the same.
@@ -1366,10 +1368,13 @@ fn modules_are_serialized() {
         .position(|ty| s(ty) == "Rel2")
         .unwrap();
     assert_eq!(
-        common::entry_module_hint(&parsed, hinted_entry).as_deref(),
+        common::entry_module_hint(&parsed_result, hinted_entry).as_deref(),
         Some("with \"quotes\"")
     );
-    assert_eq!(common::entry_module_path(&parsed, hinted_entry), None);
+    assert_eq!(
+        common::entry_module_path(&parsed_result, hinted_entry),
+        None
+    );
     assert_eq!(
         common::in_module(common::entry(&parsed, hinted_entry)),
         Some(hinted)
@@ -1379,8 +1384,8 @@ fn modules_are_serialized() {
         assert_eq!(common::in_module(common::entry(&parsed, ix)), module);
         // The module's own context, with its id, path, hint and parent.
         assert_eq!(
-            common::entry_module(&parsed, ix),
-            common::entry_module(&referrer, ix)
+            common::entry_module(&parsed_result, ix),
+            common::entry_module(&result, ix)
         );
     }
     // The ids of the modules are written, and the parent of a nested one.
@@ -1398,7 +1403,7 @@ fn modules_are_serialized() {
         }
     );
     parsed
-        .visitor(root, |_, _| parse_quote!(P))
+        .visitor(root, |_, _, _| parse_quote!(P))
         .visit_item_mod_mut(&mut item);
     assert_eq!(
         s(&item),
@@ -1477,7 +1482,7 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
     // The nested scope declares a generic and `Self`, enters a module, and records types, a
     // context and an error, and then panics. The outer closure catches it and goes on: it is as if
     // the scope had never been entered.
-    fn run(panic: bool) -> (ContextId, Referrer) {
+    fn run(panic: bool) -> (ContextId, LeakerResult) {
         let mut leaker = Leaker::new();
         let (top, ()) = leaker.enter_generics(&parse_quote!(<T>), |view| {
             view.visit_type(&parse_quote!(Rel<T>));
@@ -1496,10 +1501,13 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
             view.visit_type(&parse_quote!(Wrap<U>));
             view.visit_type(&parse_quote!(Wrap2<T>));
         });
-        (top, leaker.result().finish().unwrap())
+        let result = leaker.result();
+        result.clone().finish().unwrap();
+        (top, result)
     }
-    let (top, referrer) = run(true);
+    let (top, result) = run(true);
     let (expected_top, expected) = run(false);
+    let (referrer, expected) = (result.clone().into_referrer(), expected.into_referrer());
     assert_eq!(top, expected_top);
     assert_eq!(referrer, expected);
     assert_eq!(
@@ -1512,7 +1520,7 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
     );
     // The top-level context is that of the generics, with no module.
     assert_eq!(common::entry_id(&referrer, 0), top);
-    assert_eq!(common::entry_module(&referrer, 0), None);
+    assert_eq!(common::entry_module(&result, 0), None);
     assert_eq!(
         referrer.to_token_stream().to_string(),
         expected.to_token_stream().to_string()
@@ -1577,7 +1585,8 @@ fn a_panic_caught_in_a_nested_module_restores_the_module() {
         // `S` is declared by the module, and `Lost` was by the module which is not entered.
         view.visit_type(&parse_quote!(S<Lost>));
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Lost", "")]);
     assert_eq!(
         common::in_module(common::entry(&referrer, 0)),
@@ -1585,7 +1594,7 @@ fn a_panic_caught_in_a_nested_module_restores_the_module() {
         "the type is in the outer module"
     );
     assert_eq!(
-        common::entry_module_hint(&referrer, 0).as_deref(),
+        common::entry_module_hint(&result, 0).as_deref(),
         Some("outer")
     );
     // (A module which panicked takes no number: see the layers of the item scopes, below.)
@@ -1602,10 +1611,11 @@ fn a_panic_caught_in_the_outermost_scope_of_a_generics_scope_keeps_the_top_level
         });
         view.visit_type(&parse_quote!(Rel<T>));
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(common::entry_id(&referrer, 0), top);
     assert_eq!(s(&common::entry(&referrer, 0).generics), "< T >");
-    assert_eq!(common::entry_module(&referrer, 0), None);
+    assert_eq!(common::entry_module(&result, 0), None);
     assert_eq!(common::in_module(common::entry(&referrer, 0)), None);
 }
 
@@ -1650,7 +1660,7 @@ fn record_and_panic(view: &mut View<'_, '_>, message: &str) {
 }
 
 /// The ids of the calls after the panic and the Referrer, with the panic (or without).
-fn after_a_panic(panic: bool) -> (Vec<ContextId>, Referrer) {
+fn after_a_panic(panic: bool) -> (Vec<ContextId>, LeakerResult) {
     let (mut leaker, mut ids) = leaker_with_contexts();
     if panic {
         caught_with("an outermost closure panics", || {
@@ -1688,13 +1698,16 @@ fn after_a_panic(panic: bool) -> (Vec<ContextId>, Referrer) {
         ),
         true,
     ));
-    (ids, leaker.result().finish().unwrap())
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    (ids, result)
 }
 
 #[test]
 fn a_panic_in_an_outermost_scope_keeps_the_earlier_contexts_and_ids() {
-    let (ids, referrer) = after_a_panic(true);
+    let (ids, result) = after_a_panic(true);
     let (expected_ids, expected) = after_a_panic(false);
+    let (referrer, expected) = (result.clone().into_referrer(), expected.into_referrer());
     assert_eq!(ids, expected_ids);
     assert_eq!(referrer, expected);
     assert_eq!(
@@ -1723,7 +1736,7 @@ fn a_panic_in_an_outermost_scope_keeps_the_earlier_contexts_and_ids() {
         Some(ids[3])
     );
     assert_eq!(
-        common::entry_module_hint(&referrer, at("Rel4")).as_deref(),
+        common::entry_module_hint(&result, at("Rel4")).as_deref(),
         Some("kept")
     );
     assert_eq!(
@@ -2677,7 +2690,8 @@ fn outcome(errors: &[ErrorItem]) -> String {
 /// the calls returned. A context that no entry has (a module's own, or a scope's with no entry in
 /// it) is not seen, but for its id, which the ids of the others skip, and for the hint and the path
 /// of a module, which the entries in it tell.
-fn dump(referrer: &Referrer, ids: &[(&str, ContextId)]) -> String {
+fn dump(result: &LeakerResult, ids: &[(&str, ContextId)]) -> String {
+    let referrer = &result.clone().into_referrer();
     let mut lines = Vec::new();
     for (name, id) in ids {
         lines.push(format!("id {} = {}", name, id.index()));
@@ -2700,8 +2714,8 @@ fn dump(referrer: &Referrer, ids: &[(&str, ContextId)]) -> String {
             Some(module) => module.index().to_string(),
         };
         let info = match (
-            common::entry_module_hint(referrer, ix),
-            common::entry_module_path(referrer, ix),
+            common::entry_module_hint(result, ix),
+            common::entry_module_path(result, ix),
         ) {
             (None, None) => String::new(),
             (hint, path) => format!(
@@ -2751,7 +2765,9 @@ fn root_item(kind: &str) -> String {
     };
     let (id, value) = enter!(leaker, kind, &generics, true, body);
     assert_eq!(value, 7);
-    dump(&leaker.result().finish().unwrap(), &[("top", id)])
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    dump(&result, &[("top", id)])
 }
 
 #[test]
@@ -2858,7 +2874,9 @@ fn nested_ids() -> String {
         ]);
     });
     ids.push(("top", top));
-    dump(&leaker.result().finish().unwrap(), &ids)
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    dump(&result, &ids)
 }
 
 const NESTED_IDS: &str = r#"
@@ -2953,13 +2971,13 @@ fn failing(kind: &str, fail: bool) -> (LeakerResult, [(&'static str, ContextId);
 fn a_failing_scope_of_an_item_or_a_module_keeps_its_corrected_result() {
     let (result, ids) = failing("struct", false);
     assert!(result.errors().is_empty());
-    let ok = dump(&result.finish().unwrap(), &ids);
+    let ok = dump(&result, &ids);
     pin("failing ok", &ok, FAILING_OK);
     let mut errors = Vec::new();
     let mut kept = String::new();
     for kind in KINDS {
         let (result, ids) = failing(kind, true);
-        let left = dump(&result.clone().into_referrer(), &ids);
+        let left = dump(&result, &ids);
         if kind == "struct" {
             kept = left.clone();
         }
@@ -2968,7 +2986,7 @@ fn a_failing_scope_of_an_item_or_a_module_keeps_its_corrected_result() {
         // causes of its errors afterwards drops them and changes nothing else.
         let accepted = accept_failing(result.clone());
         assert!(accepted.errors().is_empty(), "{}", kind);
-        assert_eq!(dump(&accepted.into_referrer(), &ids), left, "{}", kind);
+        assert_eq!(dump(&accepted, &ids), left, "{}", kind);
         assert_ne!(left, ok, "{}", kind);
         errors.push(messages(result.errors()));
     }
@@ -3148,7 +3166,7 @@ fn panicking(outer: &str, kind: &str, panic: bool, mention_self: bool) -> String
     let (top, module) = enter!(leaker, outer, &parse_quote!(<T>), false, body);
     let result = leaker.result();
     let errors = result.errors().to_vec();
-    let dumped = dump(&result.into_referrer(), &[("top", top), ("module", module)]);
+    let dumped = dump(&result, &[("top", top), ("module", module)]);
     if errors.is_empty() {
         dumped
     } else {

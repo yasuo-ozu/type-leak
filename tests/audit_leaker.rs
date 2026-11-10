@@ -7,7 +7,9 @@ mod common;
 use common::{check_in, starts_with};
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, Leaker, Options, Referrer, Rules, SelfRequirement};
+use type_leak::{
+    to_syn_error, Allow, Leaker, LeakerResult, Options, Referrer, Rules, SelfRequirement,
+};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -41,31 +43,42 @@ fn assertions_of<A: Allow>(config: A, item: &ItemTrait) -> String {
     assertions
 }
 
-/// The Referrer of the module `item`, or the text of its errors.
-fn leak_module_with<A: Allow>(config: A, item: &ItemMod) -> std::result::Result<Referrer, String> {
+/// The result of the analysis of the module `item` (it has no error), or the text of its errors.
+fn leak_module_result_with<A: Allow>(
+    config: A,
+    item: &ItemMod,
+) -> std::result::Result<LeakerResult, String> {
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_mod(item);
-    leaker
-        .result()
-        .finish()
-        .map_err(|e| to_syn_error(&e).to_string())
+    let result = leaker.result();
+    if result.errors().is_empty() {
+        Ok(result)
+    } else {
+        Err(to_syn_error(result.errors()).to_string())
+    }
+}
+
+/// The Referrer of the module `item`, or the text of its errors.
+fn leak_module_with<A: Allow>(config: A, item: &ItemMod) -> std::result::Result<Referrer, String> {
+    leak_module_result_with(config, item).map(LeakerResult::into_referrer)
 }
 
 /// The leaked types with their generics (and where clause).
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(_, ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
 
 /// The path of the module of each entry (see `Referrer::module_path()`).
-fn modules(referrer: &Referrer) -> Vec<Option<Vec<String>>> {
+fn modules(result: &LeakerResult) -> Vec<Option<Vec<String>>> {
+    let referrer = &result.clone().into_referrer();
     (0..referrer.iter().count())
         .map(|ix| {
             common::in_module(common::entry(referrer, ix)).map(|_| {
-                common::entry_module_path(referrer, ix)
+                common::entry_module_path(result, ix)
                     .unwrap()
                     .iter()
                     .map(|i| i.to_string())
@@ -354,10 +367,11 @@ fn module_key_follows_module_relative_requirements() {
             pub mod b { pub struct S(::p::W<'x, Self>); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    let result = leak_module_result_with(config(), &m).unwrap();
+    let referrer = result.clone().into_referrer();
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
-        modules(&referrer),
+        modules(&result),
         [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
     );
     // The bounds of the generics are.
@@ -367,7 +381,8 @@ fn module_key_follows_module_relative_requirements() {
             pub mod b { pub trait L {} pub struct S<T: L>(::p::W<'x, T>); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    let result = leak_module_result_with(config(), &m).unwrap();
+    let referrer = result.clone().into_referrer();
     assert_eq!(
         entries(&referrer),
         [
@@ -376,7 +391,7 @@ fn module_key_follows_module_relative_requirements() {
         ]
     );
     assert_eq!(
-        modules(&referrer),
+        modules(&result),
         [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
     );
     // A type which depends on no module is not keyed.
@@ -386,9 +401,10 @@ fn module_key_follows_module_relative_requirements() {
             pub mod b { pub struct S<T: ::p::L>(::p::W<'x, T>); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    let result = leak_module_result_with(config(), &m).unwrap();
+    let referrer = result.clone().into_referrer();
     assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(modules(&referrer), [None]);
+    assert_eq!(modules(&result), [None]);
 }
 
 #[test]
@@ -436,12 +452,13 @@ fn relative_use_is_not_portable_in_nested_modules() {
             );
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    let result = leak_module_result_with(config(), &m).unwrap();
+    let referrer = result.clone().into_referrer();
     assert_eq!(
         entries(&referrer),
         [e("inner :: Missing", ""), e("inner :: Rel", "")]
     );
-    assert_eq!(modules(&referrer), [Some(vec![]), Some(vec![])]);
+    assert_eq!(modules(&result), [Some(vec![]), Some(vec![])]);
 }
 
 #[test]
@@ -470,9 +487,9 @@ fn type_macros() {
             pub mod b { pub struct S(::p::m!(x)); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    let result = leak_module_result_with(config(), &m).unwrap();
     assert_eq!(
-        modules(&referrer),
+        modules(&result),
         [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
     );
 }

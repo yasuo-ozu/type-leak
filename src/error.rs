@@ -538,6 +538,36 @@ impl ErrorItem {
 
 /// Converts the errors into one [`syn::Error`], with the notes and the help appended to each
 /// message. Pass at least one: an empty slice gives an error "not internable" at the call site.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// // A relative trait in a bound, and a relative type with an elided lifetime.
+/// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&item, true);
+/// let errors = leaker.result().finish().unwrap_err();
+/// let messages: Vec<String> = to_syn_error(&errors)
+///     .into_iter()
+///     .map(|error| error.to_string())
+///     .collect();
+/// assert_eq!(
+///     messages,
+///     [
+///         // The notes and the help follow the message.
+///         concat!(
+///             "use absolute path: 'Clone'\n\n",
+///             "  = help: use `::core::clone::Clone` instead of `Clone`\n",
+///         ),
+///         concat!(
+///             "use absolute path: 'MyType<'_>'\n\n",
+///             "  = note: it cannot be leaked as a whole because of `'_`\n",
+///             "  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
+///         ),
+///     ]
+/// );
+/// assert_eq!(to_syn_error(&[]).to_string(), "not internable");
+/// ```
 #[must_use]
 pub fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
     items

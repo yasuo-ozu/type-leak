@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, ModuleScope, Options, Visitor};
+use type_leak::{Context, ContextId, EntryId, Leaker, LeakerResult, ModuleScope, Options, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -16,7 +16,10 @@ fn tag() -> String {
 /// Visits the items of the module copy `item` one by one with `visitor`, whose context is the
 /// module the copy is of. A visited `mod` item is a module nested in the context, so the items
 /// are what a copy of a whole module is rewritten with.
-fn visit_items<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<'_, F>, item: &mut ItemMod) {
+fn visit_items<F: FnMut(Type, EntryId, &Context) -> Type>(
+    mut visitor: Visitor<'_, F>,
+    item: &mut ItemMod,
+) {
     for item in &mut item.content.as_mut().unwrap().1 {
         visitor.visit_item_mut(item);
     }
@@ -43,7 +46,7 @@ fn intern_mod_leaks_with_local_generics() {
     assert_eq!(
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (quote!(#ty).to_string(), quote!(#generics).to_string()))
             .collect::<BTreeSet<_>>(),
         [
@@ -65,7 +68,7 @@ fn intern_mod_referrer_rewrites_a_copy() {
     let referrer = leaker.result().finish().unwrap();
     let mut item = module();
     visit_items(
-        referrer.visitor(context, |ty, ix| {
+        referrer.visitor(context, |ty, ix, _| {
             let ty = quote!(#ty).to_string();
             let name = ty.replace(' ', "");
             let _ = ix;
@@ -198,7 +201,7 @@ fn intern_mod_generics_shadow_module_items() {
     assert_eq!(
         referrer
             .iter()
-            .map(|(ty, context)| (ty, &context.generics))
+            .map(|(_, ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (quote!(#ty).to_string(), quote!(#generics).to_string()))
             .collect::<Vec<_>>(),
         [("Wrap < S >".to_string(), "< S >".to_string())]
@@ -227,7 +230,7 @@ fn intern_mod_referrer_keeps_module_items() {
     let (referrer, context) = referrer_with_prelude(&portable_module());
     let mut item = portable_module();
     visit_items(
-        referrer.visitor(context, |ty, _| {
+        referrer.visitor(context, |ty, _, _| {
             let name = quote!(#ty).to_string();
             parse_str(&format!("P_{}", name)).unwrap()
         }),
@@ -272,13 +275,14 @@ fn nested_module() -> ItemMod {
 }
 
 /// The modules of the entries, as `type@a::b`.
-fn modules_of(referrer: &type_leak::Referrer) -> Vec<String> {
+fn modules_of(result: &LeakerResult) -> Vec<String> {
+    let referrer = &result.clone().into_referrer();
     common::types(referrer)
         .enumerate()
         .map(|(ix, ty)| {
             let module = match common::in_module(common::entry(referrer, ix)) {
                 None => String::new(),
-                Some(_) => match common::entry_module_path(referrer, ix).unwrap().as_slice() {
+                Some(_) => match common::entry_module_path(result, ix).unwrap().as_slice() {
                     [] => "self".to_string(),
                     path => {
                         let path: Vec<String> = path.iter().map(|i| i.to_string()).collect();
@@ -295,14 +299,15 @@ fn modules_of(referrer: &type_leak::Referrer) -> Vec<String> {
 fn same_tokens_in_different_modules_are_different_entries() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_mod(&nested_module());
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(modules_of(&referrer), ["Rel@self", "Rel@inner"]);
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
+    assert_eq!(modules_of(&result), ["Rel@self", "Rel@inner"]);
     // The contexts are those of the two modules and of the two entries.
     assert_eq!(common::context_ids(&referrer).len(), 4);
     let module = |ix: usize| common::in_module(common::entry(&referrer, ix)).unwrap();
-    assert_eq!(common::entry_module_path(&referrer, 0), Some(vec![]));
+    assert_eq!(common::entry_module_path(&result, 0), Some(vec![]));
     assert_eq!(
-        common::entry_module_path(&referrer, 1),
+        common::entry_module_path(&result, 1),
         Some(vec![ident("inner")])
     );
     // The top-level context is the module analyzed.
@@ -316,10 +321,11 @@ fn deep_module_path() {
     };
     let mut leaker = Leaker::new();
     leaker.intern_mod(&m);
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(modules_of(&referrer), ["Wrap < T >@a::b"]);
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    assert_eq!(modules_of(&result), ["Wrap < T >@a::b"]);
     assert_eq!(
-        common::entry_module_path(&referrer, 0),
+        common::entry_module_path(&result, 0),
         Some(vec![ident("a"), ident("b")])
     );
 }
@@ -335,8 +341,9 @@ fn types_not_depending_on_the_module_are_shared() {
     // `::foo::X` is an optional entry, which does not depend on a module.
     let mut leaker = Leaker::new();
     leaker.intern_mod(&m);
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(modules_of(&referrer), [":: foo :: X@"]);
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
+    assert_eq!(modules_of(&result), [":: foo :: X@"]);
     // The context of `::foo::X`, and the module analyzed.
     assert_eq!(common::context_ids(&referrer).len(), 2);
     // A relative type next to it is still keyed by its module.
@@ -350,7 +357,9 @@ fn types_not_depending_on_the_module_are_shared() {
         modules_of(&{
             let mut leaker = Leaker::new();
             leaker.intern_mod(&m);
-            leaker.result().finish().unwrap()
+            let result = leaker.result();
+            result.clone().finish().unwrap();
+            result
         }),
         ["& 'static Rel@inner", ":: foo :: X@"]
     );
@@ -363,7 +372,7 @@ fn referrer_rewrites_each_module_to_its_own_entry() {
     let referrer = leaker.result().finish().unwrap();
     let mut item = nested_module();
     visit_items(
-        referrer.visitor(context, |_, ix| parse_str(&format!("P{}", ix)).unwrap()),
+        referrer.visitor(context, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap()),
         &mut item,
     );
     let expected: ItemMod = parse_quote! {
@@ -385,7 +394,8 @@ fn referrer_visits_a_copy_in_a_module() {
     let referrer = leaker.result().finish().unwrap();
     let inner = common::in_module(common::entry(&referrer, 1)).unwrap();
     let copy = |module: ContextId| {
-        let mut visitor = referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
+        let mut visitor =
+            referrer.visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap());
         let mut item: ItemStruct = parse_quote!(
             pub struct C {
                 y: Rel,
@@ -415,7 +425,7 @@ fn referrer_tracks_the_modules_it_enters() {
     let mut leaker = Leaker::new();
     let root = leaker.intern_mod(&m);
     let referrer = leaker.result().finish().unwrap();
-    let rewrite = |_: Type, _| -> Type { parse_quote!(P) };
+    let rewrite = |_: Type, _, _: &Context| -> Type { parse_quote!(P) };
     let unchanged: ItemMod = parse_quote!(
         mod inner {
             pub struct C {
@@ -491,9 +501,10 @@ fn serialization_with_modules() {
     };
     let mut leaker = Leaker::new();
     leaker.intern_mod(&m);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(
-        modules_of(&referrer),
+        modules_of(&result),
         ["Rel@self", "Rel@a::b", "Wrap < T >@a::b"]
     );
     let tokens = referrer.to_token_stream();
@@ -536,7 +547,7 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
     let (other, ()) = leaker.enter_mod("other", [], |_| ());
     let referrer = leaker.result().finish().unwrap();
     let copy = |module: ContextId| {
-        let mut visitor = referrer.visitor(module, |_, _| parse_quote!(P));
+        let mut visitor = referrer.visitor(module, |_, _, _| parse_quote!(P));
         let mut item: ItemStruct = parse_quote!(
             pub struct C {
                 y: Rel,
@@ -579,7 +590,7 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
             }
         }
     );
-    visit_items(referrer.visitor(root, |_, _| parse_quote!(P)), &mut item);
+    visit_items(referrer.visitor(root, |_, _, _| parse_quote!(P)), &mut item);
     let expected: ItemMod = parse_quote!(
         mod m {
             pub struct A {
@@ -603,8 +614,8 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
 // ── a module found with no module around it ──────────────────────────────────────────────────
 
 /// The path of the module the `ix`-th entry is in.
-fn path_of(referrer: &type_leak::Referrer, ix: usize) -> Vec<String> {
-    common::entry_module_path(referrer, ix)
+fn path_of(result: &LeakerResult, ix: usize) -> Vec<String> {
+    common::entry_module_path(result, ix)
         .unwrap()
         .iter()
         .map(|ident| ident.to_string())
@@ -631,10 +642,11 @@ fn a_module_found_with_no_module_around_has_its_name_as_path() {
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Mod(inner.clone()))
     });
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
-    assert_eq!(path_of(&referrer, 0), ["inner"]);
-    assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
+    assert_eq!(path_of(&result, 0), ["inner"]);
+    assert_eq!(path_of(&result, 1), ["inner", "deep"]);
     // It is a root, which has no parent (it is not the empty path of the module `intern_mod()`
     // analyzes), and the one in it has: `parent` is written for it only.
     let text = {
@@ -653,22 +665,24 @@ fn a_module_found_with_no_module_around_has_its_name_as_path() {
     let (outer, ()) = leaker.enter_mod("outer", [], |view| {
         view.visit_item(&Item::Mod(inner.clone()))
     });
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(path_of(&referrer, 0), ["inner"]);
-    assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
+    assert_eq!(path_of(&result, 0), ["inner"]);
+    assert_eq!(path_of(&result, 1), ["inner", "deep"]);
     // The module found has no hint, and the module it is in is its parent.
     let found = common::in_module(common::entry(&referrer, 0)).unwrap();
     assert_ne!(found, outer);
-    assert_eq!(common::entry_module_hint(&referrer, 0), None);
-    assert_eq!(common::entry_module_parent(&referrer, 0), Some(outer));
+    assert_eq!(common::entry_module_hint(&result, 0), None);
+    assert_eq!(common::entry_module_parent(&result, 0), Some(outer));
     // The one `intern_mod()` analyzes has the empty path, and the ones in it are relative to it.
     let outer: ItemMod = parse_quote!(mod outer { #inner });
     let mut leaker = Leaker::new();
     let top = leaker.intern_mod(&outer);
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(common::entry_module_parent(&referrer, 0), Some(top));
-    assert_eq!(path_of(&referrer, 0), ["inner"]);
-    assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
+    let result = leaker.result();
+    result.clone().finish().unwrap();
+    assert_eq!(common::entry_module_parent(&result, 0), Some(top));
+    assert_eq!(path_of(&result, 0), ["inner"]);
+    assert_eq!(path_of(&result, 1), ["inner", "deep"]);
 }
 
 #[test]
@@ -690,7 +704,7 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
-            .visitor(module, |_, _| parse_quote!(P))
+            .visitor(module, |_, _, _| parse_quote!(P))
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
     };
@@ -729,7 +743,7 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
-            .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
+            .visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap())
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
     };
@@ -799,7 +813,7 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         visit_items(
-            referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap()),
+            referrer.visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap()),
             &mut item,
         );
         quote!(#item).to_string()
@@ -822,7 +836,7 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
     let whole = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
-            .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
+            .visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap())
             .visit_item_mod_mut(&mut item);
         quote!(#item).to_string()
     };
@@ -864,7 +878,7 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it_unless_it_is_the_mod
     )
     .to_string();
     let visitor = |module: ContextId| {
-        referrer.visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
+        referrer.visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap())
     };
     // The items of `m` are in the module analyzed, and `inner` is found by its name.
     let by_items = |module: ContextId| {
@@ -937,7 +951,7 @@ fn shown(item: Item) -> String {
 /// Rewrites `item`, a copy in the scope `context`, replacing the `ix`-th entry with `P<ix>`.
 fn rewrite_in(referrer: &type_leak::Referrer, context: ContextId, mut item: Item) -> String {
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_mut(&mut item);
     quote!(#item).to_string()
 }
@@ -1111,7 +1125,7 @@ fn the_items_of_a_module_are_nested_items() {
         pub struct S<T>(Wrap<T>);
     );
     referrer
-        .visitor(module, |_, ix| parse_quote!(P<#ix>))
+        .visitor(module, |_, ix, _| parse_quote!(P<#ix>))
         .with_outermost_generics_as_leakers()
         .visit_item_mut(&mut item);
     assert_eq!(
@@ -1136,7 +1150,7 @@ fn the_items_of_a_module_are_nested_items() {
         }
     );
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
         .with_outermost_generics_as_leakers()
         .visit_item_mut(&mut item);
     assert_eq!(
@@ -1240,7 +1254,8 @@ fn a_module_context_has_its_path_hint_and_parent() {
     let mut leaker = Leaker::new();
     let root = leaker.intern_mod(&nested_module());
     let (hinted, ()) = leaker.enter_mod("h", [], |view| view.visit_type(&parse_quote!(Rel2)));
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // The entries 0, 1 and 2 are in the root, in `inner` and in the module of `enter_mod()`.
     assert_eq!(
         common::types(&referrer)
@@ -1248,7 +1263,7 @@ fn a_module_context_has_its_path_hint_and_parent() {
             .collect::<Vec<_>>(),
         ["Rel", "Rel", "Rel2"]
     );
-    let itself = |ix: usize| match common::entry_module(&referrer, ix) {
+    let itself = |ix: usize| match common::entry_module(&result, ix) {
         Some(ModuleScope::Itself {
             id,
             path,
@@ -1273,7 +1288,7 @@ fn a_module_context_has_its_path_hint_and_parent() {
     assert_eq!(entry.module, Some(ModuleScope::In(inner)));
     assert_eq!(entry.module.as_ref().map(ModuleScope::id), Some(inner));
     assert_eq!(
-        common::entry_module(&referrer, 1)
+        common::entry_module(&result, 1)
             .as_ref()
             .map(ModuleScope::id),
         Some(inner)
@@ -1283,22 +1298,35 @@ fn a_module_context_has_its_path_hint_and_parent() {
 /// A Referrer that has another path, hint or parent of a module is another Referrer.
 #[test]
 fn a_referrer_with_another_path_hint_or_parent_of_a_module_is_another_referrer() {
-    let parse = |modules: &str| -> type_leak::Referrer {
+    let parse_result = |modules: &str| -> LeakerResult {
         parse_str(&format!("\"{}\" {}", tag(), modules)).unwrap()
     };
+    let parse = |modules: &str| parse_result(modules).into_referrer();
     let text_a = "3 mod { path = [a], hint = \"x\" } ; () mod { } ; () mod 0 ; (A)";
+    let text_b = "3 mod { path = [b], hint = \"y\" } ; () mod { } ; () mod 0 ; (A)";
     let a = parse(text_a);
-    let b = parse("3 mod { path = [b], hint = \"y\" } ; () mod { } ; () mod 0 ; (A)");
+    let b = parse(text_b);
     let first = common::id(0);
-    assert_ne!(common::entry_module(&a, 0), common::entry_module(&b, 0));
+    assert_ne!(
+        common::entry_module(&parse_result(text_a), 0),
+        common::entry_module(&parse_result(text_b), 0)
+    );
     assert_eq!(common::in_module(common::entry(&a, 0)), Some(first));
     assert_ne!(a, b);
     assert_eq!(a, a.clone());
     assert_eq!(a, parse(text_a));
     // The parent: the second module is nested in the first in one, and in none in the other.
-    let nested = parse("3 mod { } ; () mod { parent = 0 } ; () mod 1 ; (B)");
-    let apart = parse("3 mod { } ; () mod { } ; () mod 1 ; (B)");
-    assert_eq!(common::entry_module_parent(&nested, 0), Some(first));
-    assert_eq!(common::entry_module_parent(&apart, 0), None);
+    let text_nested = "3 mod { } ; () mod { parent = 0 } ; () mod 1 ; (B)";
+    let text_apart = "3 mod { } ; () mod { } ; () mod 1 ; (B)";
+    let nested = parse(text_nested);
+    let apart = parse(text_apart);
+    assert_eq!(
+        common::entry_module_parent(&parse_result(text_nested), 0),
+        Some(first)
+    );
+    assert_eq!(
+        common::entry_module_parent(&parse_result(text_apart), 0),
+        None
+    );
     assert_ne!(nested, apart);
 }

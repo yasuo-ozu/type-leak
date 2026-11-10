@@ -277,7 +277,7 @@ fn generics_text(generics: &Generics, only_relaxed_sized: bool) -> String {
 fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
     let mut lines: Vec<String> = referrer
         .iter()
-        .map(|(ty, context)| {
+        .map(|(_, ty, context)| {
             let ty = absolute_text(&ty.clone(), only_relaxed_sized, |v, t| v.visit_type_mut(t));
             let generics = generics_text(&context.generics, only_relaxed_sized);
             let self_text = match context.self_ty.as_ref() {

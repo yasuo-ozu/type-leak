@@ -9,7 +9,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ErrorItem, Leaker, Reason, Referrer, SelfRequirement};
+use type_leak::{Context, EntryId, ErrorItem, Leaker, Reason, Referrer, SelfRequirement};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -691,8 +691,8 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
 // ── the Referrer ─────────────────────────────────────────────────────────────────────────────
 
 /// Rewrites each leaked type to `P<index>`.
-fn replace(_: Type, ix: usize) -> Type {
-    let ix = proc_macro2::Literal::usize_unsuffixed(ix);
+fn replace(_: Type, ix: EntryId, _: &Context) -> Type {
+    let ix = proc_macro2::Literal::usize_unsuffixed(ix.index());
     parse_quote!(P<#ix>)
 }
 

@@ -4,8 +4,9 @@ use syn::parse::{ParseStream, Parser};
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    array_const, Allow, Cause, CheckResult, Context, ContextId, ErrorItem, ImplSelf, Leaker,
-    LeakerResult, ModuleScope, Options, Place, Referrer, Rules, View,
+    array_const, encode_generics_args_with_params, Allow, Cause, CheckResult, Context, ContextId,
+    EncodeError, EntryId, ErrorItem, ImplSelf, Leaker, LeakerResult, ModuleScope, Options, Place,
+    Referrer, Rules, UseSite, View,
 };
 
 /// Converts the types of a `Referrer` to a `BTreeSet<String>` for order-independent comparison.
@@ -14,26 +15,52 @@ pub fn finish_as_strings<A: Allow>(leaker: Leaker<A>) -> BTreeSet<String> {
     let referrer = leaker.result().finish().unwrap();
     referrer
         .iter()
-        .map(|(t, _)| quote!(#t).to_string())
+        .map(|(_, t, _)| quote!(#t).to_string())
         .collect()
 }
 
 /// The types of the entries, by index (`Referrer::iter()` gives them with their contexts).
 #[allow(dead_code)]
 pub fn types(referrer: &Referrer) -> impl Iterator<Item = &Type> {
-    referrer.iter().map(|(ty, _)| ty)
+    referrer.iter().map(|(_, ty, _)| ty)
+}
+
+/// The `EntryId` of the `n`-th entry, counted from 0 (`Referrer::iter()` gives it).
+#[allow(dead_code)]
+pub fn entry_id_at(referrer: &Referrer, n: usize) -> EntryId {
+    referrer.iter().nth(n).expect("no such entry").0
 }
 
 /// The type of the `ix`-th entry (`Referrer::iter()` gives it with its context).
 #[allow(dead_code)]
 pub fn entry_ty(referrer: &Referrer, ix: usize) -> &Type {
-    referrer.iter().nth(ix).expect("no such entry").0
+    referrer.iter().nth(ix).expect("no such entry").1
 }
 
 /// The context of the `ix`-th entry (`Referrer::iter()` gives it with the type).
 #[allow(dead_code)]
 pub fn entry(referrer: &Referrer, ix: usize) -> &Context {
-    referrer.iter().nth(ix).expect("no such entry").1
+    referrer.iter().nth(ix).expect("no such entry").2
+}
+
+/// The first argument of the Repeater for an entry with `context`, as written at `site`: the
+/// arguments of `site` for the generics of the context (`UseSite::generic_args()`), encoded by
+/// `encode_generics_args_with_params()`. `self_ty` is what `Self: 'a` names (`None`: `Self`).
+#[allow(dead_code)]
+pub fn repeater_args(
+    context: &Context,
+    site: &UseSite,
+    self_ty: Option<&Type>,
+    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    let args = site.generic_args(&context.generics)?;
+    let default: Type = parse_quote!(Self);
+    encode_generics_args_with_params(
+        &args,
+        &context.generics.params,
+        Some((self_ty.unwrap_or(&default), &context.self_outlives)),
+        const_fn,
+    )
 }
 
 /// The context id with the number `n`.
@@ -186,22 +213,30 @@ pub fn in_module(context: &Context) -> Option<ContextId> {
     }
 }
 
-/// The module of the `ix`-th entry, as `Referrer::repeater_impl()` gives it in `RepeaterImpl::module`:
-/// the `ModuleScope::Itself` of the module its impl goes in, or `None` if the entry is in no module.
+/// The module of the `ix`-th entry, as `LeakerResult::repeater_impls()` gives it in
+/// `RepeaterImpl::module`: the `ModuleScope::Itself` of the module its impl goes in, or `None` if
+/// the entry is in no module.
 #[allow(dead_code)]
-pub fn entry_module(referrer: &Referrer, ix: usize) -> Option<ModuleScope> {
+pub fn entry_module(result: &LeakerResult, ix: usize) -> Option<ModuleScope> {
     let param: Ident = parse_quote!(__S);
-    referrer
-        .repeater_impl(ix, ImplSelf::Param(&param), array_const)
-        .unwrap_or_else(|error| panic!("the impl of the entry {}: {}", ix, error))
-        .module
+    let r = result
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Param(&param),
+            array_const,
+        )
+        .unwrap_or_else(|error| panic!("the impls: {}", error))
+        .nth(ix)
+        .unwrap_or_else(|| panic!("no such entry: {}", ix));
+    r.module
 }
 
 /// The path from its root of the module of the `ix`-th entry (`ModuleScope::Itself::path`); `None`
 /// if the entry is in no module, or in a module of `enter_mod()`.
 #[allow(dead_code)]
-pub fn entry_module_path(referrer: &Referrer, ix: usize) -> Option<Vec<Ident>> {
-    match entry_module(referrer, ix) {
+pub fn entry_module_path(result: &LeakerResult, ix: usize) -> Option<Vec<Ident>> {
+    match entry_module(result, ix) {
         Some(ModuleScope::Itself { path, .. }) => path,
         _ => None,
     }
@@ -210,8 +245,8 @@ pub fn entry_module_path(referrer: &Referrer, ix: usize) -> Option<Vec<Ident>> {
 /// The hint given to `Leaker::enter_mod()` for the module of the `ix`-th entry
 /// (`ModuleScope::Itself::hint`).
 #[allow(dead_code)]
-pub fn entry_module_hint(referrer: &Referrer, ix: usize) -> Option<String> {
-    match entry_module(referrer, ix) {
+pub fn entry_module_hint(result: &LeakerResult, ix: usize) -> Option<String> {
+    match entry_module(result, ix) {
         Some(ModuleScope::Itself { hint, .. }) => hint,
         _ => None,
     }
@@ -219,8 +254,8 @@ pub fn entry_module_hint(referrer: &Referrer, ix: usize) -> Option<String> {
 
 /// The module in which the module of the `ix`-th entry is nested (`ModuleScope::Itself::parent`).
 #[allow(dead_code)]
-pub fn entry_module_parent(referrer: &Referrer, ix: usize) -> Option<ContextId> {
-    match entry_module(referrer, ix) {
+pub fn entry_module_parent(result: &LeakerResult, ix: usize) -> Option<ContextId> {
+    match entry_module(result, ix) {
         Some(ModuleScope::Itself { parent, .. }) => parent,
         _ => None,
     }
