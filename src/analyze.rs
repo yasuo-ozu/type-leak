@@ -1,10 +1,11 @@
 //! The analysis of items and types by the [`Leaker`].
 
+use crate::allow::{Allow, Place};
 use crate::analysis::{
     ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
     has_ambiguous, has_error, has_optional, names_self, part_names_self, primitive_effects,
     primitive_names, scope_error, shift_seen, unshift_seen, CheckResult, Effect, Part, PendingType,
-    Place, SelfMention, SignatureFacts, SignatureMark,
+    SelfMention, SignatureFacts, SignatureMark,
 };
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
@@ -21,8 +22,8 @@ use crate::util::{
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
     is_primitive_name, or_list, self_in_param, self_in_predicate, selves_in_generics, tidy,
     token_names, trait_object_of, type_mentions_self, unwrap_type_group,
-    where_predicate_mentions_self, without_arguments, without_crate_prefix, without_defaults,
-    AllowedPaths,
+    where_predicate_mentions_self, without_crate_prefix, without_defaults, AllowedPaths, Kinded,
+    PathFinder, PathOf,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -101,8 +102,9 @@ struct Must {
     /// An entry that is leaked alone has it, so it is no conflict of the type around: see
     /// [`AnalyzeVisitor::conflict_causes()`].
     covered: bool,
-    /// The relative path it is, without its arguments, if it is one (not a lifetime, not `Self`).
-    path: Option<Path>,
+    /// The relative path it is, as the cause of its kind without its arguments, if it is one (not
+    /// a lifetime, not `Self`): an entry of [`ErrorItem::paths`].
+    path: Option<Cause>,
 }
 
 /// The causes that stop a type from being leaked whole, in order of appearance.
@@ -502,8 +504,8 @@ impl ScopeSpec {
 /// Where a scope is entered: the Leaker (outermost) or a [`View`] (nested). The public `enter_*`
 /// methods build the [`ScopeSpec`] here and differ only in `enter_spec()`.
 pub(crate) trait Scopes {
-    /// The paths rule of the Leaker's [`Allow`](crate::Allow), for the paths left as written.
-    type Rule: Fn(&Path) -> bool;
+    /// The Leaker's [`Allow`], for the paths left as written.
+    type Rule: Allow;
 
     fn enter_spec<R>(
         &mut self,
@@ -687,8 +689,8 @@ struct Checkpoint {
 }
 
 /// What a probe for nested errors puts back when it ends ([`AnalyzeVisitor::begin_probe()`]).
-struct Probe<P> {
-    allowed: AllowedPaths<P>,
+struct Probe<A> {
+    allowed: AllowedPaths<A>,
     checkpoint: Checkpoint,
     probing: bool,
     /// The mentions of `Self` and the cycles that the visitor had when the probe began.
@@ -741,8 +743,11 @@ pub(crate) struct Finished {
     pub(crate) not_optional: Vec<(Context, String)>,
 }
 
-pub(crate) struct AnalyzeVisitor<P> {
-    allowed: AllowedPaths<P>,
+pub(crate) struct AnalyzeVisitor<A> {
+    allowed: AllowedPaths<A>,
+    /// The place of the visitor that this one is a throwaway copy of ([`AnalyzeVisitor::alone()`]):
+    /// the rule is asked at the place of the original.
+    outer_place: Place,
     /// The Leaker's table while it analyzes (see [`AnalyzeVisitor::swap_contexts()`]), an empty one
     /// in a throwaway visitor.
     contexts: Contexts,
@@ -913,10 +918,11 @@ impl Inherits {
     }
 }
 
-impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
-    pub(crate) fn new(allowed: AllowedPaths<P>, generics: &Generics) -> Self {
+impl<A: Allow> AnalyzeVisitor<A> {
+    pub(crate) fn new(allowed: AllowedPaths<A>, generics: &Generics) -> Self {
         Self {
             allowed,
+            outer_place: Place::default(),
             contexts: Contexts::default(),
             self_errors: Vec::new(),
             top_levels: Vec::new(),
@@ -988,29 +994,33 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         std::mem::swap(&mut self.contexts, other);
     }
 
-    /// Returns `true` if the rule on paths panicked during this analysis, even if the panic was
+    /// Returns `true` if the rule panicked during this analysis, even if the panic was
     /// caught since: the frames of the visitor are not reliable.
     pub(crate) fn rule_panicked(&self) -> bool {
         self.allowed.rule_panicked()
     }
 
+    /// Runs `f` on a new visitor with the generics `generics`, which asks the rule at `place`.
     fn alone<R>(
-        allowed: AllowedPaths<P>,
+        allowed: AllowedPaths<A>,
         generics: &Generics,
-        f: impl FnOnce(&mut AnalyzeVisitor<P>) -> R,
+        place: Place,
+        f: impl FnOnce(&mut AnalyzeVisitor<A>) -> R,
     ) -> R {
-        f(&mut AnalyzeVisitor::new(allowed, generics))
+        let mut visitor = AnalyzeVisitor::new(allowed, generics);
+        visitor.outer_place = place;
+        f(&mut visitor)
     }
 
     /// Analyzes the default `ty` of a type parameter, with the parameters before it as the root
     /// generics. Returns the effects and the mentions of `Self` that have no meaning.
     fn analyze_default(
-        allowed: AllowedPaths<P>,
+        allowed: AllowedPaths<A>,
         ty: &Type,
         generics: &Generics,
         declares_self: bool,
     ) -> (Vec<Effect>, Vec<SelfMention>) {
-        Self::alone(allowed, generics, |visitor| {
+        Self::alone(allowed, generics, Place::default(), |visitor| {
             visitor.in_default = Some(declares_self);
             visitor.visit_type(ty);
             (
@@ -1067,7 +1077,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// The relative paths of the causes from `must_start` on, outermost first, also those that an
     /// entry covers: the type that conflicts is copied as written whole, so every path in it is
     /// written in the copy ([`CheckResult::paths`]).
-    fn paths_since(&self, must_start: usize) -> Vec<Path> {
+    fn paths_since(&self, must_start: usize) -> Vec<Cause> {
         let mut must: Vec<&Must> = self.musts[must_start..].iter().collect();
         must.sort_by_key(|must| must.depth);
         paths_of(must.into_iter())
@@ -1142,36 +1152,37 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     }
 
     /// Records a cause that depends on the context, at the depth of the type being visited. `path`
-    /// is the relative path it is, if it is one.
-    fn push_must(&mut self, must: Cause, path: Option<&Path>) {
+    /// is the relative path it is, if it is one (an entry of [`ErrorItem::paths`]).
+    fn push_must(&mut self, must: Cause, path: Option<Cause>) {
         self.musts.push(Must {
             depth: self.type_depth,
             cause: must,
             covered: false,
-            path: path.map(without_arguments),
+            path,
         });
         self.frame.min_depth = self.frame.min_depth.min(self.type_depth);
     }
 
     /// Where the visitor is, for the errors it finds ([`ErrorItem::in_value`],
-    /// [`ErrorItem::in_default`]).
+    /// [`ErrorItem::in_default`]) and for the rule.
     fn place(&self) -> Place {
         Place {
-            value: self.in_value,
-            default: self.in_trait_default
+            in_value: self.in_value || self.outer_place.in_value,
+            in_default: self.in_trait_default
                 || self.in_param_default
                 || self.in_nested_default
-                || self.in_default.is_some(),
+                || self.in_default.is_some()
+                || self.outer_place.in_default,
         }
     }
 
     /// Returns `true` if `path` is a relative path in the sense of the Leaker: it means something
     /// else wherever it is written, so it is leaked, or rejected where it cannot be.
-    fn is_relative_path(&self, path: &Path) -> bool {
+    fn is_relative_path(&self, path: &Path, of: PathOf) -> bool {
         path.leading_colon.is_none()
             && self_segment(path).is_none()
             && !self.starts_with_generic(path)
-            && !self.is_context_free(path)
+            && !self.is_context_free(path, of)
     }
 
     fn mention(&mut self, scope: usize) {
@@ -1268,7 +1279,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 && matches!(path.segments.first(), Some(seg)
                     if seg.ident != "crate" && seg.ident != "$crate" && seg.ident != "Self")
                 && !self.starts_with_generic(path)
-                && !self.is_free_path(path)
+                && !self.is_free_path(path, PathOf::Unknown)
         });
         finder.visit_generics(context.generics());
         match context.self_ty() {
@@ -1655,17 +1666,22 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// cause, or no path that is not allowed (each probe allows at least one more, which ends the
     /// nesting). The caller visits the syntax of the part again where the visitor is, then calls
     /// [`AnalyzeVisitor::end_probe()`].
-    fn begin_probe(&mut self, conflict: &CheckResult) -> Option<Probe<P>> {
+    fn begin_probe(&mut self, conflict: &CheckResult) -> Option<Probe<A>> {
+        let paths: Vec<(Path, PathOf)> = conflict
+            .paths
+            .iter()
+            .filter_map(|entry| Some((entry.entry_path()?, PathOf::of_entry(entry))))
+            .collect();
         let open = conflict.part.is_some()
             && !conflict.must.is_empty()
-            && conflict
-                .paths
+            && paths
                 .iter()
-                .any(|path| !self.is_allowed_path(path));
+                .any(|(path, of)| !self.is_allowed_path(path, *of));
         if !open {
             return None;
         }
-        let more = self.allowed.with(&conflict.paths);
+        let paths: Vec<Path> = paths.into_iter().map(|(path, _)| path).collect();
+        let more = self.allowed.with(&paths);
         let allowed = std::mem::replace(&mut self.allowed, more);
         let checkpoint = self.checkpoint();
         Some(Probe {
@@ -1680,7 +1696,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
 
     /// Ends a probe, and returns the errors it found. Nothing it recorded stays, but the types that
     /// `Self` or `Self::A` in the part keeps as written (`probe_kept`).
-    fn end_probe(&mut self, probe: Probe<P>) -> Vec<ErrorItem> {
+    fn end_probe(&mut self, probe: Probe<A>) -> Vec<ErrorItem> {
         let Probe {
             allowed,
             checkpoint,
@@ -2157,15 +2173,17 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// Returns `true` if the path of `ty`, or the trait of a bound in it (`dyn Tr<..>`), names an
     /// item of the module: `Local<MY_CONST>`, as opposed to `Other<Local, MY_CONST>`.
     fn names_module_head(&self, ty: &Type) -> bool {
-        let item = |path: &Path| {
-            !self.starts_with_generic(path) && !self.is_free_path(path) && self.is_module_path(path)
+        let item = |path: &Path, of: PathOf| {
+            !self.starts_with_generic(path)
+                && !self.is_free_path(path, of)
+                && self.is_module_path(path)
         };
         match ty {
-            Type::Path(TypePath { path, .. }) => item(path),
+            Type::Path(TypePath { path, .. }) => item(path, PathOf::Type),
             Type::TraitObject(TypeTraitObject { bounds, .. })
-            | Type::ImplTrait(TypeImplTrait { bounds, .. }) => bounds
-                .iter()
-                .any(|bound| matches!(bound, TypeParamBound::Trait(bound) if item(&bound.path))),
+            | Type::ImplTrait(TypeImplTrait { bounds, .. }) => bounds.iter().any(|bound| {
+                matches!(bound, TypeParamBound::Trait(bound) if item(&bound.path, PathOf::Trait))
+            }),
             _ => false,
         }
     }
@@ -2191,7 +2209,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 !names.iter().any(|name| name == "array" || name == "simd")
             }
             (false, Some("Box" | "Vec" | "Option" | "Result")) => {
-                names.len() == 1 && self.is_free_path(path)
+                names.len() == 1 && self.is_free_path(path, PathOf::Type)
             }
             _ => false,
         }
@@ -2715,8 +2733,9 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
 
     /// Returns the part for a node copied as written, whole, though types are in it: a bound whose
     /// trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), or a path of a value. `path` stands for it
-    /// as a type, to compute the context, which is `None` if it cannot be written.
-    fn node_part(&self, cause: Cause, path: &Path) -> Part {
+    /// as a type, to compute the context, which is `None` if it cannot be written. `of`: what
+    /// `path` is the path of.
+    fn node_part(&self, cause: Cause, path: &Path, of: PathOf) -> Part {
         let ty = Type::Path(TypePath {
             qself: None,
             path: path.clone(),
@@ -2733,18 +2752,18 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             Some(module) => context.with_module(Some(module.id)),
             None => context,
         });
-        let mut names = PrimitiveNames {
+        let mut names = Kinded(PrimitiveNames {
             visitor: self,
             found: Vec::new(),
-        };
-        names.visit_path(path);
+        });
+        names.path_of(path, of);
         Part {
             cause,
             context,
             in_predicate: self.env_depth > 0,
             within: None,
             mark: None,
-            primitives: names.found,
+            primitives: names.0.found,
         }
     }
 
@@ -2980,13 +2999,18 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
 
     /// Runs `visit` on a probe visitor that has the generics and the `Self` of `context`, and
     /// checks nothing itself.
-    fn probe<R>(&self, context: &Context, visit: impl FnOnce(&mut AnalyzeVisitor<P>) -> R) -> R {
-        Self::alone(self.allowed.clone(), context.generics(), |probe| {
-            probe.check_env = false;
-            probe.modules = self.modules.clone();
-            probe.self_ty = context.self_ty().cloned();
-            visit(probe)
-        })
+    fn probe<R>(&self, context: &Context, visit: impl FnOnce(&mut AnalyzeVisitor<A>) -> R) -> R {
+        Self::alone(
+            self.allowed.clone(),
+            context.generics(),
+            Place::default(),
+            |probe| {
+                probe.check_env = false;
+                probe.modules = self.modules.clone();
+                probe.self_ty = context.self_ty().cloned();
+                visit(probe)
+            },
+        )
     }
 
     /// Returns `true` if the self type of `context`, which is the self type of an impl, names a
@@ -3064,7 +3088,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         if !bounded {
             return None;
         }
-        let names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor<P>)| {
+        let names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor<A>)| {
             self.probe(context, |probe| {
                 visit(probe);
                 !probe.musts.is_empty() || (optional && has_optional(&probe.frame.effects))
@@ -3247,7 +3271,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         cause: Cause,
         impossible: Cause,
         part: Option<Part>,
-        paths: Vec<Path>,
+        paths: Vec<Cause>,
     ) {
         self.push_error(CheckResult {
             must: vec![cause],
@@ -3270,13 +3294,16 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// The relative paths in the syntax that `visit` walks, without their arguments, each once, in
     /// order: those that mean something else wherever they are written ([`AnalyzeVisitor::is_relative_path()`]).
     /// A cause that is copied as written holds them all, also those in the arguments of its path.
-    fn relative_paths_in(&self, visit: impl FnOnce(&mut RelativePaths<'_, P>)) -> Vec<Path> {
-        let mut finder = RelativePaths {
+    fn relative_paths_in(
+        &self,
+        visit: impl FnOnce(&mut Kinded<RelativePaths<'_, A>>),
+    ) -> Vec<Cause> {
+        let mut finder = Kinded(RelativePaths {
             visitor: self,
             found: Vec::new(),
-        };
+        });
         visit(&mut finder);
-        finder.found
+        finder.0.found
     }
 
     /// Records the conflict as an effect, with the number of mentions of `Self` without meaning
@@ -3299,7 +3326,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         let outer_trait = std::mem::replace(&mut self.self_trait, trait_);
         self.visit_generics(&i.generics);
         if let Some((_, path, _)) = &i.trait_ {
-            self.visit_path(path);
+            self.visit_path_of(path, PathOf::Trait);
         }
         let start = self.frame.effects.len();
         self.visit_type(&i.self_ty);
@@ -3327,7 +3354,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// is an entry anyway) would be a cycle, so the graph does not choose it: its parts are the
     /// entries, whose bounds the check looks at. A type that must be an entry is an error.
     fn block_unstable_self_types(&mut self, start: usize, end: usize) {
-        fn block<P: Fn(&Path) -> bool>(visitor: &AnalyzeVisitor<P>, effects: &mut [Effect]) {
+        fn block<A: Allow>(visitor: &AnalyzeVisitor<A>, effects: &mut [Effect]) {
             for effect in effects {
                 let pending = match effect {
                     Effect::Type(pending) => pending,
@@ -3395,7 +3422,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     fn check_bound_path(&mut self, path: &Path, cause: Cause, whole: bool) -> bool {
         if self_segment(path).is_some() && self.self_ty.is_none() {
             // The mention of `Self` is the error; the bound is copied as written, whole.
-            let part = whole.then(|| self.node_part(cause.clone(), path));
+            let part = whole.then(|| self.node_part(cause.clone(), path, PathOf::Trait));
             if let Some(part) = part {
                 let mut corrected = CheckResult::corrected();
                 corrected.part = Some(part);
@@ -3406,14 +3433,14 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 place: self.place(),
             });
             true
-        } else if !self.is_context_free(path) {
-            let part = whole.then(|| self.node_part(cause.clone(), path));
+        } else if !self.is_context_free(path, PathOf::Trait) {
+            let part = whole.then(|| self.node_part(cause.clone(), path, PathOf::Trait));
             // A bound that is copied as written holds the paths in its arguments too; the
             // arguments of the trait of an impl are analyzed on their own.
             let paths = if whole {
-                self.relative_paths_in(|finder| finder.visit_path(path))
+                self.relative_paths_in(|finder| finder.path_of(path, PathOf::Trait))
             } else {
-                self.relative_paths_in(|finder| finder.visit_head(path))
+                self.relative_paths_in(|finder| finder.0.path(path, PathOf::Trait))
             };
             self.relative_path(cause.clone(), cause, part, paths);
             true
@@ -3426,15 +3453,15 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     fn impl_trait(&self, path: &Path) -> ImplTrait {
         ImplTrait {
             path: path.clone(),
-            absolute: self.is_context_free(path),
+            absolute: self.is_context_free(path, PathOf::Trait),
         }
     }
 
-    fn is_context_free(&self, path: &Path) -> bool {
-        self.is_free_path(path) || self.is_module_path(path)
+    fn is_context_free(&self, path: &Path, of: PathOf) -> bool {
+        self.is_free_path(path, of) || self.is_module_path(path)
     }
 
-    /// Returns `true` if `path` starts with `Self` or a generic in scope: the rule on paths is
+    /// Returns `true` if `path` starts with `Self` or a generic in scope: the rule is
     /// never asked about it.
     fn heads_own_name(&self, path: &Path) -> bool {
         path.leading_colon.is_none()
@@ -3442,22 +3469,28 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 if seg.ident == "Self" || self.is_generic(&seg.ident))
     }
 
-    /// [`AllowedPaths::is_context_free_path()`] for `path`.
-    fn is_free_path(&self, path: &Path) -> bool {
+    /// [`AllowedPaths::is_context_free_path()`] for `path`, the path of `of`, at the place of the
+    /// visitor.
+    fn is_free_path(&self, path: &Path, of: PathOf) -> bool {
         self.allowed
-            .is_context_free_path(path, !self.heads_own_name(path))
+            .is_context_free_path(path, of, self.place(), !self.heads_own_name(path))
     }
 
-    /// [`AllowedPaths::is_allowed_path()`] for `path`.
-    fn is_allowed_path(&self, path: &Path) -> bool {
+    /// [`AllowedPaths::is_allowed_path()`] for `path`, the path of `of`.
+    fn is_allowed_path(&self, path: &Path, of: PathOf) -> bool {
         self.allowed
-            .is_allowed_path(path, !self.heads_own_name(path))
+            .is_allowed_path(path, of, self.place(), !self.heads_own_name(path))
     }
 
-    fn is_relative(&self, path: &Path) -> bool {
+    /// [`AllowedPaths::is_soft_path()`] for `path`, the path of `of`.
+    fn is_soft_path(&self, path: &Path, of: PathOf) -> bool {
+        self.allowed.is_soft_path(path, of, self.place())
+    }
+
+    fn is_relative(&self, path: &Path, of: PathOf) -> bool {
         path.leading_colon.is_none()
             && !matches!(path.segments.first(), Some(seg) if seg.ident == "crate")
-            && !self.is_context_free(path)
+            && !self.is_context_free(path, of)
     }
 
     /// Returns `true` if `path` names an item of the analyzed module, as Rust resolves it.
@@ -3992,7 +4025,10 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     /// undeclared name) it is `false`.
     fn is_not_a_cause(&self, object: &TypeTraitObject, in_scope: &Generics) -> bool {
         let ty = Type::TraitObject(object.clone());
-        let result = Self::alone(self.allowed.clone(), in_scope, |visitor| visitor.found(&ty));
+        let place = self.place();
+        let result = Self::alone(self.allowed.clone(), in_scope, place, |visitor| {
+            visitor.found(&ty)
+        });
         // The Referrer may replace an external trait object, with the reference holding it.
         !result.is_own && !result.optional && result.impossible.is_empty()
     }
@@ -4176,7 +4212,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
             Type::Array(array) => self.names_external_crate_in_expr(&array.len),
             Type::Path(TypePath { qself: None, path }) => {
                 !self.is_projection(path)
-                    && (self.allowed.is_soft_path(path) || self.holds_external_object(path))
+                    && (self.is_soft_path(path, PathOf::Type) || self.holds_external_object(path))
             }
             Type::TraitObject(object) => self.names_external_crate(object),
             _ => false,
@@ -4235,14 +4271,14 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     }
 
     fn names_external_crate_in_expr(&self, expr: &Expr) -> bool {
-        let mut finder = AnyPath::new(false, |path| self.allowed.is_soft_path(path));
+        let mut finder = AnyPath::new(false, |path| self.is_soft_path(path, PathOf::Unknown));
         finder.visit_expr(expr);
         finder.found
     }
 
     fn names_external_crate(&self, object: &TypeTraitObject) -> bool {
         object.bounds.iter().any(|bound| {
-            matches!(bound, TypeParamBound::Trait(bound) if self.allowed.is_soft_path(&bound.path))
+            matches!(bound, TypeParamBound::Trait(bound) if self.is_soft_path(&bound.path, PathOf::Trait))
         })
     }
 
@@ -4366,7 +4402,7 @@ fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)
 
 /// What a [`View`] asks of the analysis it wraps. The view forwards the `visit_*` methods the
 /// analysis overrides to it.
-impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
+impl<A: Allow> AnalyzeVisitor<A> {
     /// Checks `ty` where the visitor is, as [`View::check()`] does: what the visit of `ty` finds,
     /// and nothing stays recorded.
     ///
@@ -4401,7 +4437,7 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     pub(crate) fn enter<R>(
         &mut self,
         spec: ScopeSpec,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         let mark = self.enter_scope(&spec, false);
         // The closure may panic and the scope around may catch it: leave the scope as if it failed.
@@ -4416,38 +4452,13 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
     }
 }
 
-/// What a path that the visitor reaches is the path of.
-#[derive(Clone, Copy)]
-enum PathOf {
-    Type,
-    Trait,
-    Value,
-    /// The path of a macro call.
-    Macro,
-    /// The path of a qualified type (`Tr<u8>::X` in `<Self as Tr<u8>>::X`), which no node holds.
-    Qualified,
-}
-
-impl PathOf {
-    /// The syntax that a mention of `Self` in `path` is.
-    fn cause(self, path: &Path) -> Cause {
-        match self {
-            PathOf::Type => Cause::type_path(path),
-            PathOf::Trait => Cause::Trait(path.clone()),
-            PathOf::Value => Cause::expr_path(path),
-            PathOf::Macro => Cause::Macro(path.clone()),
-            PathOf::Qualified => Cause::Unreadable(quote!(#path)),
-        }
-    }
-}
-
-impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
+impl<A: Allow> AnalyzeVisitor<A> {
     /// Visits the path `i`. `of` says what it is the path of: a mention of `Self` that has no
     /// meaning is an error about that syntax.
     fn visit_path_of(&mut self, i: &Path, of: PathOf) {
         let in_type = self.type_depth > 0;
         let starts_with_generic = self.starts_with_generic(i);
-        let free = self.is_free_path(i);
+        let free = self.is_free_path(i, of);
         let in_module = !starts_with_generic && !free && self.is_module_path(i);
         if in_type {
             if starts_with_generic {
@@ -4477,14 +4488,14 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
                 self.frame.effects.push(Effect::Primitive(ident.clone()));
             }
             // An external crate path is resolved by name, which the Referrer may not share.
-            if in_type && self.allowed.is_soft_path(i) {
+            if in_type && self.is_soft_path(i, of) {
                 self.frame.soft_depth = self.frame.soft_depth.min(self.type_depth);
             }
         } else if in_type && !starts_with_generic && !in_module {
             let is_self = matches!(self_segment(i), Some(seg) if seg.arguments.is_none());
             if !is_self {
-                self.push_must(of.cause(i), Some(i));
-                self.frame.relative |= self.is_relative(i);
+                self.push_must(of.cause(i), Some(of.entry(i)));
+                self.frame.relative |= self.is_relative(i, of);
             } else if !self.allow_self {
                 self.impossibles.push(of.cause(i));
             }
@@ -4501,11 +4512,11 @@ impl<P: Fn(&Path) -> bool> AnalyzeVisitor<P> {
         if let Some(qself) = &i.qself {
             self.visit_qself(qself);
         }
-        self.visit_path_of(&i.path, PathOf::Value);
+        self.visit_path_of(&i.path, expr_path_of(i));
     }
 }
 
-impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
+impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
     fn visit_type_param(&mut self, i: &TypeParam) {
         if i.default.is_some() && self.is_alone_default(&i.ident) {
             let mut i = i.clone();
@@ -4736,10 +4747,13 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
         match i {
             Type::Macro(m) => {
                 // A type macro cannot be analyzed: it is leaked whole.
-                let path = Some(&m.mac.path).filter(|path| self.is_relative_path(path));
+                let path = Some(&m.mac.path)
+                    .filter(|path| self.is_relative_path(path, PathOf::Macro))
+                    .map(|path| PathOf::Macro.entry(path));
                 self.push_must(Cause::Type(i.clone()), path);
                 // It is expanded in the module where it is written, whatever its path is.
-                self.frame.relative |= !self.modules.is_empty() || self.is_relative(&m.mac.path);
+                self.frame.relative |=
+                    !self.modules.is_empty() || self.is_relative(&m.mac.path, PathOf::Macro);
                 // The generics (and `Self`) are matched by name.
                 let mut names = HashSet::new();
                 token_names(quote!(#i), &mut names);
@@ -4988,7 +5002,8 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
                     self.frame.effects.push(Effect::Primitive(ident.clone()));
                 }
             }
-            Type::Path(TypePath { qself: None, path }) if self.is_context_free(path) => {}
+            Type::Path(TypePath { qself: None, path })
+                if self.is_context_free(path, PathOf::Type) => {}
             _ => {
                 // The Visitor does not rewrite the type of a const parameter: no part.
                 let paths = self.relative_paths_in(|finder| finder.visit_type(&i.ty));
@@ -5021,7 +5036,7 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
     }
 
     fn visit_path(&mut self, i: &Path) {
-        self.visit_path_of(i, PathOf::Type)
+        self.visit_path_of(i, PathOf::Unknown)
     }
 
     fn visit_macro(&mut self, i: &Macro) {
@@ -5052,9 +5067,14 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
                 // As `syn::visit::visit_type_path()`, with the path told to be that of a qualified
                 // type.
                 self.visit_qself(qself);
-                self.visit_path_of(&i.path, PathOf::Qualified);
+                let position = if qself.as_token.is_some() {
+                    qself.position
+                } else {
+                    0
+                };
+                self.visit_path_of(&i.path, PathOf::Qualified(position));
             }
-            None => syn::visit::visit_type_path(self, i),
+            None => self.visit_path_of(&i.path, PathOf::Type),
         }
     }
 
@@ -5159,19 +5179,32 @@ impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for AnalyzeVisitor<P> {
         }
         if (i.qself.is_none() && self.starts_with_generic(&i.path))
             || (is_self && self.allow_self)
-            || self.is_context_free(&i.path)
+            || self.is_context_free(&i.path, expr_path_of(i))
         {
             self.walk_expr_path(i)
         } else {
             // A path with a qualified self type is not told from the paths of the Visitor's.
             let part = match i.qself {
-                None => Some(self.node_part(Cause::expr_path(&i.path), &i.path)),
+                None => Some(self.node_part(Cause::expr_path(&i.path), &i.path, PathOf::Value)),
                 Some(_) => None,
             };
-            let paths = self.relative_paths_in(|finder| finder.visit_path(&i.path));
+            let paths = self.relative_paths_in(|finder| finder.path_of(&i.path, expr_path_of(i)));
             self.relative_path(Cause::path_expr(i), Cause::path_expr(i), part, paths);
             self.nest_last(|visitor| visitor.visit_expr_path(i));
         }
+    }
+}
+
+/// What the path of the expression `i` is the path of: a value, or the trait of a qualified path
+/// (`<u8 as Tr>::f`).
+fn expr_path_of(i: &ExprPath) -> PathOf {
+    match &i.qself {
+        None => PathOf::Value,
+        Some(qself) => PathOf::Qualified(if qself.as_token.is_some() {
+            qself.position
+        } else {
+            0
+        }),
     }
 }
 
@@ -5186,58 +5219,50 @@ fn primitive_head(path: &Path) -> Option<&Ident> {
 /// Collects the primitive names in the syntax it visits that the copy writes as they are, each
 /// once: those that `AnalyzeVisitor::visit_path_of()` records in a type, for the syntax that is a
 /// part copied as written without the visit of its types (a bound, the path of a value).
-struct PrimitiveNames<'a, P> {
-    visitor: &'a AnalyzeVisitor<P>,
+struct PrimitiveNames<'a, A> {
+    visitor: &'a AnalyzeVisitor<A>,
     found: Vec<Ident>,
 }
 
-impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for PrimitiveNames<'_, P> {
-    fn visit_path(&mut self, i: &'ast Path) {
-        if self.visitor.is_free_path(i) && !self.visitor.starts_with_generic(i) {
-            if let Some(ident) = primitive_head(i) {
+impl<A: Allow> PathFinder for PrimitiveNames<'_, A> {
+    fn path(&mut self, path: &Path, of: PathOf) {
+        if self.visitor.is_free_path(path, of) && !self.visitor.starts_with_generic(path) {
+            if let Some(ident) = primitive_head(path) {
                 if !self.found.contains(ident) {
                     self.found.push(ident.clone());
                 }
             }
         }
-        syn::visit::visit_path(self, i)
     }
 }
 
 /// Collects the relative paths in the syntax it visits ([`AnalyzeVisitor::relative_paths_in()`]).
-struct RelativePaths<'a, P> {
-    visitor: &'a AnalyzeVisitor<P>,
-    found: Vec<Path>,
+struct RelativePaths<'a, A> {
+    visitor: &'a AnalyzeVisitor<A>,
+    found: Vec<Cause>,
 }
 
-impl<P: Fn(&Path) -> bool> RelativePaths<'_, P> {
+impl<A: Allow> PathFinder for RelativePaths<'_, A> {
     /// Records `path` alone, if it is relative.
-    fn visit_head(&mut self, path: &Path) {
-        if self.visitor.is_relative_path(path) {
-            let path = without_arguments(path);
-            if !self.found.contains(&path) {
-                self.found.push(path);
+    fn path(&mut self, path: &Path, of: PathOf) {
+        if self.visitor.is_relative_path(path, of) {
+            let entry = of.entry(path);
+            if !self.found.contains(&entry) {
+                self.found.push(entry);
             }
         }
     }
 }
 
-impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for RelativePaths<'_, P> {
-    fn visit_path(&mut self, i: &'ast Path) {
-        self.visit_head(i);
-        syn::visit::visit_path(self, i)
-    }
-}
-
 /// The distinct paths of the types among `types` that are paths (bare identifiers), without
 /// arguments.
-fn paths_of_types(types: &[Type]) -> Vec<Path> {
-    let mut paths: Vec<Path> = Vec::new();
+fn paths_of_types(types: &[Type]) -> Vec<Cause> {
+    let mut paths: Vec<Cause> = Vec::new();
     for ty in types {
         if let Type::Path(TypePath { qself: None, path }) = unwrap_type_group(ty) {
-            let path = without_arguments(path);
-            if !paths.contains(&path) {
-                paths.push(path);
+            let entry = PathOf::Type.entry(path);
+            if !paths.contains(&entry) {
+                paths.push(entry);
             }
         }
     }
@@ -5245,8 +5270,8 @@ fn paths_of_types(types: &[Type]) -> Vec<Path> {
 }
 
 /// The distinct relative paths of `musts`, in order.
-fn paths_of<'a>(musts: impl Iterator<Item = &'a Must>) -> Vec<Path> {
-    let mut paths: Vec<Path> = Vec::new();
+fn paths_of<'a>(musts: impl Iterator<Item = &'a Must>) -> Vec<Cause> {
+    let mut paths: Vec<Cause> = Vec::new();
     for path in musts.filter_map(|must| must.path.as_ref()) {
         if !paths.contains(path) {
             paths.push(path.clone());
@@ -5367,7 +5392,7 @@ impl AssocSelf {
 
     /// The conflict of the type `ty` leaked whole, with the generics that name it. `paths`: the
     /// relative paths of `ty`.
-    fn of(self, ty: &Type, paths: Vec<Path>) -> CheckResult {
+    fn of(self, ty: &Type, paths: Vec<Cause>) -> CheckResult {
         let mut conflict = CheckResult {
             must: vec![Cause::Type(ty.clone())],
             impossible: vec![self.cause.clone()],
@@ -5393,7 +5418,7 @@ impl AssocSelf {
     fn give(self, conflict: &mut CheckResult, ty: &Type, in_bounds: bool) {
         // The paths as a user writes them: without the spaces of a token stream.
         let cause = tidy(&self.cause.shown());
-        let path = self.cause.as_path().cloned();
+        let path = self.cause.path().cloned();
         let item = path
             .as_ref()
             .and_then(|path| path.segments.iter().nth(1))

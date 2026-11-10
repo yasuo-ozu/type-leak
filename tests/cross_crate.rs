@@ -2201,7 +2201,7 @@ fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
 }
 
 /// F50, fixture 9205 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method.
-/// `allow_std_crates()` given to the result after the analysis leaves the error, whose path is
+/// `Rules::std_crates()` given to the result after the analysis leaves the error, whose path is
 /// `Rel` now: the copy is made in a module that names it (`stage_copies`), and in no crate that does
 /// not (`clean`, where the macro makes the copy only if the rule left no error: it would write
 /// `Rel` as written, E0412). The config that allows the crates leaks `Rel` and has no error.
@@ -2276,7 +2276,7 @@ fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
 
 /// Issue 3 of `tests/downstream_findings.rs`, fixture 9208: `None`, `Some`, `Ok` and `Err` in the
 /// values of a trait and `DoubleEndedIterator + ExactSizeIterator` in a bound are names of the
-/// prelude of every edition, so `allow_prelude()` accepts them (it rejected the trait before: the
+/// prelude of every edition, so `Rules::prelude()` accepts them (it rejected the trait before: the
 /// Referrer's crate had no `PreludeNamesCopy`, which also fails to build the test). The copy writes
 /// them as they are, replaces the relative type of the values, and computes what the original does.
 #[test]

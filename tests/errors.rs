@@ -40,8 +40,8 @@ fn notes_of(item: &ErrorItem) -> Vec<(String, String)> {
         .collect()
 }
 
-fn leaker_config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_crate()
+fn leaker_config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().crate_paths()
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
@@ -240,7 +240,7 @@ fn error(message: &str, help: Option<&str>) -> Option<(String, Option<String>)> 
 
 #[test]
 fn help_suggests_absolute_prelude_path() {
-    // A prelude trait in a bound, without `allow_prelude()`.
+    // A prelude trait in a bound, without `Rules::prelude()`.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
             fn f<T: Iterator<Item = u8>>(&self, t: T);
@@ -299,7 +299,7 @@ fn help_suggests_absolute_prelude_path() {
 
 #[test]
 fn help_suggests_absolute_primitive_path() {
-    // A primitive in a const expression of a bound, without `allow_primitive()`.
+    // A primitive in a const expression of a bound, without `Rules::primitive()`.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: ::my_crate::Sup<{ usize::MAX }> {}
     })

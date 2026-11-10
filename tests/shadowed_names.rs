@@ -31,8 +31,8 @@ fn text<T: ToTokens>(t: &T) -> String {
     quote!(#t).to_string()
 }
 
-fn config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 /// The Referrer as the macro of the Referrer's crate reads it.
@@ -101,7 +101,7 @@ fn replace(
     found.into_inner()
 }
 
-fn analyze_item<P: Fn(&Path) -> bool>(leaker: &mut Leaker<P>, item: &Item) -> ContextId {
+fn analyze_item<A: Allow>(leaker: &mut Leaker<A>, item: &Item) -> ContextId {
     match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
         Item::Trait(i) => leaker.intern_trait(i, true),

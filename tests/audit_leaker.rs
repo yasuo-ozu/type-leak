@@ -7,21 +7,18 @@ mod common;
 use common::{check_in, starts_with};
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options, Referrer, SelfRequirement};
+use type_leak::{to_syn_error, Allow, Leaker, Options, Referrer, Rules, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
-fn config() -> Allow {
-    Allow::new()
+fn config() -> Rules {
+    Rules::new()
 }
 
 /// The Referrer of `item`, or the text of its errors.
-fn leak_trait_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-    item: &ItemTrait,
-) -> std::result::Result<Referrer, String> {
+fn leak_trait_with<A: Allow>(config: A, item: &ItemTrait) -> std::result::Result<Referrer, String> {
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(item, true);
     leaker
@@ -36,10 +33,7 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 
 /// The compile-time checks that the analysis of `item` asks for (`Leaker::assertions()`); it has
 /// no error.
-fn assertions_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-    item: &ItemTrait,
-) -> String {
+fn assertions_of<A: Allow>(config: A, item: &ItemTrait) -> String {
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(item, true);
     let assertions = leaker.assertions().to_string();
@@ -48,10 +42,7 @@ fn assertions_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
 }
 
 /// The Referrer of the module `item`, or the text of its errors.
-fn leak_module_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-    item: &ItemMod,
-) -> std::result::Result<Referrer, String> {
+fn leak_module_with<A: Allow>(config: A, item: &ItemMod) -> std::result::Result<Referrer, String> {
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_mod(item);
     leaker
@@ -309,7 +300,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
         assert!(err.contains("E0195"), "{}: {}", s(&y), err);
     }
     // Unless it is allowed, as `::core` is.
-    let allowed = config().allow_path_if(starts_with(parse_quote!(::p)));
+    let allowed = config().or_if(starts_with(parse_quote!(::p)));
     let referrer = leak_trait_with(
         allowed,
         &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::p::Tr) -> &'a (); } },
@@ -497,7 +488,7 @@ fn type_macros() {
 
 #[test]
 fn primitives_are_assumed_when_the_type_is_copied() {
-    let config = || config().allow_primitive();
+    let config = || config().primitive();
     let assertions = assertions_of(config(), &parse_quote! { trait Tr { fn f(&self) -> &u8; } });
     assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
     let assertions = assertions_of(

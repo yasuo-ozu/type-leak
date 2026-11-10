@@ -188,18 +188,49 @@ pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots)
     ))
 }
 
-/// The rule that accepts the paths that start with one of `prefixes` (`path_starts_with()`).
-pub(crate) fn starts_with(prefixes: Vec<Path>) -> impl Fn(&Path) -> bool {
-    move |path: &Path| prefixes.iter().any(|prefix| path_starts_with(path, prefix))
+/// The rule that allows the paths that start with one of `prefixes` (`Cause::starts_with()`): a
+/// cause that is a path without generic arguments, as the analysis asks about one.
+pub(crate) fn starts_with(prefixes: Vec<Path>) -> impl Fn(&Cause, Place) -> bool {
+    move |cause: &Cause, _: Place| {
+        cause.path().map_or(false, |path| {
+            path.segments.iter().all(|seg| seg.arguments.is_none())
+        }) && prefixes.iter().any(|prefix| cause.starts_with(prefix))
+    }
 }
 
-/// Allows the cause of every error that remains, until none does: an error that is dropped puts its
-/// nested errors in its place (`ErrorItem::nested`), which have causes of their own.
+/// The causes that a rule must allow to accept `error`: each of its paths (one of unknown kind, as
+/// a type and as a trait), or its cause if it has no path.
+fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
+    if error.paths.is_empty() {
+        return vec![error.cause.clone()];
+    }
+    let mut found = Vec::new();
+    for entry in &error.paths {
+        match entry {
+            Cause::Unreadable(tokens) => match parse2::<Path>(tokens.clone()) {
+                Ok(path) => {
+                    found.push(Cause::Type(Type::Path(TypePath {
+                        qself: None,
+                        path: path.clone(),
+                    })));
+                    found.push(Cause::Trait(path));
+                }
+                Err(_) => found.push(entry.clone()),
+            },
+            other => found.push(other.clone()),
+        }
+    }
+    found
+}
+
+/// Allows every error that remains, until none does: each by its paths, or by its cause if it has
+/// none. An error that is dropped puts its nested errors in its place (`ErrorItem::nested`), which
+/// are other errors.
 pub(crate) fn allow_every_cause(mut result: LeakerResult) -> LeakerResult {
     while !result.errors().is_empty() {
-        let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
-        for cause in causes {
-            result = result.allow(|e| e.cause == cause);
+        let each: Vec<Vec<Cause>> = result.errors().iter().map(causes_to_allow).collect();
+        for allowed in each {
+            result = result.allow(move |c: &Cause, _: Place| allowed.contains(c));
         }
     }
     result
@@ -469,7 +500,7 @@ fn entry_string(ty: &Type, must: bool) -> String {
 /// ```ignore
 /// check_leak! {
 ///     { Rel, ? ::foo::X, Other<u8> }         // the leaked types, sorted, or `error: "message"`
-///     { allow = ::bar }                      // the config (`allow_primitive` is always set)
+///     { allow = ::bar }                      // the config (`Rules::primitive` is always set)
 ///     trait Tr { fn f(&self) -> $crate::m::Wrap<Rel>; } // a trait, a struct or a module
 /// }
 /// ```
@@ -484,9 +515,9 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         item,
     } = parse_macro_input!(input as CheckLeakInput);
     let mut leaker = Leaker::from_config(
-        Allow::new()
-            .allow_primitive()
-            .allow_path_if(starts_with(allowed)),
+        Rules::new()
+            .primitive()
+            .or_if(starts_with(allowed)),
         Options::new(),
     );
     match &item {
@@ -537,10 +568,10 @@ pub fn leak(
 
 fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let mut leaker = Leaker::from_config(
-        Allow::new()
-            .allow_primitive()
-            .allow_prelude()
-            .allow_path_if(starts_with(args.allow.clone().into_iter().collect())),
+        Rules::new()
+            .primitive()
+            .prelude()
+            .or_if(starts_with(args.allow.clone().into_iter().collect())),
         Options::new(),
     );
     let context = leaker.intern_trait(&item_trait, true);

@@ -182,7 +182,7 @@ fn allow_a_cause_copies_that_part_as_written() {
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
 
     // `f` is copied as written either way, and only `g` leaks `dyn RelTr`.
-    result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
+    result = result.allow(|c: &Cause, _: Place| *c == Cause::Trait(parse_quote!(RelTr)));
     assert_eq!(result.finish().unwrap().required().count(), 1);
 }
 
@@ -217,7 +217,7 @@ fn leaker_result_with_its_errors_is_read_back_from_tokens() {
 
     let result: LeakerResult = parse2(tokens).unwrap();
     assert_eq!(result.errors().len(), 1);
-    assert!(result.allow_std_crates().errors().is_empty());
+    assert!(result.allow(Rules::new().std_crates()).errors().is_empty());
 }
 
 /// `check_values` reads a value: it leaks the types in it and rejects a path that is not one.
@@ -228,13 +228,13 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
         trait Tr { const N: usize = ::core::mem::size_of::<inner::Local>(); }
     };
     // Without the option the value is not read: the copy breaks without an error.
-    let config = Allow::new().allow_primitive();
+    let config = Rules::new().primitive();
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     assert!(leaker.result().finish().unwrap().is_empty());
 
     // With it the type is an entry, which the visitor replaces in the copy of the value.
-    let config = || Allow::new().allow_primitive();
+    let config = || Rules::new().primitive();
     let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     let context = leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
@@ -269,15 +269,15 @@ fn nested_self_entries_accepts_self_in_a_nested_type_with_a_self_bound() {
     let item: Item = parse_quote! {
         pub struct S<T: ::core::convert::AsRef<Self>> { pub b: Rel2<Self, T> }
     };
-    let nested = |leaker: &mut Leaker| {
+    let nested = |leaker: &mut Leaker<Rules>| {
         leaker.enter_mod("m", [parse_quote!(S)], |view| view.visit_item(&item));
     };
     // Without the option it is an error: the bound and the type name `Self`.
-    let mut leaker = Leaker::new();
+    let mut leaker = Leaker::from_config(Rules::new(), Options::new());
     nested(&mut leaker);
     assert_eq!(leaker.result().errors().len(), 1);
 
-    let mut leaker = Leaker::from_config(Allow::new(), Options::new().nested_self_entries());
+    let mut leaker = Leaker::from_config(Rules::new(), Options::new().nested_self_entries());
     nested(&mut leaker);
     let referrer = leaker.result().finish().unwrap();
     // The entry is for any type that the bound holds for, with `Self` as its implementor.
@@ -319,7 +319,7 @@ fn allow_prelude_is_needed_for_sized_but_not_for_relaxed_sized() {
     );
 }
 
-/// `allow_prelude()` leaves `Clone` and `Vec` as written, so `Vec<Rel>` is the only entry.
+/// `Rules::prelude()` leaves `Clone` and `Vec` as written, so `Vec<Rel>` is the only entry.
 #[test]
 fn allow_prelude_leaves_the_names_of_the_prelude_as_written() {
     let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> Vec<Rel>; } };
@@ -327,7 +327,7 @@ fn allow_prelude_leaves_the_names_of_the_prelude_as_written() {
     leaker.intern_trait(&item, true);
     assert!(leaker.result().finish().is_err());
 
-    let config = Allow::new().allow_prelude();
+    let config = Rules::new().prelude();
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     // `Clone` and `Vec` are left as written. The only entry is `Vec<Rel>`: a bare `Rel` may be
@@ -335,7 +335,7 @@ fn allow_prelude_leaves_the_names_of_the_prelude_as_written() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }
 
-/// `allow_crate()` leaves `crate::Foo` as written, which is leaked by default.
+/// `Rules::crate_paths()` leaves `crate::Foo` as written, which is leaked by default.
 #[test]
 fn allow_crate_leaves_crate_paths_as_written() {
     let item: ItemStruct = parse_quote! { struct S { a: crate::Foo } };
@@ -344,7 +344,7 @@ fn allow_crate_leaves_crate_paths_as_written() {
     leaker.intern_struct(&item, true);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     // ...and left as written if the copy is in the same crate.
-    let config = Allow::new().allow_crate();
+    let config = Rules::new().crate_paths();
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(&item, true);
     assert!(leaker.result().finish().unwrap().is_empty());

@@ -117,13 +117,13 @@ use type_leak::*;
 
 /// The config of the property test: primitive types and the names of the standard prelude are
 /// allowed.
-fn new_leaker() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new().allow_primitive().allow_prelude();
+fn new_leaker() -> Leaker<impl Allow> {
+    let config = Rules::new().primitive().prelude();
     Leaker::from_config(config, Options::new())
 }
 
 /// Analyzes `item` with `intern_*`. The errors are read through `Leaker::result()`.
-fn intern<P: Fn(&Path) -> bool>(leaker: &mut Leaker<P>, item: &Item) -> ContextId {
+fn intern<A: Allow>(leaker: &mut Leaker<A>, item: &Item) -> ContextId {
     match item {
         Item::Struct(item) => leaker.intern_struct(item, true),
         Item::Trait(item) => leaker.intern_trait(item, true),
@@ -135,8 +135,8 @@ fn intern<P: Fn(&Path) -> bool>(leaker: &mut Leaker<P>, item: &Item) -> ContextI
 
 /// Analyzes `item` with `leaker`, and returns the Referrer with the top-level context, or the
 /// errors that remain.
-fn analyze_in<P: Fn(&Path) -> bool>(
-    mut leaker: Leaker<P>,
+fn analyze_in<A: Allow>(
+    mut leaker: Leaker<A>,
     item: &Item,
 ) -> std::result::Result<(ContextId, Referrer), Vec<ErrorItem>> {
     let context = intern(&mut leaker, item);
@@ -144,7 +144,7 @@ fn analyze_in<P: Fn(&Path) -> bool>(
 }
 
 /// The errors that remain after the analysis of `leaker`.
-fn errors_of<P: Fn(&Path) -> bool>(leaker: Leaker<P>) -> Vec<ErrorItem> {
+fn errors_of<A: Allow>(leaker: Leaker<A>) -> Vec<ErrorItem> {
     leaker.result().errors().to_vec()
 }
 
@@ -1603,8 +1603,8 @@ fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), V
 }
 
 /// Like `f12_copy()`, with the Leaker `leaker`.
-fn f12_copy_with<P: Fn(&Path) -> bool>(
-    mut leaker: Leaker<P>,
+fn f12_copy_with<A: Allow>(
+    mut leaker: Leaker<A>,
     item: &ItemTrait,
 ) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
     let context = leaker.intern_trait(item, true);
@@ -1785,11 +1785,11 @@ fn self_referential_entries(referrer: &Referrer) -> Vec<String> {
 }
 
 /// The Leaker of F13: `::p` is allowed.
-fn f13_leaker() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(starts_with(parse_quote!(::p)));
+fn f13_leaker() -> Leaker<impl Allow> {
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(::p)));
     Leaker::from_config(config, Options::new())
 }
 
@@ -2160,10 +2160,10 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
 /// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a strict Referrer
 /// or not, and whether the Leaker accepts `item`.
 fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(starts_with(parse_quote!(::p)));
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(::p)));
     let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_impl(item, true);
     let mut result = leaker.result();
@@ -3067,7 +3067,7 @@ fn f17_optional_entry_in_own_context() {
 /// F18 (fixed): a strict Referrer replaced the optional entry that holds a lifetime of a method, so
 /// the copy did not have it where the original did.
 ///
-/// `Allow::allow_path_if()` docs: an absolute path of a crate that the Leaker does not allow is an
+/// `Rules::or_if()` docs: an absolute path of a crate that the Leaker does not allow is an
 /// optional entry, which a Referrer leaves as written by default and replaces if it is strict
 /// (`deny_ambiguous_crate_name()`). Trigger:
 /// `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the trait, `'x` is
@@ -3112,10 +3112,13 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
     };
     let copy_of = |allow_ext: bool, strict: bool| {
         let ext: Path = parse_quote!(::ext);
-        let config = Allow::new()
-            .allow_primitive()
-            .allow_prelude()
-            .allow_path_if(move |path| allow_ext && starts_with(ext.clone())(path));
+        let config =
+            Rules::new()
+                .primitive()
+                .prelude()
+                .or_if(move |cause: &Cause, place: Place| {
+                    allow_ext && starts_with(ext.clone())(cause, place)
+                });
         let mut leaker = Leaker::from_config(config, Options::new());
         let context = leaker.intern_trait(&item, true);
         let mut result = leaker.result();
@@ -3347,8 +3350,8 @@ fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>
 
 /// Like `f19_copy()`, with the Leaker that `f13_leaker()` makes (it allows `::p`, so that the self
 /// type of an impl has parts that are entries and a part that is not).
-fn f19_copy_with<P: Fn(&Path) -> bool>(
-    mut leaker: Leaker<P>,
+fn f19_copy_with<A: Allow>(
+    mut leaker: Leaker<A>,
     item: &Item,
 ) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>> {
     let context = match item {
@@ -7594,8 +7597,8 @@ fn nested_copy_with(
 }
 
 /// Like `nested_copy_with()`, analyzed by `leaker`.
-fn nested_copy_in<P: Fn(&Path) -> bool>(
-    leaker: Leaker<P>,
+fn nested_copy_in<A: Allow>(
+    leaker: Leaker<A>,
     nest: Nest,
     item: &Item,
     declared: &[&str],
@@ -7607,8 +7610,8 @@ fn nested_copy_in<P: Fn(&Path) -> bool>(
 
 /// Like `nested_copy_in()`; with `recover` the errors of the Leaker do not fail the copy:
 /// the part that conflicts is copied as written (`LeakerResult::into_referrer()`).
-fn nested_copy_recovering<P: Fn(&Path) -> bool>(
-    mut leaker: Leaker<P>,
+fn nested_copy_recovering<A: Allow>(
+    mut leaker: Leaker<A>,
     nest: Nest,
     item: &Item,
     declared: &[&str],
@@ -8131,8 +8134,8 @@ fn nested_analysis(nest: Nest, item: &Item, declared: &[&str]) -> LeakerResult {
 }
 
 /// Like `nested_analysis()`, in `leaker`.
-fn nested_analysis_in<P: Fn(&Path) -> bool>(
-    mut leaker: Leaker<P>,
+fn nested_analysis_in<A: Allow>(
+    mut leaker: Leaker<A>,
     nest: Nest,
     item: &Item,
     declared: &[&str],
@@ -8636,7 +8639,7 @@ fn f37_a_default_that_names_self_with_a_bound_that_names_it_is_rejected() {
     );
     for nested_self_entries in [false, true] {
         for nest in NESTS {
-            let config = Allow::new().allow_primitive().allow_prelude();
+            let config = Rules::new().primitive().prelude();
             let result = nested_analysis_in(
                 Leaker::from_config(
                     config,
@@ -9967,9 +9970,9 @@ fn f39_a_nested_struct_has_no_self_in_the_entry_of_the_default() {
 /// A Leaker that reads the values (`Options::check_values()`), as the
 /// downstream crate of F40 has it: primitive types and the names of the standard prelude are
 /// allowed.
-fn values_leaker() -> Leaker<impl Fn(&Path) -> bool> {
+fn values_leaker() -> Leaker<impl Allow> {
     Leaker::from_config(
-        Allow::new().allow_primitive().allow_prelude(),
+        Rules::new().primitive().prelude(),
         Options::new().check_values(),
     )
 }
@@ -10939,7 +10942,7 @@ fn f41_the_controls_are_unchanged() {
     for (item, name, _) in &f41_items() {
         for nest in NESTS {
             let plain = nested_analysis(nest, item, &[name]);
-            let with_option = Allow::new().allow_primitive().allow_prelude();
+            let with_option = Rules::new().primitive().prelude();
             let option = nested_analysis_in(
                 Leaker::from_config(with_option, Options::new().nested_self_entries()),
                 nest,
@@ -10974,8 +10977,8 @@ fn f41_the_controls_are_unchanged() {
 // ── F42 ──────────────────────────────────────────────────────────────────────
 
 /// A Leaker that accepts the entries of F42 (`nested_self_entries`).
-fn nested_self_leaker() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new().allow_primitive().allow_prelude();
+fn nested_self_leaker() -> Leaker<impl Allow> {
+    let config = Rules::new().primitive().prelude();
     Leaker::from_config(config, Options::new().nested_self_entries())
 }
 
@@ -11312,7 +11315,7 @@ fn f42_the_controls_are_unchanged() {
 
     // The item itself: `Self` is written as the Leaker's type, which has the bound, with or without.
     for (item, _, _, _) in &f42_items() {
-        fn analyze<P: Fn(&Path) -> bool>(mut leaker: Leaker<P>, item: &Item) -> Referrer {
+        fn analyze<A: Allow>(mut leaker: Leaker<A>, item: &Item) -> Referrer {
             match item {
                 Item::Struct(item) => leaker.intern_struct(item, true),
                 Item::Enum(item) => leaker.intern_enum(item, true),
@@ -11403,15 +11406,15 @@ fn without_parts(referrer: &Referrer) -> Referrer {
 }
 
 /// The config of `new_leaker()`.
-fn std_config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn std_config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 /// The scope of F43: the trait `Tr<T: AsRef<Self>>` (a bound of `T` names the `Self` of the trait),
 /// with `direct` visited in it as types, and `nested` an item nested in it
 /// (`View::visit_item()`), which has a `Self` of its own.
-fn f43_analyze<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
+fn f43_analyze<A: Allow>(
+    config: A,
     check_values: bool,
     direct: &[Type],
     nested: &Item,
@@ -11689,8 +11692,8 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
 
 /// The Leaker of F44: `::p` is allowed (the types of the items are relative, `::core::..` is
 /// absolute), and the prelude and the primitives.
-fn f44_config() -> Allow<impl Fn(&Path) -> bool> {
-    std_config().allow_path_if(starts_with(parse_quote!(::p)))
+fn f44_config() -> Rules<impl Allow + Clone> {
+    std_config().or_if(starts_with(parse_quote!(::p)))
 }
 
 /// The copy of the trait, once with `Self`, once with `with_self(Host)`.
@@ -12534,22 +12537,18 @@ fn f49_a_function_pointer_and_fn_sugar_count_each_input() {
 /// The analysis of `item` with `check_values` and the primitive types allowed, and the path rule
 /// `rule` (`"std"`, `"crate"` or the prelude) if there is one.
 fn f50_analyze(item: &ItemTrait, rule: Option<&str>) -> LeakerResult {
-    fn run<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-        item: &ItemTrait,
-        config: Allow<P, E>,
-    ) -> LeakerResult {
+    fn run<A: Allow>(item: &ItemTrait, config: A) -> LeakerResult {
         let mut leaker = Leaker::from_config(config, Options::new().check_values());
         leaker.intern_trait(item, true);
         leaker.result()
     }
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_path_if(move |path| match rule {
-            None => false,
-            Some("std") => is_std_crate_path(path),
-            Some("crate") => is_crate_path(path),
-            Some(_) => is_prelude_path(path),
-        });
+    let config = Rules::new().primitive();
+    let config = match rule {
+        None => config,
+        Some("std") => config.std_crates(),
+        Some("crate") => config.crate_paths(),
+        Some(_) => config.prelude(),
+    };
     run(item, config)
 }
 
@@ -12565,10 +12564,10 @@ fn f50_paths(result: &LeakerResult, at: usize) -> Vec<String> {
 /// Cause: the error of a relative path of a value (`ValueWalk::relative_part()`) had its own path
 /// alone (`core::mem::size_of`), where the error of a type or a bound has all the relative paths in
 /// it. The whole path is copied as written, `Rel` too, but a path rule after the analysis
-/// (`allow_std_crates()`) dropped the error: `Rel` stayed relative in a copy that no crate can
+/// (`Rules::std_crates()`) dropped the error: `Rel` stayed relative in a copy that no crate can
 /// resolve, whereas the config that allows the crates leaks it (the entry `Rel`). The same for
-/// `Vec::<Rel>::new()` with `allow_prelude()` and `crate::base::bg::<*const R0>()` with
-/// `allow_crate()`.
+/// `Vec::<Rel>::new()` with `Rules::prelude()` and `crate::base::bg::<*const R0>()` with
+/// `Rules::crate_paths()`.
 ///
 /// Fix: the paths of the error have the relative paths of the arguments, at any depth (not a
 /// generic, `Self`, or a name the value declares). The probe for the nested errors allows them
@@ -12677,9 +12676,9 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
         // The rule leaves the error, with the paths it does not allow.
         let after = result.clone();
         let after = match rule {
-            "std" => after.allow_std_crates(),
-            "crate" => after.allow_crate(),
-            _ => after.allow_prelude(),
+            "std" => after.allow(Rules::new().std_crates()),
+            "crate" => after.allow(Rules::new().crate_paths()),
+            _ => after.allow(Rules::new().prelude()),
         };
         assert_eq!(after.errors().len(), 1, "{}", what);
         assert_eq!(f50_paths(&after, 0), left, "{}", what);
@@ -12692,7 +12691,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
         // Allowing them too drops the error, and nothing is left inside the part.
         let mut all = after.clone();
         for path in left {
-            all = all.allow_path_if(starts_with(syn::parse_str(path).unwrap()));
+            all = all.allow(starts_with(syn::parse_str(path).unwrap()));
         }
         assert!(all.errors().is_empty(), "{}", what);
     }
@@ -12878,10 +12877,10 @@ fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
     );
     assert_eq!(entries(""), (0, vec!["?:: ext :: B0".to_string()]));
     // The path of the part allowed in the config: it is not an error, and `Self::A0` is visited.
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(starts_with(parse_quote!(RelTr)));
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(RelTr)));
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item("fn m<Y>(&self) where Y: RelTr<Self::A0>;"), true);
     let result = leaker.result();
@@ -13213,7 +13212,7 @@ fn f55_visiting_the_mod_item_of_the_module_of_the_context_is_visiting_its_items(
 
 // ── F56 ──────────────────────────────────────────────────────────────────────
 
-/// What the Leaker finds in `source`, a struct or an enum, analyzed with `allow_primitive()`: for
+/// What the Leaker finds in `source`, a struct or an enum, analyzed with `Rules::primitive()`: for
 /// each error its cause, `in_value` and `in_default`, and then the entries. `check_values` is on
 /// and off, which must not matter (an enum discriminant and the default of a const parameter are
 /// read either way).
@@ -13222,7 +13221,7 @@ fn f56_read(source: &str, allow_self: bool) -> (Vec<(String, bool, bool)>, Vec<S
     let mut found = Vec::new();
     for check_values in [false, true] {
         let mut leaker = Leaker::from_config(
-            Allow::new().allow_primitive(),
+            Rules::new().primitive(),
             if check_values {
                 Options::new().check_values()
             } else {
@@ -13272,7 +13271,7 @@ fn f56_read(source: &str, allow_self: bool) -> (Vec<(String, bool, bool)>, Vec<S
 /// its rules: a binding, an item, a generic or `Self` is local, a relative macro, struct literal,
 /// function or constant is an error (`RelativePath`, the path as the cause), and a type in a type
 /// position is leaked as before. The error is not `in_value` (a value that `check_values` reads:
-/// `allow_values()` leaves it), and `in_default` for a const parameter. What else changes: the
+/// `Rules::values()` leaves it), and `in_default` for a const parameter. What else changes: the
 /// cause of a qualified path with a relative trait (`<::p::S as Rel>::N`) is the trait (`Rel`, as
 /// in a value that `check_values` reads), not the whole path, and its self type is an entry; a
 /// macro with arguments that are not expressions is `Unreadable` also if its path is absolute.
@@ -13367,7 +13366,7 @@ fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value
             B = two!(),
         }
     );
-    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
     leaker.intern_enum(&item, true);
     let err = assert_rejected(
         &item,
@@ -13381,7 +13380,7 @@ fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value
     let item: ItemStruct = parse_quote!(
         struct S<const N: usize = { Rel { a: 1 }.a }>([u8; N]);
     );
-    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
     leaker.intern_struct(&item, true);
     let err = assert_rejected(
         &item,
@@ -13393,13 +13392,11 @@ fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value
         ["it is in the default of `N`, which the copy writes as it is"]
     );
 
-    // `allow_values()` accepts what `check_values` reads, which this is not. `allow_default()`
+    // `Rules::values()` accepts what `check_values` reads, which this is not. `Rules::defaults()`
     // accepts the default of a parameter, not a discriminant.
     let analyze = |source: &str| {
-        let mut leaker = Leaker::from_config(
-            Allow::new().allow_primitive(),
-            Options::new().check_values(),
-        );
+        let mut leaker =
+            Leaker::from_config(Rules::new().primitive(), Options::new().check_values());
         match parse_str::<Item>(source).unwrap() {
             Item::Enum(item) => leaker.intern_enum(&item, true),
             Item::Struct(item) => leaker.intern_struct(&item, true),
@@ -13411,11 +13408,11 @@ fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value
         "enum E { B = two!() }",
         "struct S<const N: usize = { two!() }>([u8; N]);",
     );
-    // The errors that remain after `allow_values()` and after `allow_default()`.
+    // The errors that remain after `Rules::values()` and after `Rules::defaults()`.
     for (source, values, defaults) in [(discriminant, 1, 1), (default, 1, 0)] {
-        let result = analyze(source).allow_values();
+        let result = analyze(source).allow(Rules::new().values());
         assert_eq!(result.errors().len(), values, "{}", source);
-        let result = analyze(source).allow_default();
+        let result = analyze(source).allow(Rules::new().defaults());
         assert_eq!(result.errors().len(), defaults, "{}", source);
     }
 
@@ -13451,10 +13448,7 @@ fn f57_names(tokens: proc_macro2::TokenStream) -> Vec<String> {
 }
 
 /// Analyzes a struct, an enum or a trait.
-fn f57_intern<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    leaker: &mut Leaker<P, E>,
-    item: &Item,
-) {
+fn f57_intern<A: Allow>(leaker: &mut Leaker<A>, item: &Item) {
     match item {
         Item::Struct(item) => leaker.intern_struct(item, true),
         Item::Enum(item) => leaker.intern_enum(item, true),
@@ -13463,15 +13457,16 @@ fn f57_intern<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
     };
 }
 
-/// The primitive names that the assertions of `source` check with `allow_primitive()`, which must
-/// be those with `allow(|_| true)` besides (it drops every error), and the same again: the text of
-/// the assertions does not change.
+/// The primitive names that the assertions of `source` check with `Rules::primitive()`, which must
+/// be those with a rule that drops every error whose cause is no bare path besides (the analysis
+/// leaks the same paths: it is asked about bare paths only), and the same again: the text of the
+/// assertions does not change.
 fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
     let item: Item = parse_str(source).unwrap();
     let mut texts = Vec::new();
     for _ in 0..2 {
         let mut leaker = Leaker::from_config(
-            Allow::new().allow_primitive(),
+            Rules::new().primitive(),
             if check_values {
                 Options::new().check_values()
             } else {
@@ -13480,7 +13475,9 @@ fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
         );
         f57_intern(&mut leaker, &item);
         texts.push(leaker.assertions().to_string());
-        let config = Allow::new().allow_primitive().allow(|_| true);
+        let config = Rules::new()
+            .primitive()
+            .or_if(|cause, _| common::bare_path(cause).is_none());
         let mut leaker = Leaker::from_config(
             config,
             if check_values {
@@ -13502,8 +13499,8 @@ fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
 /// copied as written.
 ///
 /// Trigger: `struct A { a: Rel<'_, u8> }`, `struct A { a: &dyn RelTr<u8> }` and `struct A<T:
-/// Into<u32>> { a: T }`, with `allow_primitive()` (and `allow(|_| true)`, which drops the errors):
-/// the assertions were empty. With `Allow::new()` `u8` is a relative path, so there is nothing to
+/// Into<u32>> { a: T }`, with `Rules::primitive()` (and a rule that drops the errors):
+/// the assertions were empty. With `Rules::new()` `u8` is a relative path, so there is nothing to
 /// assume. The copy writes `u8` as it is, which would be another type if the Leaker's crate shadowed
 /// `u8`, and the assertion is for that.
 ///
@@ -13593,7 +13590,7 @@ fn f57_the_primitive_names_in_a_part_copied_as_written_are_asserted() {
         {
         }
     );
-    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
     leaker.intern_impl(&item, true);
     let assertions = f57_names(leaker.assertions());
     let errors = leaker.result().errors().to_vec();
@@ -13601,13 +13598,13 @@ fn f57_the_primitive_names_in_a_part_copied_as_written_are_asserted() {
         .iter()
         .any(|error| error.message.contains("is in the self type of the impl")));
     assert_eq!(assertions, ["u8"]);
-    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Rel<u8, Self>))
     });
     assert_eq!(f57_names(leaker.assertions()), ["u8"]);
     // Control: the same type without `Self` is an entry, and asserts nothing.
-    let mut leaker = Leaker::from_config(Allow::new().allow_primitive(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Rel<u8>))
     });

@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::visit_function;
+use common::{visit_function, AcceptCause};
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
@@ -341,10 +341,10 @@ fn bad_generics() -> Generics {
 /// Accepts the causes of the errors of the scope which fails in `failing()`.
 fn accept_failing(result: LeakerResult) -> LeakerResult {
     result
-        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad1<'_>)))
-        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad<'_, A>)))
+        .accept_cause(&Cause::Type(parse_quote!(Bad1<'_>)))
+        .accept_cause(&Cause::Type(parse_quote!(Bad<'_, A>)))
         // A module declares no `Self`.
-        .allow(|e| e.cause == Cause::Type(parse_quote!(Self)))
+        .accept_cause(&Cause::Type(parse_quote!(Self)))
 }
 
 /// Enters a module with a scope around which succeeds, one which does not if `fail` (`kind` is the

@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{allow_every_cause, starts_with, Rule};
+use common::{allow_every_cause, causes_accepting, starts_with, AcceptCause, Rule};
 use std::cell::RefCell;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -28,20 +28,15 @@ thread_local! {
 }
 
 /// `config`, with the rules of `with_rules()`.
-fn configured<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-) -> Allow<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
-    let for_paths = RULES.with(|rules| rules.borrow().clone());
-    let for_errors = for_paths.clone();
-    config
-        .allow_path_if(move |path| for_paths.iter().any(|rule| rule.accepts_path(path)))
-        .allow(move |error| for_errors.iter().any(|rule| rule.accepts_error(error)))
+fn configured<A: Allow>(config: A) -> impl Allow {
+    let rules = RULES.with(|rules| rules.borrow().clone());
+    (config, move |cause: &Cause, place: Place| {
+        rules.iter().any(|rule| rule.allow(cause, place))
+    })
 }
 
 /// The Leaker of the triggers: `Leaker::from_config(config, ..)` with the rules of `with_rules()`.
-fn leaker_from<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-) -> Leaker<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
+fn leaker_from<A: Allow>(config: A) -> Leaker<impl Allow> {
     Leaker::from_config(configured(config), Options::new())
 }
 
@@ -54,29 +49,29 @@ fn with_rules<R>(rules: &[Rule], f: impl FnOnce() -> R) -> R {
 }
 
 /// The config of the triggers with `::p` allowed (the crate of the property test).
-fn allowing_config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(starts_with(parse_quote!(::p)))
+fn allowing_config() -> Rules<impl Allow + Clone> {
+    Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(::p)))
 }
 
-fn allowing() -> Leaker<impl Fn(&Path) -> bool, impl Fn(&ErrorItem) -> bool> {
+fn allowing() -> Leaker<impl Allow> {
     leaker_from(allowing_config())
 }
 
 /// The config of the triggers that read the values of the items too (`check_values`).
-fn reading_values_config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn reading_values_config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 /// An analysis of an item that goes wrong.
 type Trigger = fn() -> LeakerResult;
 
 /// Runs `analyze` on `leaker` and returns its result.
-fn run<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool, R>(
-    mut leaker: Leaker<P, E>,
-    analyze: impl FnOnce(&mut Leaker<P, E>) -> R,
+fn run<A: Allow, R>(
+    mut leaker: Leaker<A>,
+    analyze: impl FnOnce(&mut Leaker<A>) -> R,
 ) -> LeakerResult {
     analyze(&mut leaker);
     leaker.result()
@@ -162,7 +157,7 @@ fn relative_path() -> LeakerResult {
             fn f(&self, a: MyType<'_>);
         }
     );
-    run(leaker_from(Allow::new()), |leaker| {
+    run(leaker_from(Rules::new()), |leaker| {
         leaker.intern_trait(&item, true)
     })
 }
@@ -531,10 +526,7 @@ fn the_cause_of_a_bound_is_the_trait() {
 // ── the kind of the cause is that of the syntax node which holds the part reported ──────────
 
 /// The errors that a type gives in the generics `<T>`, where `Self` has no meaning.
-fn type_errors<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    mut leaker: Leaker<P, E>,
-    ty: Type,
-) -> Vec<ErrorItem> {
+fn type_errors<A: Allow>(mut leaker: Leaker<A>, ty: Type) -> Vec<ErrorItem> {
     leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&ty));
     leaker.result().errors().to_vec()
 }
@@ -911,7 +903,7 @@ fn the_serialized_form_is_one_brace_group_for_each_item() {
         items[1].to_token_stream().to_string(),
         "{ type (MyType < '_ >) RelativePath \"use absolute path: 'MyType<'_>'\" \
          [('_) \"it cannot be leaked as a whole because of `'_`\"] \
-         (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\" paths [MyType] }"
+         (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\" paths [type (MyType)] }"
     );
     // A serialization is not a report: it is no `compile_error!`.
     let all: proc_macro2::TokenStream = items.iter().map(ToTokens::to_token_stream).collect();
@@ -963,15 +955,25 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
     );
     // After the help, or after the notes if there is none, in this order.
     let placed = parse_item(
-        r#"{ type ( A ) RelativePath "m" [] ( B ) "h" value default paths [ a :: b , :: c , Self , crate :: d ] }"#,
+        r#"{ type ( A ) RelativePath "m" [] ( B ) "h" value default paths [ type ( a :: b ) , trait ( :: c ) , expr ( Self ) , macro ( crate :: d ! ) , unreadable ( e ) ] }"#,
     )
     .unwrap();
     assert!(placed.in_value && placed.in_default);
     let paths: Vec<String> = placed.paths.iter().map(text_of).collect();
-    assert_eq!(paths, ["a :: b", ":: c", "Self", "crate :: d"]);
+    assert_eq!(paths, ["a :: b", ":: c", "Self", "crate :: d !", "e"]);
+    assert!(matches!(
+        &placed.paths[..],
+        [
+            Cause::Type(_),
+            Cause::Trait(_),
+            Cause::Expr(_),
+            Cause::Macro(_),
+            Cause::Unreadable(_)
+        ]
+    ));
     assert_eq!(
         placed.to_token_stream().to_string(),
-        r#"{ type (A) RelativePath "m" [] (B) "h" value default paths [a :: b , :: c , Self , crate :: d] }"#
+        r#"{ type (A) RelativePath "m" [] (B) "h" value default paths [type (a :: b) , trait (:: c) , expr (Self) , macro (crate :: d !) , unreadable (e)] }"#
     );
     let only_default = parse_item(r#"{ type ( A ) RelativePath "m" [] default }"#).unwrap();
     assert!(!only_default.in_value && only_default.in_default && only_default.help.is_none());
@@ -986,14 +988,18 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
         empty.to_token_stream().to_string(),
         r#"{ type (A) RelativePath "m" [] value default }"#
     );
-    // A word that is none of them, or a path with arguments, is refused.
+    // A word that is none of them, or an entry that is no path or has arguments, is refused.
     let error = parse_item(r#"{ type ( A ) RelativePath "m" [] values }"#).unwrap_err();
     assert!(
         error.to_string().contains("unknown field `values`"),
         "{}",
         error
     );
-    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ a < b > ] }"#).is_err());
+    assert!(
+        parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ type ( a < b > ) ] }"#).is_err()
+    );
+    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ a ] }"#).is_err());
+    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ lifetime ( 'a ) ] }"#).is_err());
     assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths a }"#).is_err());
 }
 
@@ -1206,7 +1212,7 @@ fn messages(items: &[ErrorItem]) -> Vec<&str> {
 fn allowing_causes(trigger: Trigger, causes: &[Cause]) -> LeakerResult {
     let mut result = trigger();
     for cause in causes {
-        result = result.allow(|e| e.cause == cause.clone());
+        result = result.accept_cause(cause);
     }
     result
 }
@@ -1274,8 +1280,10 @@ fn serialized(result: &LeakerResult) -> Vec<String> {
         .collect()
 }
 
-/// Asserts that the rules give the same errors and an equal Referrer given to the config of a
-/// trigger and given to its result.
+/// Asserts that the rules give the same errors and the same entries given to the config of a
+/// trigger and given to its result. The Referrer of the config may have fewer parts: a rule that
+/// allows a path (a cause that is one, a place) makes the analysis write it as it is without a
+/// conflict, where the result found the conflict, dropped its error and kept the part.
 #[track_caller]
 fn assert_stages_agree(name: &str, trigger: Trigger, rules: &[Rule]) -> usize {
     let before = with_rules(rules, trigger);
@@ -1287,19 +1295,49 @@ fn assert_stages_agree(name: &str, trigger: Trigger, rules: &[Rule]) -> usize {
     let dropped = dropped - after.errors().len();
     assert_eq!(serialized(&before), serialized(&after), "{}", name);
     let (before, after) = (before.into_referrer(), after.into_referrer());
-    assert_same_referrer(&before, &after, name);
+    let entries = |referrer: &Referrer| -> Vec<(String, bool)> {
+        referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty.to_token_stream().to_string(), referrer.must(ix)))
+            .collect()
+    };
+    assert_eq!(entries(&before), entries(&after), "{}", name);
+    let length = |referrer: &Referrer| referrer.to_token_stream().to_string().len();
+    assert!(length(&before) <= length(&after), "{}", name);
     dropped
 }
 
 #[test]
-fn the_cause_value_and_default_rules_give_the_same_result_before_and_after_the_analysis() {
+fn the_cause_value_and_default_rules_give_the_same_errors_before_and_after_the_analysis() {
     let (mut by_cause, mut by_value, mut by_default) = (0, 0, 0);
     for (name, trigger) in every_trigger() {
-        let causes = causes_of(trigger().errors());
-        for cause in &causes {
-            by_cause += assert_stages_agree(name, trigger, &[Rule::Cause(cause.clone())]);
+        // An error that has paths is accepted by them, which are path rules in the config too: the
+        // result drops the error, and the config may find other errors (`tests/allow_stages.rs`).
+        // The cause of an error without paths is the same rule at both stages.
+        let errors = trigger().errors().to_vec();
+        for error in errors.iter().filter(|error| !error.paths.is_empty()) {
+            let left = trigger().accept_cause(&error.cause);
+            assert!(
+                left.errors().iter().all(|other| other.cause != error.cause),
+                "{}: {}",
+                name,
+                text(&error.cause)
+            );
         }
-        let all: Vec<Rule> = causes.iter().cloned().map(Rule::Cause).collect();
+        let causes: Vec<Cause> = errors
+            .iter()
+            .filter(|error| error.paths.is_empty())
+            .map(|error| error.cause.clone())
+            .collect();
+        for cause in &causes {
+            let rule = Rule::Cause(causes_accepting(&errors, cause));
+            by_cause += assert_stages_agree(name, trigger, &[rule]);
+        }
+        let all: Vec<Rule> = causes
+            .iter()
+            .map(|cause| Rule::Cause(causes_accepting(&errors, cause)))
+            .collect();
         by_cause += assert_stages_agree(name, trigger, &all);
         by_value += assert_stages_agree(name, trigger, &[Rule::Values]);
         by_default += assert_stages_agree(name, trigger, &[Rule::Default]);
@@ -1317,10 +1355,11 @@ fn a_path_rule_leaves_the_errors_that_have_a_path_it_does_not_allow() {
         for error in trigger().errors() {
             let paths: Vec<String> = error.paths.iter().map(text_of).collect();
             // A path is relative: no leading `::`, no `Self`, no `$crate`.
-            for path in &error.paths {
+            for entry in &error.paths {
+                let path = entry.path().expect("a path");
                 assert!(path.leading_colon.is_none(), "{}: {:?}", name, paths);
                 assert!(path.segments.iter().all(|seg| seg.arguments.is_empty()));
-                assert_ne!(text_of(path), "Self", "{}: {:?}", name, paths);
+                assert_ne!(text_of(entry), "Self", "{}: {:?}", name, paths);
             }
         }
     }
@@ -1334,9 +1373,7 @@ fn a_path_rule_leaves_the_errors_that_have_a_path_it_does_not_allow() {
     }
     // Allowing the first path of an error that has several leaves it.
     let result = relative_path();
-    let left = result
-        .clone()
-        .allow_path_if(starts_with(parse_quote!(MyType)));
+    let left = result.clone().allow(starts_with(parse_quote!(MyType)));
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
     assert_eq!(text(&left.errors()[0].cause), "Clone");
@@ -1419,7 +1456,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
     );
     assert_eq!(copy, expected);
     // Allowing the cause drops the error and leaves the Referrer.
-    result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
+    result = result.accept_cause(&Cause::Trait(parse_quote!(RelTr)));
     assert_same_referrer(&referrer, &result.finish().unwrap(), "S");
 }
 
@@ -1462,15 +1499,15 @@ fn the_errors_of_self_are_reported_with_the_others() {
     assert_eq!(referrer.iter().count(), 0);
     let mut allowed = analyze();
     for cause in causes_of(&errors) {
-        allowed = allowed.allow(|e| e.cause == cause);
+        allowed = allowed.accept_cause(&cause);
     }
     assert!(allowed.errors().is_empty());
     assert_same_referrer(&referrer, &allowed.into_referrer(), "Self");
     // Allowing the conflict leaves the mention, and the other way round.
-    let left = analyze().allow(|e| e.cause == errors[0].cause.clone());
+    let left = analyze().accept_cause(&errors[0].cause);
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::SelfWithoutMeaning);
-    let left = analyze().allow(|e| e.cause == errors[1].cause.clone());
+    let left = analyze().accept_cause(&errors[1].cause);
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
 }

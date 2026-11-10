@@ -27,10 +27,10 @@ mod common;
 use common::check_in;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, Cause, ErrorItem, Leaker, Options, Referrer};
+use type_leak::{to_syn_error, Allow, Cause, ErrorItem, Leaker, Options, Referrer, Rules};
 
-fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new().allow_primitive().allow_prelude();
+fn leaker() -> Leaker<impl Allow> {
+    let config = Rules::new().primitive().prelude();
     Leaker::from_config(config, Options::new())
 }
 

@@ -19,14 +19,14 @@
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{Allow, ContextId, Leaker, Options, Referrer, SelfRequirement};
+use type_leak::{Allow, ContextId, Leaker, Options, Referrer, Rules, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
-fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new().allow_primitive().allow_prelude();
+fn leaker() -> Leaker<impl Allow> {
+    let config = Rules::new().primitive().prelude();
     Leaker::from_config(config, Options::new())
 }
 
@@ -1166,7 +1166,7 @@ mod projection_paths {
             s(&sig)
         };
         let copy = rewrite_sig(parse_quote!(
-            fn f<P: Fn(&Path) -> bool, 'a, T: ::p::Gat, U>(&self, x: ::core::cell::Ref<'a, T::A<Rel2<U>>>)
+            fn f<A: Allow, 'a, T: ::p::Gat, U>(&self, x: ::core::cell::Ref<'a, T::A<Rel2<U>>>)
         ));
         assert!(!copy.contains("Rel2"), "{}", copy);
         assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
@@ -1187,7 +1187,7 @@ mod projection_paths {
     #[test]
     fn the_head_of_a_projection_is_a_type_parameter_if_a_scope_declares_it() {
         // `T` and `U` are declared by the trait, so they are the context's; `'a` is the method's.
-        // Both types are in the Leaker<P>.
+        // Both types are in the Leaker<A>.
         let tr: ItemTrait = parse_quote! {
             trait Tr<T: ::p::Gat, U> {
                 fn f<'a>(&self, x: &'a T::A<Rel2<U>>, y: &'a ::std::vec::Vec<Rel2<U>>);

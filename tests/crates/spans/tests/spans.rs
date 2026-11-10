@@ -159,7 +159,7 @@ fn the_syn_error_has_the_span_of_each_item() {
 fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let source = "trait Tr<T: Fn(Rel)> {\n    fn f(&self, a: Wrap<T>)\n    where\n        Wrap<T>: Sized;\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let config = Allow::new().allow_primitive().allow_prelude();
+    let config = Rules::new().primitive().prelude();
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
@@ -317,12 +317,12 @@ fn an_accepted_cause_is_the_same_whatever_its_spans() {
     };
     assert_eq!(hash(&cause), hash(&errors[0].cause));
     let mut allowed = result.clone();
-    assert!(allowed.allow(|e| e.cause == cause).errors().is_empty());
+    assert!(allowed.allow(|c: &Cause, _: Place| *c == cause).errors().is_empty());
     // Another cause drops nothing.
     let mut other = result.clone();
     assert_eq!(
         other
-            .allow(|e| e.cause == Cause::Trait(parse_quote!(Other)))
+            .allow(|c: &Cause, _: Place| *c == Cause::Trait(parse_quote!(Other)))
             .errors()
             .len(),
         1
@@ -367,7 +367,7 @@ fn assert_in_source(tokens: proc_macro2::TokenStream, source: &str) {
 /// length. `u8` is allowed, so `two` is the first error.
 fn macro_error(source: &str) -> ErrorItem {
     let item: ItemStruct = parse_str(source).unwrap();
-    let config = Allow::new().allow_primitive();
+    let config = Rules::new().primitive();
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(&item, true);
     let result = leaker.result();
@@ -447,7 +447,7 @@ fn an_error_of_a_macro_cause_is_reported_at_the_name_of_the_macro() {
 fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     let source = "trait Tr {\n    fn f(&self) -> u8 {\n        two!() + 1\n    }\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let config = Allow::new().allow_primitive();
+    let config = Rules::new().primitive();
     let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();

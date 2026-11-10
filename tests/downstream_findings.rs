@@ -58,8 +58,8 @@ fn messages(errors: &[ErrorItem]) -> String {
         .join("\n")
 }
 
-fn config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 fn trait_of(item: ItemTrait) -> Referrer {
@@ -1110,7 +1110,7 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
         );
     }
     // In the message of a value that cannot be read.
-    let config = || config().allow_path_if(starts_with(parse_quote!(::p)));
+    let config = || config().or_if(starts_with(parse_quote!(::p)));
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self) {
@@ -1175,7 +1175,7 @@ fn issue_two_a_help_has_no_colon_in_its_words() {
     assert!(checked >= 3, "{}", checked);
 }
 
-/// Issue 3: `allow_prelude()` did not accept `Some`, `None`, `Ok`, `Err`, `DoubleEndedIterator` and
+/// Issue 3: `Rules::prelude()` did not accept `Some`, `None`, `Ok`, `Err`, `DoubleEndedIterator` and
 /// `ExactSizeIterator`, which every edition has in its prelude, although the help knew some of
 /// them; `FromIterator`, which only the 2021 edition has, was accepted. It accepts the names of the
 /// prelude of every edition (2015 to 2024, rustc 1.56) now.
@@ -1206,8 +1206,8 @@ fn issue_three_allow_prelude_accepts_the_names_of_every_edition() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert_eq!(messages(result.errors()), "");
-    // Without `allow_prelude()`, they are relative paths.
-    let config = Allow::new().allow_primitive();
+    // Without `Rules::prelude()`, they are relative paths.
+    let config = Rules::new().primitive();
     let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
@@ -1291,7 +1291,7 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
     let item: ItemStruct = parse_quote!(
         struct S<T: Base<Local>>(T);
     );
-    let crate_only = || Allow::new().allow_crate();
+    let crate_only = || Rules::new().crate_paths();
     let mut leaker = Leaker::from_config(crate_only(), Options::new());
     leaker.intern_struct(&item, true);
     let result = leaker.result();

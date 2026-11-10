@@ -1,6 +1,6 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
-use crate::allow::Allow;
+use crate::allow::{filter, Allow};
 use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
 use crate::analyze::{declared_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
 use crate::context::{Context, ContextId, Contexts, Gat, SelfRequirement};
@@ -15,7 +15,6 @@ use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
 use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -31,9 +30,8 @@ use template_quote::{quote, ToTokens};
 ///
 /// Analyze a whole item with an `intern_*` method, or parts of one with an `enter_*` method, then
 /// call [`Leaker::result()`]. Keep the returned [`ContextId`] for [`Referrer::visitor()`]. See the
-/// [quick start](crate#quick-start). `P` and `E` are the rules of its [`Allow`]: a helper takes a
-/// configured Leaker as `fn g<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(leaker: &mut
-/// Leaker<P, E>)`.
+/// [quick start](crate#quick-start). `A` is its [`Allow`]: a helper takes a configured Leaker as
+/// `fn g<A: Allow>(leaker: &mut Leaker<A>)`.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -52,9 +50,9 @@ use template_quote::{quote, ToTokens};
 ///
 /// An error does not stop the analysis: the part that cannot be leaked is copied as written, and
 /// the error is kept (once, in the order found). A panic in a closure rolls its scope back and
-/// records nothing. A panicking rule on paths is treated alike: the call is rolled back and panics,
-/// even if the closure caught the panic of the rule. The `allow*()` methods of [`Allow`] and
-/// [`LeakerResult`] drop the errors you accept.
+/// records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and panics,
+/// even if the closure caught the panic of the rule. [`LeakerResult::allow()`] drops the errors
+/// you accept.
 ///
 /// # Limitations
 ///
@@ -62,7 +60,7 @@ use template_quote::{quote, ToTokens};
 /// rejects what would not compile in the copy; the `help` of an error says what to write instead.
 ///
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path
-///   (`Self: Sized` needs [`allow_prelude()`](Allow::allow_prelude)).
+///   (`Self: Sized` needs [`Rules::prelude()`](crate::Rules::prelude)).
 /// - An absolute path of another crate is copied as written, which assumes that both crates
 ///   resolve it alike ([`LeakerResult::deny_ambiguous_crate_name()`]).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
@@ -112,14 +110,12 @@ use template_quote::{quote, ToTokens};
 /// A bare identifier argument (`MyType<MY_CONST>`) may be a type or a const. The Leaker leaks the
 /// type that holds it as a whole, right for both; where it cannot (an elided lifetime or reference
 /// in the holder, a trait bound), it leaks the identifier alone, which fails for a const (E0573,
-/// E0747). Write an absolute path (`MyType<{ ::my_crate::MY_CONST }>`) or an
-/// [allowed](Allow::allow_path_if) name.
-pub struct Leaker<P = fn(&Path) -> bool, E = fn(&ErrorItem) -> bool> {
-    /// The rule of the [`Allow`] for the paths that are left as written instead of being
-    /// leaked. Shared with the visitors of the analysis.
-    paths: Rc<P>,
-    /// The rule of the [`Allow`] for the errors that are not recorded.
-    accepted: E,
+/// E0747). Write an absolute path (`MyType<{ ::my_crate::MY_CONST }>`) or an [allowed](Allow)
+/// name.
+pub struct Leaker<A = ()> {
+    /// What the Leaker leaves as written instead of leaking it, and the errors it does not
+    /// record. Shared with the visitors of the analysis.
+    allow: Rc<A>,
     state: State,
 }
 
@@ -128,7 +124,7 @@ pub struct Leaker<P = fn(&Path) -> bool, E = fn(&ErrorItem) -> bool> {
 ///
 /// ```
 /// # use type_leak::*;
-/// let leaker = Leaker::from_config(Allow::new().allow_prelude(), Options::new().check_values());
+/// let leaker = Leaker::from_config(Rules::new().prelude(), Options::new().check_values());
 /// # let _ = leaker;
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -153,8 +149,8 @@ impl Options {
     /// generic arguments of a path or method call, the self type of a qualified path) are leaked
     /// like any type of the item. Another relative path (a function, a constant, a struct literal,
     /// a variant, the trait of a qualified path) is rejected unless it is absolute or starts with
-    /// `$crate`, is allowed ([`Allow::allow_path_if()`]), or starts with a generic or `Self` in
-    /// scope or a name that the value declares. A macro whose arguments are not expressions
+    /// `$crate`, is [allowed](Allow) (the types too, by [`Rules::values()`](crate::Rules::values)),
+    /// or starts with a generic or `Self` in scope or a name that the value declares. A macro whose arguments are not expressions
     /// (`cfg!`, `stringify!` and `matches!` excepted), a `macro_rules!`, a glob import and syntax
     /// that `syn` does not parse are rejected.
     pub fn check_values(mut self) -> Self {
@@ -208,7 +204,7 @@ struct State {
 impl Leaker {
     /// Creates a [`Leaker`] that allows nothing, so every relative path is leaked.
     pub fn new() -> Self {
-        Self::from_config(Allow::new(), Options::new())
+        Self::from_config((), Options::new())
     }
 }
 
@@ -218,14 +214,13 @@ impl Default for Leaker {
     }
 }
 
-impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
-    /// Creates a [`Leaker`] with the rules of `allow` and the `options` of the analysis.
+impl<A: Allow> Leaker<A> {
+    /// Creates a [`Leaker`] with the rule `allow` and the `options` of the analysis.
     ///
     /// See [`Options::check_values()`] and [`Options::nested_self_entries()`].
-    pub fn from_config(allow: Allow<P, E>, options: Options) -> Self {
+    pub fn from_config(allow: A, options: Options) -> Self {
         Self {
-            paths: Rc::new(allow.paths),
-            accepted: allow.errors,
+            allow: Rc::new(allow),
             state: State {
                 options,
                 ..State::default()
@@ -234,7 +229,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     }
 
     /// Returns a compile-time check that the primitive names copied as written (`u8` in `const N:
-    /// u8`, or by [`Allow::allow_primitive()`]) are not shadowed, also those in a part that an error
+    /// u8`, or by [`Rules::primitive()`](crate::Rules::primitive)) are not shadowed, also those in a part that an error
     /// makes copied as written. Emit it in the Leaker's crate. It is empty if none was copied.
     #[must_use]
     pub fn assertions(&self) -> TokenStream {
@@ -364,7 +359,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
         &mut self,
         hint: impl Display,
         declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_mod(self, hint, declared, f)
     }
@@ -376,7 +371,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     pub fn enter_generics<R>(
         &mut self,
         generics: &Generics,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_generics(self, generics, f)
     }
@@ -390,7 +385,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_type(self, ident, generics, allow_self, f)
     }
@@ -402,15 +397,15 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
     /// checked here (a relative path is an error), not its arguments: `f` visits them. The methods
     /// of an inherent impl are not compared with a trait's
     /// ([Method lifetimes](Leaker#method-lifetimes)), and the help for `Self::A` names the trait.
-    /// A caller that resolves the trait by its name elsewhere passes the path and allows it
-    /// ([`Allow::allow_path_if()`](crate::Allow::allow_path_if)), or `None` if it visits no method.
+    /// A caller that resolves the trait by its name elsewhere passes the path and [allows it](Allow),
+    /// or `None` if it visits no method.
     pub fn enter_impl<R>(
         &mut self,
         generics: &Generics,
         self_ty: &Type,
         trait_: Option<&Path>,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_impl(self, generics, self_ty, trait_, allow_self, f)
     }
@@ -424,7 +419,7 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Leaker<P, E> {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
     }
@@ -533,15 +528,13 @@ impl State {
 
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
 ///
-/// [`allow()`](LeakerResult::allow) and [`allow_path_if()`](LeakerResult::allow_path_if) drop the
-/// errors that a rule accepts, and the other `allow*` methods are rules of the same names as those
-/// of [`Allow`]. They take and return the result, so they chain. They only drop errors and leave the
-/// entries as they are (you promise that the part compiles as written): to remove entries, give an
-/// [`Allow`] to [`Leaker::from_config()`]. A rule is applied at once and may be an `FnMut`, so it
-/// may borrow or count. A path rule here only approximates the one of the [`Allow`] of the Leaker
-/// (more errors may remain, and a copy may fail to build): give path rules to the Leaker when you
-/// can. The [nested errors](ErrorItem::nested) of a dropped error come up in its place, so allow
-/// until [`errors()`](LeakerResult::errors) is empty.
+/// [`allow()`](LeakerResult::allow) drops the errors that an [`Allow`] accepts. It takes and
+/// returns the result, so it chains. It only drops errors and leaves the entries as they are (you
+/// promise that the part compiles as written): to remove entries, give the [`Allow`] to
+/// [`Leaker::from_config()`]. A rule here only approximates the one of the Leaker (more errors may
+/// remain, and a copy may fail to build): give rules to the Leaker when you can. The [nested
+/// errors](ErrorItem::nested) of a dropped error come up in its place, so allow until
+/// [`errors()`](LeakerResult::errors) is empty.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -554,7 +547,7 @@ impl State {
 /// let referrer = result.clone().into_referrer();
 /// assert_eq!(referrer.iter().count(), 1);
 /// // Allowing the error leaves the Referrer as it is, and `finish()` returns it.
-/// let result = result.allow(|e| e.cause == Cause::Trait(parse_quote!(RelTr)));
+/// let result = result.allow(|cause: &Cause, _: Place| *cause == Cause::Trait(parse_quote!(RelTr)));
 /// assert_eq!(result.finish().unwrap(), referrer);
 /// ```
 #[derive(Clone, Debug)]
@@ -564,65 +557,21 @@ pub struct LeakerResult {
 }
 
 impl LeakerResult {
-    /// Applies `allow` to the errors, in place: a rule that panics loses the result.
-    fn apply<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-        mut self,
-        allow: Allow<P, E>,
-    ) -> Self {
-        allow.filter(&mut self.errors);
-        self
-    }
-
-    /// Drops the errors that `rule` accepts: the part is copied as written.
+    /// Drops the errors that `rule` accepts: the part is copied as written. An error is accepted
+    /// by its [`paths`](ErrorItem::paths) if it has any, else by its cause.
     ///
     /// You promise that the part can be written as it is in the copy. The cause may be smaller
     /// than the part that is copied: in `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`,
     /// and the array is copied whole. Allowing a [`Reason::UnprovableBound`] does not make the copy
     /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
-    /// ignored).
-    pub fn allow(self, rule: impl FnMut(&ErrorItem) -> bool) -> Self {
-        let rule = RefCell::new(rule);
-        self.apply(Allow::new().allow(|error| (*rule.borrow_mut())(error)))
-    }
-
-    /// Drops the errors whose relative paths `rule` accepts all, and the accepted paths of the
-    /// others. An absolute path is never an error, so a rule for `::serde` changes nothing here.
+    /// ignored). An absolute path is never an error, so a rule for `::serde` changes nothing here.
     ///
-    /// The rule sees [`ErrorItem::paths`] (no generic arguments), never one that starts with
-    /// `Self`, and also the nested errors that come up.
-    pub fn allow_path_if(self, rule: impl FnMut(&Path) -> bool) -> Self {
-        let rule = RefCell::new(rule);
-        self.apply(Allow::new().allow_path_if(|path| (*rule.borrow_mut())(path)))
-    }
-
-    /// Drops the errors whose relative paths are all primitive type names.
-    pub fn allow_primitive(self) -> Self {
-        self.apply(Allow::new().allow_primitive())
-    }
-
-    /// Drops the errors whose relative paths are all names of the standard prelude (`Clone`).
-    pub fn allow_prelude(self) -> Self {
-        self.apply(Allow::new().allow_prelude())
-    }
-
-    /// Drops the errors whose relative paths all start with `std`, `core` or `alloc`.
-    pub fn allow_std_crates(self) -> Self {
-        self.apply(Allow::new().allow_std_crates())
-    }
-
-    /// Drops the errors whose relative paths all start with `crate`.
-    pub fn allow_crate(self) -> Self {
-        self.apply(Allow::new().allow_crate())
-    }
-
-    /// Drops the errors found in a value (see [`ErrorItem::in_value`]).
-    pub fn allow_values(self) -> Self {
-        self.apply(Allow::new().allow_values())
-    }
-
-    /// Drops the errors found in a default (see [`ErrorItem::in_default`]).
-    pub fn allow_default(self) -> Self {
-        self.apply(Allow::new().allow_default())
+    /// See [`Allow`] for what the rule is asked (also for the nested errors that come up). A closure needs
+    /// `&Cause` and [`Place`](crate::Place) annotated when it is not written in the call
+    /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none.
+    pub fn allow(mut self, rule: impl Allow) -> Self {
+        filter(&rule, &mut self.errors);
+        self
     }
 
     /// Makes the Referrer strict: optional entries (absolute paths of other crates) are replaced as
@@ -700,16 +649,16 @@ impl Parse for LeakerResult {
     }
 }
 
-impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Scopes for Leaker<P, E> {
-    type Rule = P;
+impl<A: Allow> Scopes for Leaker<A> {
+    type Rule = A;
 
     fn enter_spec<R>(
         &mut self,
         spec: ScopeSpec,
-        f: impl FnOnce(&mut View<'_, P>) -> R,
+        f: impl FnOnce(&mut View<'_, A>) -> R,
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
-        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(self.paths.clone()), &root)
+        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(self.allow.clone()), &root)
             .reading_values(self.state.options.check_values)
             .with_nested_self_entries(self.state.options.nested_self_entries);
         let mark = self.state.contexts.len();
@@ -724,16 +673,12 @@ impl<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool> Scopes for Leaker<P, E> {
             if visitor.rule_panicked() {
                 // The closure caught the panic of a rule, which left the analysis half done:
                 // raise it again, as for a panic of the closure (rolled back below).
-                resume_unwind(Box::new("a path rule panicked, and the closure caught it"));
+                resume_unwind(Box::new("the rule panicked, and the closure caught it"));
             }
             let (finished, mut errors) = visitor.finish(&root);
-            // The errors that the rules accept are dropped here, as `LeakerResult` drops
-            // them later. Its rules are user code too: if one panics, nothing is recorded.
-            let rules = Allow {
-                paths: &*self.paths,
-                errors: &self.accepted,
-            };
-            rules.filter(&mut errors);
+            // The errors that the rule accepts are dropped here, as `LeakerResult` drops
+            // them later. It is user code too: if it panics, nothing is recorded.
+            filter(&*self.allow, &mut errors);
             (finished, errors, result)
         }));
         visitor.swap_contexts(&mut self.state.contexts);

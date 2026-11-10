@@ -130,7 +130,7 @@ fn intern_mod_errors_and_bodies() {
 /// Analyzes the module like `Leaker::intern_mod()`, allowing the primitive types and the
 /// standard prelude, and returns the module context too.
 fn referrer_with_prelude(m: &ItemMod) -> (type_leak::Referrer, ContextId) {
-    let config = type_leak::Allow::new().allow_primitive().allow_prelude();
+    let config = type_leak::Rules::new().primitive().prelude();
     let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_mod(m);
     (leaker.result().finish().unwrap(), context)

@@ -71,7 +71,7 @@ impl Parse for Shared {
 /// `shared_leak!`, the Leaker's side.
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let Shared { id, items } = parse2(input)?;
-    let config = Allow::new().allow_primitive().allow_prelude();
+    let config = Rules::new().primitive().prelude();
     let mut leaker = Leaker::from_config(config, Options::new());
     let mut contexts = Vec::new();
     for item in &items {

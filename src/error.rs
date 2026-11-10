@@ -1,13 +1,13 @@
 //! The errors of the analysis by the [`Leaker`](crate::Leaker): an [`ErrorItem`] for each part of
 //! an item that cannot be interned ([recovery](crate::Leaker#errors-and-recovery)).
 
+use crate::allow::Place;
 use crate::analysis::{CheckResult, SelfMention};
-use crate::util::{or_list, tidy, without_crate_prefix, KNOWN_NAMES};
+use crate::util::{or_list, path_starts_with, tidy, without_crate_prefix, KNOWN_NAMES};
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
-use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     braced, bracketed, parenthesized, token, Expr, ExprPath, Ident, Lifetime, LitStr, Path, Token,
@@ -19,8 +19,8 @@ use template_quote::{quote, ToTokens};
 ///
 /// It is usually the whole syntax that cannot be accepted (`MyType<'_, Rel>`, not `MyType`). Causes
 /// are equal if they have the same kind and tokens (spans and spacing ignored), so a cause written
-/// by hand (`Cause::Trait(parse_quote!(RelTr))`) can be compared with `==` in a rule of
-/// [`LeakerResult::allow()`](crate::LeakerResult::allow).
+/// by hand (`Cause::Trait(parse_quote!(RelTr))`) can be compared with `==` in an
+/// [`Allow`](crate::Allow) rule.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Cause {
@@ -40,7 +40,9 @@ pub enum Cause {
     /// A lifetime: an elided one (`'_`), one of a method, or one that no scope declares.
     Lifetime(Lifetime),
     /// Syntax that the Leaker cannot read (`macro_rules!`, `use inner::*;`) or that no node of the
-    /// syntax holds: a bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses.
+    /// syntax holds: a bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses. In
+    /// [`ErrorItem::paths`] it is a path of unknown kind (the root of a `use`, a path in the tokens
+    /// of a macro).
     Unreadable(TokenStream),
 }
 
@@ -93,8 +95,10 @@ impl Cause {
         }
     }
 
-    /// The path that is the cause, if it is one, without a `qself`.
-    pub(crate) fn as_path(&self) -> Option<&Path> {
+    /// Returns the path of a [`Cause::Type`] that is a path without a qualified self type, of a
+    /// [`Cause::Trait`], of a [`Cause::Macro`] and of a [`Cause::Expr`] that is a path, as written
+    /// (with its generic arguments, if it has any).
+    pub fn path(&self) -> Option<&Path> {
         match self {
             Cause::Type(Type::Path(syn::TypePath { qself: None, path }))
             | Cause::Trait(path)
@@ -103,6 +107,21 @@ impl Cause {
                 qself: None, path, ..
             })) => Some(path),
             _ => None,
+        }
+    }
+
+    /// Returns `true` if [`path()`](Cause::path) starts with `prefix`, segment by segment by
+    /// identifier. Both must have a leading `::` or neither; generic arguments are ignored.
+    pub fn starts_with(&self, prefix: &Path) -> bool {
+        self.path()
+            .map_or(false, |path| path_starts_with(path, prefix))
+    }
+
+    /// The path that an entry of [`ErrorItem::paths`] is, of whatever kind.
+    pub(crate) fn entry_path(&self) -> Option<Path> {
+        match self {
+            Cause::Unreadable(tokens) => syn::parse2(tokens.clone()).ok(),
+            other => other.path().cloned(),
         }
     }
 
@@ -262,7 +281,7 @@ impl Hash for Cause {
 pub enum Reason {
     /// A path or type that depends on the context but cannot be leaked, so it must be written in
     /// full (`MyType` in `MyType<'_>`, a trait in a bound), or a relative path in a value. A macro
-    /// can accept a path with [`Allow::allow_path_if()`](crate::Allow::allow_path_if).
+    /// can accept a path with an [`Allow`](crate::Allow) rule.
     RelativePath,
     /// `Self` where no scope gives it a meaning: in a module, or in generics that no struct, enum,
     /// union, impl or trait encloses. A macro can enter such a scope
@@ -387,8 +406,8 @@ impl Reason {
 #[non_exhaustive]
 pub struct ErrorItem {
     /// The part of the item that cannot be interned, as written, and where the error is reported
-    /// ([`ErrorItem::span()`]). Compare it with `==` in a rule of
-    /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
+    /// ([`ErrorItem::span()`]). Compare it with `==` in an [`Allow`](crate::Allow) rule: a rule
+    /// accepts an error that has [`paths`](ErrorItem::paths) by them, and one that has none by this.
     pub cause: Cause,
     /// Why it cannot be interned.
     pub reason: Reason,
@@ -403,20 +422,31 @@ pub struct ErrorItem {
     /// is `None` only in an item that [`Parse`] read without.
     pub help: Option<(TokenStream, String)>,
     /// Found while reading a value ([`check_values()`](crate::Options::check_values)); see
-    /// [`allow_values()`](crate::LeakerResult::allow_values).
+    /// [`place()`](ErrorItem::place).
     pub in_value: bool,
     /// Found in a default: of a trait's method or const, or of a parameter; see
-    /// [`allow_default()`](crate::LeakerResult::allow_default).
+    /// [`place()`](ErrorItem::place).
     pub in_default: bool,
-    /// The relative paths that the cause depends on, without their arguments (`Vec<Rel<'_>>` has
-    /// `Vec` and `Rel`). A path rule drops the error if it accepts all of them.
-    pub paths: Vec<Path>,
+    /// The relative paths that the cause depends on, each as the cause of its kind (a
+    /// [`Cause::Type`], [`Cause::Trait`], [`Cause::Expr`] or [`Cause::Macro`] that is a path) and
+    /// without its arguments: `Vec<Rel<'_>>` has the types `Vec` and `Rel`. A path of unknown kind
+    /// (in a `use`, in the tokens of a macro) is a [`Cause::Unreadable`]. A rule drops the error if
+    /// it accepts all of them.
+    pub paths: Vec<Cause>,
     /// What is wrong inside the part if its [`paths`](ErrorItem::paths) are allowed. They take the
-    /// place of this error when an `allow*()` drops it.
+    /// place of this error when [`LeakerResult::allow()`](crate::LeakerResult::allow) drops it.
     pub nested: Vec<ErrorItem>,
 }
 
 impl ErrorItem {
+    /// Returns where the error was found, as [`Allow::allow()`](crate::Allow::allow) is asked.
+    pub fn place(&self) -> Place {
+        Place {
+            in_value: self.in_value,
+            in_default: self.in_default,
+        }
+    }
+
     /// Returns the span of the cause, where the error is reported.
     pub fn span(&self) -> Span {
         self.cause.to_token_stream().span()
@@ -566,12 +596,23 @@ impl Parse for ErrorItem {
                 "paths" => {
                     let list;
                     bracketed!(list in item);
-                    paths = Punctuated::<Path, Token![,]>::parse_terminated_with(
-                        &list,
-                        Path::parse_mod_style,
-                    )?
-                    .into_iter()
-                    .collect();
+                    while !list.is_empty() {
+                        let kind = list.call(Ident::parse_any)?;
+                        let cause;
+                        parenthesized!(cause in list);
+                        let span = cause.span();
+                        let entry = Cause::parse(&kind, &cause)?;
+                        let bare = entry.entry_path().map_or(false, |path| {
+                            path.segments.iter().all(|seg| seg.arguments.is_none())
+                        });
+                        if !bare {
+                            return Err(syn::Error::new(span, "expected a path without arguments"));
+                        }
+                        paths.push(entry);
+                        if !list.is_empty() {
+                            list.parse::<Token![,]>()?;
+                        }
+                    }
                 }
                 "nested" => {
                     let list;
@@ -626,8 +667,15 @@ impl ToTokens for ErrorItem {
             .in_default
             .then(|| Ident::new("default", Span::call_site()));
         let paths = (!self.paths.is_empty()).then(|| {
-            let paths = &self.paths;
-            quote!(paths [#(for path in paths), { #path }])
+            let paths: Vec<TokenStream> = self
+                .paths
+                .iter()
+                .map(|path| {
+                    let kind = Ident::new(path.kind(), Span::call_site());
+                    quote!(#kind (#path))
+                })
+                .collect();
+            quote!(paths [#(for path in &paths), { #path }])
         });
         let nested = (!self.nested.is_empty()).then(|| {
             let nested = &self.nested;
@@ -654,8 +702,8 @@ pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
         message: "`Self` has no meaning here".to_string(),
         notes: vec![(tokens.clone(), SELF_NOTE.to_string())],
         help: Some((tokens, SELF_HELP.to_string())),
-        in_value: mention.place.value,
-        in_default: mention.place.default,
+        in_value: mention.place.in_value,
+        in_default: mention.place.in_default,
         paths: Vec::new(),
         nested: Vec::new(),
     }
@@ -715,8 +763,8 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
             .unwrap_or_else(|| format!("use absolute path: '{}'", tidy(&tokens))),
         notes,
         help: Some(help),
-        in_value: conflict.place.value,
-        in_default: conflict.place.default,
+        in_value: conflict.place.in_value,
+        in_default: conflict.place.in_default,
         paths: conflict.paths.clone(),
         nested: conflict.nested.clone(),
     })
@@ -746,7 +794,7 @@ fn offending_path(cause: &Cause) -> Option<syn::Path> {
                 _ => None,
             }
         }),
-        other => other.as_path().cloned(),
+        other => other.path().cloned(),
     }
 }
 

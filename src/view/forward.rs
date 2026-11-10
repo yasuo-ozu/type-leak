@@ -2,6 +2,7 @@
 //! the methods the analysis overrides.
 
 use super::View;
+use crate::allow::Allow;
 use syn::visit::Visit;
 use syn::*;
 
@@ -16,7 +17,7 @@ macro_rules! forward {
     };
 }
 
-impl<P: Fn(&Path) -> bool> View<'_, P> {
+impl<A: Allow> View<'_, A> {
     /// Walks the parts of an impl of the scope: the walk of `syn::visit::visit_item_impl()`, with
     /// the self type checked.
     pub(crate) fn walk_item_impl(&mut self, item: &ItemImpl) {
@@ -75,7 +76,7 @@ impl<P: Fn(&Path) -> bool> View<'_, P> {
 // Forwards only the methods the analysis overrides, so walking the view walks the analysis. The
 // default walk of the other methods reaches the forwarded ones through the view. The test below
 // keeps this list in sync with the overrides of the analysis.
-impl<'ast, P: Fn(&Path) -> bool> Visit<'ast> for View<'_, P> {
+impl<'ast, A: Allow> Visit<'ast> for View<'_, A> {
     forward! {
         visit_angle_bracketed_generic_arguments: AngleBracketedGenericArguments,
         visit_const_param: ConstParam,

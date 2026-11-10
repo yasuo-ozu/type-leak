@@ -36,7 +36,7 @@
 //! With `stages = true` in the attribute (`TYPE_LEAK_PROP_FEATURES=allow_stages`) the macro also
 //! makes two copies of the item for each [`Rule`], which the Referrer's crates of `allow_stages`
 //! build ([`rule_stage()`], [`stage_copy()`]): after the analysis without the rule, whose result is
-//! given the rule (`LeakerResult::allow_prelude()`, ...) and then `allow(cause)` for the causes of
+//! given the rule (`Rules::prelude()`, ...) and then `allow(cause)` for the causes of
 //! the errors that remain, and after the analysis of a config that has the rule. When no error
 //! remains after the rule, the copy is also made in a crate with none of the Leaker's names (the
 //! invocation says `clean`). Their Repeater's impls have an `ID` of their own
@@ -44,7 +44,7 @@
 //!
 //! With `#[prop_leak_result]` the Leaker does not decide: an item with errors is emitted with its
 //! `LeakerResult` (the Referrer, then the errors, as tokens). The Referrer's invocation says what
-//! it allows (`allow(std_crates, trait Path, type Ty)`: `LeakerResult::allow_std_crates()`,
+//! it allows (`allow(std_crates, trait Path, type Ty)`: `Rules::std_crates()`,
 //! `allow(cause)`), [`apply()`] reports every error that remains with
 //! `ErrorItem::emit()`, and copies the item with the recovered Referrer either way.
 
@@ -78,7 +78,7 @@ pub(crate) struct Args {
     /// the impls of all the entries, for any Referrer; the Referrer's invocation says which it is
     /// (`strict`), and the two must agree if it is said.
     strict: Option<bool>,
-    /// The Leaker allows the primitive types (`Allow::allow_primitive()`).
+    /// The Leaker allows the primitive types (`Rules::primitive()`).
     primitive: bool,
     /// The expectation about a bare `?Sized` without the prelude: `true` if the Leaker accepts it
     /// whatever the prelude (the `?` applies to the real `Sized` only), `false` if it is a relative
@@ -226,9 +226,9 @@ impl Args {
 /// the Leaker's crate, each with an `ID` of their own.
 #[derive(Clone, Copy, PartialEq)]
 enum Side {
-    /// The analysis without the rule, whose result is given the rule (`LeakerResult::allow_*()`).
+    /// The analysis without the rule, whose result is given the rule (`LeakerResult::allow()`).
     Result,
-    /// The analysis of a config that has the rule (`Allow::allow_*()`). Its copy is what the
+    /// The analysis of a config that has the rule (`Rules`). Its copy is what the
     /// copy of `Result` is compared with: if the one that fails is only `Result`'s, the rule after
     /// the analysis is what makes it fail.
     Config,
@@ -259,18 +259,18 @@ impl Side {
 ///   stages: the macro tells whether they do ([`rule_stage()`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Rule {
-    /// `allow_prelude()`: for every item, with the analysis not allowing the prelude.
+    /// `Rules::prelude()`: for every item, with the analysis not allowing the prelude.
     Prelude,
-    /// `allow_crate()`.
+    /// `Rules::crate_paths()`.
     Crate,
-    /// `allow_path_if(super::base)`: the module `base` as the modules at depth 1 (`m0`, `mm0`) name it.
+    /// `Rules::or_if(super::base)`: the module `base` as the modules at depth 1 (`m0`, `mm0`) name it.
     /// The paths of the deeper ones (`super::super::base`) are other paths.
     Path,
-    /// `allow_std_crates()`.
+    /// `Rules::std_crates()`.
     StdCrates,
-    /// `allow_values()`: the items that the Leaker reads the values of.
+    /// `Rules::values()`: the items that the Leaker reads the values of.
     Values,
-    /// `allow_default()`.
+    /// `Rules::defaults()`.
     Default,
 }
 
@@ -320,15 +320,12 @@ impl Rule {
 
     fn on_result(self, result: LeakerResult) -> LeakerResult {
         match self {
-            Rule::Prelude => result.allow_prelude(),
-            Rule::Crate => result.allow_crate(),
-            Rule::Path => {
-                let base = base_path();
-                result.allow_path_if(move |path| path_starts_with(path, &base))
-            }
-            Rule::StdCrates => result.allow_std_crates(),
-            Rule::Values => result.allow_values(),
-            Rule::Default => result.allow_default(),
+            Rule::Prelude => result.allow(Rules::new().prelude()),
+            Rule::Crate => result.allow(Rules::new().crate_paths()),
+            Rule::Path => result.allow(crate::starts_with(vec![base_path()])),
+            Rule::StdCrates => result.allow(Rules::new().std_crates()),
+            Rule::Values => result.allow(Rules::new().values()),
+            Rule::Default => result.allow(Rules::new().defaults()),
         }
     }
 }
@@ -338,7 +335,7 @@ fn base_path() -> Path {
     parse_quote!(super::base)
 }
 
-/// `std`, `core` or `alloc` as a relative path (`Allow::allow_std_crates()`).
+/// `std`, `core` or `alloc` as a relative path (`Rules::std_crates()`).
 fn is_std_crate(path: &Path) -> bool {
     path.leading_colon.is_none()
         && path.segments.len() == 1
@@ -389,35 +386,37 @@ fn analyze_with(
     args: &Args,
     rule: Option<Rule>,
 ) -> (LeakerResult, ContextId, TokenStream) {
-    let allowed = args.allow.clone();
-    let (primitive, prelude) = (args.primitive, args.prelude);
-    let base = base_path();
-    let config = Allow::new()
-        .allow_path_if(move |path| {
-            allowed.iter().any(|prefix| path_starts_with(path, prefix))
-                || (primitive && is_primitive_path(path))
-                || (prelude && is_prelude_path(path))
-                || match rule {
-                    Some(Rule::Prelude) => is_prelude_path(path),
-                    Some(Rule::Crate) => is_crate_path(path),
-                    Some(Rule::Path) => path_starts_with(path, &base),
-                    Some(Rule::StdCrates) => is_std_crate_path(path),
-                    _ => false,
-                }
-        })
-        .allow(move |error| match rule {
-            Some(Rule::Values) => error.in_value,
-            Some(Rule::Default) => error.in_default,
-            _ => false,
-        });
+    let mut config = Rules::new().or_if(crate::starts_with(args.allow.clone()));
+    if args.primitive {
+        config = config.primitive();
+    }
+    if args.prelude || rule == Some(Rule::Prelude) {
+        config = config.prelude();
+    }
+    if rule == Some(Rule::Crate) {
+        config = config.crate_paths();
+    }
+    if rule == Some(Rule::StdCrates) {
+        config = config.std_crates();
+    }
+    if rule == Some(Rule::Values) {
+        config = config.values();
+    }
+    if rule == Some(Rule::Default) {
+        config = config.defaults();
+    }
+    let path_rule = crate::starts_with(vec![base_path()]);
+    let config = config.or_if(move |cause: &Cause, place: Place| {
+        rule == Some(Rule::Path) && path_rule(cause, place)
+    });
     analyze_config(item, args, config)
 }
 
 /// [`analyze()`] with the whole `config`.
-fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+fn analyze_config<A: Allow>(
     item: &Item,
     args: &Args,
-    config: Allow<P, E>,
+    config: A,
 ) -> (LeakerResult, ContextId, TokenStream) {
     let mut options = Options::new();
     if args.values {
@@ -2019,7 +2018,7 @@ fn rewrite_defaults(
 /// items stay.
 ///
 /// With `constants` the import of `ILEN` stays: the paths of values and defaults that a rule allows
-/// name it (`clean` copies of `allow_values()` and `allow_default()`).
+/// name it (`clean` copies of `Rules::values()` and `Rules::defaults()`).
 fn drop_relative_uses(items: &mut Vec<Item>, constants: bool) {
     fn renames_ilen(tree: &UseTree) -> bool {
         match tree {
@@ -2148,7 +2147,7 @@ fn host_impl(
     }
 }
 
-/// Without `Allow::allow_primitive()`, `u8` is a relative path like any other (a module may
+/// Without `Rules::primitive()`, `u8` is a relative path like any other (a module may
 /// declare its own `u8`): the type that has it is an entry, and the copy replaces it. A copy that
 /// keeps a primitive in a type position copies a name that means something else in the Referrer's
 /// crate, whatever it is equal to there.
@@ -2876,7 +2875,7 @@ fn stage_copy(
 /// What the Referrer's invocation allows of the errors it got (`allow(std_crates, trait Path, type
 /// Ty)`).
 enum AllowArg {
-    /// `LeakerResult::allow_std_crates()`
+    /// `Rules::std_crates()`
     StdCrates,
     /// `LeakerResult::allow(cause)`: `trait Path` is a `Cause::Trait`, `type Ty` a `Cause::Type`.
     Cause(Cause),
@@ -3025,8 +3024,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     }
     for allowed in allow {
         result = match allowed {
-            AllowArg::StdCrates => result.allow_std_crates(),
-            AllowArg::Cause(cause) => result.allow(|e| e.cause == cause),
+            AllowArg::StdCrates => result.allow(Rules::new().std_crates()),
+            AllowArg::Cause(cause) => result.allow(|c: &Cause, _: Place| *c == cause),
         };
     }
     let errors = result.errors().to_vec();

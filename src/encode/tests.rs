@@ -1256,14 +1256,14 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
 
 // ── The helpers against what a macro wrote by hand before them ───────────────────────────────
 
-use crate::{Allow, ErrorItem, ImplSelf, Options, SelfRequirement, UseSite};
+use crate::{ErrorItem, ImplSelf, Options, Rules, SelfRequirement, UseSite};
 
 fn t(ty: Type) -> String {
     s(&ty)
 }
 
-fn config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn config() -> Rules {
+    Rules::new().primitive().prelude()
 }
 
 /// Analyzes a whole item the way a downstream macro does.

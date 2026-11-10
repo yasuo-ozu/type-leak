@@ -14,8 +14,9 @@
 
 mod common;
 
-use common::{allow_every_cause, starts_with};
+use common::{allow_every_cause, starts_with, AcceptCause};
 use proc_macro2::{Delimiter, Literal, TokenStream, TokenTree};
+use std::cell::{Cell, RefCell};
 use syn::parse::Parser;
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -170,7 +171,7 @@ fn a_result_with_errors_is_written_and_read_back() {
     );
 }
 
-/// `allow(cause)` and `allow_std_crates()` drop the same errors after the trip as before it, each
+/// `allow(cause)` and `Rules::std_crates()` drop the same errors after the trip as before it, each
 /// step and all of them, and so does writing the rest again. Accepting every cause leaves a Referrer
 /// that `finish()` returns, equal to the original.
 #[test]
@@ -182,14 +183,14 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
 
     for cause in &causes {
         let (mut before, mut after) = (result.clone(), read_back.clone());
-        before = before.allow(|e| e.cause == cause.clone());
-        after = after.allow(|e| e.cause == cause.clone());
+        before = before.accept_cause(cause);
+        after = after.accept_cause(cause);
         assert!(before.errors().len() < result.errors().len());
         assert_eq!(describe_all(&after), describe_all(&before));
     }
     let (mut before, mut after) = (result.clone(), read_back.clone());
-    before = before.allow_std_crates();
-    after = after.allow_std_crates();
+    before = before.allow(Rules::new().std_crates());
+    after = after.allow(Rules::new().std_crates());
     // `core::fmt::Debug` is the only cause that starts with the name of a crate of the library.
     let remaining: Vec<String> = before.errors().iter().map(|e| text(&e.cause)).collect();
     assert_eq!(remaining.len(), result.errors().len() - 1);
@@ -206,7 +207,7 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     assert_eq!(all.finish().unwrap(), referrer);
 }
 
-/// The path, value and default rules (`LeakerResult::allow_path_if()` and the others) give the same
+/// The path, value and default rules (`Rules::or_if()` and the others) give the same
 /// errors on the other side of the trip. A path rule leaves the paths it does not allow in the
 /// error, which is serialized with them, so rules given in two macros add up as they do in one.
 #[test]
@@ -219,7 +220,7 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
             }
         }
     );
-    let config = Allow::new().allow_primitive();
+    let config = Rules::new().primitive();
     let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
@@ -230,13 +231,13 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
 
     type Rule = fn(LeakerResult) -> LeakerResult;
     let rules: [(&str, Rule); 7] = [
-        ("path", |r| r.allow_path_if(starts_with(parse_quote!(my)))),
-        ("prelude", |r| r.allow_prelude()),
-        ("std crates", |r| r.allow_std_crates()),
-        ("crate", |r| r.allow_crate()),
-        ("primitive", |r| r.allow_primitive()),
-        ("values", |r| r.allow_values()),
-        ("default", |r| r.allow_default()),
+        ("path", |r| r.allow(starts_with(parse_quote!(my)))),
+        ("prelude", |r| r.allow(Rules::new().prelude())),
+        ("std crates", |r| r.allow(Rules::new().std_crates())),
+        ("crate", |r| r.allow(Rules::new().crate_paths())),
+        ("primitive", |r| r.allow(Rules::new().primitive())),
+        ("values", |r| r.allow(Rules::new().values())),
+        ("default", |r| r.allow(Rules::new().defaults())),
     ];
     let mut dropped_something = 0;
     for (name, rule) in rules {
@@ -281,30 +282,33 @@ fn into_parts_returns_the_referrer_and_the_errors_that_remain() {
     assert_eq!(again, referrer);
 }
 
-/// The `allow*()` methods and `deny_ambiguous_crate_name()` take and return the result, so they
-/// chain; a rule is an `FnMut`, applied at once, so it may count.
+/// `allow()` and `deny_ambiguous_crate_name()` take and return the result, so they chain; a rule is
+/// applied at once, so it may count (through a `Cell`).
 #[test]
 fn the_rules_chain_and_a_rule_may_count() {
     let result = with_errors();
-    let mut asked = 0;
-    let mut seen = Vec::new();
+    let asked = Cell::new(0);
+    let seen = RefCell::new(Vec::new());
     let chained = result
         .clone()
-        .allow(|_| {
-            asked += 1;
+        .allow(|_: &Cause, _: Place| {
+            asked.set(asked.get() + 1);
             false
         })
-        .allow_path_if(|path| {
-            seen.push(text(path));
+        .allow(|cause: &Cause, _: Place| {
+            if let Some(path) = cause.path() {
+                seen.borrow_mut().push(text(path));
+            }
             false
         })
-        .allow_std_crates()
+        .allow(Rules::new().std_crates())
         .deny_ambiguous_crate_name();
-    // The rule on errors is asked once for each error, and the rule on paths for the paths.
-    assert_eq!(asked, result.errors().len());
-    assert!(seen.iter().any(|path| path == "Rel"), "{:?}", seen);
+    // The rule is asked about the cause of each error, and then about the paths of those it did not
+    // accept: the counting rule saw at least one question for each error.
+    assert!(asked.get() >= result.errors().len());
+    assert!(seen.borrow().iter().any(|path| path == "Rel"), "{:?}", seen);
     // Chained: the same errors as one call after the other, and a strict Referrer.
-    let one_by_one = result.clone().allow_std_crates();
+    let one_by_one = result.clone().allow(Rules::new().std_crates());
     assert_eq!(describe_all(&chained), describe_all(&one_by_one));
     // Only the strict Referrer replaces the optional entry `::foo::X` (`==` ignores strictness).
     let expand = |result: LeakerResult| {

@@ -1,6 +1,7 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
 //! visiting it, which the [`Analysis`] turns into the graphs of the entries.
 
+use crate::allow::Place;
 use crate::analyze::{input_type, unconstrained_in_output, Elision};
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
@@ -10,7 +11,7 @@ use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
 use std::collections::HashSet;
-use syn::{FnArg, Ident, Lifetime, Path, Signature, Type};
+use syn::{FnArg, Ident, Lifetime, Signature, Type};
 use template_quote::quote;
 
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
@@ -70,7 +71,7 @@ pub struct CheckResult {
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`), which the Referrer may not share. `must` holds only its
-    /// parts. See [`Allow::allow_path_if()`](crate::Allow::allow_path_if).
+    /// parts. See [`Allow`](crate::Allow).
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no meaning).
     /// Reported first.
@@ -95,24 +96,12 @@ pub struct CheckResult {
     /// Where the conflict was found: in a value, in a default ([`ErrorItem::in_value`],
     /// [`ErrorItem::in_default`]). Set where it is recorded as an error.
     pub(crate) place: Place,
-    /// The relative paths that the conflict depends on, without their arguments, in the order of
-    /// `must` ([`ErrorItem::paths`]).
-    pub(crate) paths: Vec<Path>,
+    /// The relative paths that the conflict depends on, with their kinds and without their
+    /// arguments, in the order of `must` ([`ErrorItem::paths`]).
+    pub(crate) paths: Vec<Cause>,
     /// What the analysis finds inside the part if `paths` are allowed ([`ErrorItem::nested`]).
     /// Only a conflict with a part has some.
     pub(crate) nested: Vec<ErrorItem>,
-}
-
-/// Where in an item the analysis was when it found an error: what
-/// [`Allow::allow_values()`](crate::Allow::allow_values) and
-/// [`Allow::allow_default()`](crate::Allow::allow_default) accept.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Place {
-    /// While a value is read (`check_values`), including trait default values and
-    /// bodies.
-    pub(crate) value: bool,
-    /// In the default of a generic parameter, a trait default body or an associated const default.
-    pub(crate) default: bool,
 }
 
 /// A mention of `Self` that has no meaning where it is written ([`Reason::SelfWithoutMeaning`]).
@@ -257,7 +246,7 @@ pub(crate) struct PendingType {
     /// The type is in a bound or where predicate of the item.
     pub(crate) in_predicate: bool,
     /// The relative paths the type depends on, if it is an entry ([`CheckResult::paths`]).
-    pub(crate) paths: Vec<Path>,
+    pub(crate) paths: Vec<Cause>,
     /// The primitive names in a type that is leaked whole, which `components` does not hold: they
     /// are assumed if the type is copied as written instead ([`Part::primitives`]).
     pub(crate) primitives: Vec<Ident>,

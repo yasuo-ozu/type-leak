@@ -311,7 +311,7 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9192!(
         path = ::type_leak_test_leaker::kinds,
         accept,
-        allow(trait PlainTr, type Held<'_>)
+        allow(trait PlainTr, type Held)
     );
 
     // Parts that name `Self` or have no context, found by the visitor (F43 to F45).
@@ -336,7 +336,7 @@ pub mod unnamed {
     type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(1));
 }
 
-/// The copies that `stages = true` makes after `allow_std_crates()` given to the result (F50): the
+/// The copies that `stages = true` makes after `Rules::std_crates()` given to the result (F50): the
 /// Leaker's `ValuePathArguments` has `core::mem::size_of::<*const Rel>()` in a default method. This
 /// module names `Rel`, so the copy that keeps the path as written (the error stays, and its cause is
 /// allowed) builds here.

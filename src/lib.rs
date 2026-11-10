@@ -24,9 +24,7 @@ mod view;
 
 pub use syn;
 
-pub use crate::allow::{
-    is_crate_path, is_prelude_path, is_primitive_path, is_std_crate_path, path_starts_with, Allow,
-};
+pub use crate::allow::{Allow, Place, Rules};
 pub use crate::analysis::CheckResult;
 pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{array_const, EncodeError};

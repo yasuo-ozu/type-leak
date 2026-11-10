@@ -3,6 +3,9 @@
 //! `Leaker::enter_generics()` and its relatives, and the ids are not renumbered by
 //! `Leaker::result()`, so the Referrer may have gaps.
 
+mod common;
+
+use common::AcceptCause;
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
@@ -254,7 +257,7 @@ fn a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted() {
     assert!(result.errors().iter().all(|error| error.cause == cause));
     let referrer = result.clone().into_referrer();
     // Accepting the causes drops the errors, and neither the ids nor the Referrer change.
-    let accepted = result.clone().allow(|e| e.cause == cause);
+    let accepted = result.clone().accept_cause(&cause);
     assert!(accepted.errors().is_empty());
     let accepted_referrer = accepted.finish().unwrap();
     assert_eq!(referrer, accepted_referrer);

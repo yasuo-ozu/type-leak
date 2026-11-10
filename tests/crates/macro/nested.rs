@@ -119,7 +119,7 @@ impl ToTokens for Nested {
 /// `nested_leak!`, the Leaker's side.
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let nested: Nested = parse2(input)?;
-    let config = Allow::new().allow_primitive().allow_prelude();
+    let config = Rules::new().primitive().prelude();
     let mut leaker = Leaker::from_config(config, Options::new());
     let (context, ()) =
         leaker.enter_trait(&nested.trait_ident, &nested.trait_generics, true, |view| {

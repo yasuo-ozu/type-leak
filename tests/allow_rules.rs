@@ -1,17 +1,25 @@
-//! The rules of `allow()` and `allow_path_if()` of `Allow` and `LeakerResult`: closures,
-//! which the convenience methods (`allow_prelude()`, `allow_default()`, ..) are made of. The last
-//! tests are about what a path rule is asked (never `Self` or a generic, never arguments) and about
-//! a rule that panics (on a result, and inside the closure of a scope).
+//! `Allow` and `Rules`: closures, tuples and the flags, which the convenience methods are made
+//! of. The last tests are about what the rule is asked (each path as the cause of its kind, never
+//! `Self` or a generic, never arguments in the analysis) and about a rule that panics (on a result,
+//! and inside the closure of a scope).
 
 mod common;
 
-use common::{analyze_trait, starts_with};
+use common::{analyze_trait, bare_path, starts_with, AcceptCause};
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
+
+/// `Place` is non-exhaustive.
+fn place(in_value: bool, in_default: bool) -> Place {
+    let mut place = Place::default();
+    place.in_value = in_value;
+    place.in_default = in_default;
+    place
+}
 
 fn entries(referrer: &Referrer) -> Vec<(String, bool)> {
     referrer
@@ -37,10 +45,7 @@ fn paths(error: &ErrorItem) -> Vec<String> {
 }
 
 /// The result of the analysis of the struct `item` with `config`.
-fn analyze<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    item: &ItemStruct,
-    config: Allow<P, E>,
-) -> LeakerResult {
+fn analyze<A: Allow>(item: &ItemStruct, config: A) -> LeakerResult {
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(item, true);
     leaker.result()
@@ -55,7 +60,7 @@ fn a_path_rule_leaves_the_paths_it_accepts_as_written() {
         }
     );
     // Without a rule `Vec<u8>` is an entry, and `::serde::W` an optional one.
-    let result = analyze(&item, Allow::new());
+    let result = analyze(&item, Rules::new());
     assert!(result.errors().is_empty());
     assert_eq!(
         entries(&result.into_referrer()),
@@ -65,60 +70,117 @@ fn a_path_rule_leaves_the_paths_it_accepts_as_written() {
         ]
     );
     // A rule for each of them: nothing is leaked, and there is no error.
-    let config = Allow::new()
-        .allow_prelude()
-        .allow_primitive()
-        .allow_path_if(starts_with(parse_quote!(::serde)));
+    let config = Rules::new()
+        .prelude()
+        .primitive()
+        .or_if(starts_with(parse_quote!(::serde)));
     let result = analyze(&item, config);
     assert!(result.errors().is_empty());
     assert!(entries(&result.into_referrer()).is_empty());
 }
 
 #[test]
-fn an_error_rule_accepts_what_the_convenience_method_does() {
+fn a_rule_on_the_place_accepts_what_the_flag_does() {
     let item: ItemStruct = parse_quote!(
         struct S<'a, U = &'a Rel<'_>> {
             a: &'a Rel<'_>,
             u: U,
         }
     );
-    let result = analyze(&item, Allow::new());
+    let result = analyze(&item, Rules::new());
     // The type of the field and the default are two errors of one cause, one of them in a default.
     assert_eq!(result.errors().len(), 2);
     assert_eq!(result.errors()[0].cause, result.errors()[1].cause);
     let in_default: Vec<bool> = result.errors().iter().map(|e| e.in_default).collect();
     assert_eq!(in_default.iter().filter(|&&d| d).count(), 1);
-    // A rule on the errors drops the one in the default, as `allow_default()` does.
-    let by_rule = result.clone().allow(|error| error.in_default);
+    for error in result.errors() {
+        assert_eq!(error.place(), place(error.in_value, error.in_default));
+    }
+    // A rule on the place drops the one in the default, as `defaults()` does.
+    let by_rule = result
+        .clone()
+        .allow(|_: &Cause, place: Place| place.in_default);
     assert_eq!(by_rule.errors().len(), 1);
     assert!(!by_rule.errors()[0].in_default);
-    let by_method = result.allow_default();
+    let by_method = result.allow(Rules::new().defaults());
     assert_eq!(texts(by_rule.errors()), texts(by_method.errors()));
-    // The same in the config.
-    let by_config = analyze(&item, Allow::new().allow_default());
+    // The same in the config: the default is analyzed with everything allowed, so its path `Rel` is
+    // written as it is, and the field stays an error.
+    let by_config = analyze(&item, Rules::new().defaults());
     assert_eq!(by_config.errors().len(), 1);
     assert!(!by_config.errors()[0].in_default);
     assert_eq!(texts(by_config.errors()), texts(by_rule.errors()));
 }
 
 #[test]
-fn path_rules_add_up_on_a_result() {
+fn rules_add_up_on_a_result() {
     let item: ItemStruct = parse_quote!(
         struct S<'a> {
             a: &'a Rel<'_, Vec<u8>>,
         }
     );
-    let result = analyze(&item, Allow::new());
+    let result = analyze(&item, Rules::new());
     assert_eq!(result.errors().len(), 1);
     assert_eq!(paths(&result.errors()[0]), ["Rel", "Vec", "u8"]);
     // The rules take the paths off one by one, as the rule of one call that accepts them all.
-    let result = result.allow_prelude();
+    let result = result.allow(Rules::new().prelude());
     assert_eq!(paths(&result.errors()[0]), ["Rel", "u8"]);
-    let result = result.allow_primitive();
+    let result = result.allow(Rules::new().primitive());
     assert_eq!(paths(&result.errors()[0]), ["Rel"]);
     // The error goes with the last.
-    let result = result.allow_path_if(starts_with(parse_quote!(Rel)));
+    let result = result.allow(starts_with(parse_quote!(Rel)));
     assert!(result.errors().is_empty());
+}
+
+#[test]
+fn an_error_is_accepted_by_its_paths_if_it_has_any_and_by_its_cause_if_it_has_none() {
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: Base<'_, Local>,
+        }
+    );
+    let result = analyze(&item, Rules::new());
+    assert_eq!(result.errors().len(), 1);
+    let error = &result.errors()[0];
+    assert_eq!(paths(error), ["Base", "Local"]);
+    // A rule for the cause, as written, never accepts it, and is not even asked: the paths are.
+    let seen = Rc::new(Seen::default());
+    let cause = error.cause.clone();
+    let seen_rule = seen.rule();
+    let by_cause = result.clone().allow(move |c: &Cause, place: Place| {
+        seen_rule(c, place);
+        *c == cause
+    });
+    assert_eq!(texts(by_cause.errors()), texts(result.errors()));
+    assert!(!seen.asked.borrow().iter().any(|(c, _)| *c == error.cause));
+    assert!(seen.contains("Base") && seen.contains("Local"));
+    assert!(seen.paths().iter().all(|p| p == "Base" || p == "Local"));
+    // A rule that allows a cause that is a path and some of the paths trims the others: the error
+    // stays with those that are not allowed.
+    let some = result.clone().allow(starts_with(parse_quote!(Base)));
+    assert_eq!(paths_of(&some), [["Local"]]);
+    // It goes when all the paths are allowed, by whatever rule.
+    let all = some.allow(starts_with(parse_quote!(Local)));
+    assert!(all.errors().is_empty());
+    let whole = error.cause.clone();
+    assert!(result.accept_cause(&whole).errors().is_empty());
+
+    // An error without paths is accepted by its cause.
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Self))
+    });
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert!(result.errors()[0].paths.is_empty());
+    let cause = Cause::Type(parse_quote!(Self));
+    assert_eq!(result.errors()[0].cause, cause);
+    assert!(result
+        .clone()
+        .allow(|c: &Cause, _: Place| *c == cause)
+        .errors()
+        .is_empty());
+    assert_eq!(result.allow(()).errors().len(), 1);
 }
 
 #[test]
@@ -130,21 +192,25 @@ fn the_rules_may_borrow_what_is_around() {
             c: Other<'_>,
         }
     );
-    let result = analyze(&item, Allow::new());
+    let result = analyze(&item, Rules::new());
     let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
     assert_eq!(causes.len(), 3);
-    // A rule of a result borrows a list of causes that is not 'static.
+    // A rule of a result borrows a list of paths that is not 'static.
+    let first_two: Vec<Cause> = result.errors()[..2]
+        .iter()
+        .flat_map(|e| e.paths.clone())
+        .collect();
     let left = result
         .clone()
-        .allow(|error| causes[..2].contains(&error.cause));
+        .allow(|cause: &Cause, _: Place| first_two.contains(cause));
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].cause, causes[2]);
     // So does a rule of a config, which the Leaker keeps while it analyzes.
     let allowed: Vec<Path> = vec![parse_quote!(MyType)];
-    let own = [causes[0].clone()];
-    let config = Allow::new()
-        .allow_path_if(|path| allowed.iter().any(|a| starts_with(a.clone())(path)))
-        .allow(|error| own.contains(&error.cause));
+    let own = result.errors()[0].paths.clone();
+    let config = Rules::new().or_if(|cause: &Cause, place: Place| {
+        allowed.iter().any(|a| starts_with(a.clone())(cause, place)) || own.contains(cause)
+    });
     let by_config = analyze(&item, config);
     assert_eq!(by_config.errors().len(), 1);
     assert_eq!(by_config.errors()[0].cause, causes[2]);
@@ -166,27 +232,30 @@ fn a_rule_that_accepts_everything_leaves_no_error_and_no_nested_error() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.errors().iter().any(|error| !error.nested.is_empty()));
-    let all = result.clone().allow(|_| true);
+    let all = result.clone().allow(|_: &Cause, _: Place| true);
     assert!(all.errors().is_empty());
     // Dropping the bound alone brings the nested error up.
-    let brought_up =
-        result.allow(|error| error.cause == Cause::Trait(parse_quote!(Into<Self::A0>)));
+    let brought_up = result.accept_cause(&Cause::Trait(parse_quote!(Into<Self::A0>)));
     assert_eq!(brought_up.errors().len(), 1);
 }
 
 #[test]
-fn a_config_with_rules_has_a_debug_form() {
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_default()
-        .allow_path_if(starts_with(parse_quote!(::serde)))
-        .allow(|error| error.in_value);
-    assert_eq!(format!("{:?}", config), "Allow { .. }");
-    assert_eq!(format!("{:?}", Allow::new()), "Allow { .. }");
+fn rules_are_clone_and_debug_where_their_rule_is() {
+    let rules = Rules::new().primitive().defaults();
+    assert_eq!(
+        format!("{:?}", rules.clone()),
+        "Rules { primitive: true, prelude: false, std_crates: false, crate_paths: false, \
+         values: false, defaults: true, custom: () }"
+    );
+    // A function is `Debug` and `Clone`; a closure that captures is `Clone` if its captures are.
+    let _ = format!("{:?}", Rules::new().or(()));
+    let owned: Path = parse_quote!(::serde);
+    let rules = Rules::new().or_if(move |cause: &Cause, _: Place| cause.starts_with(&owned));
+    let _clone = rules.clone();
 }
 
 #[test]
-fn a_path_rule_of_a_config_is_called_on_every_check_of_a_path() {
+fn a_rule_of_a_config_is_called_on_every_check_of_a_path() {
     let item: ItemStruct = parse_quote!(
         struct S {
             a: Foo,
@@ -197,56 +266,75 @@ fn a_path_rule_of_a_config_is_called_on_every_check_of_a_path() {
     let saw_foo = Rc::new(Cell::new(false));
     let rule = {
         let (calls, saw_foo) = (calls.clone(), saw_foo.clone());
-        move |path: &Path| {
+        move |cause: &Cause, _: Place| {
             calls.set(calls.get() + 1);
-            if path.is_ident("Foo") {
+            if bare_path(cause).map_or(false, |path| path.is_ident("Foo")) {
                 saw_foo.set(true);
             }
             false
         }
     };
-    let result = analyze(&item, Allow::new().allow_path_if(rule));
+    let result = analyze(&item, Rules::new().or_if(rule));
     assert!(result.errors().is_empty());
     // `Foo` is checked for each of the fields, and nothing is remembered between the checks.
     assert!(calls.get() >= 2, "{} calls", calls.get());
     assert!(saw_foo.get());
 }
 
-// ── what a path rule is asked, and what a panic of a rule does ───────────────────────────────
+// ── what a rule is asked, and what a panic of a rule does ────────────────────────────────────
 
-/// The paths that a rule saw, as tokens, and whether one of them had generic arguments.
+/// What a rule was asked: the causes, with the place.
 #[derive(Default)]
 struct Seen {
-    paths: RefCell<Vec<String>>,
-    with_arguments: Cell<bool>,
+    asked: RefCell<Vec<(Cause, Place)>>,
 }
 
 impl Seen {
     /// A rule that records what it is asked, and accepts nothing.
-    fn rule(self: &Rc<Self>) -> impl Fn(&Path) -> bool {
+    fn rule(self: &Rc<Self>) -> impl Fn(&Cause, Place) -> bool {
         let seen = self.clone();
-        move |path: &Path| {
-            seen.paths
-                .borrow_mut()
-                .push(path.to_token_stream().to_string());
-            if path.segments.iter().any(|seg| !seg.arguments.is_none()) {
-                seen.with_arguments.set(true);
-            }
+        move |cause: &Cause, place: Place| {
+            seen.asked.borrow_mut().push((cause.clone(), place));
             false
         }
     }
 
+    /// The paths that a rule saw, as tokens.
+    fn paths(&self) -> Vec<String> {
+        self.asked
+            .borrow()
+            .iter()
+            .filter_map(|(cause, _)| cause.path())
+            .map(|path| path.to_token_stream().to_string())
+            .collect()
+    }
+
     fn contains(&self, path: &str) -> bool {
-        self.paths.borrow().iter().any(|seen| seen == path)
+        self.paths().iter().any(|seen| seen == path)
     }
 
     /// Whether a path that starts with the segment `head` was asked about.
     fn starts_with(&self, head: &str) -> bool {
         let longer = format!("{} ::", head);
-        self.paths
-            .borrow()
+        self.paths()
             .iter()
             .any(|seen| seen == head || seen.starts_with(&longer))
+    }
+
+    /// Whether the rule was asked about a cause that is a path with generic arguments, but for the
+    /// causes of `errors` (and the errors in them), which the filter asks about as written.
+    fn with_arguments(&self, errors: &[ErrorItem]) -> bool {
+        fn causes(errors: &[ErrorItem], found: &mut Vec<Cause>) {
+            for error in errors {
+                found.push(error.cause.clone());
+                causes(&error.nested, found);
+            }
+        }
+        let mut errors_causes = Vec::new();
+        causes(errors, &mut errors_causes);
+        self.asked.borrow().iter().any(|(cause, _)| {
+            cause.path().is_some() && bare_path(cause).is_none() && !errors_causes.contains(cause)
+        })
     }
 }
 
@@ -259,7 +347,7 @@ fn three_errors() -> LeakerResult {
             c: Other<'_>,
         }
     );
-    let result = analyze(&item, Allow::new());
+    let result = analyze(&item, Rules::new());
     assert_eq!(paths_of(&result), [["Rel"], ["MyType"], ["Other"]]);
     result
 }
@@ -273,13 +361,13 @@ fn a_rule_that_panics_on_a_result_panics_the_call_and_loses_that_result() {
     let result = three_errors();
     let before = texts(result.errors());
 
-    // A rule on errors, which accepts the first and panics on the second.
+    // A rule that accepts the first cause and panics on the second.
     let calls = Cell::new(0);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        result.clone().allow(|_| {
+        result.clone().allow(|_: &Cause, _: Place| {
             calls.set(calls.get() + 1);
             if calls.get() == 2 {
-                panic!("the rule on errors");
+                panic!("the rule on causes");
             }
             true
         })
@@ -288,21 +376,30 @@ fn a_rule_that_panics_on_a_result_panics_the_call_and_loses_that_result() {
     assert_eq!(calls.get(), 2);
     // The result that the call took is gone with the panic; the one it was cloned from is as it was.
     assert_eq!(texts(result.errors()), before);
-    assert!(result.clone().allow(|_| true).errors().is_empty());
+    assert!(result
+        .clone()
+        .allow(|_: &Cause, _: Place| true)
+        .errors()
+        .is_empty());
 
     // A rule on paths, which accepts `Rel` and panics on `MyType`.
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        result.clone().allow_path_if(|path| {
-            if path.is_ident("MyType") {
+        result.clone().allow(|cause: &Cause, _: Place| {
+            let path = bare_path(cause);
+            if path.map_or(false, |path| path.is_ident("MyType")) {
                 panic!("the rule on paths");
             }
-            path.is_ident("Rel")
+            path.map_or(false, |path| path.is_ident("Rel"))
         })
     }));
     assert!(outcome.is_err());
     assert_eq!(texts(result.errors()), before);
     assert!(result.clone().finish().is_err());
-    let by_path = result.allow_path_if(|path| path.is_ident("MyType") || path.is_ident("Other"));
+    let by_path = result.allow(|cause: &Cause, _: Place| {
+        bare_path(cause).map_or(false, |path| {
+            path.is_ident("MyType") || path.is_ident("Other")
+        })
+    });
     assert_eq!(paths_of(&by_path), [["Rel"]]);
 }
 
@@ -329,11 +426,11 @@ fn all_paths(errors: &[ErrorItem], found: &mut Vec<String>) {
 }
 
 #[test]
-fn the_path_rule_is_not_asked_about_self_or_a_generic() {
+fn the_rule_is_not_asked_about_self_or_a_generic() {
     for (allow_self, check_values) in [(true, false), (false, false), (true, true), (false, true)] {
         let seen = Rc::new(Seen::default());
         let mut leaker = Leaker::from_config(
-            Allow::new().allow_path_if(seen.rule()),
+            Rules::new().or_if(seen.rule()),
             if check_values {
                 Options::new().check_values()
             } else {
@@ -343,13 +440,27 @@ fn the_path_rule_is_not_asked_about_self_or_a_generic() {
         leaker.intern_trait(&own_names(), allow_self);
         let result = leaker.result();
         let what = format!("allow_self {}, check_values {}", allow_self, check_values);
-        assert!(seen.contains("Rel"), "{}: {:?}", what, seen.paths);
+        assert!(seen.contains("Rel"), "{}: {:?}", what, seen.paths());
         for head in ["Self", "T", "Vec", "Iterator"] {
-            // `Iterator` is the bound of `T`, a relative path that the rule may see.
-            let asked = seen.starts_with(head);
-            assert_eq!(asked, head == "Iterator", "{}: {:?}", what, seen.paths);
+            // `Iterator` is the bound of `T`, a relative path that the rule may see. The causes of
+            // the errors are asked about as written, so `Self` and `T` may be among them.
+            let asked = seen
+                .asked
+                .borrow()
+                .iter()
+                .filter(|(cause, _)| bare_path(cause).is_some())
+                .any(|(cause, _)| {
+                    let path = cause.path().unwrap();
+                    path.segments.first().map_or(false, |seg| seg.ident == head)
+                });
+            assert_eq!(asked, head == "Iterator", "{}: {:?}", what, seen.paths());
         }
-        assert!(!seen.with_arguments.get(), "{}: {:?}", what, seen.paths);
+        assert!(
+            !seen.with_arguments(result.errors()),
+            "{}: {:?}",
+            what,
+            seen.paths()
+        );
         // The paths of the errors are the paths that the rule may see: none of those either.
         let mut found = Vec::new();
         all_paths(result.errors(), &mut found);
@@ -365,7 +476,7 @@ fn the_path_rule_is_not_asked_about_self_or_a_generic() {
 #[test]
 fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
     // With `allow_self = false` a type that names `Self` cannot be an entry.
-    fn by<P: Fn(&Path) -> bool>(source: &str, allow: Allow<P>) -> LeakerResult {
+    fn by<A: Allow>(source: &str, allow: A) -> LeakerResult {
         let item: ItemStruct = parse_str(source).unwrap();
         let mut leaker = Leaker::from_config(allow, Options::new());
         leaker.intern_struct(&item, false);
@@ -375,22 +486,27 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
         ("struct S { a: Rel<Self>, b: Self }", "Rel"),
         ("struct S { a: Box<Self>, b: Self }", "Box"),
     ] {
-        let plain = by(source, Allow::new());
+        let plain = by(source, Rules::new());
         assert_eq!(plain.errors().len(), 1, "{}", source);
         assert!(plain.clone().into_referrer().is_empty());
         // A rule for every path of one segment but the relative one accepts `Self` and a generic
-        // too, if it is asked.
-        let short = |path: &Path| path.segments.len() == 1 && !path.is_ident(relative);
-        let by_rule = by(source, Allow::new().allow_path_if(short));
+        // too, if it is asked: it is not, neither in the analysis nor as a path of the error.
+        let seen = Rc::new(Seen::default());
+        let seen_rule = seen.rule();
+        let short = move |cause: &Cause, place: Place| {
+            seen_rule(cause, place);
+            bare_path(cause).map_or(false, |path| {
+                path.segments.len() == 1 && !path.is_ident(relative)
+            })
+        };
+        let by_rule = by(source, Rules::new().or_if(short));
         assert_eq!(texts(by_rule.errors()), texts(plain.errors()), "{}", source);
         assert!(by_rule.into_referrer().is_empty(), "{}", source);
-        // Accepting `Self` only, in a config or on a result.
-        let by_rule = by(
-            source,
-            Allow::new().allow_path_if(|path| path.is_ident("Self")),
-        );
-        assert_eq!(texts(by_rule.errors()), texts(plain.errors()), "{}", source);
-        let on_result = plain.clone().allow_path_if(|path| path.is_ident("Self"));
+        assert!(!seen.starts_with("Self"), "{}: {:?}", source, seen.paths());
+        // Accepting `Self` only, on a result.
+        let on_result = plain.clone().allow(|cause: &Cause, _: Place| {
+            cause.path().map_or(false, |path| path.is_ident("Self"))
+        });
         assert_eq!(
             texts(on_result.errors()),
             texts(plain.errors()),
@@ -401,20 +517,21 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
 }
 
 #[test]
-fn the_filter_does_not_ask_the_rule_about_self() {
+fn the_filter_does_not_ask_the_rule_about_a_path_of_self() {
     // An error written by hand, with a path that starts with `Self`, read as a serialized result.
     let base = three_errors();
     let mut error = base.errors()[0].clone();
-    error.paths = vec![parse_quote!(Self::A)];
+    error.paths = vec![Cause::Type(parse_quote!(Self::A))];
     let mut tokens = base.into_referrer().to_token_stream();
     tokens.extend(quote!(@ [#error]));
     let result: LeakerResult = parse2(tokens).unwrap();
     assert_eq!(paths_of(&result), [["Self :: A"]]);
     let seen = Rc::new(Seen::default());
-    let result = result.allow_path_if(seen.rule());
-    assert!(seen.paths.borrow().is_empty());
+    let result = result.allow(seen.rule());
+    // The error has a path, so its cause is not asked about, and the path of `Self` is not either.
+    assert!(seen.asked.borrow().is_empty(), "{:?}", seen.paths());
     // A rule that accepts everything does not accept it either.
-    let result = result.allow_path_if(|_| true);
+    let result = result.allow(|_: &Cause, _: Place| true);
     assert_eq!(paths_of(&result), [["Self :: A"]]);
 }
 
@@ -425,10 +542,14 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
             fn f(&self, t: T);
         }
     );
-    let exact = |path: &Path| path.to_token_stream().to_string() == "m :: Bound";
+    let exact = |cause: &Cause, _: Place| {
+        cause.path().map_or(false, |path| {
+            path.to_token_stream().to_string() == "m :: Bound"
+        })
+    };
     let prefix = starts_with(parse_quote!(m::Bound));
-    let by_exact = analyze_trait(&item, Allow::new().allow_path_if(exact), false);
-    let by_prefix = analyze_trait(&item, Allow::new().allow_path_if(prefix), false);
+    let by_exact = analyze_trait(&item, Rules::new().or_if(exact), false);
+    let by_prefix = analyze_trait(&item, Rules::new().or_if(prefix), false);
     assert!(by_exact.errors().is_empty());
     assert_eq!(texts(by_exact.errors()), texts(by_prefix.errors()));
     // `Rel` in the arguments is still analyzed: it is the one entry.
@@ -444,17 +565,22 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
             }
         }
     );
-    let exact = |path: &Path| path.to_token_stream().to_string() == "helper :: f";
+    let exact = |cause: &Cause, _: Place| {
+        cause.path().map_or(false, |path| {
+            path.to_token_stream().to_string() == "helper :: f"
+        })
+    };
     let prefix = starts_with(parse_quote!(helper::f));
-    let by_exact = analyze_trait(&item, Allow::new().allow_path_if(exact), true);
-    let by_prefix = analyze_trait(&item, Allow::new().allow_path_if(prefix), true);
+    let by_exact = analyze_trait(&item, Rules::new().or_if(exact), true);
+    let by_prefix = analyze_trait(&item, Rules::new().or_if(prefix), true);
     assert!(by_exact.errors().is_empty());
     assert_eq!(texts(by_exact.errors()), texts(by_prefix.errors()));
     let (by_exact, by_prefix) = (by_exact.into_referrer(), by_prefix.into_referrer());
     assert_eq!(entries(&by_exact), [("Rel".to_string(), true)]);
     assert_eq!(entries(&by_exact), entries(&by_prefix));
 
-    // Whatever it is given has no arguments, in the analysis and on a result.
+    // Whatever it is given in the analysis has no arguments; on a result it is given the causes of
+    // the errors as written, and then their paths without arguments.
     let seen = Rc::new(Seen::default());
     let item: ItemTrait = parse_quote!(
         trait Tr<T: m::Bound<Rel>> {
@@ -463,13 +589,13 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
             }
         }
     );
-    let result = analyze_trait(&item, Allow::new().allow_path_if(seen.rule()), true);
+    let result = analyze_trait(&item, Rules::new().or_if(seen.rule()), true);
     assert!(seen.contains("m :: Bound") && seen.contains("helper :: f"));
-    assert!(!seen.with_arguments.get(), "{:?}", seen.paths);
-    seen.paths.borrow_mut().clear();
-    let _ = result.allow_path_if(seen.rule());
-    assert!(!seen.paths.borrow().is_empty());
-    assert!(!seen.with_arguments.get(), "{:?}", seen.paths);
+    assert!(!seen.with_arguments(result.errors()), "{:?}", seen.paths());
+    seen.asked.borrow_mut().clear();
+    let result = result.allow(seen.rule());
+    assert!(!seen.asked.borrow().is_empty());
+    assert!(!seen.with_arguments(result.errors()), "{:?}", seen.paths());
 }
 
 #[test]
@@ -483,7 +609,7 @@ fn the_rule_is_asked_about_absolute_paths_of_types_except_core() {
             d: Rel,
         }
     );
-    let result = analyze(&item, Allow::new().allow_path_if(seen.rule()));
+    let result = analyze(&item, Rules::new().or_if(seen.rule()));
     assert!(result.errors().is_empty());
     // `::core` is never optional, and `$crate` is context-free: the rule is not asked.
     assert!(seen.contains(":: std :: vec :: Vec"));
@@ -493,8 +619,8 @@ fn the_rule_is_asked_about_absolute_paths_of_types_except_core() {
 }
 
 /// A rule that panics when it is asked about `Boom`.
-fn boom(path: &Path) -> bool {
-    if path.is_ident("Boom") {
+fn boom(cause: &Cause, _: Place) -> bool {
+    if bare_path(cause).map_or(false, |path| path.is_ident("Boom")) {
         panic!("the rule is asked about Boom");
     }
     false
@@ -502,7 +628,7 @@ fn boom(path: &Path) -> bool {
 
 #[test]
 fn a_rule_that_panics_in_a_caught_visit_poisons_the_call() {
-    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
     let generics: Generics = parse_quote!(<T>);
     let where_clause: WhereClause = parse_quote!(where T: m::Tr<Rel2>);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -531,7 +657,7 @@ fn a_rule_that_panics_in_a_caught_visit_poisons_the_call() {
 
 #[test]
 fn a_rule_that_panics_in_a_caught_inner_scope_poisons_the_outer_call() {
-    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
     let generics: Generics = parse_quote!(<T>);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         leaker.enter_generics(&generics, |view| {
@@ -554,7 +680,7 @@ fn a_rule_that_panics_in_a_caught_inner_scope_poisons_the_outer_call() {
 
 #[test]
 fn a_rule_that_panics_is_a_panic_of_the_closure() {
-    let mut leaker = Leaker::from_config(Allow::new().allow_path_if(boom), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
     let item: ItemStruct = parse_quote!(
         struct S {
             a: Rel,
@@ -578,61 +704,400 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
     );
 }
 
-// The rules of the convenience methods are public functions: `allow_x()` is
-// `allow_path_if(is_x_path)`, and a run-time choice goes into one closure.
+// ── each path is asked about as the cause of its kind ────────────────────────────────────────
 
-const RULES: [&str; 4] = ["primitive", "prelude", "std", "crate"];
-
-/// The analysis of `item` with the wrapper of `Allow` that has `rule` as its name (none if `None`),
-/// or with `allow_path_if()` of the function of `rule`.
-fn analyze_rule(
-    rule: Option<&str>,
-    function: bool,
-    item: &ItemTrait,
-    values: bool,
-) -> LeakerResult {
-    let allow = Allow::new();
-    match (rule, function) {
-        (None, _) => analyze_trait(item, allow, values),
-        (Some("primitive"), false) => analyze_trait(item, allow.allow_primitive(), values),
-        (Some("primitive"), true) => {
-            analyze_trait(item, allow.allow_path_if(is_primitive_path), values)
-        }
-        (Some("prelude"), false) => analyze_trait(item, allow.allow_prelude(), values),
-        (Some("prelude"), true) => {
-            analyze_trait(item, allow.allow_path_if(is_prelude_path), values)
-        }
-        (Some("std"), false) => analyze_trait(item, allow.allow_std_crates(), values),
-        (Some("std"), true) => analyze_trait(item, allow.allow_path_if(is_std_crate_path), values),
-        (Some("crate"), false) => analyze_trait(item, allow.allow_crate(), values),
-        (Some("crate"), true) => analyze_trait(item, allow.allow_path_if(is_crate_path), values),
-        _ => unreachable!(),
+/// What a rule was asked about `item`, as `kind(path)` in the order asked, without the repeats.
+fn asked_as(item: &ItemTrait, values: bool, nested: bool) -> Vec<String> {
+    let seen = Rc::new(Seen::default());
+    let mut leaker = Leaker::from_config(
+        Rules::new().or_if(seen.rule()),
+        if values {
+            Options::new().check_values()
+        } else {
+            Options::new()
+        },
+    );
+    if nested {
+        leaker.enter_mod("m", [], |view| view.visit_item(&Item::Trait(item.clone())));
+    } else {
+        leaker.intern_trait(item, true);
     }
-}
-
-/// `result` after the wrapper of `LeakerResult` named `rule`, or after `allow_path_if()` of the
-/// function of `rule`.
-fn on_result(rule: &str, function: bool, result: LeakerResult) -> LeakerResult {
-    match (rule, function) {
-        ("primitive", false) => result.allow_primitive(),
-        ("primitive", true) => result.allow_path_if(is_primitive_path),
-        ("prelude", false) => result.allow_prelude(),
-        ("prelude", true) => result.allow_path_if(is_prelude_path),
-        ("std", false) => result.allow_std_crates(),
-        ("std", true) => result.allow_path_if(is_std_crate_path),
-        ("crate", false) => result.allow_crate(),
-        ("crate", true) => result.allow_path_if(is_crate_path),
-        _ => unreachable!(),
+    let _ = leaker.result();
+    let mut found: Vec<String> = Vec::new();
+    for (cause, _) in seen.asked.borrow().iter() {
+        let kind = match cause {
+            Cause::Type(_) => "type",
+            Cause::Trait(_) => "trait",
+            Cause::Expr(_) => "expr",
+            Cause::Macro(_) => "macro",
+            other => panic!("{:?}", other),
+        };
+        let text = format!("{}({})", kind, cause.to_token_stream());
+        // The causes of the errors are asked about as written, after the analysis: leave them.
+        if bare_path(cause).is_some() && !found.contains(&text) {
+            found.push(text);
+        }
     }
-}
-
-/// The Referrer and the errors of `result`, as one text.
-fn serialized(result: &LeakerResult) -> String {
-    result.to_token_stream().to_string()
+    found
 }
 
 #[test]
-fn the_wrappers_are_the_path_functions() {
+fn the_rule_is_asked_about_a_type_a_trait_a_value_and_a_macro_each_as_its_kind() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr: SuperTr {
+            fn f(&self, a: TyArg, b: Box<dyn ObjTr>, c: ty_mac!(u8)) -> <Rel as QualTr>::X
+            where
+                Rel: WhereTr;
+            fn g(&self) {
+                let _: LetTy = val_mod::func(ValArg);
+                mac_path!();
+            }
+        }
+    );
+    let asked = asked_as(&item, true, false);
+    for expected in [
+        "trait(SuperTr)",
+        "type(TyArg)",
+        "type(Box)",
+        "trait(ObjTr)",
+        "macro(ty_mac !)",
+        "type(Rel)",
+        "trait(QualTr)",
+        "trait(WhereTr)",
+        "type(LetTy)",
+        "expr(val_mod :: func)",
+        "macro(mac_path !)",
+        "expr(ValArg)",
+    ] {
+        assert!(
+            asked.iter().any(|a| a == expected),
+            "{}: {:?}",
+            expected,
+            asked
+        );
+    }
+    // Never as another kind: a trait is not asked about as a type.
+    for unexpected in [
+        "type(SuperTr)",
+        "type(ObjTr)",
+        "type(QualTr)",
+        "type(WhereTr)",
+        "trait(Rel)",
+        "type(val_mod :: func)",
+        "type(ValArg)",
+        "trait(TyArg)",
+    ] {
+        assert!(
+            !asked.iter().any(|a| a == unexpected),
+            "{}: {:?}",
+            unexpected,
+            asked
+        );
+    }
+}
+
+#[test]
+fn a_rule_for_one_kind_leaves_a_path_of_another_kind_leaked() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, a: Same) -> u8
+            where
+                u8: Same2;
+        }
+    );
+    // `Same` is a type: a rule for traits named `Same` does not allow it, one for types does.
+    let only_traits = |cause: &Cause, _: Place| matches!(cause, Cause::Trait(_));
+    let only_types = |cause: &Cause, _: Place| matches!(cause, Cause::Type(_));
+    let by_traits = analyze_trait(&item, Rules::new().primitive().or_if(only_traits), false);
+    let by_types = analyze_trait(&item, Rules::new().primitive().or_if(only_types), false);
+    // Types allowed: no entry for `Same`; the trait `Same2` is an error.
+    assert!(entries(&by_types.clone().into_referrer()).is_empty());
+    assert_eq!(by_types.errors().len(), 1);
+    assert!(matches!(
+        by_types.errors()[0].cause,
+        Cause::Type(_) | Cause::Trait(_)
+    ));
+    // Traits allowed: the type `Same` is an entry, and the trait is fine.
+    assert!(by_traits.errors().is_empty());
+    assert_eq!(
+        entries(&by_traits.into_referrer()),
+        [("Same".to_string(), true)]
+    );
+}
+
+#[test]
+fn a_path_of_unknown_kind_is_allowed_as_a_trait_or_as_a_type() {
+    // The root of a `use` in a body is a path of unknown kind: a module, a type or a trait.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                use inner::Thing;
+            }
+        }
+    );
+    let plain = analyze_trait(&item, Rules::new(), true);
+    assert_eq!(plain.errors().len(), 1);
+    assert!(matches!(
+        plain.errors()[0].paths[..],
+        [Cause::Unreadable(_)]
+    ));
+    let only_traits = |cause: &Cause, _: Place| {
+        matches!(cause, Cause::Trait(_)) && cause.starts_with(&parse_quote!(inner))
+    };
+    let only_types = |cause: &Cause, _: Place| {
+        matches!(cause, Cause::Type(_)) && cause.starts_with(&parse_quote!(inner))
+    };
+    // The error is about an expression path (`Cause::Expr`), its path has no known kind.
+    let only_macros = |cause: &Cause, _: Place| {
+        matches!(cause, Cause::Macro(_)) && cause.starts_with(&parse_quote!(inner))
+    };
+    // In the analysis.
+    assert!(analyze_trait(&item, Rules::new().or_if(only_traits), true)
+        .errors()
+        .is_empty());
+    assert!(analyze_trait(&item, Rules::new().or_if(only_types), true)
+        .errors()
+        .is_empty());
+    assert_eq!(
+        analyze_trait(&item, Rules::new().or_if(only_macros), true)
+            .errors()
+            .len(),
+        1
+    );
+    // And on the result, also after a round trip through the serialization.
+    let serialized: LeakerResult = parse2(plain.to_token_stream()).unwrap();
+    for result in [plain.clone(), serialized] {
+        assert!(result.clone().allow(only_traits).errors().is_empty());
+        assert!(result.clone().allow(only_types).errors().is_empty());
+        assert_eq!(result.allow(only_macros).errors().len(), 1);
+    }
+}
+
+// ── the built-in rules ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_built_in_rules_take_relative_paths_by_their_head() {
+    let paths: &[(Path, [bool; 4])] = &[
+        // primitive, prelude, std, crate
+        (parse_quote!(u8), [true, false, false, false]),
+        (parse_quote!(str), [true, false, false, false]),
+        (parse_quote!(u8::MAX), [true, false, false, false]),
+        (parse_quote!(f64), [true, false, false, false]),
+        (parse_quote!(Vec), [false, true, false, false]),
+        (parse_quote!(Clone), [false, true, false, false]),
+        (parse_quote!(Rel), [false, false, false, false]),
+        (parse_quote!(TryFrom), [false, false, false, false]),
+        (parse_quote!(std), [false, false, true, false]),
+        (parse_quote!(std::vec::Vec), [false, false, true, false]),
+        (parse_quote!(core::fmt), [false, false, true, false]),
+        (parse_quote!(alloc::vec), [false, false, true, false]),
+        (parse_quote!(stdx::Rel), [false, false, false, false]),
+        (parse_quote!(crate), [false, false, false, true]),
+        (parse_quote!(crate::m::T), [false, false, false, true]),
+        (parse_quote!(self::m::T), [false, false, false, false]),
+        (parse_quote!(super::T), [false, false, false, false]),
+        // A leading `::` is another crate, never one of these.
+        (parse_quote!(::u8), [false; 4]),
+        (parse_quote!(::std::vec::Vec), [false; 4]),
+        (parse_quote!(::core::primitive::u8), [false; 4]),
+        (parse_quote!(::crate::T), [false; 4]),
+    ];
+    let place = Place::default();
+    for (path, expected) in paths {
+        let causes = [
+            Cause::Type(Type::Path(TypePath {
+                qself: None,
+                path: path.clone(),
+            })),
+            Cause::Trait(path.clone()),
+            Cause::Macro(path.clone()),
+            Cause::Expr(Expr::Path(ExprPath {
+                attrs: Vec::new(),
+                qself: None,
+                path: path.clone(),
+            })),
+        ];
+        // Whatever the kind of the cause is, as long as it carries a path.
+        for cause in &causes {
+            let found = [
+                Rules::new().primitive().allow(cause, place),
+                Rules::new().prelude().allow(cause, place),
+                Rules::new().std_crates().allow(cause, place),
+                Rules::new().crate_paths().allow(cause, place),
+            ];
+            assert_eq!(&found, expected, "{}", cause.to_token_stream());
+        }
+        // With generic arguments the cause is not a path of one of these: its paths are.
+        let mut with_arguments = path.clone();
+        if let Some(last) = with_arguments.segments.last_mut() {
+            last.arguments = PathArguments::AngleBracketed(parse_quote!(<u8>));
+        }
+        let cause = Cause::Trait(with_arguments);
+        let all = Rules::new()
+            .primitive()
+            .prelude()
+            .std_crates()
+            .crate_paths();
+        assert!(!all.allow(&cause, place), "{}", cause.to_token_stream());
+    }
+    // A cause that is no path: not allowed by the paths.
+    let all = Rules::new()
+        .primitive()
+        .prelude()
+        .std_crates()
+        .crate_paths();
+    for cause in [
+        Cause::Type(parse_quote!(&u8)),
+        Cause::Type(parse_quote!(<u8 as Tr>::X)),
+        Cause::Lifetime(parse_quote!('a)),
+        Cause::Unreadable(quote!(u8)),
+    ] {
+        assert!(!all.allow(&cause, place), "{}", cause.to_token_stream());
+    }
+}
+
+#[test]
+fn values_and_defaults_allow_everything_in_their_place() {
+    let cause = Cause::Type(parse_quote!(&Rel<'_>));
+    let rules = |values: bool, defaults: bool| {
+        let mut rules = Rules::new();
+        if values {
+            rules = rules.values();
+        }
+        if defaults {
+            rules = rules.defaults();
+        }
+        rules
+    };
+    for (in_value, in_default) in [(false, false), (true, false), (false, true), (true, true)] {
+        let place = place(in_value, in_default);
+        assert_eq!(rules(true, false).allow(&cause, place), in_value);
+        assert_eq!(rules(false, true).allow(&cause, place), in_default);
+        assert_eq!(
+            rules(true, true).allow(&cause, place),
+            in_value || in_default
+        );
+        assert!(!rules(false, false).allow(&cause, place));
+    }
+}
+
+#[test]
+fn values_writes_every_relative_path_in_a_value_as_it_is() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            const N: usize = inner::N;
+            fn f(&self, a: Sig) {
+                let x: Local<Arg> = inner::make::<Turbo>();
+                helper!(x);
+            }
+        }
+    );
+    // Values are read: a relative type in a `let` is an entry, and the paths of the value are errors.
+    let plain = analyze_trait(&item, Rules::new(), true);
+    assert!(!plain.errors().is_empty());
+    let leaked: Vec<String> = entries(&plain.clone().into_referrer())
+        .into_iter()
+        .map(|(ty, _)| ty)
+        .collect();
+    assert!(
+        leaked.contains(&"Local < Arg >".to_string()),
+        "{:?}",
+        leaked
+    );
+    // With the flag everything in a value is written as it is, the types too: no entry for them,
+    // and no error. A type of the signature is not in a value, and stays an entry (`usize` too:
+    // the primitive types are not allowed).
+    let by_flag = analyze_trait(&item, Rules::new().values(), true);
+    assert!(by_flag.errors().is_empty());
+    let kept: Vec<String> = entries(&by_flag.into_referrer())
+        .into_iter()
+        .map(|(ty, _)| ty)
+        .collect();
+    assert_eq!(kept, ["Sig", "usize"]);
+    // Only the values of the item are read: without `check_values()` the flag changes nothing.
+    let without = analyze_trait(&item, Rules::new().values(), false);
+    let plain_without = analyze_trait(&item, Rules::new(), false);
+    assert_eq!(
+        without.to_token_stream().to_string(),
+        plain_without.to_token_stream().to_string()
+    );
+    // After the analysis it only drops the errors, and leaves the entries.
+    let on_result = plain.allow(Rules::new().values());
+    assert!(on_result.errors().is_empty());
+    assert!(entries(&on_result.into_referrer())
+        .iter()
+        .any(|(ty, _)| ty == "Local < Arg >"));
+}
+
+#[test]
+fn defaults_writes_every_relative_path_in_a_default_as_it_is() {
+    let item: ItemStruct = parse_quote!(
+        struct S<T = Rel<Other>, U = Wrap<'static>> {
+            a: T,
+            b: U,
+            c: Plain,
+        }
+    );
+    let plain = analyze(&item, Rules::new());
+    let leaked: Vec<String> = entries(&plain.into_referrer())
+        .into_iter()
+        .map(|(ty, _)| ty)
+        .collect();
+    assert!(
+        leaked.contains(&"Rel < Other >".to_string()),
+        "{:?}",
+        leaked
+    );
+    // The types of the defaults are written as they are, and the field `c` is an entry still.
+    let by_flag = analyze(&item, Rules::new().defaults());
+    assert!(by_flag.errors().is_empty());
+    let kept: Vec<String> = entries(&by_flag.into_referrer())
+        .into_iter()
+        .map(|(ty, _)| ty)
+        .collect();
+    assert_eq!(kept, ["Plain"]);
+}
+
+#[test]
+fn cause_starts_with_compares_identifiers_segment_by_segment() {
+    let starts = |path: Path, prefix: Path| Cause::Trait(path).starts_with(&prefix);
+    assert!(starts(parse_quote!(a::b::c), parse_quote!(a)));
+    assert!(starts(parse_quote!(a::b::c), parse_quote!(a::b)));
+    assert!(starts(parse_quote!(a::b::c), parse_quote!(a::b::c)));
+    assert!(!starts(parse_quote!(a::b), parse_quote!(a::b::c)));
+    assert!(!starts(parse_quote!(a::b::c), parse_quote!(b)));
+    assert!(!starts(parse_quote!(ab::c), parse_quote!(a)));
+    // Both have a leading `::`, or neither.
+    assert!(starts(parse_quote!(::a::b), parse_quote!(::a)));
+    assert!(!starts(parse_quote!(a::b), parse_quote!(::a)));
+    assert!(!starts(parse_quote!(::a::b), parse_quote!(a)));
+    // The arguments of the segments are not compared.
+    assert!(starts(parse_quote!(a::B<u8>::c), parse_quote!(a::B)));
+    assert!(starts(parse_quote!(a::B), parse_quote!(a::B<u8>)));
+    // Every cause that is a path has one, and no other has.
+    let path: Path = parse_quote!(a::b);
+    assert_eq!(Cause::Trait(path.clone()).path(), Some(&path));
+    assert_eq!(Cause::Macro(path.clone()).path(), Some(&path));
+    assert_eq!(Cause::Type(parse_quote!(a::b)).path(), Some(&path));
+    assert_eq!(Cause::Expr(parse_quote!(a::b)).path(), Some(&path));
+    assert_eq!(Cause::Type(parse_quote!(&a::b)).path(), None);
+    assert_eq!(Cause::Type(parse_quote!(<u8 as a>::b)).path(), None);
+    assert_eq!(Cause::Expr(parse_quote!(a::b())).path(), None);
+    assert_eq!(Cause::Lifetime(parse_quote!('a)).path(), None);
+    assert!(!Cause::Type(parse_quote!(&a::b)).starts_with(&parse_quote!(a)));
+}
+
+// ── composition ──────────────────────────────────────────────────────────────────────────────
+
+/// The serialized result of `item` (with `values`) after `allow` given to the config.
+fn by_config<A: Allow>(item: &ItemTrait, allow: A, values: bool) -> String {
+    analyze_trait(item, allow, values)
+        .to_token_stream()
+        .to_string()
+}
+
+#[test]
+fn a_rule_built_by_flags_closures_tuples_or_or_is_one_rule() {
     let items: Vec<ItemTrait> = vec![
         parse_quote!(
             trait Tr: Clone {
@@ -651,27 +1116,6 @@ fn the_wrappers_are_the_path_functions() {
         ),
         parse_quote!(
             trait Tr {
-                type A: alloc::fmt::Debug + crate::m::Bound;
-                fn f(&self, a: Self::A);
-            }
-        ),
-        parse_quote!(
-            trait Tr {
-                fn f(&self, a: crate::m::T<u8>, b: crate::T) -> Rel<char>;
-            }
-        ),
-        parse_quote!(
-            trait Tr<T: Sized + Default> {
-                fn f(&self, a: u8::Foo, b: ::std::vec::Vec<T>);
-            }
-        ),
-        parse_quote!(
-            trait Tr: Iterator<Item = u8> {
-                fn f(&self, a: f64, b: &str, c: ::core::primitive::u8);
-            }
-        ),
-        parse_quote!(
-            trait Tr {
                 const C: usize = std::mem::size_of::<u8>() + crate::N;
                 fn f(&self) -> usize {
                     core::cmp::max(1, Rel::N)
@@ -679,129 +1123,169 @@ fn the_wrappers_are_the_path_functions() {
             }
         ),
     ];
-    // Whether the rule changes something for some item: the comparison is not vacuous.
+    // Whether something changes for some item: the comparison is not vacuous.
     let mut changes = [false; 4];
-    for (n, rule) in RULES.iter().enumerate() {
-        for item in &items {
-            let what = item.to_token_stream().to_string();
-            for values in [false, true] {
-                let by_wrapper = analyze_rule(Some(rule), false, item, values);
-                let by_function = analyze_rule(Some(rule), true, item, values);
-                let what = format!("{} (values: {}) in {}", rule, values, what);
+    for item in &items {
+        for values in [false, true] {
+            let plain = by_config(item, Rules::new(), values);
+            let flags: [Rules; 4] = [
+                Rules::new().primitive(),
+                Rules::new().prelude(),
+                Rules::new().std_crates(),
+                Rules::new().crate_paths(),
+            ];
+            for (n, flag) in flags.iter().enumerate() {
+                let what = format!("{} in {}", n, item.to_token_stream());
+                let expected = by_config(item, flag.clone(), values);
+                changes[n] |= expected != plain;
+                // The same flag, as a rule of a closure, of a tuple, or added by `or()`.
+                let inner = flag.clone();
+                let closure = move |cause: &Cause, place: Place| inner.allow(cause, place);
                 assert_eq!(
-                    serialized(&by_wrapper),
-                    serialized(&by_function),
+                    by_config(item, closure.clone(), values),
+                    expected,
                     "{}",
                     what
                 );
                 assert_eq!(
-                    texts(by_wrapper.errors()),
-                    texts(by_function.errors()),
+                    by_config(item, Rules::new().or_if(closure), values),
+                    expected,
                     "{}",
                     what
                 );
-                let plain = analyze_rule(None, false, item, values);
-                changes[n] |= serialized(&plain) != serialized(&by_wrapper);
+                assert_eq!(
+                    by_config(item, (flag.clone(), ()), values),
+                    expected,
+                    "{}",
+                    what
+                );
+                assert_eq!(
+                    by_config(item, ((), flag.clone()), values),
+                    expected,
+                    "{}",
+                    what
+                );
+                assert_eq!(
+                    by_config(item, Rules::new().or(flag.clone()), values),
+                    expected,
+                    "{}",
+                    what
+                );
+                // On the result of the analysis without it: the same errors, however it is built.
+                let plain = analyze_trait(item, Rules::new(), values);
+                let on_result = plain.clone().allow(flag.clone());
+                let inner = flag.clone();
+                let by_closure = plain
+                    .clone()
+                    .allow(move |cause: &Cause, place: Place| inner.allow(cause, place));
+                let by_tuple = plain.allow(((), flag.clone()));
+                assert_eq!(
+                    on_result.to_token_stream().to_string(),
+                    by_closure.to_token_stream().to_string(),
+                    "{}",
+                    what
+                );
+                assert_eq!(
+                    on_result.to_token_stream().to_string(),
+                    by_tuple.to_token_stream().to_string(),
+                    "{}",
+                    what
+                );
             }
-            // After the analysis: the same errors, and the same Referrer.
-            let plain = analyze_rule(None, false, item, false);
-            let by_wrapper = on_result(rule, false, plain.clone());
-            let by_function = on_result(rule, true, plain);
-            let what = format!("{} on the result of {}", rule, what);
-            assert_eq!(
-                serialized(&by_wrapper),
-                serialized(&by_function),
-                "{}",
-                what
-            );
         }
     }
-    assert_eq!(changes, [true; 4], "{:?}", RULES);
+    assert_eq!(changes, [true; 4]);
 }
 
 #[test]
-fn the_path_functions_take_relative_paths_by_their_head() {
-    let paths: &[(Path, [bool; 4])] = &[
-        // primitive, prelude, std, crate
-        (parse_quote!(u8), [true, false, false, false]),
-        (parse_quote!(str), [true, false, false, false]),
-        (parse_quote!(u8::MAX), [true, false, false, false]),
-        (parse_quote!(f64), [true, false, false, false]),
-        (parse_quote!(Vec), [false, true, false, false]),
-        (parse_quote!(Option<u8>), [false, true, false, false]),
-        (parse_quote!(Clone), [false, true, false, false]),
-        (parse_quote!(Rel), [false, false, false, false]),
-        (parse_quote!(TryFrom), [false, false, false, false]),
-        (parse_quote!(std), [false, false, true, false]),
-        (parse_quote!(std::vec::Vec<u8>), [false, false, true, false]),
-        (parse_quote!(core::fmt), [false, false, true, false]),
-        (parse_quote!(alloc::vec), [false, false, true, false]),
-        (parse_quote!(stdx::Rel), [false, false, false, false]),
-        (parse_quote!(crate), [false, false, false, true]),
-        (parse_quote!(crate::m::T), [false, false, false, true]),
-        (parse_quote!(self::m::T), [false, false, false, false]),
-        (parse_quote!(super::T), [false, false, false, false]),
-        // A leading `::` is another crate, never one of these.
-        (parse_quote!(::u8), [false; 4]),
-        (parse_quote!(::std::vec::Vec), [false; 4]),
-        (parse_quote!(::core::primitive::u8), [false; 4]),
-        (parse_quote!(::crate::T), [false; 4]),
-    ];
-    for (path, expected) in paths {
-        let found = [
-            is_primitive_path(path),
-            is_prelude_path(path),
-            is_std_crate_path(path),
-            is_crate_path(path),
-        ];
-        assert_eq!(&found, expected, "{}", path.to_token_stream());
-    }
-}
-
-#[test]
-fn path_starts_with_compares_identifiers_segment_by_segment() {
-    let starts = |path: Path, prefix: Path| path_starts_with(&path, &prefix);
-    assert!(starts(parse_quote!(a::b::c), parse_quote!(a)));
-    assert!(starts(parse_quote!(a::b::c), parse_quote!(a::b)));
-    assert!(starts(parse_quote!(a::b::c), parse_quote!(a::b::c)));
-    assert!(!starts(parse_quote!(a::b), parse_quote!(a::b::c)));
-    assert!(!starts(parse_quote!(a::b::c), parse_quote!(b)));
-    assert!(!starts(parse_quote!(ab::c), parse_quote!(a)));
-    // Both have a leading `::`, or neither.
-    assert!(starts(parse_quote!(::a::b), parse_quote!(::a)));
-    assert!(!starts(parse_quote!(a::b), parse_quote!(::a)));
-    assert!(!starts(parse_quote!(::a::b), parse_quote!(a)));
-    // The arguments of the segments are not compared.
-    assert!(starts(parse_quote!(a::B<u8>::c), parse_quote!(a::B)));
-    assert!(starts(parse_quote!(a::B), parse_quote!(a::B<u8>)));
-}
-
-#[test]
-fn a_run_time_choice_goes_into_one_closure() {
+fn a_run_time_choice_through_rules_keeps_one_type() {
     let item: ItemTrait = parse_quote!(
         trait Tr: Clone {
             fn f(&self, a: u8) -> Vec<char>;
         }
     );
     for (primitive, prelude) in [(false, false), (true, false), (false, true), (true, true)] {
-        let config = Allow::new().allow_path_if(move |path| {
-            (primitive && is_primitive_path(path)) || (prelude && is_prelude_path(path))
-        });
-        let chosen = analyze_trait(&item, config, false);
-        let allow = Allow::new();
+        // The choice is made at run time, and the type of `config` does not depend on it.
+        let mut config = Rules::new();
+        if primitive {
+            config = config.primitive();
+        }
+        if prelude {
+            config = config.prelude();
+        }
+        let chosen = analyze_trait(&item, config.clone(), false);
+        let allow = Rules::new();
         let expected = match (primitive, prelude) {
-            (true, true) => analyze_trait(&item, allow.allow_primitive().allow_prelude(), false),
-            (true, false) => analyze_trait(&item, allow.allow_primitive(), false),
-            (false, true) => analyze_trait(&item, allow.allow_prelude(), false),
+            (true, true) => analyze_trait(&item, allow.primitive().prelude(), false),
+            (true, false) => analyze_trait(&item, allow.primitive(), false),
+            (false, true) => analyze_trait(&item, allow.prelude(), false),
             (false, false) => analyze_trait(&item, allow, false),
         };
         let what = format!("primitive: {}, prelude: {}", primitive, prelude);
-        assert_eq!(serialized(&chosen), serialized(&expected), "{}", what);
+        assert_eq!(
+            chosen.to_token_stream().to_string(),
+            expected.to_token_stream().to_string(),
+            "{}",
+            what
+        );
         // `Clone` is an error, `u8` and `Vec<char>` are entries, unless the flags allow them.
         assert_eq!(chosen.errors().is_empty(), prelude, "{}", what);
     }
-    // The result takes the same closure.
-    let result = analyze_trait(&item, Allow::new(), false)
-        .allow_path_if(|path| is_prelude_path(path) || is_primitive_path(path));
+    // The result takes the same type.
+    let mut config = Rules::new();
+    if item.supertraits.len() == 1 {
+        config = config.prelude();
+    }
+    let result = analyze_trait(&item, Rules::new(), false).allow(config.primitive());
     assert!(result.errors().is_empty());
+}
+
+#[test]
+fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, a: Rel) -> Other;
+        }
+    );
+    // No type annotation on the closure.
+    let by_closure = analyze_trait(
+        &item,
+        Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(Rel))),
+        false,
+    );
+    assert_eq!(
+        entries(&by_closure.into_referrer()),
+        [("Other".to_string(), true)]
+    );
+    // Rules add up, in any order, and a struct of the user is a rule.
+    struct OnlyOther;
+    impl Allow for OnlyOther {
+        fn allow(&self, cause: &Cause, _: Place) -> bool {
+            cause.starts_with(&parse_quote!(Other))
+        }
+    }
+    let both = Rules::new()
+        .or_if(|cause, _| cause.starts_with(&parse_quote!(Rel)))
+        .or(OnlyOther)
+        .primitive();
+    let result = analyze_trait(&item, both, false);
+    assert!(result.errors().is_empty());
+    assert!(result.into_referrer().is_empty());
+    // And on a result: an annotated closure, a function, a tuple, `()`.
+    let errored: ItemTrait = parse_quote!(
+        trait Tr: Rel {}
+    );
+    let result = analyze_trait(&errored, Rules::new(), false);
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.clone().allow(()).errors().len(), 1);
+    fn trait_rel(cause: &Cause, _: Place) -> bool {
+        matches!(cause, Cause::Trait(_)) && cause.starts_with(&parse_quote!(Rel))
+    }
+    assert!(result.clone().allow(trait_rel).errors().is_empty());
+    assert!(result
+        .clone()
+        .allow(|cause: &Cause, _: Place| cause.starts_with(&parse_quote!(Rel)))
+        .errors()
+        .is_empty());
+    assert!(result.allow((OnlyOther, trait_rel)).errors().is_empty());
 }

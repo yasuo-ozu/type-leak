@@ -141,7 +141,7 @@
 //!
 //! # The copies after the analysis without a rule (`TYPE_LEAK_PROP_FEATURES=allow_stages`)
 //!
-//! `Allow::allow_X()` and `LeakerResult::allow_X()` are one rule, but the result judges an
+//! `Rules` given to the Leaker and to `LeakerResult::allow()` are one rule, but the result judges an
 //! analysis made without it, so for a path rule it can leave other errors and other entries (see
 //! `tests/allow_stages.rs`). With `allow_stages` the macro of each item takes each rule of
 //! `gen::rules()` in turn and makes two copies, and the test builds them, to see whether the
@@ -155,13 +155,14 @@
 //! - after the config: the item is analyzed with a config that has the rule, the causes of the
 //!   errors that remain are allowed, and its Referrer copies the item (`__tl_st_<rule>_cfg_<id>!`).
 //!
-//! The rules are `prelude` (`allow_prelude()`, every item), `crate` (`allow_crate()`), `path`
-//! (`allow_path_if(super::base)`: the module `base` as the modules at depth 1 name it), `std`
-//! (`allow_std_crates()`, with `relative_std`), `values` (`allow_values()`, with `values`) and
-//! `default` (`allow_default()`). A rule is made for the items where it matters: it drops or trims an
+//! The rules are `prelude` (`Rules::prelude()`, every item), `crate` (`Rules::crate_paths()`), `path`
+//! (`Rules::or_if(super::base)`: the module `base` as the modules at depth 1 name it), `std`
+//! (`Rules::std_crates()`, with `relative_std`), `values` (`Rules::values()`, with `values`) and
+//! `default` (`Rules::defaults()`). A rule is made for the items where it matters: it drops or trims an
 //! error of the analysis without it, or the config finds other errors or another Referrer than the
-//! result. `values` and `default` are cause and place rules: the config and the result must give
-//! identical errors and an equal Referrer (`STAGES DIFFER` fails the run).
+//! result. `values` and `default` are place rules: the config and the result must give the same
+//! errors (`STAGES DIFFER` fails the run), but not the same Referrer: the config writes the paths of a
+//! value or a default as they are, and records no part for them.
 //!
 //! The Repeater's impls of the copies are written next to those of the ordinary analysis with an `ID`
 //! of their own (`Args::repeater_id()`), the witnesses are the ordinary ones (written for a rejected
@@ -892,7 +893,8 @@ fn attr_lines(case: &Case) -> Vec<(usize, usize)> {
 /// the rule, those that remain when the rule is given to the config (`before`), and when it is given
 /// to the result (`after`). The path rules cannot be exact (see `tests/allow_stages.rs`), and the
 /// difference is a finding, printed with the causes. The cause and place rules (`values`, `default`)
-/// are: the config and the result give the same errors and an equal Referrer, or the run fails.
+/// are: the config and the result give the same errors, or the run fails (their Referrers differ
+/// in the parts).
 #[derive(Debug)]
 struct Stages {
     case: usize,
@@ -909,7 +911,8 @@ struct Stages {
     same_referrer: bool,
 }
 
-/// The rules whose config and result give the same errors and Referrer.
+/// The rules whose config and result give the same errors (not always the same Referrer: see
+/// `RuleResult::judge()`).
 fn exact_rule(rule: &str) -> bool {
     matches!(rule, "values" | "default")
 }
@@ -1386,11 +1389,14 @@ impl RuleResult {
 
         if exact_rule(rule) {
             for stage in &run.stages {
-                if stage.before != stage.after || !stage.same_errors || !stage.same_referrer {
+                // The Referrer may differ: the config is asked about each path of a value or of a
+                // default, so it writes them as they are and records no part for them, where the
+                // result found the conflict and kept the part.
+                if stage.before != stage.after || !stage.same_errors {
                     problems.push(Failure {
                         case: stage.case,
                         item: Some(stage.item),
-                        class: "STAGES DIFFER: the config and the result give other errors or another Referrer, for a rule that is a cause or a place",
+                        class: "STAGES DIFFER: the config and the result give other errors, for a rule that is a place",
                         code: String::new(),
                         text: format!(
                             "rule {}: {} errors in the config, {} in the result; the same errors: {}; an equal Referrer: {}\n    config: {}\n    result: {}",
@@ -1971,7 +1977,7 @@ fn explain_copies(
 }
 
 /// The names of the standard prelude (types, traits, functions and variants) and of the primitive
-/// types, which `allow_prelude()` and `allow_primitive()` take for the names of the prelude: the
+/// types, which `Rules::prelude()` and `Rules::primitive()` take for the names of the prelude: the
 /// Referrer's crate of the stage copies must not shadow any.
 const PRELUDE_NAMES: &[&str] = &[
     "Box",
@@ -3108,7 +3114,7 @@ fn random_items_leak_across_crates() {
     // `LeakerResult::allow()` list, or defects: each must be one of them, and the item must have the
     // shape that gives it (`accept_families()`). The documented ones are counted and are no failure.
     // The same for the copies of `allow_stages`, which allowed the causes of the errors that
-    // `allow_prelude()` leaves.
+    // `Rules::prelude()` leaves.
     let (copies, failures): (Vec<Failure>, Vec<Failure>) = failures
         .into_iter()
         .partition(|failure| failure.class == ACCEPT_COPY);

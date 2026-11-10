@@ -21,18 +21,18 @@ use syn::*;
 use type_leak::*;
 
 /// The config of the rows with `::p` allowed (the crate of the property test).
-fn allowing() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(starts_with(parse_quote!(::p)));
+fn allowing() -> Leaker<impl Allow> {
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(::p)));
     Leaker::from_config(config, Options::new())
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
-fn errors<P: Fn(&Path) -> bool, R>(
-    mut leaker: Leaker<P>,
-    analyze: impl FnOnce(&mut Leaker<P>) -> R,
+fn errors<A: Allow, R>(
+    mut leaker: Leaker<A>,
+    analyze: impl FnOnce(&mut Leaker<A>) -> R,
 ) -> Vec<ErrorItem> {
     analyze(&mut leaker);
     leaker.result().errors().to_vec()

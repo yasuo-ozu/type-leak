@@ -2001,8 +2001,8 @@ pub mod kinds {
     }
 
     /// A trait of the module in a bound, twice, and a type of the module with an elided lifetime:
-    /// two causes (`PlainTr`, `Held<'_>`), allowed by writing them, `allow(trait PlainTr, type
-    /// Held<'_>)`.
+    /// two errors (`PlainTr`, `Held<'_>`), allowed by writing their paths, `allow(trait PlainTr, type
+    /// Held)`.
     #[prop_leak_result(id = 9192, allow_self = true)]
     pub trait ExplicitCauses<T: PlainTr> {
         fn held(&self, x: Held<'_>) -> Rel;
@@ -2114,7 +2114,7 @@ pub mod kinds {
     // unrelated error used to get wrong. Each fails to build on the code before its fix.
 
     /// F50, 9205: the path of the value is relative (`core::mem::size_of`, no leading `::`), and
-    /// `Rel` is in its arguments. `allow_std_crates()` after the analysis drops the path, and the
+    /// `Rel` is in its arguments. `Rules::std_crates()` after the analysis drops the path, and the
     /// copy writes it with `Rel` as written: a crate that does not name `Rel` cannot build it. The
     /// error must stay until `Rel` is allowed too (`stages = true`: the macro makes the copy after
     /// each rule, in a crate of the Referrer that invokes it `clean`, and gets it only if the rule
@@ -2174,10 +2174,10 @@ pub mod kinds {
             Y: GenTr<Self::A0>;
     }
 
-    // Issue 3 of `tests/downstream_findings.rs`: the names `allow_prelude()` took for the prelude.
+    // Issue 3 of `tests/downstream_findings.rs`: the names `Rules::prelude()` took for the prelude.
 
     /// Issue 3, 9208: `None`, `Some`, `Ok` and `Err` in values, and `DoubleEndedIterator +
-    /// ExactSizeIterator` in a bound, are names of the prelude of every edition. `allow_prelude()`
+    /// ExactSizeIterator` in a bound, are names of the prelude of every edition. `Rules::prelude()`
     /// refused them (`use absolute path: 'None'`), so the Leaker rejected the item, which the
     /// Referrer's crate then lacks (`PreludeNamesCopy`). The copy writes them as they are; the
     /// entries are the relative types.

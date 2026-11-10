@@ -1,6 +1,6 @@
 //! Helpers for inspecting paths and types.
 
-use crate::allow::path_starts_with;
+use crate::allow::{ask, Allow, Place};
 use crate::error::Cause;
 use proc_macro2::TokenStream;
 use std::cell::Cell;
@@ -34,20 +34,148 @@ pub(crate) fn without_arguments(path: &Path) -> Path {
     path
 }
 
+/// What a path is the path of: the kind of the [`Cause`] that
+/// [`ErrorItem::paths`](crate::ErrorItem::paths) holds for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathOf {
+    Type,
+    Trait,
+    /// The path of a value.
+    Value,
+    /// The path of a macro call.
+    Macro,
+    /// The path of a qualified type (`Tr<u8>::X` in `<Self as Tr<u8>>::X`), which no node holds:
+    /// its first `position` segments are the trait.
+    Qualified(usize),
+    /// Not known: the root of a `use`, a path in the tokens of a macro, or one that a walk reaches
+    /// from a node it does not tell apart. A mention of `Self` in it is read as a type.
+    Unknown,
+}
+
+impl PathOf {
+    /// The syntax that a mention of `Self` in `path` is.
+    pub(crate) fn cause(self, path: &Path) -> Cause {
+        match self {
+            PathOf::Type | PathOf::Unknown => Cause::type_path(path),
+            PathOf::Trait => Cause::Trait(path.clone()),
+            PathOf::Value => Cause::expr_path(path),
+            PathOf::Macro => Cause::Macro(path.clone()),
+            PathOf::Qualified(_) => Cause::Unreadable(quote!(#path)),
+        }
+    }
+
+    /// The entry of [`ErrorItem::paths`](crate::ErrorItem::paths) for `path`: the cause of this
+    /// kind for its head (the trait of a qualified path), without arguments.
+    pub(crate) fn entry(self, path: &Path) -> Cause {
+        let bare = without_arguments(path);
+        match self {
+            PathOf::Qualified(position) if position > 0 => {
+                Cause::Trait(trait_head(&bare, position))
+            }
+            PathOf::Qualified(_) | PathOf::Unknown => Cause::Unreadable(quote!(#bare)),
+            PathOf::Type => Cause::type_path(&bare),
+            PathOf::Trait => Cause::Trait(bare),
+            PathOf::Value => Cause::expr_path(&bare),
+            PathOf::Macro => Cause::Macro(bare),
+        }
+    }
+
+    /// The kind of the entry `cause` of [`ErrorItem::paths`](crate::ErrorItem::paths).
+    pub(crate) fn of_entry(cause: &Cause) -> PathOf {
+        match cause {
+            Cause::Type(_) => PathOf::Type,
+            Cause::Trait(_) => PathOf::Trait,
+            Cause::Expr(_) => PathOf::Value,
+            Cause::Macro(_) => PathOf::Macro,
+            _ => PathOf::Unknown,
+        }
+    }
+}
+
+/// The first `position` segments of `path`: the trait of a qualified path.
+fn trait_head(path: &Path, position: usize) -> Path {
+    Path {
+        leading_colon: path.leading_colon,
+        segments: path.segments.iter().take(position).cloned().collect(),
+    }
+}
+
+/// A visitor of the paths of some syntax, which is told what each is the path of.
+pub(crate) trait PathFinder {
+    fn path(&mut self, path: &Path, of: PathOf);
+}
+
+/// Walks syntax and tells `F` each path with what it is the path of. A path reached from a node
+/// that it does not tell apart is [`PathOf::Unknown`].
+pub(crate) struct Kinded<F>(pub(crate) F);
+
+impl<F: PathFinder> Kinded<F> {
+    /// Tells `F` the path `path`, then walks its arguments.
+    pub(crate) fn path_of(&mut self, path: &Path, of: PathOf) {
+        self.0.path(path, of);
+        syn::visit::visit_path(self, path)
+    }
+}
+
+impl<'ast, F: PathFinder> Visit<'ast> for Kinded<F> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        self.path_of(i, PathOf::Unknown)
+    }
+
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        match &i.qself {
+            None => self.path_of(&i.path, PathOf::Type),
+            Some(qself) => {
+                self.visit_qself(qself);
+                let position = if qself.as_token.is_some() {
+                    qself.position
+                } else {
+                    0
+                };
+                self.path_of(&i.path, PathOf::Qualified(position))
+            }
+        }
+    }
+
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        self.visit_trait_bound_modifier(&i.modifier);
+        if let Some(lifetimes) = &i.lifetimes {
+            self.visit_bound_lifetimes(lifetimes);
+        }
+        self.path_of(&i.path, PathOf::Trait)
+    }
+
+    fn visit_expr_path(&mut self, i: &'ast ExprPath) {
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(qself) = &i.qself {
+            self.visit_qself(qself);
+        }
+        self.path_of(&i.path, PathOf::Value)
+    }
+
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        self.path_of(&i.path, PathOf::Macro)
+    }
+}
+
 /// Returns `true` if `path` starts with `Self`.
 pub(crate) fn heads_self(path: &Path) -> bool {
     path.leading_colon.is_none()
         && matches!(path.segments.first(), Some(seg) if seg.ident == "Self")
 }
 
-/// Asks the rule on paths about `path`, without the generic arguments of its segments: the form of
-/// [`ErrorItem::paths`](crate::ErrorItem::paths), wherever the rule is asked.
-pub(crate) fn ask_rule<R: Fn(&Path) -> bool + ?Sized>(rule: &R, path: &Path) -> bool {
-    if path.segments.iter().all(|seg| seg.arguments.is_none()) {
-        rule(path)
-    } else {
-        rule(&without_arguments(path))
-    }
+/// Returns `true` if `path` starts with `prefix`, segment by segment by identifier. Both must have
+/// a leading `::` or neither; the generic arguments of the segments are ignored.
+pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    prefix.leading_colon.is_some() == path.leading_colon.is_some()
+        && prefix.segments.len() <= path.segments.len()
+        && prefix
+            .segments
+            .iter()
+            .zip(path.segments.iter())
+            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
 }
 
 /// Sets the flag when it is dropped: the rule did not return.
@@ -59,16 +187,16 @@ impl Drop for Unwound<'_> {
     }
 }
 
-/// The paths a Leaker treats as context-free: the paths rule of its `Allow` and the paths a probe
+/// The paths a Leaker treats as context-free: those its [`Allow`] allows and the paths a probe
 /// adds, shared by the throwaway visitors of an analysis. The rule is called at every check.
-pub(crate) struct AllowedPaths<P> {
-    rule: Rc<P>,
+pub(crate) struct AllowedPaths<A> {
+    rule: Rc<A>,
     extra: Rc<[Path]>,
     /// Set if the rule panicked: shared by the clones, which are all of one analysis.
     panicked: Rc<Cell<bool>>,
 }
 
-impl<P> Clone for AllowedPaths<P> {
+impl<A> Clone for AllowedPaths<A> {
     fn clone(&self) -> Self {
         Self {
             rule: self.rule.clone(),
@@ -78,8 +206,8 @@ impl<P> Clone for AllowedPaths<P> {
     }
 }
 
-impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
-    pub(crate) fn new(rule: Rc<P>) -> Self {
+impl<A: Allow> AllowedPaths<A> {
+    pub(crate) fn new(rule: Rc<A>) -> Self {
         Self {
             rule,
             extra: Rc::from(Vec::new()),
@@ -87,7 +215,7 @@ impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
         }
     }
 
-    /// The allowed paths and `more`.
+    /// The allowed paths and `more`, whatever they are the paths of.
     pub(crate) fn with(&self, more: &[Path]) -> Self {
         Self {
             rule: self.rule.clone(),
@@ -102,9 +230,16 @@ impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
         self.panicked.get()
     }
 
-    /// Returns `true` if `path` is absolute, starts with `$crate`, or is allowed. A type with an
-    /// absolute path may still be an optional entry (see `is_soft_path()`). `ask`: see `is_allowed_path()`.
-    pub(crate) fn is_context_free_path(&self, path: &Path, ask: bool) -> bool {
+    /// Returns `true` if `path`, the path of `of` at `place`, is absolute, starts with `$crate`, or
+    /// is allowed. A type with an absolute path may still be an optional entry (see
+    /// `is_soft_path()`). `ask`: see `is_allowed_path()`.
+    pub(crate) fn is_context_free_path(
+        &self,
+        path: &Path,
+        of: PathOf,
+        place: Place,
+        ask: bool,
+    ) -> bool {
         path.leading_colon.is_some()
             || matches!(
                 path.segments.iter().next(),
@@ -113,14 +248,14 @@ impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
                     arguments: PathArguments::None,
                 }) if ident == "$crate"
             )
-            || self.is_allowed_path(path, ask)
+            || self.is_allowed_path(path, of, place, ask)
     }
 
-    /// Returns `true` if the rule allows `path`, or it starts with a path that a probe allowed.
-    /// `ask` is `false` for a path that starts with `Self` or a generic in scope, which the
-    /// rule never sees.
-    pub(crate) fn is_allowed_path(&self, path: &Path, ask: bool) -> bool {
-        (ask && self.call_rule(path))
+    /// Returns `true` if the rule allows `path`, the path of `of` at `place`, or it starts with a
+    /// path that a probe allowed. `ask` is `false` for a path that starts with `Self` or a generic
+    /// in scope, which the rule never sees.
+    pub(crate) fn is_allowed_path(&self, path: &Path, of: PathOf, place: Place, ask: bool) -> bool {
+        (ask && self.call_rule(path, of, place))
             || self
                 .extra
                 .iter()
@@ -129,17 +264,17 @@ impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
 
     /// Returns `true` for an absolute path to an external crate (not `::core`, not allowed). The
     /// Referrer may replace such a type, so nothing in it is anchored (see `scan_anchors()`).
-    pub(crate) fn is_soft_path(&self, path: &Path) -> bool {
+    pub(crate) fn is_soft_path(&self, path: &Path, of: PathOf, place: Place) -> bool {
         path.leading_colon.is_some()
             && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
-            && !self.is_allowed_path(path, true)
+            && !self.is_allowed_path(path, of, place, true)
     }
 
     /// Asks the rule. If it panics, the analysis is not to be trusted any more, whoever catches
     /// the panic ([`AllowedPaths::rule_panicked()`]).
-    fn call_rule(&self, path: &Path) -> bool {
+    fn call_rule(&self, path: &Path, of: PathOf, place: Place) -> bool {
         let unwound = Unwound(&self.panicked);
-        let allowed = ask_rule(&*self.rule, path);
+        let allowed = ask(&*self.rule, path, of, place);
         std::mem::forget(unwound);
         allowed
     }
@@ -148,9 +283,9 @@ impl<P: Fn(&Path) -> bool> AllowedPaths<P> {
 /// How the Leaker treats a name of [`KNOWN_NAMES`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Known {
-    /// A primitive type: `allow_primitive()` allows it.
+    /// A primitive type: `Rules::primitive()` allows it.
     Primitive,
-    /// In the prelude of every edition, as of rustc 1.56: `allow_prelude()` allows it.
+    /// In the prelude of every edition, as of rustc 1.56: `Rules::prelude()` allows it.
     Prelude,
     /// In the prelude of some editions or of later versions of rustc only, so the copy's crate may
     /// not have it: no option allows it, and the help gives its absolute path.
@@ -158,7 +293,7 @@ pub(crate) enum Known {
 }
 
 /// The names that the help gives an absolute path for, and the option that allows each. The one
-/// source of `allow_primitive()`, `allow_prelude()` and the help (`use ::core::.. instead of ..`).
+/// source of `Rules::primitive()`, `Rules::prelude()` and the help (`use ::core::.. instead of ..`).
 pub(crate) const KNOWN_NAMES: &[(&str, &str, Known)] = &[
     // The prelude of every edition (`std::prelude::v1`).
     ("Copy", "::core::marker::Copy", Known::Prelude),
@@ -247,7 +382,7 @@ pub(crate) fn starts_with_known(path: &Path, known: Known) -> bool {
         })
 }
 
-/// The crates that `allow_std_crates()` allows.
+/// The crates that `Rules::std_crates()` allows.
 pub(crate) const STD_CRATES: &[&str] = &["std", "core", "alloc"];
 
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {

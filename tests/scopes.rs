@@ -3,12 +3,12 @@
 
 mod common;
 
-use common::{enter_function, visit_function};
+use common::{enter_function, visit_function, AcceptCause};
 use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Options, Reason, Referrer,
+    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Options, Reason, Referrer, Rules,
     SelfRequirement, View,
 };
 
@@ -829,8 +829,8 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
     // Accepting the causes afterwards drops the errors, and does not change the Referrer.
     let mut accepted = failed.result.clone();
     accepted = accepted
-        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad1<'_>)))
-        .allow(|e| e.cause == Cause::Type(parse_quote!(Bad2<'_, U>)));
+        .accept_cause(&Cause::Type(parse_quote!(Bad1<'_>)))
+        .accept_cause(&Cause::Type(parse_quote!(Bad2<'_, U>)));
     assert!(accepted.errors().is_empty());
     let accepted = accepted.finish().unwrap();
     let ok = ok.result.finish().unwrap();
@@ -945,8 +945,8 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
 }
 
 /// A Leaker that allows the primitive types and the names of the standard prelude.
-fn leaker_with_std() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new().allow_primitive().allow_prelude();
+fn leaker_with_std() -> Leaker<impl Allow> {
+    let config = Rules::new().primitive().prelude();
     Leaker::from_config(config, Options::new())
 }
 
@@ -990,7 +990,7 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
 /// bounds) is an error of the outermost call too. Audit mutant `rb_leave_env_errors`.
 #[test]
 fn the_cycle_of_a_failed_inner_scope_is_an_error_of_the_outer_one() {
-    fn inner<P: Fn(&Path) -> bool>(view: &mut View<'_, P>) {
+    fn inner<A: Allow>(view: &mut View<'_, A>) {
         // `Self` is the self type `W<V>`, which the copy writes through the Repeater because of
         // `Rel`, and the bound `V: Fn(Rel)` names it: a cycle of the inner scope.
         view.enter_impl(
@@ -1068,7 +1068,7 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
     assert_eq!(result.errors().len(), 2);
     assert!(result.errors().iter().all(|error| error.cause == cause));
     let tokens = result.clone().into_referrer().to_token_stream().to_string();
-    let accepted = result.clone().allow(|e| e.cause == cause);
+    let accepted = result.clone().accept_cause(&cause);
     assert!(accepted.errors().is_empty());
     assert_eq!(
         accepted.finish().unwrap().to_token_stream().to_string(),

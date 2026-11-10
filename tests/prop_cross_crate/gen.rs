@@ -97,7 +97,7 @@ use std::hash::Hasher;
 /// `?` applies to the real `Sized` only, so `T: ?Sized` is no more context-dependent than
 /// `T: ?::core::marker::Sized`. `type-leak` at fb11f41 does not know it: it takes the bare `Sized`
 /// of `?Sized` for a relative path like any other bare name of the prelude, and rejects it unless
-/// `Allow::allow_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
+/// `Rules::prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
 /// to the real `Sized` only), so it is `true`; it is the only place that says so. It reaches
 /// three places: the generator (a bare `?Sized` is an expected rejection without the prelude only
 /// if it is `false`: the tag `bare:?Sized`), the macro (`relaxed_sized` argument of `prop_leak`:
@@ -517,7 +517,7 @@ pub struct Config {
     pub allow_std: bool,
     /// The Leaker allows its own crate.
     pub allow_crate: bool,
-    /// The Leaker allows the primitive types (`Allow::allow_primitive()`). Without it, `u8`
+    /// The Leaker allows the primitive types (`Rules::primitive()`). Without it, `u8`
     /// is a relative path like any other: each is an entry of the item.
     pub primitive: bool,
 }

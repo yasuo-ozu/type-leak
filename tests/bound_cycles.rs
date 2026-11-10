@@ -13,7 +13,7 @@ mod common;
 use common::starts_with;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Allow, ErrorItem, Leaker, Options, Referrer};
+use type_leak::{Allow, Cause, ErrorItem, Leaker, Options, Place, Referrer, Rules};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -28,20 +28,22 @@ fn messages(errors: &[ErrorItem]) -> String {
         .join("\n")
 }
 
-fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
+fn leaker() -> Leaker<impl Allow> {
     leaker_allowing(&[])
 }
 
 /// Like `leaker()`, with the paths `allowed` too.
-fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Fn(&Path) -> bool> {
+fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
     let allowed: Vec<Path> = allowed
         .iter()
         .map(|path| parse_str(path).unwrap())
         .collect();
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(move |path| allowed.iter().any(|a| starts_with(a.clone())(path)));
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(move |cause: &Cause, place: Place| {
+            allowed.iter().any(|a| starts_with(a.clone())(cause, place))
+        });
     Leaker::from_config(config, Options::new())
 }
 
@@ -342,7 +344,7 @@ fn a_reference_that_is_leaked_whole_in_a_cycle_is_rejected() {
 }
 
 /// A Leaker for which the types of `::ext`, a crate that it does not allow, are optional entries.
-fn ext_leaker() -> Leaker<impl Fn(&Path) -> bool> {
+fn ext_leaker() -> Leaker<impl Allow> {
     leaker()
 }
 

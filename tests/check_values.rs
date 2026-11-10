@@ -18,8 +18,8 @@ use template_quote::quote;
 use type_leak::*;
 
 /// The rules of the tests below, which all read the values (`check_values`) unless they say not.
-fn config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 /// The messages of the errors of a trait whose method `f` has the body `body`, or none. The trait
@@ -35,10 +35,7 @@ fn body_messages(body: &str) -> Vec<String> {
     messages_of(config(), &source)
 }
 
-fn messages_of<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-    source: &str,
-) -> Vec<String> {
+fn messages_of<A: Allow>(config: A, source: &str) -> Vec<String> {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
@@ -251,15 +248,12 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     // Not by none: the primitives and the prelude are relative names, as in a type. The path
     // `Vec::new` is rejected; the type `Vec<u8>` of the `let` is leaked, as the one of the
     // signature is.
-    let none = Allow::new();
+    let none = Rules::new();
     assert_eq!(
         messages_of(none.clone(), source),
         ["use absolute path: 'Vec::new'"]
     );
-    fn entries<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-        config: Allow<P, E>,
-        source: &str,
-    ) -> Vec<String> {
+    fn entries<A: Allow>(config: A, source: &str) -> Vec<String> {
         let item: ItemTrait = parse_str(source).unwrap();
         let mut leaker = Leaker::from_config(config, Options::new().check_values());
         leaker.intern_trait(&item, true);
@@ -276,13 +270,13 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     let types = "trait Tr { fn f(&self, p: u8) -> Vec<u8> { let v: Vec<u8> = ::core::unimplemented!(); v } }";
     assert_eq!(entries(none, types), ["Vec < u8 >", "u8"]);
     // Each option allows its own names: `Vec` or `u8`.
-    let only_primitive = || Allow::new().allow_primitive();
+    let only_primitive = || Rules::new().primitive();
     assert_eq!(
         messages_of(only_primitive(), source),
         ["use absolute path: 'Vec::new'"]
     );
     assert_eq!(entries(only_primitive(), types), ["Vec < u8 >"]);
-    let only_prelude = || Allow::new().allow_prelude();
+    let only_prelude = || Rules::new().prelude();
     assert_eq!(messages_of(only_prelude(), source), Vec::<String>::new());
     assert_eq!(entries(only_prelude(), types), ["Vec < u8 >", "u8"]);
 }
@@ -299,7 +293,7 @@ fn the_name_of_the_item_itself_is_relative() {
     );
 }
 
-/// `Some`, `None`, `Ok` and `Err` are in the prelude of every edition, as `drop` is: `allow_prelude()`
+/// `Some`, `None`, `Ok` and `Err` are in the prelude of every edition, as `drop` is: `Rules::prelude()`
 /// allows them in an expression and a pattern, and without it they are relative paths.
 #[test]
 fn the_variants_of_the_prelude_are_allowed_in_a_value() {
@@ -315,7 +309,7 @@ fn the_variants_of_the_prelude_are_allowed_in_a_value() {
     ] {
         assert_eq!(body_messages(body), Vec::<String>::new(), "{}", body);
     }
-    let none = Allow::new();
+    let none = Rules::new();
     for (path, body) in [
         ("Some", "let _ = Some(1u8);"),
         ("None::<u8>", "let _ = None::<u8>;"),
@@ -357,7 +351,7 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
             Some(format!("use `{}` instead of `{}`", absolute, first).as_str())
         );
         // An allowed path is accepted.
-        let config = config().allow_path_if(starts_with(parse_str(first).unwrap()));
+        let config = config().or_if(starts_with(parse_str(first).unwrap()));
         let mut leaker = Leaker::from_config(config, Options::new().check_values());
         leaker.intern_trait(&item, true);
         assert!(leaker.result().finish().is_ok(), "{}", body);
@@ -778,7 +772,7 @@ fn self_without_meaning_in_a_value() {
         err
     );
     // The value is not read without the option.
-    let plain = Allow::new().allow_primitive();
+    let plain = Rules::new().primitive();
     let mut leaker = Leaker::from_config(plain, Options::new());
     leaker.intern_mod(&item);
     let result = leaker.result();
@@ -796,11 +790,7 @@ fn the_types_are_leaked_as_ever() {
             fn g(&self) -> Rel;
         }
     };
-    fn entries<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-        config: Allow<P, E>,
-        check_values: bool,
-        source: &ItemTrait,
-    ) -> Vec<String> {
+    fn entries<A: Allow>(config: A, check_values: bool, source: &ItemTrait) -> Vec<String> {
         let mut leaker = Leaker::from_config(
             config,
             if check_values {
@@ -818,7 +808,7 @@ fn the_types_are_leaked_as_ever() {
             .map(|ty| quote!(#ty).to_string())
             .collect()
     }
-    let without = Allow::new().allow_primitive().allow_prelude();
+    let without = Rules::new().primitive().prelude();
     assert_eq!(
         entries(config(), true, &source),
         entries(without, false, &source)
@@ -877,8 +867,11 @@ fn ordinary_bodies_are_accepted() {
         .iter()
         .map(|name| Ident::new(name, proc_macro2::Span::call_site()).into())
         .collect();
-    let config = config()
-        .allow_path_if(move |path| names.iter().any(|name| starts_with(name.clone())(path)));
+    let config = config().or_if(move |cause: &Cause, place: Place| {
+        names
+            .iter()
+            .any(|name| starts_with(name.clone())(cause, place))
+    });
     let mut leaker = Leaker::from_config(config, Options::new().check_values());
     leaker.intern_trait(&item, true);
     // The types of the signatures are in the prelude: nothing is leaked.
@@ -900,15 +893,15 @@ fn the_option_is_off_by_default() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Allow::new(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new(), Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Allow::default(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::<()>::default(), Options::new());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Allow::new(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(Rules::new(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_err());

@@ -151,19 +151,22 @@ impl ScopeInput {
 
     /// The analysis, as `coinduction` does it: a scope, in which the arguments are visited.
     fn analyze(&self) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
-        let (primitive, prelude) = (self.primitive, self.prelude);
-        let config = Allow::new().allow_path_if(move |path| {
-            (primitive && is_primitive_path(path)) || (prelude && is_prelude_path(path))
-        });
+        let mut config = Rules::new();
+        if self.primitive {
+            config = config.primitive();
+        }
+        if self.prelude {
+            config = config.prelude();
+        }
         self.analyze_with(config)
     }
 
-    fn analyze_with<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
+    fn analyze_with<A: Allow>(
         &self,
-        config: Allow<P, E>,
+        config: A,
     ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
         let mut leaker = Leaker::from_config(config, Options::new());
-        let visit = |view: &mut View<'_, P>| {
+        let visit = |view: &mut View<'_, A>| {
             for arguments in self.fragments() {
                 view.visit_path_arguments(arguments);
             }

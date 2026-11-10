@@ -1,4 +1,4 @@
-//! The names that `Allow::allow_primitive()` and `Allow::allow_prelude()` allow.
+//! The names that `Rules::primitive()` and `Rules::prelude()` allow.
 //!
 //! An allowed path is the same on both sides, so it is not leaked: a bound that names it is fine,
 //! and a type that names it has no entry. Without the option the same name is a relative path:
@@ -12,13 +12,13 @@ use syn::*;
 use template_quote::quote;
 use type_leak::*;
 
-/// The names that `allow_primitive()` allows.
+/// The names that `Rules::primitive()` allows.
 const PRIMITIVES: [&str; 17] = [
     "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
     "i128", "isize", "f32", "f64",
 ];
 
-/// The names that `allow_prelude()` allows, with their absolute paths: those of the prelude of
+/// The names that `Rules::prelude()` allows, with their absolute paths: those of the prelude of
 /// every edition (rustc 1.56).
 const PRELUDE: [(&str, &str); 36] = [
     ("Copy", "::core::marker::Copy"),
@@ -74,7 +74,7 @@ const PRELUDE_LATER: [(&str, &str); 9] = [
 ];
 
 /// Whether the config allows the primitive types and the prelude.
-type Rules = (bool, bool);
+type Names = (bool, bool);
 
 /// Where the name is written, and the headline of the error where that is one.
 struct Form {
@@ -110,18 +110,19 @@ fn forms(name: &str) -> Vec<Form> {
 }
 
 /// The entries of the Referrer, or the headline of the error, with the options of `options`.
-fn analyze(options: Rules, source: &str) -> std::result::Result<Vec<String>, String> {
+fn analyze(options: Names, source: &str) -> std::result::Result<Vec<String>, String> {
     let (primitive, prelude) = options;
-    let config = Allow::new().allow_path_if(move |path| {
-        (primitive && is_primitive_path(path)) || (prelude && is_prelude_path(path))
-    });
+    let mut config = Rules::new();
+    if primitive {
+        config = config.primitive();
+    }
+    if prelude {
+        config = config.prelude();
+    }
     analyze_config(config, source)
 }
 
-fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
-    config: Allow<P, E>,
-    source: &str,
-) -> std::result::Result<Vec<String>, String> {
+fn analyze_config<A: Allow>(config: A, source: &str) -> std::result::Result<Vec<String>, String> {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_trait(&item, true);
@@ -135,7 +136,7 @@ fn analyze_config<P: Fn(&Path) -> bool, E: Fn(&ErrorItem) -> bool>(
 }
 
 /// `names` are allowed by the config `allowing`, and not by the other config, nor by none.
-fn check(names: &[&str], allowing: Rules, others: &[Rules]) {
+fn check(names: &[&str], allowing: Names, others: &[Names]) {
     for name in names {
         for form in forms(name) {
             let context = format!("{} in {}: {}", name, form.label, form.source);
@@ -198,7 +199,7 @@ fn the_names_of_a_later_prelude_are_not_allowed() {
     }
 }
 
-/// The help gives the absolute path of every name that `allow_prelude()` allows or leaves out
+/// The help gives the absolute path of every name that `Rules::prelude()` allows or leaves out
 /// (`DoubleEndedIterator` had "e.g. `::my_crate::DoubleEndedIterator`"), and of a primitive type.
 #[test]
 fn the_help_gives_the_absolute_path_of_every_name_of_the_prelude_and_the_primitives() {
@@ -242,10 +243,10 @@ fn the_options_allow_those_names_and_no_others() {
 fn allow_crate_and_allow_std_crates_allow_the_paths_that_start_with_their_roots() {
     // In a supertrait and in a type: the root decides, and the rest of the path does not.
     let analyze_with = |root: &str, source: &str| {
-        let config = Allow::new();
+        let config = Rules::new();
         match root {
-            "crate" => analyze_config(config.allow_crate(), source),
-            "std crates" => analyze_config(config.allow_std_crates(), source),
+            "crate" => analyze_config(config.crate_paths(), source),
+            "std crates" => analyze_config(config.std_crates(), source),
             _ => analyze_config(config, source),
         }
     };
@@ -278,7 +279,7 @@ fn allow_crate_and_allow_std_crates_allow_the_paths_that_start_with_their_roots(
     // A root decides by its first segment only: `my::core::X` is not `core::X`, and the absolute
     // `::core::X` is context-free whatever is allowed.
     let relative = analyze_config(
-        Allow::new().allow_std_crates().allow_crate(),
+        Rules::new().std_crates().crate_paths(),
         "trait Tr { fn f(&self, x: my::core::X<()>); }",
     );
     assert_eq!(relative, Ok(vec!["my :: core :: X < () >".to_string()]));

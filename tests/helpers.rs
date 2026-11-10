@@ -32,8 +32,8 @@ fn slots() -> RepeaterSlots {
     RepeaterSlots::new(parse_quote!(crate::Repeater))
 }
 
-fn config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 /// Analyzes a whole item the way a downstream macro does.

@@ -27,11 +27,11 @@ use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// The config of the property test, with `::p` allowed.
-fn leaker() -> Leaker<impl Fn(&Path) -> bool> {
-    let config = Allow::new()
-        .allow_primitive()
-        .allow_prelude()
-        .allow_path_if(starts_with(parse_quote!(::p)));
+fn leaker() -> Leaker<impl Allow> {
+    let config = Rules::new()
+        .primitive()
+        .prelude()
+        .or_if(starts_with(parse_quote!(::p)));
     Leaker::from_config(config, Options::new())
 }
 
@@ -80,9 +80,9 @@ fn messages(errors: &[ErrorItem]) -> String {
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
-fn errors_of<P: Fn(&Path) -> bool, R>(
-    mut leaker: Leaker<P>,
-    analyze: impl FnOnce(&mut Leaker<P>) -> R,
+fn errors_of<A: Allow, R>(
+    mut leaker: Leaker<A>,
+    analyze: impl FnOnce(&mut Leaker<A>) -> R,
 ) -> Vec<ErrorItem> {
     analyze(&mut leaker);
     leaker.result().errors().to_vec()

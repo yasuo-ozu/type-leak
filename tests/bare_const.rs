@@ -42,8 +42,8 @@ macro_rules! item {
 }
 
 /// Analyzes `item` with the `intern_*` of its kind.
-fn analyze_with<P: Fn(&Path) -> bool>(
-    mut leaker: Leaker<P>,
+fn analyze_with<A: Allow>(
+    mut leaker: Leaker<A>,
     item: &Item,
     allow_self: bool,
 ) -> std::result::Result<Referrer, Vec<ErrorItem>> {
@@ -60,7 +60,7 @@ fn analyze_with<P: Fn(&Path) -> bool>(
 }
 
 fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
-    let config = Allow::new().allow_primitive();
+    let config = Rules::new().primitive();
     analyze_with(
         Leaker::from_config(config, Options::new()),
         item,
@@ -220,7 +220,7 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
         assert!(entries(&referrer).is_empty(), "{}", quote!(#item));
     }
     // Allowed by the config: left as written, so it is no cause either.
-    let config = Allow::new().allow_path_if(starts_with(parse_quote!(ILEN)));
+    let config = Rules::new().or_if(starts_with(parse_quote!(ILEN)));
     let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, false).unwrap();
     assert!(entries(&referrer).is_empty());
 }
@@ -926,8 +926,8 @@ fn module_with(nested: bool, ilen: &str, place: &str, holder: &str) -> Item {
 }
 
 /// The config of the tests of modules: primitives and the prelude (`Vec`, `Box`, ..) are copied.
-fn module_config() -> Allow<impl Fn(&Path) -> bool> {
-    Allow::new().allow_primitive().allow_prelude()
+fn module_config() -> Rules<impl Allow + Clone> {
+    Rules::new().primitive().prelude()
 }
 
 fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
@@ -1041,7 +1041,7 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
     }
     // Allowed by the config: left as written, so it is no cause either.
     let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
-    let config = module_config().allow_path_if(starts_with(parse_quote!(ILEN)));
+    let config = module_config().or_if(starts_with(parse_quote!(ILEN)));
     let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, true).unwrap();
     assert!(entries(&referrer).is_empty());
 }
