@@ -2772,7 +2772,16 @@ impl ElidedSignatures {
             .cloned()
             .collect();
         if shown == 0 {
-            self.hidden.extend(named);
+            // `Self` is the item at the use site, which holds every parameter: an argument with a
+            // lifetime adds one to the inputs that a path hides.
+            if inputs
+                .clone()
+                .any(|input| count_name(quote!(#input), "Self") > 0)
+            {
+                self.hidden.extend(self.names.iter().cloned());
+            } else {
+                self.hidden.extend(named);
+            }
         } else if !named.is_empty() {
             self.found.push(ElidedSignature {
                 params: named,
@@ -2835,6 +2844,35 @@ fn elided_inputs(item: &Item, generics: &Generics) -> std::collections::HashSet<
         .collect()
 }
 
+/// The pairs of a type parameter of `generics` and a signature of `item` that relies on elision and
+/// names it in its inputs, where an argument with a lifetime breaks the copy unless it names the
+/// elided lifetime (F69): a parameter that can be given any type ([`friendly_type()`]), with no path
+/// hiding a lifetime of that signature ([`hidden_inputs()`]). With `replaced` (the tokens of each
+/// entry that the copy replaced), only the signatures that have one in their inputs: the path
+/// through the Repeater names the lifetime too (F70). A name for each pair.
+fn elided_candidates(item: &Item, generics: &Generics, replaced: Option<&[String]>) -> Vec<String> {
+    let hidden = hidden_inputs(item, generics);
+    let friendly = |name: &String| {
+        generics.params.iter().any(|param| match param {
+            GenericParam::Type(t) => t.ident == *name && friendly_type(item, t).is_some(),
+            _ => false,
+        })
+    };
+    elided_signatures(item, generics)
+        .into_iter()
+        .filter(|signature| {
+            replaced.map_or(true, |replaced| {
+                signature
+                    .inputs
+                    .iter()
+                    .any(|input| replaced.iter().any(|entry| input.contains(entry.as_str())))
+            })
+        })
+        .flat_map(|signature| signature.params)
+        .filter(|name| !hidden.contains(name) && friendly(name))
+        .collect()
+}
+
 /// A value for a const parameter of the type `ty`, as an argument.
 fn concrete_const(ty: &Type, draw: &mut Draw) -> GenericArgument {
     let text = match ty {
@@ -2863,7 +2901,8 @@ fn concrete_const(ty: &Type, draw: &mut Draw) -> GenericArgument {
 /// - for a type parameter that only has marker bounds and appears in no other bound and predicate
 ///   ([`friendly_type()`]): a type of [`concrete_type()`], or one that holds a lifetime
 ///   ([`lifetime_type()`]) if a function pointer or `Fn(..)` whose output has an elided lifetime
-///   names it in its inputs (always with `lifetime_args`); for a const parameter that appears
+///   names it in its inputs (always with `lifetime_args`, and with an entry in the inputs, [`elided_candidates()`]); for a
+///   const parameter that appears
 ///   in no bound, a value; and otherwise the parameter itself, which the use site declares as the
 ///   item does;
 /// - left out for the defaults at the end of the list (if no predicate or bound names them):
@@ -2901,39 +2940,35 @@ impl Instance {
 
     /// How many times a parameter that was given a type with a lifetime is named in the inputs of a
     /// signature of the item that relies on elision (a function pointer, `Fn(..)`): one for each
-    /// pair. The copy at the instantiation must name the elided lifetime there. And how many of them
+    /// pair. The copy at the instantiation must name the elided lifetime there. How many of them
     /// are in a signature that has an entry in its inputs that the copy replaced (`replaced`: the
-    /// tokens of each): the path through the Repeater names the lifetime too.
-    fn lifetime_args_in_elided_signatures(
-        &self,
-        item: &Item,
-        replaced: &[String],
-    ) -> (usize, usize) {
+    /// tokens of each): the path through the Repeater names the lifetime too. And how many pairs of
+    /// each kind the generator could have made ([`elided_candidates()`]), those whose parameter
+    /// the instantiation gives an argument: `[all, with_entry, all_candidates, entry_candidates]`.
+    fn lifetime_args_in_elided_signatures(&self, item: &Item, replaced: &[String]) -> [usize; 4] {
         let generics = Generics {
             params: self.params.clone(),
             ..Default::default()
         };
-        let holds_lifetime = |name: &str| {
+        let holds_lifetime = |name: &String| {
             matches!(self.arg_of(name), Some(arg) if self.concrete.contains(name)
                 && quote!(#arg).to_string().contains('\''))
         };
-        let (mut all, mut with_entry) = (0, 0);
-        for signature in elided_signatures(item, &generics) {
-            let pairs = signature
-                .params
+        let given = |name: &String| {
+            self.params
                 .iter()
-                .filter(|name| holds_lifetime(name))
-                .count();
-            all += pairs;
-            if signature
-                .inputs
-                .iter()
-                .any(|input| replaced.iter().any(|entry| input.contains(entry.as_str())))
-            {
-                with_entry += pairs;
-            }
-        }
-        (all, with_entry)
+                .position(|param| param_name(param) == *name)
+                .map_or(false, |at| at < self.given.len())
+        };
+        let count = |pairs: &[String]| {
+            (
+                pairs.iter().filter(|name| holds_lifetime(name)).count(),
+                pairs.iter().filter(|name| given(name)).count(),
+            )
+        };
+        let (all, all_candidates) = count(&elided_candidates(item, &generics, None));
+        let (with_entry, entry_pairs) = count(&elided_candidates(item, &generics, Some(replaced)));
+        [all, with_entry, all_candidates, entry_pairs]
     }
 
     /// Sets what the use site declares from the generics of the copy (the entries in their bounds are
@@ -3031,6 +3066,7 @@ fn plan_instance(
     item: &Item,
     generics: &Generics,
     ask: InstAsk,
+    replaced: &[String],
     type_fn: impl FnMut(Type, usize, &[GenericArgument]) -> Type,
 ) -> Result<Option<Instance>> {
     let params: Vec<&GenericParam> = generics.params.iter().collect();
@@ -3061,6 +3097,11 @@ fn plan_instance(
     // lifetime in a share of the instantiations, which that signature must still compile with.
     let elided = elided_inputs(item, generics);
     let hidden = hidden_inputs(item, generics);
+    // Those that also have an entry in the inputs always are ([`elided_candidates()`]).
+    let candidates: std::collections::HashSet<String> =
+        elided_candidates(item, generics, Some(replaced))
+            .into_iter()
+            .collect();
     let mut lifetimes: Vec<(Lifetime, Lifetime)> = Vec::new();
     let mut given: Vec<GenericArgument> = Vec::new();
     let mut concrete = std::collections::HashSet::new();
@@ -3076,10 +3117,15 @@ fn plan_instance(
                 given.push(GenericArgument::Lifetime(to));
             }
             GenericParam::Type(t) => match friendly_type(item, t) {
-                Some(traits) if lifetime_args || draw.chance(75) => {
+                Some(traits)
+                    if lifetime_args
+                        || draw.chance(75)
+                        || candidates.contains(&t.ident.to_string()) =>
+                {
                     concrete.insert(t.ident.to_string());
                     let ty = if lifetime_args
                         || (elided.contains(&t.ident.to_string()) && draw.chance(80))
+                        || candidates.contains(&t.ident.to_string())
                     {
                         lifetime_type(&mut draw)
                     } else {
@@ -3657,8 +3703,9 @@ fn shadow_check(
 /// What an invocation of the item with `inst(N)` adds: the checks at an instantiation of its
 /// generics (see [`Instance`]) and of `Referrer::context_generic_args()`. Returns the tokens, the
 /// number of positions checked at the instantiation, and how many times the instantiation passed an
-/// argument that holds a lifetime to a signature that relies on elision, and how many of those have
-/// a replaced entry in their inputs ([`Instance::lifetime_args_in_elided_signatures()`]).
+/// argument that holds a lifetime to a signature that relies on elision, how many of those have
+/// a replaced entry in their inputs, and how many pairs of each kind it could have made
+/// ([`Instance::lifetime_args_in_elided_signatures()`]).
 fn instance_part(
     referrer: &Referrer,
     context: ContextId,
@@ -3667,18 +3714,18 @@ fn instance_part(
     path: &Path,
     dyn_host: bool,
     ask: InstAsk,
-) -> Result<(TokenStream, usize, usize, usize)> {
+) -> Result<(TokenStream, usize, [usize; 4])> {
     let generics = match item {
         Item::Struct(i) => &i.generics,
         Item::Enum(i) => &i.generics,
         Item::Union(i) => &i.generics,
         Item::Trait(i) => &i.generics,
         Item::Impl(i) => &i.generics,
-        _ => return Ok((TokenStream::new(), 0, 0, 0)),
+        _ => return Ok((TokenStream::new(), 0, [0; 4])),
     };
     // The copy of a trait that is declared again passes `()` for its defaults.
     if generics.params.is_empty() || args.redeclare {
-        return Ok((TokenStream::new(), 0, 0, 0));
+        return Ok((TokenStream::new(), 0, [0; 4]));
     }
     check_refusals(referrer, &generics.params)?;
     let host_name = ident(&format!("Host{}I", args.id));
@@ -3695,20 +3742,35 @@ fn instance_part(
         used: Default::default(),
         at_instance: true,
     };
-    let planned = plan_instance(referrer, context, args.id, item, generics, ask, |_, ix, prefix| {
-        projector_with(prefix.to_vec())
-            .project(ix)
-            .unwrap_or_else(|e| {
-                *error.borrow_mut() = Some(e);
-                parse_quote!(())
-            })
-    })?;
+    let replaced: Vec<String> = rewrite(referrer, context, item, args, path, dyn_host)?
+        .used
+        .iter()
+        .filter_map(|ix| referrer.iter().nth(*ix))
+        .map(|entry| quote!(#entry).to_string())
+        .collect();
+    let planned = plan_instance(
+        referrer,
+        context,
+        args.id,
+        item,
+        generics,
+        ask,
+        &replaced,
+        |_, ix, prefix| {
+            projector_with(prefix.to_vec())
+                .project(ix)
+                .unwrap_or_else(|e| {
+                    *error.borrow_mut() = Some(e);
+                    parse_quote!(())
+                })
+        },
+    )?;
     if let Some(e) = error.into_inner() {
         return Err(e);
     }
     let inst = match planned {
         Some(inst) => inst,
-        None => return Ok((TokenStream::new(), 0, 0, 0)),
+        None => return Ok((TokenStream::new(), 0, [0; 4])),
     };
     let mut inst = inst;
     let rewritten = rewrite_with(referrer, context, item, args, path, dyn_host, Some(&inst), None)?;
@@ -3740,14 +3802,8 @@ fn instance_part(
         out.extend(host_impl(&copy, original, host, dyn_host, path, false, Some(&inst)));
     }
     out.extend(defaults_check(&inst, item, path, host_ty));
-    let replaced: Vec<String> = rewritten
-        .used
-        .iter()
-        .filter_map(|ix| referrer.iter().nth(*ix))
-        .map(|entry| quote!(#entry).to_string())
-        .collect();
-    let (with_lifetimes, with_entry) = inst.lifetime_args_in_elided_signatures(item, &replaced);
-    Ok((out, positions, with_lifetimes, with_entry))
+    let counts = inst.lifetime_args_in_elided_signatures(item, &replaced);
+    Ok((out, positions, counts))
 }
 
 
@@ -6346,12 +6402,14 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
                 seed,
                 lifetime_args,
             };
-            let (tokens, n, with_lifetimes, with_entry) =
+            let (tokens, n, [elided, entry, elided_pairs, entry_pairs]) =
                 instance_part(&referrer, context, &item, &args, &path, dyn_host, ask)?;
             more.extend(tokens);
             counted("inst", id, n);
-            counted("inst_elided", id, with_lifetimes);
-            counted("inst_elided_entry", id, with_entry);
+            counted("inst_elided", id, elided);
+            counted("inst_elided_entry", id, entry);
+            counted("inst_elided_candidates", id, elided_pairs);
+            counted("inst_elided_entry_candidates", id, entry_pairs);
         }
         if let Some(seed) = shadow {
             let hidden = shadow_check(&referrer, context, &item, &args, &path, dyn_host, seed)?;
@@ -6551,6 +6609,78 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(friendly_type(&item, &t).is_none());
+    }
+
+    /// The parameters that no type with a lifetime can be given to: those a signature names whose
+    /// lifetime a path hides, and all of them if it names `Self` (or `Self::A`), which holds them.
+    #[test]
+    fn a_signature_that_names_self_hides_every_parameter() {
+        let hidden = |src: &str| {
+            let item: Item = parse_str(src).unwrap();
+            let generics = match &item {
+                Item::Struct(i) => &i.generics,
+                _ => unreachable!(),
+            };
+            let mut hidden: Vec<String> = hidden_inputs(&item, generics).into_iter().collect();
+            hidden.sort();
+            hidden
+        };
+        // The inputs show no lifetime and name `U` only.
+        assert_eq!(
+            hidden("struct S<T, U>(fn(::core::str::Chars, U) -> &B1<T>);"),
+            ["U"]
+        );
+        for input in ["Self", "Self::A", "Box<Self>", "(u8, <Self as Tr>::A)"] {
+            let item = format!(
+                "struct S<T, U>(fn(::core::str::Chars, {}) -> &B1<T>);",
+                input
+            );
+            assert_eq!(hidden(&item), ["T", "U"], "{}", input);
+        }
+        // A lifetime in the inputs is the one the output takes: the copy can name it.
+        assert!(hidden("struct S<T, U>(fn(&u8, Self) -> &B1<T>);").is_empty());
+        // No lifetime in the output, nothing to elide.
+        assert!(hidden("struct S<T, U>(fn(::core::str::Chars, Self) -> B1<T>);").is_empty());
+    }
+
+    /// The pairs where an argument with a lifetime meets a signature that relies on elision (with a
+    /// replaced entry in the inputs, or any), but not the parameters that cannot be given any type
+    /// or that a path hides a lifetime from.
+    #[test]
+    fn candidates_are_the_parameters_of_a_signature_that_relies_on_elision() {
+        let candidates = |src: &str| {
+            let item: Item = parse_str(src).unwrap();
+            let generics = match &item {
+                Item::Struct(i) => &i.generics,
+                _ => unreachable!(),
+            };
+            let replaced = [quote!(::std::vec::Vec<T>).to_string()];
+            elided_candidates(&item, generics, Some(&replaced))
+        };
+        // `V` is named by a signature without the entry, `W` by none.
+        let item =
+            "struct S<T, U, V, W>(fn(&::std::vec::Vec<T>, U) -> &u8, fn(&V) -> &u8, Option<W>);";
+        assert_eq!(candidates(item), ["T", "U"]);
+        let parsed: Item = parse_str(item).unwrap();
+        let generics = match &parsed {
+            Item::Struct(i) => &i.generics,
+            _ => unreachable!(),
+        };
+        assert_eq!(elided_candidates(&parsed, generics, None), ["T", "U", "V"]);
+        // One pair for each signature.
+        assert_eq!(
+            candidates("struct S<T>(fn(&::std::vec::Vec<T>) -> &u8, Box<dyn Fn(T, &::std::vec::Vec<T>) -> &u8>);"),
+            ["T", "T"]
+        );
+        // `U` needs more than a type has, and a path hides a lifetime of the signature `V` is in.
+        assert_eq!(
+            candidates(
+                "struct S<T, U: Iterator, V>(fn(&::std::vec::Vec<T>, U, V) -> &u8, fn(::core::str::Chars, V) -> &u8);"
+            ),
+            ["T"]
+        );
+        // And an output with no elided lifetime has nothing to name.
+        assert!(candidates("struct S<T>(fn(&::std::vec::Vec<T>) -> u8);").is_empty());
     }
 
     /// An item put in a module or a block that declares names is found there again.

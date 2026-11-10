@@ -304,9 +304,11 @@ fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
             ))
         })
         .collect();
-    // (Not the contexts: they are keyed by the text of their generics, so a bound spelled bare in
-    // one place and in full in another makes two where the twin has one.)
+    // The entries are counted per context, and the contexts are keyed by the text of their generics:
+    // a bound spelled bare in one item and in full in another makes two contexts, and two equal
+    // lines, where the twin with the traits in full has one. So the set of lines is compared.
     lines.sort();
+    lines.dedup();
     lines
 }
 
@@ -456,4 +458,35 @@ pub(crate) fn check(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn referrer(item: &Item) -> Referrer {
+        let module = match item {
+            Item::Mod(m) => m,
+            _ => unreachable!("not a module"),
+        };
+        let mut leaker = Leaker::from_config(Rules::new().prelude(), Options::new());
+        leaker.intern_mod(module);
+        leaker.result().into_referrer()
+    }
+
+    /// Two items of a module spell the same bound differently, so the bare module has two contexts
+    /// with the entry `Vec<U>` where its twin with the traits in full has one: the same set of lines.
+    #[test]
+    fn contexts_that_differ_in_spelling_give_one_line() {
+        let item: Item = parse_quote! {
+            pub mod mm {
+                pub struct A<U: ::core::default::Default>(::std::vec::Vec<U>);
+                pub struct B<U: Default>(::std::vec::Vec<U>);
+            }
+        };
+        let bare = summary(&referrer(&item), false);
+        let twin = summary(&referrer(&absolute_item(&item, false)), false);
+        assert!(!bare.is_empty());
+        assert_eq!(bare, twin);
+    }
 }

@@ -279,7 +279,8 @@
 //!   the copy must name the elided lifetime there (F69, `UseSite::substitute()`, and F70 where the
 //!   path through the Repeater that replaces an entry in the inputs names it): the summary counts the
 //!   pairs of a parameter and a signature (`inst_elided`), and those with a replaced entry in the
-//!   inputs (`inst_elided_entry`).
+//!   inputs (`inst_elided_entry`), each with the pairs the instantiation could have made
+//!   (`*_candidates`).
 //! - **Shadowing** (`shadow(N)`, `prop.rs: shadow_check()`): the item is copied inside a module and a
 //!   block that declare names its entries start with: the visitor must leave those entries.
 //! - **Unique names**: each copy is in a module of its own (`c<id>`), so a relative path that it keeps by
@@ -3513,16 +3514,30 @@ const CONSTRUCT_SAMPLES: usize = 3;
 /// elided lifetime and a macro in an array length, which have no witness).
 const MIN_CHECKED: f64 = 85.0;
 
-/// The least number of times, over a run with at least 100 items invoked with `inst`, that an
-/// instantiation passes an argument that holds a lifetime to a signature that relies on elision
-/// (`use_summary()`, `gen::ELIDED_PARAM_PERCENT`): the shape of F69. Without it a generator that
-/// stopped making the shape would leave the check vacuous. Measured at 60 cases: 23 to 49 over the
-/// seeds 1 to 16.
+/// The least number of times that an instantiation passes an argument that holds a lifetime to a
+/// signature that relies on elision (`use_summary()`, `gen::ELIDED_PARAM_PERCENT`): the shape of F69.
+/// It applies to a run with at least `MIN_ELIDED_CANDIDATES` candidates (`TLCOUNT
+/// inst_elided_candidates`): the pairs of a signature and a parameter that the instantiation gives an
+/// argument, that any type fits and that no path hides a lifetime of the signature from. Without it a
+/// generator that stopped making the shape would leave the check vacuous. A candidate gets a type with
+/// a lifetime in about 60% of the instantiations (69% of 2188 measured), and a parameter in two
+/// signatures is two candidates, so a run with 16 has none with a probability under 1e-3. Measured at
+/// 60 cases: 36 to 78 candidates and 21 to 57 counted over the seeds 1 to 16 and 22, with and without
+/// `values`.
 const MIN_ELIDED_LIFETIME_ARGS: usize = 1;
+const MIN_ELIDED_CANDIDATES: usize = 16;
 
 /// The same for the instantiations that pass the argument to a signature that has an entry in its
-/// inputs, which the copy replaced (F70). Measured at 60 cases: 2 to 19 over the seeds 1 to 16.
+/// inputs, which the copy replaced (F70). `plan_instance()` always gives such a candidate a type with
+/// a lifetime, so a run that has one has it counted: the least is exact. Measured at 60 cases: the
+/// counted are the candidates in each of 40 runs, 3 to 26 over the seeds 1 to 16 and 22, with and
+/// without `values` (a run with none passes the least, but see `MIN_ASKED_FOR_CANDIDATES`).
 const MIN_ELIDED_ENTRY_LIFETIME_ARGS: usize = 1;
+const MIN_ELIDED_ENTRY_CANDIDATES: usize = 1;
+
+/// The fewest items invoked with `inst` for which a run must have candidates of F69 and F70 at all:
+/// at 60 cases (about 500 such items) the fewest F70 candidates in 40 runs was 3.
+const MIN_ASKED_FOR_CANDIDATES: usize = 100;
 
 #[derive(Debug, PartialEq)]
 struct Floors {
@@ -3790,34 +3805,57 @@ fn use_summary(cases: &[(usize, &Case)], build: &Build) -> (String, Vec<String>)
         let ran = counts.len();
         let total: usize = counts.iter().map(|c| c.n).sum();
         let with: usize = counts.iter().filter(|c| c.n > 0).count();
+        // The shapes of F69 and F70 are made on purpose (`gen::ELIDED_PARAM_PERCENT`,
+        // `ELIDED_ENTRY_PERCENT`) and counted with the pairs that could have them: some instantiation
+        // must pass a lifetime into such a signature when there are enough, or the run does not
+        // test it.
+        let (least, enough) = match what {
+            "inst_elided" => (MIN_ELIDED_LIFETIME_ARGS, MIN_ELIDED_CANDIDATES),
+            "inst_elided_entry" => (MIN_ELIDED_ENTRY_LIFETIME_ARGS, MIN_ELIDED_ENTRY_CANDIDATES),
+            _ => (0, 0),
+        };
+        let candidates: Option<usize> = (least > 0).then(|| {
+            build
+                .counts
+                .iter()
+                .filter(|c| c.what == format!("{}_candidates", what))
+                .map(|c| c.n)
+                .sum()
+        });
         writeln!(
             text,
-            "  copies with `{}`: {} items invoked, the check ran for {}, with something to compare for {}; {}: {}",
-            what, asked, ran, with, noun, total
+            "  copies with `{}`: {} items invoked, the check ran for {}, with something to compare for {}; {}: {}{}",
+            what,
+            asked,
+            ran,
+            with,
+            noun,
+            total,
+            candidates.map_or(String::new(), |n| format!(" of {} candidates", n)),
         )
         .unwrap();
-        // The shapes of F69 and F70 (below) depend on what the generator made: a run of one case may
-        // have none, and a run of many is held to a least number.
-        let made_on_purpose = matches!(what, "inst_elided" | "inst_elided_entry");
-        if asked >= 10 && with == 0 && !made_on_purpose {
+        // The shapes depend on what the generator made: a run of one case may have none.
+        if asked >= 10 && with == 0 && least == 0 {
             problems.push(format!(
                 "`{}` was asked of {} items and compared nothing: the macro does not do it",
                 what, asked
             ));
         }
-        // The shapes of F69 and F70 are made on purpose (`gen::ELIDED_PARAM_PERCENT`,
-        // `ELIDED_ENTRY_PERCENT`): over many items, some instantiation must pass a lifetime into such
-        // a signature, or the run does not test it.
-        let least = match what {
-            "inst_elided" => MIN_ELIDED_LIFETIME_ARGS,
-            "inst_elided_entry" => MIN_ELIDED_ENTRY_LIFETIME_ARGS,
-            _ => 0,
-        };
-        if least > 0 && asked >= 100 && total < least {
-            problems.push(format!(
-                "{} items were invoked with `inst` and only {} {} (at least {}): the generator or the macro misses the shape",
-                asked, total, noun, least
-            ));
+        if let Some(candidates) = candidates {
+            if candidates >= enough && total < least {
+                problems.push(format!(
+                    "{} items were invoked with `inst` and only {} {} (at least {} of {} candidates): the generator or the macro misses the shape",
+                    asked, total, noun, least, candidates
+                ));
+            }
+            // A run this large always had some (3 or more over 40 runs): none means the generator
+            // stopped making the shape.
+            if asked >= MIN_ASKED_FOR_CANDIDATES && candidates == 0 {
+                problems.push(format!(
+                    "{} items were invoked with `inst` and none is a candidate for `{}`: the generator does not make the shape",
+                    asked, what
+                ));
+            }
         }
     }
     (text, problems)
