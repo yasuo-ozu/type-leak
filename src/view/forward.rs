@@ -72,9 +72,8 @@ impl View<'_> {
     ///         // `T` is a generic of the scope, and `U` is local to the struct. Each type is an
     ///         // entry with the generics it uses.
     ///         view.visit_item(&parse_quote!(struct Inner<U> { a: Rel<U>, b: Wrap<T> }));
-    ///     })
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     });
+    /// let referrer = leaker.result().finish().unwrap();
     /// assert_eq!(referrer.iter().count(), 2);
     /// assert_eq!(referrer.generics(0).params.len(), 1);
     /// assert_eq!(referrer.generics(1).params.len(), 1);
@@ -92,10 +91,9 @@ impl View<'_> {
     /// leaker
     ///     .enter_generics(&parse_quote!(<T>), |view| {
     ///         view.visit_type(&parse_quote!(::core::option::Option<Wrap<T>>));
-    ///     })
-    ///     .unwrap();
+    ///     });
     /// // `Option<..>` is a path of the standard library, which is the same in every crate.
-    /// assert_eq!(leaker.finish().iter().collect::<Vec<_>>(), [&parse_quote!(Wrap<T>)]);
+    /// assert_eq!(leaker.result().finish().unwrap().iter().collect::<Vec<_>>(), [&parse_quote!(Wrap<T>)]);
     /// ```
     pub fn visit_type(&mut self, ty: &Type) {
         Visit::visit_type(&mut *self.visitor, ty)
@@ -147,6 +145,7 @@ impl<'ast> Visit<'ast> for View<'_> {
         visit_item_type: ItemType,
         visit_item_union: ItemUnion,
         visit_lifetime: Lifetime,
+        visit_macro: Macro,
         visit_parenthesized_generic_arguments: ParenthesizedGenericArguments,
         visit_path: Path,
         visit_predicate_type: PredicateType,

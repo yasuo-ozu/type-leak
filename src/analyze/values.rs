@@ -31,9 +31,10 @@
 //! that `syn` leaves unparsed.
 
 use super::{self_segment, AnalyzeVisitor};
-use crate::analysis::{CheckResult, Effect};
+use crate::analysis::{CheckResult, Effect, Part};
 #[cfg(doc)]
 use crate::config::LeakerConfig;
+use crate::error::{Cause, Reason};
 use crate::util::{ident_name, is_primitive_name, tidy, token_names};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
@@ -42,7 +43,7 @@ use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 
 impl AnalyzeVisitor {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
@@ -179,7 +180,7 @@ impl<'a> ValueWalk<'a> {
             return true;
         }
         if self_segment(path).is_some() {
-            self.visitor.check_self_has_meaning(quote!(#path));
+            self.visitor.check_self_has_meaning(Cause::expr_path(path));
             return true;
         }
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
@@ -205,12 +206,31 @@ impl<'a> ValueWalk<'a> {
     }
 
     fn error(&mut self, error: CheckResult) {
-        self.visitor.frame.effects.push(Effect::Error(error));
+        self.visitor.push_error(error);
     }
 
-    /// Rejects the relative path `tokens`, with `help` for what to write if it has to say more
-    /// than the absolute path.
-    fn relative(&mut self, tokens: TokenStream, help: Option<String>) {
+    /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
+    /// the absolute path.
+    fn relative(&mut self, cause: Cause, help: Option<String>) {
+        self.relative_part(cause, help, None)
+    }
+
+    /// Rejects the relative path `path` of a value, copied as written with the types in its
+    /// arguments (see [`Part`]).
+    fn relative_path(&mut self, path: &Path) {
+        let cause = Cause::expr_path(path);
+        let part = self.visitor.node_part(cause.clone(), path);
+        self.relative_part(cause, None, part)
+    }
+
+    /// Like `relative()`, for a node that the Referrer leaves as written: `part`.
+    fn relative_part(&mut self, cause: Cause, help: Option<String>, part: Option<Part>) {
+        // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
+        // type is shown by its path alone.
+        let headline = match &cause {
+            Cause::Macro(_) => Some(format!("use absolute path: '{}'", cause.to_token_stream())),
+            _ => None,
+        };
         let mut note = format!("it is in {}, which the copy writes as it is", self.what);
         if let Some(name) = &self.declared_name {
             note.push_str(&format!(
@@ -219,13 +239,17 @@ impl<'a> ValueWalk<'a> {
             ));
         }
         self.error(CheckResult {
-            must: vec![tokens.clone()],
-            impossible: vec![tokens],
+            must: vec![cause.clone()],
+            impossible: vec![cause],
             is_own: true,
             optional: false,
             note: Some(note),
             help,
-            headline: None,
+            headline,
+            cause: None,
+            reason: Reason::RelativePath,
+            seen: 0,
+            part,
         });
     }
 
@@ -238,8 +262,12 @@ impl<'a> ValueWalk<'a> {
         );
         self.error(CheckResult {
             headline: Some(format!("cannot analyze `{}` in {}", shown, self.what)),
-            must: vec![tokens.clone()],
-            impossible: vec![tokens],
+            cause: None,
+            reason: Reason::Unreadable,
+            seen: 0,
+            part: None,
+            must: vec![Cause::Unreadable(tokens.clone())],
+            impossible: vec![Cause::Unreadable(tokens)],
             is_own: true,
             optional: false,
             note: Some(note),
@@ -327,7 +355,7 @@ impl<'a> ValueWalk<'a> {
     fn check_name(&mut self, ident: &Ident) {
         let path = Path::from(ident.clone());
         if !self.is_known(&path) {
-            self.relative(quote!(#path), None);
+            self.relative(Cause::expr_path(&path), None);
         }
     }
 
@@ -354,7 +382,7 @@ impl<'a> ValueWalk<'a> {
                     self.visit_path_arguments(&seg.arguments);
                 }
             } else {
-                self.relative(quote!(#trait_path), None);
+                self.relative(Cause::Trait(trait_path), None);
             }
         }
         for seg in path.segments.iter().skip(position) {
@@ -378,7 +406,7 @@ impl<'a> ValueWalk<'a> {
         };
         let path = Path::from(ident.clone());
         if !absolute && !self.is_local(&path) && !self.visitor.is_context_free(&path) {
-            self.relative(quote!(#path), None);
+            self.relative(Cause::expr_path(&path), None);
         }
     }
 
@@ -388,7 +416,7 @@ impl<'a> ValueWalk<'a> {
         let path = &mac.path;
         if !self.is_known(path) {
             let help = macro_help(path);
-            return self.relative(quote!(#path !), Some(help));
+            return self.relative(Cause::Macro(path.clone()), Some(help));
         }
         self.reads += 1;
         self.macro_arguments_of(mac);
@@ -459,7 +487,7 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
         if self.is_known(i) {
             syn::visit::visit_path(self, i)
         } else {
-            self.relative(quote!(#i), None)
+            self.relative_path(i)
         }
     }
 

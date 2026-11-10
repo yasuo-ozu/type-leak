@@ -1,12 +1,14 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
+use crate::analysis::PartItem;
 use crate::context::{Context, ContextId, Enclosing, Gat, ModuleInfo, Scope, SelfRequirement};
 use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
+use crate::error::Cause;
 use crate::graph::TypeKey;
 use crate::util::{
-    first_self_in_generics, generic_param_name, ident_name, mentions_names, parenthesize_bounded,
-    type_mentions_self, ReplaceSelf,
+    bound_cause, first_self_in_generics, generic_param_name, ident_name, mentions_names,
+    parenthesize_bounded, type_mentions_self, ReplaceSelf,
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
@@ -21,7 +23,8 @@ use template_quote::{quote, ToTokens};
 
 /// The result of an analysis: the leaked types of an item (its *entries*), each with an index `ix`.
 ///
-/// [`Leaker::finish()`](crate::Leaker::finish) returns it. Use it in two steps:
+/// [`Leaker::result()`](crate::Leaker::result) returns it, in a [`LeakerResult`](crate::LeakerResult).
+/// Use it in two steps:
 ///
 /// 1. **In crate A**, which defines the item: for each entry, emit the Repeater impl that
 ///    [`repeater_impl(ix, ..)`](Referrer::repeater_impl) describes.
@@ -56,10 +59,8 @@ use template_quote::{quote, ToTokens};
 /// use template_quote::{quote, ToTokens};
 ///
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker
-///     .intern_struct(&parse_quote!(struct S<T> { a: Wrap<T> }), true)
-///     .unwrap();
-/// let referrer = leaker.finish();
+/// let top_level = leaker.intern_struct(&parse_quote!(struct S<T> { a: Wrap<T> }), true);
+/// let referrer = leaker.result().finish().unwrap();
 ///
 /// // Crate A writes the Referrer and the `ContextId` into the input of the macro of crate B...
 /// let tokens = quote!(#referrer, #top_level);
@@ -87,6 +88,13 @@ pub struct Referrer {
     pub(crate) modules: BTreeMap<ContextId, ModuleInfo>,
     /// Keyed by tokens as in the Leaker, so a type in an invisible group is found too.
     pub(crate) map: HashMap<TypeKey, Vec<usize>>,
+    /// The parts copied as written, which the visitor leaves so. Serialized after the format tag.
+    pub(crate) parts: Vec<PartItem>,
+    /// The indices in `parts`, by the part.
+    pub(crate) part_map: HashMap<Cause, Vec<usize>>,
+    /// The indices in `parts` of the parts with an anchor (`within`), by the anchor, as a
+    /// `Cause::Type`.
+    pub(crate) anchor_map: HashMap<Cause, Vec<usize>>,
 }
 
 /// Where a visitor is, among the modules of the Leaker.
@@ -141,12 +149,32 @@ enum Matching<'a> {
     Default,
 }
 
+/// Where a type or a node is among the predicates of the item, for the parts.
+#[derive(Clone, Copy, Debug, Default)]
+struct Place {
+    /// In a bound or a where predicate of the item, or in what is in them.
+    in_predicate: bool,
+    /// In an argument of a function, whose `impl Trait` bounds are predicates.
+    in_fn_arg: bool,
+    /// In a part: it is left as written, so no entry is looked up.
+    protected: bool,
+}
+
+/// How [`Referrer::expand_with()`] and [`Referrer::is_part()`] look a type up.
+#[derive(Clone, Copy)]
+struct Lookup<'a> {
+    matching: Matching<'a>,
+    module: ModulePos,
+    place: Place,
+}
+
 impl Referrer {
     /// `context_map` always has at least one context.
     pub(crate) fn new(
         entries: impl IntoIterator<Item = (ContextId, Type, bool, Vec<String>)>,
         mut context_map: BTreeMap<ContextId, Context>,
         modules: BTreeMap<ContextId, ModuleInfo>,
+        parts: Vec<PartItem>,
     ) -> Self {
         if context_map.is_empty() {
             context_map.insert(ContextId::new(0), Context::none());
@@ -160,7 +188,18 @@ impl Referrer {
             context_map,
             modules,
             map: HashMap::new(),
+            parts,
+            part_map: HashMap::new(),
+            anchor_map: HashMap::new(),
         };
+        for (ix, item) in referrer.parts.iter().enumerate() {
+            let PartItem { part, within, .. } = item;
+            referrer.part_map.entry(part.clone()).or_default().push(ix);
+            if let Some((anchor, _)) = within {
+                let anchor = Cause::Type(anchor.clone());
+                referrer.anchor_map.entry(anchor).or_default().push(ix);
+            }
+        }
         for (ix, (context, ty, must, crates)) in entries.into_iter().enumerate() {
             referrer.map.entry(TypeKey::new(&ty)).or_default().push(ix);
             referrer.leak_types.push(ty);
@@ -216,6 +255,97 @@ impl Referrer {
         }
         let ix = best?.1;
         Some(ix).filter(|&ix| !self.allow_ambiguous_crate_name || self.musts[ix])
+    }
+
+    /// Returns `true` if `ty` has the context `context` at `at`, in `scopes`, as an entry of that
+    /// context would be found ([`Referrer::find()`]).
+    fn fits(
+        &self,
+        context: ContextId,
+        ty: &Type,
+        at: Lookup,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+    ) -> bool {
+        let no_self = matches!(at.matching, Matching::Scope { no_self: true, .. });
+        let found = self.get_context(context);
+        if no_self && (found.self_ty().is_some() || type_mentions_self(ty)) {
+            return false;
+        }
+        let in_module = match (at.module, found.module()) {
+            (ModulePos::In(module), Some(found)) => found == module,
+            (_, Some(_)) => false,
+            (_, None) => true,
+        };
+        in_module && Self::matches(at.matching, ty, scopes, enclosing, found).is_some()
+    }
+
+    /// Returns `true` if `cause`, which `ty` stands for, is a part: a part has the same tokens, is
+    /// in a predicate as `at` says, and has the context that `ty` has in `scopes`. A part with an
+    /// anchor counts only if its anchor is one of the `active` ones ([`Referrer::anchors()`]).
+    fn is_part(
+        &self,
+        cause: &Cause,
+        ty: &Type,
+        at: Lookup,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+        active: &[usize],
+    ) -> bool {
+        let items = match self.part_map.get(cause) {
+            Some(items) => items,
+            None => return false,
+        };
+        items.iter().any(|&ix| {
+            let PartItem {
+                context,
+                in_predicate,
+                within,
+                ..
+            } = &self.parts[ix];
+            *in_predicate == at.place.in_predicate
+                && (within.is_none() || active.contains(&ix))
+                && self.fits(*context, ty, at, scopes, enclosing)
+        })
+    }
+
+    /// Returns `true` if the type `ty` is a part that the Leaker copied as written.
+    fn is_part_type(
+        &self,
+        ty: &Type,
+        at: Lookup,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+        active: &[usize],
+    ) -> bool {
+        !self.part_map.is_empty()
+            && self.is_part(&Cause::Type(ty.clone()), ty, at, scopes, enclosing, active)
+    }
+
+    /// Pushes onto `active` the parts whose anchor `ty` is, as an entry would be found: they are
+    /// left as written inside `ty`, and only there.
+    fn anchors(
+        &self,
+        ty: &Type,
+        at: Lookup,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+        active: &mut Vec<usize>,
+    ) {
+        if self.anchor_map.is_empty() {
+            return;
+        }
+        let items = match self.anchor_map.get(&Cause::Type(ty.clone())) {
+            Some(items) => items,
+            None => return,
+        };
+        for &ix in items {
+            if let Some((_, anchor)) = &self.parts[ix].within {
+                if self.fits(*anchor, ty, at, scopes, enclosing) {
+                    active.push(ix);
+                }
+            }
+        }
     }
 
     /// Returns where a visited `mod ident` is, inside `module`: the module nested in it with that
@@ -340,8 +470,8 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// let context = leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true).unwrap();
-    /// let referrer = leaker.finish();
+    /// let context = leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let ty: Type = parse_quote!(::foo::X);
     /// let replaced: Type = parse_quote!(Replaced);
     /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), ty);
@@ -363,9 +493,8 @@ impl Referrer {
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
     /// leaker
-    ///     .intern_struct(&parse_quote!(struct S { a: ::foo::X<::bar::Y>, b: Rel }), true)
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     .intern_struct(&parse_quote!(struct S { a: ::foo::X<::bar::Y>, b: Rel }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // `Rel` is entry 0, `::foo::X<::bar::Y>` entry 1.
     /// assert!(referrer.external_crates_require(0).is_empty());
     /// assert_eq!(referrer.external_crates_require(1), ["bar", "foo"]);
@@ -396,8 +525,8 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X, b: Rel }), true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X, b: Rel }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// assert!(referrer.must(0)); // `Rel`
     /// assert!(!referrer.must(1)); // `::foo::X`
     /// ```
@@ -420,9 +549,8 @@ impl Referrer {
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
     /// leaker
-    ///     .intern_struct(&parse_quote!(struct S { a: Rel, b: ::foo::X }), true)
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     .intern_struct(&parse_quote!(struct S { a: Rel, b: ::foo::X }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // `::foo::X` is optional: another crate may name it differently.
     /// assert_eq!(referrer.iter().count(), 2);
     /// assert_eq!(referrer.required().count(), 1);
@@ -446,8 +574,8 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// assert!(!referrer.is_empty()); // `::foo::X` is an optional entry
     /// assert!(!referrer.has_required()); // and no Referrer needs an impl for it, unless strict
     /// ```
@@ -479,8 +607,8 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S { a: Rel, b: ::foo::X }), true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_struct(&parse_quote!(struct S { a: Rel, b: ::foo::X }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // One impl for each entry, the optional one too.
     /// let param: Ident = parse_quote!(__S);
     /// let impls: Vec<RepeaterImpl> = (0..referrer.iter().count())
@@ -505,9 +633,8 @@ impl Referrer {
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
     /// leaker
-    ///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self, a: Rel, b: Wrap<T>) -> Self::A; }), true)
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self, a: Rel, b: Wrap<T>) -> Self::A; }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let plain: Vec<_> = referrer.iter().enumerate().filter(|(ix, _)| referrer.is_plain(*ix)).collect();
     /// // `Wrap<T>` uses a generic, and `Self::A` names `Self`.
     /// assert_eq!(plain.len(), 1);
@@ -540,7 +667,8 @@ impl Referrer {
         self.contexts[ix]
     }
 
-    /// Returns the contexts in ascending order, with the top-level ones that have no entry.
+    /// Returns the contexts in ascending order, with the top-level ones that have no entry, and
+    /// those of the parts that were copied as written.
     ///
     /// The ids may have gaps. There is always at least one context. See [`ContextId`].
     pub fn contexts(&self) -> impl Iterator<Item = ContextId> + '_ {
@@ -576,8 +704,8 @@ impl Referrer {
     ///     trait Tr<'a, T: 'a + ::core::clone::Clone> { fn f(&self, x: &'a Wrap<T>); }
     /// };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let context = referrer.context(0);
     /// // The arguments of the Repeater encode `T: 'a` (as `&'a T`), so the impl must not declare it.
     /// // `Clone` stays.
@@ -613,9 +741,8 @@ impl Referrer {
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
     /// leaker
-    ///     .intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self>; fn g(&self) -> Rel; }), true)
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     .intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self>; fn g(&self) -> Rel; }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // `Wrap<Self>` is written for the implementors of the trait. `Rel` is for any type.
     /// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<Self>)).unwrap();
     /// let rel = referrer.iter().position(|ty| *ty == parse_quote!(Rel)).unwrap();
@@ -706,12 +833,12 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self::A>; }), true).unwrap();
-    /// assert!(leaker.finish().has_self());
+    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self::A>; }), true);
+    /// assert!(leaker.result().finish().unwrap().has_self());
     ///
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap; }), true).unwrap();
-    /// assert!(!leaker.finish().has_self());
+    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap; }), true);
+    /// assert!(!leaker.result().finish().unwrap().has_self());
     /// ```
     pub fn has_self(&self) -> bool {
         self.leak_types.iter().any(type_mentions_self)
@@ -734,8 +861,8 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self::A>; }), true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self::A>; }), true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // The impl is for a type parameter `__S`, where `Self` of the trait is not available.
     /// let implementor: Type = parse_quote!(__S);
     /// let (ty, _generics) = referrer.iter_with_self(&implementor).next().unwrap();
@@ -773,8 +900,8 @@ impl Referrer {
     /// # use template_quote::quote;
     /// let tr: ItemTrait = parse_quote!(trait Tr<T, U = Rel<T>> { fn f(&self, t: T) -> U; });
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // For `impl Tr<u8> for ..`, omitting `U`.
     /// let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
     /// let completed = referrer
@@ -801,9 +928,13 @@ impl Referrer {
                 };
                 // Placeholders keep the substitution from touching the replaced paths.
                 let mut leaked = Vec::new();
+                let at = Lookup {
+                    matching: Matching::Default,
+                    module: ModulePos::Outside,
+                    place: Place::default(),
+                };
                 let ty = self.expand_with(
-                    Matching::Default,
-                    ModulePos::Outside,
+                    at,
                     &mut vec![Scope::new(&root, None)],
                     None,
                     default.clone(),
@@ -842,8 +973,8 @@ impl Referrer {
     /// # use syn::*;
     /// let tr: ItemTrait = parse_quote!(trait Tr<T> { fn f<U>(&self, t: T, u: U) -> Wrap<T, U>; });
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // `impl Tr<u8> for ..`: `T` is `u8`. `U` is a generic of the method, passed by its name.
     /// let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
     /// let args = referrer.generic_args(0, &tr.generics.params, &trait_args).unwrap();
@@ -933,6 +1064,11 @@ impl Referrer {
     ///   So the copy must nest the same items as the scopes of the Leaker. The entries that depend
     ///   on the own `Self` of such an item are found only if you call
     ///   [`Visitor::with_nested_self()`], which writes them.
+    /// - A part that the Leaker copied as written ([recovery](crate::Leaker#errors-and-recovery)) is
+    ///   left as written, whole, and no entry is looked up in it, though the same tokens can be an
+    ///   entry elsewhere. It is found by its tokens, its context and whether it is in a predicate,
+    ///   and, with an anchor (`within`), only inside a type that matches the anchor. `Self` in a
+    ///   part is still replaced if you call [`Visitor::with_self()`].
     ///
     /// In a copy of a module ([`Leaker::intern_mod()`](crate::Leaker::intern_mod),
     /// [`Leaker::enter_mod()`](crate::Leaker::enter_mod)):
@@ -962,8 +1098,8 @@ impl Referrer {
     /// # use syn::visit_mut::VisitMut;
     /// let tr: ItemTrait = parse_quote!(trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; });
     /// let mut leaker = Leaker::new();
-    /// let top_level = leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// let top_level = leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     ///
     /// // The copy of `f` in `impl Tr<u8> for ..`.
     /// let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
@@ -1006,6 +1142,7 @@ impl Referrer {
             mod_path: Vec::new(),
             defaults: Defaults::Plain,
             module,
+            place: Place::default(),
         }
     }
 
@@ -1021,8 +1158,8 @@ impl Referrer {
     /// # use syn::*;
     /// let item: ItemStruct = parse_quote!(struct S<T> { a: ::core::option::Option<Wrap<T>> });
     /// let mut leaker = Leaker::new();
-    /// let context = leaker.intern_struct(&item, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// let context = leaker.intern_struct(&item, true);
+    /// let referrer = leaker.result().finish().unwrap();
     ///
     /// let ty: Type = parse_quote!(::core::option::Option<Wrap<T>>);
     /// let ty = referrer.expand(context, ty, |_, ix| parse_quote!(<Marker as Repeater<#ix>>::Type));
@@ -1039,25 +1176,24 @@ impl Referrer {
         type_fn: impl FnMut(Type, usize) -> Type,
     ) -> Type {
         let (scope, self_requirement, module) = self.place(context);
-        self.expand_with(
-            Matching::Scope {
-                self_ty: self_requirement.as_ref(),
-                no_self: false,
-                nested_type: false,
-                alone: false,
-            },
+        let matching = Matching::Scope {
+            self_ty: self_requirement.as_ref(),
+            no_self: false,
+            nested_type: false,
+            alone: false,
+        };
+        // A type cut out of an item is not known to be in a predicate.
+        let at = Lookup {
+            matching,
             module,
-            &mut vec![scope],
-            None,
-            ty,
-            type_fn,
-        )
+            place: Place::default(),
+        };
+        self.expand_with(at, &mut vec![scope], None, ty, type_fn)
     }
 
     fn expand_with(
         &self,
-        matching: Matching,
-        module: ModulePos,
+        at: Lookup,
         scopes: &mut Vec<Scope>,
         self_ty: Option<&Type>,
         ty: Type,
@@ -1066,21 +1202,54 @@ impl Referrer {
         use syn::fold::Fold;
         struct Folder<'a, 'b, F> {
             referrer: &'a Referrer,
-            matching: Matching<'b>,
-            module: ModulePos,
+            at: Lookup<'b>,
             scopes: &'a mut Vec<Scope>,
             replace_self: Option<ReplaceSelf<'a>>,
             enclosing: Enclosing,
+            /// The parts whose anchor is a type around the one being folded.
+            active: Vec<usize>,
             type_fn: F,
+        }
+        impl<'a, 'b, F: FnMut(Type, usize) -> Type> Folder<'a, 'b, F> {
+            /// The entry that stands for `ty`, unless `ty` is, or is inside, a part: that is left
+            /// as written.
+            fn lookup(&mut self, ty: &Type, enclosing: &Enclosing) -> Option<usize> {
+                if self.at.place.protected {
+                    return None;
+                }
+                if self
+                    .referrer
+                    .is_part_type(ty, self.at, self.scopes, enclosing, &self.active)
+                {
+                    self.at.place.protected = true;
+                    return None;
+                }
+                self.referrer
+                    .find(self.at.matching, self.at.module, ty, self.scopes, enclosing)
+            }
         }
         impl<'a, 'b, F: FnMut(Type, usize) -> Type> Fold for Folder<'a, 'b, F> {
             fn fold_type(&mut self, ty: Type) -> Type {
                 let enclosing = self.enclosing.clone();
-                let found =
-                    self.referrer
-                        .find(self.matching, self.module, &ty, self.scopes, &enclosing);
+                let outer = self.at.place;
+                let active = self.active.len();
+                let found = self.lookup(&ty, &enclosing);
                 if found.is_none() {
                     self.enclosing = enclosing.components_of(&ty, self.scopes.len());
+                    // A type that owns the cause of a conflict is the anchor of the part in it.
+                    if !self.at.place.protected {
+                        self.referrer.anchors(
+                            &ty,
+                            self.at,
+                            self.scopes,
+                            &enclosing,
+                            &mut self.active,
+                        );
+                    }
+                    // The bounds of an `impl Trait` argument are predicates of the item.
+                    if self.at.place.in_fn_arg && matches!(ty, Type::ImplTrait(_)) {
+                        self.at.place.in_predicate = true;
+                    }
                 }
                 let folded = match (found, self.replace_self) {
                     (Some(ix), None) => (self.type_fn)(ty, ix),
@@ -1088,6 +1257,8 @@ impl Referrer {
                     (None, None) => syn::fold::fold_type(self, ty),
                     (None, Some(replace)) => replace.fold_type_with(self, ty),
                 };
+                self.at.place = outer;
+                self.active.truncate(active);
                 self.enclosing = enclosing;
                 folded
             }
@@ -1132,15 +1303,23 @@ impl Referrer {
         }
         Folder {
             referrer: self,
-            matching,
-            module,
+            at,
             scopes,
             replace_self: self_ty.map(|self_ty| ReplaceSelf { self_ty }),
             enclosing: Enclosing::default(),
+            active: Vec::new(),
             type_fn,
         }
         .fold_type(ty)
     }
+}
+
+/// The path `path` read as a type, which stands for a node that is no type (a bound, a value).
+fn path_type(path: &Path) -> Type {
+    Type::Path(TypePath {
+        qself: None,
+        path: path.clone(),
+    })
 }
 
 fn param_names<'a>(params: impl IntoIterator<Item = &'a GenericParam>) -> HashSet<String> {
@@ -1197,8 +1376,8 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 ///     mod m { mod inner { struct S<T> { a: Rel<Self>, b: T } } }
 /// };
 /// let mut leaker = Leaker::new();
-/// let module = leaker.intern_mod(&item).unwrap();
-/// let referrer = leaker.finish();
+/// let module = leaker.intern_mod(&item);
+/// let referrer = leaker.result().finish().unwrap();
 ///
 /// // A copy of the items of `m`. The entry `Rel<Self>` names the `Self` of `S`.
 /// let mut file = File { shebang: None, attrs: vec![], items: item.content.unwrap().1 };
@@ -1275,8 +1454,8 @@ impl Declares {
 /// use syn::visit_mut::VisitMut;
 /// let item: ItemTrait = parse_quote!(trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; });
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker.intern_trait(&item, true).unwrap();
-/// let referrer = leaker.finish();
+/// let top_level = leaker.intern_trait(&item, true);
+/// let referrer = leaker.result().finish().unwrap();
 ///
 /// // Rewrite the whole copy of the trait, with the `ContextId` that the Leaker returned for it.
 /// let mut copy = item.clone();
@@ -1297,7 +1476,8 @@ impl Declares {
 /// context it was made for, then those the visited syntax declares, each with the `Self` in force
 /// where it is declared. A type is replaced only if an entry has the context the type has there.
 /// So `T: Clone` of a visited `impl<T: Clone>` does not match an entry with `T` alone, unless you
-/// call [`Visitor::with_outermost_generics_as_leakers()`].
+/// call [`Visitor::with_outermost_generics_as_leakers()`]. It leaves the parts that the Leaker
+/// copied as written ([recovery](crate::Leaker#errors-and-recovery)) as they are.
 ///
 /// Visit a whole type or item. A type cut out of another is looked up with nothing around it
 /// ([Outlives bounds](crate::Leaker#outlives-bounds)). The visited syntax is inside the module of
@@ -1346,6 +1526,8 @@ pub struct Visitor<F, G = fn(&NestedSelf, Type, usize) -> Type> {
     /// their parameters are looked up (see `Visitor::visit_type_param_mut()`).
     defaults: Defaults,
     module: ModulePos,
+    /// Where the visited syntax is among the predicates of the item.
+    place: Place,
 }
 
 impl<F, G> Clone for Visitor<F, G> {
@@ -1364,6 +1546,7 @@ impl<F, G> Clone for Visitor<F, G> {
             mod_path: self.mod_path.clone(),
             defaults: self.defaults,
             module: self.module,
+            place: self.place,
         }
     }
 }
@@ -1390,8 +1573,8 @@ where
     /// # use syn::visit_mut::VisitMut;
     /// let tr: ItemTrait = parse_quote!(trait MyTrait<T> { fn f(&self) -> Wrap<T>; });
     /// let mut leaker = Leaker::new();
-    /// let context = leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// let context = leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let replace = |_: Type, ix: usize| -> Type { parse_quote!(Leaked<#ix>) };
     ///
     /// // The copy declares `T` with another bound than the trait did.
@@ -1462,10 +1645,10 @@ where
     /// # use syn::visit_mut::VisitMut;
     /// let tr: ItemTrait = parse_quote!(trait Tr { fn f(&self, x: Rel<Self>) -> Self::Out; });
     /// let mut leaker = Leaker::new();
-    /// let context = leaker.intern_trait(&tr, true).unwrap();
+    /// let context = leaker.intern_trait(&tr, true);
     /// let mut sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>) -> Self::Out);
     /// leaker
-    ///     .finish()
+    ///     .result().finish().unwrap()
     ///     .visitor(context, |_, ix| parse_quote!(<Marker<__S> as Repeater<#ix>>::Type))
     ///     .with_self(parse_quote!(__S))
     ///     .visit_signature_mut(&mut sig);
@@ -1587,9 +1770,8 @@ where
     /// let (module, ()) = leaker
     ///     .enter_mod("m", [item.ident.clone()], |view| {
     ///         view.visit_item(&Item::Struct(item.clone()))
-    ///     })
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     });
+    /// let referrer = leaker.result().finish().unwrap();
     ///
     /// // The copy is in another crate. `Self` of the Leaker's `S<T>` is `::leaker::m::S<T>` there.
     /// let mut file = File { shebang: None, attrs: vec![], items: vec![Item::Struct(item)] };
@@ -1623,9 +1805,8 @@ where
     /// let (module, ()) = leaker
     ///     .enter_mod("m", [item.ident.clone()], |view| {
     ///         view.visit_item(&Item::Struct(item.clone()))
-    ///     })
-    ///     .unwrap();
-    /// let referrer = leaker.finish();
+    ///     });
+    /// let referrer = leaker.result().finish().unwrap();
     /// assert!(matches!(
     ///     referrer.context_self(referrer.context(0)),
     ///     Some(SelfRequirement::Any)
@@ -1687,9 +1868,8 @@ where
     /// let (module, ()) = leaker
     ///     .enter_mod("m", [item.ident.clone()], |view| {
     ///         view.visit_item(&Item::Struct(item.clone()))
-    ///     })
-    ///     .unwrap();
-    /// let referrer = leaker.finish().allow_ambiguous_crate_name(false); // strict
+    ///     });
+    /// let referrer = leaker.result().finish().unwrap().allow_ambiguous_crate_name(false); // strict
     /// assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
     ///
     /// let mut file = File { shebang: None, attrs: vec![], items: vec![Item::Struct(item)] };
@@ -1725,6 +1905,7 @@ where
             mod_path: self.mod_path,
             defaults: self.defaults,
             module: self.module,
+            place: self.place,
         }
     }
 
@@ -1790,6 +1971,43 @@ where
             }
             !entries.is_empty()
         });
+    }
+
+    /// Returns `true` if `cause`, a node that is no type (a bound whose trait path conflicts, a
+    /// path of a value), is a part. `path` stands for it as a type, to give it its context.
+    fn is_part_node(&self, cause: impl FnOnce() -> Cause, path: &Path) -> bool {
+        if self.referrer.part_map.is_empty() || self.place.protected {
+            return false;
+        }
+        let nested = self.own_self && self.nested.is_some() && self.nested_fn.is_some();
+        let at = Lookup {
+            matching: Matching::Scope {
+                self_ty: self.self_requirement.as_ref(),
+                no_self: self.own_self && !nested,
+                nested_type: self.own_self
+                    && matches!(&self.nested, Some(nested)
+                        if nested.ident.is_some()
+                            && matches!(nested.requirement, SelfRequirement::Type(_))),
+                alone: self.defaults == Defaults::OwnTraitDefault,
+            },
+            module: self.module,
+            place: self.place,
+        };
+        self.referrer.is_part(
+            &cause(),
+            &path_type(path),
+            at,
+            &self.scopes,
+            &Enclosing::default(),
+            &[],
+        )
+    }
+
+    /// Runs `visit`, which visits a part that is left as written: no entry is looked up in it.
+    fn protected(&mut self, visit: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.place.protected, true);
+        visit(self);
+        self.place.protected = outer;
     }
 
     fn visit_attrs(&mut self, attrs: &mut [Attribute]) {
@@ -1905,19 +2123,44 @@ where
                 _ => (*type_fn)(ty, ix),
             }
         };
-        *i = referrer.expand_with(
-            Matching::Scope {
+        let at = Lookup {
+            matching: Matching::Scope {
                 self_ty,
                 no_self,
                 nested_type,
                 alone: self.defaults == Defaults::OwnTraitDefault,
             },
-            self.module,
+            module: self.module,
+            place: self.place,
+        };
+        *i = referrer.expand_with(
+            at,
             &mut self.scopes,
             self.self_ty.as_ref().filter(|_| !own_self),
             i.clone(),
             replace,
         );
+    }
+    fn visit_fn_arg_mut(&mut self, i: &mut FnArg) {
+        // An `impl Trait` in an argument is a generic of the function, whose bounds are predicates
+        // of the item (the Leaker's `in_fn_arg`).
+        let outer = std::mem::replace(&mut self.place.in_fn_arg, true);
+        syn::visit_mut::visit_fn_arg_mut(self, i);
+        self.place.in_fn_arg = outer;
+    }
+    fn visit_type_param_bound_mut(&mut self, i: &mut TypeParamBound) {
+        // A bound that is not in a type is a predicate of the item (the Leaker's `env_depth`). A
+        // type is visited whole by `visit_type_mut()`, so a bound visited here is not in one.
+        let outer = std::mem::replace(&mut self.place.in_predicate, true);
+        syn::visit_mut::visit_type_param_bound_mut(self, i);
+        self.place.in_predicate = outer;
+    }
+    fn visit_path_mut(&mut self, i: &mut Path) {
+        // A path of a value that the Leaker copied as written holds types that are no entries.
+        if self.is_part_node(|| Cause::expr_path(i), i) {
+            return self.protected(|visitor| syn::visit_mut::visit_path_mut(visitor, i));
+        }
+        syn::visit_mut::visit_path_mut(self, i)
     }
     fn visit_receiver_mut(&mut self, i: &mut Receiver) {
         if self.self_ty.is_none() || self.own_self {
@@ -1929,19 +2172,27 @@ where
     fn visit_predicate_type_mut(&mut self, i: &mut PredicateType) {
         let depth = self.scopes.len();
         self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
+        let outer = std::mem::replace(&mut self.place.in_predicate, true);
         syn::visit_mut::visit_predicate_type_mut(self, i);
+        self.place.in_predicate = outer;
         self.scopes.truncate(depth);
         // What replaced the bounded type (`Self`, an entry) may need parentheses there.
         parenthesize_bounded(&mut i.bounded_ty);
     }
     fn visit_trait_bound_mut(&mut self, i: &mut TraitBound) {
-        // A bound of the generics is not in a type, which the same rewriting handles.
+        // A bound of the generics is not in a type, which the same rewriting handles. A bound whose
+        // trait path the Leaker could not leak is copied as written, with the types in it.
+        let part = self.is_part_node(|| bound_cause(i), &i.path);
         if let Some(self_ty) = self.self_ty.as_ref().filter(|_| !self.own_self) {
             name_elided_in_bound(self_ty, &self.scopes[..], i);
         }
         let depth = self.scopes.len();
         self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
-        syn::visit_mut::visit_trait_bound_mut(self, i);
+        if part {
+            self.protected(|visitor| syn::visit_mut::visit_trait_bound_mut(visitor, i));
+        } else {
+            syn::visit_mut::visit_trait_bound_mut(self, i);
+        }
         self.scopes.truncate(depth);
     }
     fn visit_type_param_mut(&mut self, i: &mut TypeParam) {
@@ -2145,7 +2396,7 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// use template_quote::ToTokens;
-    /// let referrer = Leaker::new().finish();
+    /// let referrer = Leaker::new().result().finish().unwrap();
     /// let tag = format!("\"type-leak-format-{}\"", Referrer::FORMAT_VERSION);
     /// assert!(referrer.to_token_stream().to_string().starts_with(&tag));
     ///
@@ -2189,15 +2440,18 @@ impl Referrer {
     // the Referrer finds too. 15: the context of an entry leaves out a bound of a generic that
     // names the generic in the arguments of its path (`T: Fn(Alias<T>)`), if another bound of it
     // fixes an associated type (`T: Iterator<Item = u8>`), which the Referrer computes for a copy,
-    // so the entries of 14 are not found the same way.
-    pub const FORMAT_VERSION: u32 = 15;
+    // so the entries of 14 are not found the same way. 16: the Referrer carries the parts that the
+    // Leaker copies as written, after the tag (`[KIND (CAUSE) CONTEXT [predicate] [in (TYPE)
+    // CONTEXT], ..]`), and the visitor leaves each as written: no entry is looked up in it.
+    pub const FORMAT_VERSION: u32 = 16;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.
 ///
 /// Entries keep their indices, and the tokens after the Referrer are not consumed. Fails if the
 /// format tag is missing or differs ([`Referrer::FORMAT_VERSION`]), if a module is used but not
-/// declared, or if module parents form a cycle.
+/// declared, if module parents form a cycle, or if a part copied as written names a context that is
+/// not declared.
 impl Parse for Referrer {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         let span = input.span();
@@ -2221,6 +2475,24 @@ impl Parse for Referrer {
                     Self::FORMAT_VERSION
                 ),
             ));
+        }
+        // The parts copied as written, if any. Their contexts are checked when all the contexts are
+        // known.
+        let mut parts = Vec::new();
+        let mut part_contexts: Vec<(Span, ContextId)> = Vec::new();
+        if input.peek(token::Bracket) {
+            let list: parse::ParseBuffer<'_>;
+            bracketed!(list in input);
+            while !list.is_empty() {
+                let span = list.span();
+                let item: PartItem = list.parse()?;
+                part_contexts.push((span, item.context));
+                part_contexts.extend(item.within.iter().map(|(_, anchor)| (span, *anchor)));
+                parts.push(item);
+                if !list.is_empty() {
+                    list.parse::<Token![,]>()?;
+                }
+            }
         }
         let n_contexts = if input.peek(LitInt) {
             input.parse::<LitInt>()?.base10_parse::<usize>()?
@@ -2372,6 +2644,17 @@ impl Parse for Referrer {
                 return Err(Error::new(span, unknown(referred)));
             }
         }
+        for (span, context) in part_contexts {
+            if !context_map.contains_key(&context) {
+                return Err(Error::new(
+                    span,
+                    format!(
+                        "the context {} of a part is not one of the contexts",
+                        context
+                    ),
+                ));
+            }
+        }
         for (module, (span, parent)) in &parents {
             if parent == module {
                 return Err(Error::new(
@@ -2402,7 +2685,59 @@ impl Parse for Referrer {
         }
         // The required entries come first (`Referrer::must()`).
         entries.sort_by_key(|(_, _, must, _)| !must);
-        Ok(Self::new(entries, context_map, modules))
+        Ok(Self::new(entries, context_map, modules, parts))
+    }
+}
+
+/// Reads a part written by its [`ToTokens`] implementation: `KIND ( CAUSE ) CONTEXT [predicate] [in
+/// ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an [`ErrorItem`](crate::ErrorItem).
+impl Parse for PartItem {
+    fn parse(input: parse::ParseStream) -> Result<Self> {
+        let kind = input.call(Ident::parse_any)?;
+        let cause;
+        parenthesized!(cause in input);
+        let part = Cause::parse(&kind, &cause)?;
+        let context = input.parse()?;
+        let mut in_predicate = false;
+        if input.peek(Ident) {
+            let word: Ident = input.parse()?;
+            if word != "predicate" {
+                return Err(Error::new(word.span(), "expected `predicate`, `in` or `,`"));
+            }
+            in_predicate = true;
+        }
+        // The anchor: the type that owns the cause of the conflict, in its context.
+        let mut within = None;
+        if input.parse::<Option<Token![in]>>()?.is_some() {
+            let anchor;
+            parenthesized!(anchor in input);
+            within = Some((anchor.parse()?, input.parse()?));
+        }
+        Ok(PartItem {
+            part,
+            context,
+            in_predicate,
+            within,
+        })
+    }
+}
+
+/// Writes the part as tokens, to be read back by its [`Parse`] implementation.
+impl ToTokens for PartItem {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let PartItem {
+            part,
+            context,
+            in_predicate,
+            within,
+        } = self;
+        let kind = Ident::new(part.kind(), Span::call_site());
+        tokens.extend(quote! {
+            #kind (#part) #context #(if *in_predicate) { predicate }
+            #(if let Some((anchor, anchor_context)) = within) {
+                in (#anchor) #anchor_context
+            }
+        });
     }
 }
 
@@ -2475,15 +2810,21 @@ fn crate_ident(name: &str) -> Ident {
 /// The tokens start with the format tag ([`Referrer::FORMAT_VERSION`]). Treat the rest as opaque.
 impl ToTokens for Referrer {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        // Grammar: tag [count] then one group per context in ascending id order (at least one):
+        // Grammar: tag [parts] [count] then one group per context in ascending id order (at least
+        // one):
         // [# id] [<generics> where .. ;] [Self: path ; | Self = Type ; | Self ;] [Self: 'a + 'b ;]
         // [type G<'b> where Self: 'b ; ..]
         // [mod 3 ; | mod { path = [a], hint = "h", parent = 1 } ;] ( [?] [@[crate, ..]] Type, .. )
         // `# id` only after a gap in the ids. `()` if no entry. `?`: optional. `@[..]`: crates named.
+        // parts: `[ part, .. ]`, only if there is one, as `PartItem` writes it: the `KIND ( CAUSE )`
+        // of an `ErrorItem`, a context of the groups, `predicate` in a bound, and `in ( Type )
+        // context` for the type that owns the cause (the anchor). A bracket cannot start a context
+        // group, so it needs no marker.
         let tag = format!("{}{}", FORMAT_TAG_PREFIX, Self::FORMAT_VERSION);
         let n_contexts = self.context_map.len();
         tokens.extend(quote! {
             #tag
+            #(if !self.parts.is_empty()) { [#(for item in &self.parts), { #item }] }
             // The group count lets other tokens follow the Referrer.
             #(if n_contexts > 1) { #{Literal::usize_unsuffixed(n_contexts)} }
         });

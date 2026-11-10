@@ -38,8 +38,8 @@ fn referrer_of(item: &ItemTrait) -> Referrer {
 /// The Referrer, with the top-level context of the trait: the scope of its copies.
 fn referrer_in(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = leaker();
-    let context = leaker.intern_trait(item, true).unwrap();
-    (leaker.finish(), context)
+    let context = leaker.intern_trait(item, true);
+    (leaker.result().finish().unwrap(), context)
 }
 
 /// The generics (and the where clause) of each leaked type, by its tokens.

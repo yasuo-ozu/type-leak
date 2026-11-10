@@ -41,11 +41,11 @@ use template_quote::quote;
 pub(crate) struct Unstable {
     /// The bound: a parameter with its bounds, or a where predicate.
     pub(crate) bound: TokenStream,
-    pub(crate) why: Cause,
+    pub(crate) why: Instability,
 }
 
 /// Why the environment cannot prove a bound.
-pub(crate) enum Cause {
+pub(crate) enum Instability {
     /// It names a leaked type. The errors for it are written where the cycle is found (see
     /// [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor)).
     Leaked,

@@ -27,6 +27,19 @@ pub fn rustc_is_nightly() -> bool {
 /// Runs `cargo <args> --quiet` on the fixture `tests/crates/<fixture>` with these features.
 /// `check` is enough to know whether a crate compiles (its dependencies are built in full).
 pub fn cargo(fixture: &str, args: &[&str], features: &[&str]) -> Built {
+    run(fixture, args, features, &[])
+}
+
+/// Like `cargo check` of the fixture, with `rustc_args` for the fixture's crate only (its
+/// dependencies are the ones `cargo` built): `cargo rustc --profile check -- <rustc_args>`.
+pub fn cargo_rustc(fixture: &str, features: &[&str], rustc_args: &[&str]) -> Built {
+    let tail: Vec<&str> = std::iter::once("--")
+        .chain(rustc_args.iter().copied())
+        .collect();
+    run(fixture, &["rustc", "--profile", "check"], features, &tail)
+}
+
+fn run(fixture: &str, args: &[&str], features: &[&str], tail: &[&str]) -> Built {
     let mut command = Command::new(env!("CARGO"));
     command
         .args(args)
@@ -44,6 +57,7 @@ pub fn cargo(fixture: &str, args: &[&str], features: &[&str]) -> Built {
     if !features.is_empty() {
         command.arg("--features").arg(features.join(","));
     }
+    command.args(tail);
     let output = command.output().unwrap();
     Built {
         success: output.status.success(),

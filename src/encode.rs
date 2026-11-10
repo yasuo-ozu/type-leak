@@ -670,8 +670,8 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 /// # use syn::*;
 /// let tr: ItemTrait = parse_quote!(trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true).unwrap();
-/// let referrer = leaker.finish();
+/// leaker.intern_trait(&tr, true);
+/// let referrer = leaker.result().finish().unwrap();
 ///
 /// // Only `const N: usize` is encoded by default.
 /// let err = referrer.repeater_impl(0, ImplSelf::Param(&parse_quote!(__S))).unwrap_err();

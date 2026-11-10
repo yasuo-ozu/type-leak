@@ -312,9 +312,9 @@ fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
 /// bound that names what it depends on says which of the bounds it found first, which depends on
 /// the order the bounds are in: the message stops before it. So does the `Self::A` that a bound
 /// of the generics names (the first one in the order of their text): only where it is is kept.
-fn messages(error: &NotInternableError) -> Vec<String> {
+fn messages(error: &[ErrorItem]) -> Vec<String> {
     let mut messages: Vec<String> = error
-        .items()
+        .iter()
         .map(|item| {
             let mut text = bare_text(&item.message);
             if let Some(at) = text.find(",andaboundofitsgenericsnames") {
@@ -335,7 +335,7 @@ fn messages(error: &NotInternableError) -> Vec<String> {
 
 /// The result of an analysis, as `prop::analyze()` returns it.
 pub(crate) type Analysis =
-    std::result::Result<(Referrer, ContextId, proc_macro2::TokenStream), NotInternableError>;
+    std::result::Result<(Referrer, ContextId, proc_macro2::TokenStream), Vec<ErrorItem>>;
 
 fn disagree(why: String) -> Error {
     Error::new(
@@ -380,7 +380,7 @@ pub(crate) fn check(
             Err(error) => error,
         };
         let reported: Vec<String> = error
-            .items()
+            .iter()
             .filter(|item| item.message.starts_with("use absolute path: '"))
             .map(|item| {
                 item.message["use absolute path: '".len()..].replace(char::is_whitespace, "")
@@ -405,7 +405,7 @@ pub(crate) fn check(
                     "the bare `{}` without the prelude is not reported as a relative path: the \
                      errors are {:?}",
                     name,
-                    error.items().map(|item| item.message).collect::<Vec<_>>()
+                    error.iter().map(|item| &item.message).collect::<Vec<_>>()
                 )));
             }
         }

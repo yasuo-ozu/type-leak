@@ -234,3 +234,41 @@ pub mod kinds {
     // The cyclic bound is rejected: it expands to nothing.
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
 }
+
+/// Items that the Leaker rejects and accepts with `LeakerResult::allow()` of the causes of their
+/// errors: the part that conflicts is copied as written, so this module names what the copies name
+/// (`Held`, `ElidedTr`, `SharedTr`, `Wrap`) and invokes them with `accept`. Everything else is
+/// replaced as usual.
+pub mod accepted {
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::{ElidedTr, Held, SharedTr, Wrap};
+
+    type_leak_test_leaker::__tl_prop_9184!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9185!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9186!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9187!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9188!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9189!(path = ::type_leak_test_leaker::kinds, accept);
+
+    // Items whose macro carries the errors (`prop_leak_result`) and whose invocation says what it
+    // allows: all the errors are dropped, or the crate would not compile. The copies keep `Clone`,
+    // `core::fmt::Debug`, `PlainTr` and `Held<'_>` as written (the crate names the last two).
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::PlainTr;
+
+    type_leak_test_leaker::__tl_prop_9190!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        allow(prelude)
+    );
+    type_leak_test_leaker::__tl_prop_9191!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        allow(std_crates)
+    );
+    type_leak_test_leaker::__tl_prop_9192!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        allow(trait PlainTr, type Held<'_>)
+    );
+}
