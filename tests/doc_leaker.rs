@@ -272,8 +272,8 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     let mut copy = item.clone();
     let repeater: Path = parse_quote!(Repeater);
     referrer
-        .visitor(context, |_, ix, _| {
-            repeater_projection(&repeater, &parse_quote!(()), &parse_quote!(()), 7, ix)
+        .visitor(context, |_, ix, context| {
+            repeater_projection(&repeater, &parse_quote!(()), context, 7, ix, array_const).unwrap()
         })
         .visit_item_trait_mut(&mut copy);
     let key = repeater_key(7, common::entry_id_at(&referrer, 0));

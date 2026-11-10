@@ -605,7 +605,7 @@ fn every_item_kind_is_leaked_across_crates() {
         // F69: the copy is used at an instantiation that gives the type parameter a type with a
         // lifetime, where it is in the inputs of a function pointer or `Fn(..)` whose output has an
         // elided lifetime: a struct, the arguments of a trait's method, and the default of a
-        // parameter that `Referrer::complete_args()` completes. The elided one is named.
+        // parameter that `complete_params()` completes. The elided one is named.
         (9231, __tl_report_9231!(), ok("struct", 1, 4, 4)),
         (9232, __tl_report_9232!(), ok("trait", 1, 3, 2)),
         (9233, __tl_report_9233!(), ok("struct", 1, 4, 4)),
@@ -1562,8 +1562,9 @@ fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_no
 
 /// `coinduction`'s shape: `enter_impl(.., false, ..)` with `visit_path_arguments()`, the
 /// Repeater's impls for a marker (`ImplSelf::Marker`) of the entries, and the Referrer's copy of the self type, the trait and its
-/// arguments with `Referrer::visitor(context, ..)` and `encode_generics_args_with_params()` at
-/// `UseSite::identity()`. The Referrer's crate checks the copy: each type is the original (a witness), and rustc finds
+/// arguments with `Referrer::visitor(context, ..)` and `repeater_projection()` with the generics
+/// passed by their own names. The Referrer's crate checks the copy: each type is the
+/// original (a witness), and rustc finds
 /// the Leaker's impl of the trait for the rewritten self type.
 #[test]
 fn the_scope_api_with_a_marker() {

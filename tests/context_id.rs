@@ -13,7 +13,7 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
     array_const, Cause, ContextId, ImplSelf, Leaker, LeakerResult, ModuleScope, Referrer,
-    SelfRequirement, UseSite,
+    SelfRequirement,
 };
 
 /// The tag of the format of a serialized Referrer, which it starts with.
@@ -460,9 +460,11 @@ fn the_contexts_that_exist_do_not_panic() {
     // `Wrap<U>` uses `<U>`: in `Tr<A, B>` that is `B`.
     let params: Generics = parse_quote!(<T, U>);
     let args: Vec<GenericArgument> = vec![parse_quote!(A), parse_quote!(B)];
-    let args = UseSite::substituting(&params.params, &args)
-        .generic_args(&common::entry(&referrer, 2).generics)
-        .unwrap();
+    let args = common::generic_args(
+        &common::entry(&referrer, 2).generics,
+        common::answers(&params.params, &args),
+    )
+    .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["B"]);
 }
 

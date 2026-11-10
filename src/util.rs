@@ -875,7 +875,7 @@ pub(crate) struct ReplaceSelf<'a> {
 }
 
 impl<'a> ReplaceSelf<'a> {
-    fn replace_tokens(&self, tokens: TokenStream) -> TokenStream {
+    pub(crate) fn replace_tokens(&self, tokens: TokenStream) -> TokenStream {
         use proc_macro2::{Group, TokenTree};
         tokens
             .into_iter()

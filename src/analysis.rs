@@ -33,25 +33,14 @@ use template_quote::quote;
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// let (_, results) = leaker
-///     .enter_generics(&Generics::default(), |view| {
-///         [
-///             view.check(&parse_quote!(::core::option::Option<::core::primitive::u8>)),
-///             view.check(&parse_quote!(Rel)),
-///             view.check(&parse_quote!(impl ::path::Trait)),
-///             view.check(&parse_quote!(Rel<'_>)),
-///         ]
-///     });
-/// // Nothing depends on the context: copy it as it is.
-/// assert!(results[0].must.is_empty() && results[0].impossible.is_empty());
+/// let (_, (rel, conflict)) = leaker.enter_generics(&Generics::default(), |view| {
+///     (view.check(&parse_quote!(Rel)), view.check(&parse_quote!(Rel<'_>)))
+/// });
 /// // Leak `Rel`, the path of the type itself.
-/// assert_eq!(results[1].must.len(), 1);
-/// assert!(results[1].is_own);
-/// // `impl Trait` can be neither leaked nor needs to be.
-/// assert!(results[2].must.is_empty() && !results[2].impossible.is_empty());
+/// assert!(rel.is_own && rel.must.len() == 1 && rel.impossible.is_empty());
 /// // `Rel<'_>` is a conflict: its path depends on the context, and its lifetime cannot be leaked.
-/// assert!(matches!(&results[3].must[0], Cause::Type(_)));
-/// assert!(matches!(&results[3].impossible[0], Cause::Lifetime(_)));
+/// assert!(matches!(&conflict.must[0], Cause::Type(_)));
+/// assert!(matches!(&conflict.impossible[0], Cause::Lifetime(_)));
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]

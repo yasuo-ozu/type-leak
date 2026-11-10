@@ -1,11 +1,11 @@
 //! Tests for the defaults of type parameters, analyzed with the parameters before them, and for
-//! `Referrer::complete_args()`.
+//! `complete_params()` on the parameters of the visited trait.
 
 mod common;
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, Referrer, UseSite};
+use type_leak::{ContextId, Leaker, Referrer};
 
 fn referrer_of(tr: &ItemTrait) -> Referrer {
     let mut leaker = Leaker::new();
@@ -31,31 +31,28 @@ fn args(args: AngleBracketedGenericArguments) -> Vec<GenericArgument> {
     args.args.into_iter().collect()
 }
 
-/// A call of `type_fn`: the leaked type, its index and the arguments of the preceding parameters.
-type Call = (String, usize, Vec<String>);
+/// A call of `type_fn`: the leaked type and its index.
+type Call = (String, usize);
 
-/// Completes `given` with projections `<Self as R<ix>>::Type`, and returns the calls of `type_fn`.
+/// Completes `given` with projections `<Self as R<ix>>::Type` written by the visitor in the
+/// defaults of the parameters of `tr`, and returns the calls of `type_fn`.
 fn complete_calls(
     referrer: &Referrer,
-    params: &punctuated::Punctuated<GenericParam, Token![,]>,
+    tr: &ItemTrait,
     given: &[GenericArgument],
 ) -> Result<(Vec<String>, Vec<Call>)> {
     let mut calls = Vec::new();
-    let completed = referrer
-        .complete_args(top_level(referrer), params, given, |ty, ix, _, prefix| {
-            calls.push((s(&ty), ix.index(), prefix.iter().map(s).collect()));
+    let completed =
+        common::completed_args(referrer, top_level(referrer), tr, given, |ty, ix, _| {
+            calls.push((s(&ty), ix.index()));
             parse_quote!(<Self as R<#ix>>::Type)
         })
         .map_err(Error::from)?;
     Ok((completed.iter().map(s).collect(), calls))
 }
 
-fn complete(
-    referrer: &Referrer,
-    params: &punctuated::Punctuated<GenericParam, Token![,]>,
-    given: &[GenericArgument],
-) -> Result<Vec<String>> {
-    complete_calls(referrer, params, given).map(|(completed, _)| completed)
+fn complete(referrer: &Referrer, tr: &ItemTrait, given: &[GenericArgument]) -> Result<Vec<String>> {
+    complete_calls(referrer, tr, given).map(|(completed, _)| completed)
 }
 
 #[test]
@@ -133,7 +130,7 @@ fn test_default_requirements() {
     }
 }
 
-/// `Referrer::complete_args()`: a default is analyzed with the parameters before it, and cannot
+/// `complete_params()`: a default is analyzed with the parameters before it, and cannot
 /// name a later one. A where predicate that names the later parameter `U` (`T: Conv<U>`) is not
 /// in the context of the default `Rel<T>`, which has `T` alone. Audit mutant
 /// `default_root_all_params` (the default is analyzed with all the parameters as its root).
@@ -271,45 +268,38 @@ fn test_defaults_of_several_calls_are_shared() {
     assert_eq!(common::entry_id(&referrer, 2), top_plain);
     assert_eq!(common::entry(&referrer, 2).generics.params.len(), 1);
     assert_ne!(top_tr, top_plain);
-    // A macro that writes the default as it is, at the site (the arguments of `type_fn` are not
-    // substituted again), as in any call.
-    let completed = referrer
-        .complete_args(
-            top_tr,
-            &tr.generics.params,
-            &args(parse_quote!(<u8>)),
-            |ty, ix, _, prefix| {
-                assert_eq!(ix.index(), 2);
-                let before: punctuated::Punctuated<GenericParam, Token![,]> = tr
-                    .generics
-                    .params
-                    .iter()
-                    .take(prefix.len())
-                    .cloned()
-                    .collect();
-                UseSite::substituting(&before, prefix).substitute(&ty, None)
-            },
-        )
-        .unwrap();
+    // A macro that writes the default as it is, at the site (`complete_params()` replaces the
+    // parameters before it), as in any call.
+    let completed = common::completed_args(
+        &referrer,
+        top_tr,
+        &tr,
+        &args(parse_quote!(<u8>)),
+        |ty, ix, _| {
+            assert_eq!(ix.index(), 2);
+            ty
+        },
+    )
+    .unwrap();
     assert_eq!(
         completed.iter().map(s).collect::<Vec<_>>(),
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
     // A macro that replaces the default by the entry.
     let mut replaced = Vec::new();
-    let completed = referrer
-        .complete_args(
-            top_tr,
-            &tr.generics.params,
-            &args(parse_quote!(<u8>)),
-            |ty, ix, _, prefix| {
-                replaced.push((s(&ty), ix.index(), prefix.len()));
-                parse_quote!(P)
-            },
-        )
-        .unwrap();
+    let completed = common::completed_args(
+        &referrer,
+        top_tr,
+        &tr,
+        &args(parse_quote!(<u8>)),
+        |ty, ix, _| {
+            replaced.push((s(&ty), ix.index()));
+            parse_quote!(P)
+        },
+    )
+    .unwrap();
     assert_eq!(completed.iter().map(s).collect::<Vec<_>>(), ["u8", "P"]);
-    assert_eq!(replaced, [(":: std :: vec :: Vec < T >".to_string(), 2, 1)]);
+    assert_eq!(replaced, [(":: std :: vec :: Vec < T >".to_string(), 2)]);
 }
 
 #[test]
@@ -326,25 +316,23 @@ fn test_default_const_is_kept() {
         trait Tr<T, const N: usize = 3, const M: usize = { 1 + 2 }> {}
     );
     let referrer = referrer_of(&tr);
-    let completed = complete(&referrer, &tr.generics.params, &args(parse_quote!(<u8>))).unwrap();
+    let completed = complete(&referrer, &tr, &args(parse_quote!(<u8>))).unwrap();
     assert_eq!(completed, ["u8", "3", "{ 1 + 2 }"]);
 }
 
 #[test]
-fn test_complete_args() {
+fn test_complete_params() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, T, const N: usize = 3, U = Rel<T, N>, V = (RelB, U, T)> {
             fn f(&self) -> RelC;
         }
     };
     let referrer = referrer_of(&tr);
-    let params = &tr.generics.params;
 
     // Omitted arguments take the defaults, rewritten with the entries which use the preceding
-    // parameters. `type_fn` receives the leaked type, its index and the complete arguments of the
-    // preceding parameters.
-    let (completed, calls) =
-        complete_calls(&referrer, params, &args(parse_quote!(<'x, u8>))).unwrap();
+    // parameters. `type_fn` receives the leaked type and its index, once for each entry in the
+    // defaults of the parameters, whatever the arguments are.
+    let (completed, calls) = complete_calls(&referrer, &tr, &args(parse_quote!(<'x, u8>))).unwrap();
     let projection = |ix: usize| format!("< Self as R < {}usize > > :: Type", ix);
     assert_eq!(
         completed,
@@ -356,37 +344,27 @@ fn test_complete_args() {
             format!("({} , {} , u8)", projection(0), projection(2)),
         ]
     );
-    let args_of = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
     assert_eq!(
         calls,
         [
-            ("Rel < T , N >".to_string(), 2, args_of(&["'x", "u8", "3"])),
-            (
-                // The tuple is rebuilt around `RelB`, which is interned.
-                "RelB".to_string(),
-                0,
-                args_of(&["'x", "u8", "3", &projection(2)])
-            ),
+            ("Rel < T , N >".to_string(), 2),
+            // The tuple is rebuilt around `RelB`, which is interned.
+            ("RelB".to_string(), 0),
         ]
     );
 
     // Explicit arguments are kept as they are (a bare `N` is a const argument).
-    let completed = complete(
-        &referrer,
-        params,
-        &args(parse_quote!(<'x, u8, 5, i32, i64>)),
-    )
-    .unwrap();
+    let completed = complete(&referrer, &tr, &args(parse_quote!(<'x, u8, 5, i32, i64>))).unwrap();
     assert_eq!(completed, ["'x", "u8", "5", "i32", "i64"]);
 
     // Only `V` is omitted.
-    let completed = complete(&referrer, params, &args(parse_quote!(<'x, u8, 5, i32>))).unwrap();
+    let completed = complete(&referrer, &tr, &args(parse_quote!(<'x, u8, 5, i32>))).unwrap();
     assert_eq!(completed[..4], ["'x", "u8", "5", "i32"]);
     assert_eq!(completed[4], format!("({} , i32 , u8)", projection(0)));
 
     // A parameter named like a leaked type is not substituted inside a projection: here `T`
     // is the argument (a type named `U`), and `U` is the omitted argument.
-    let completed = complete(&referrer, params, &args(parse_quote!(<'x, U>))).unwrap();
+    let completed = complete(&referrer, &tr, &args(parse_quote!(<'x, U>))).unwrap();
     assert_eq!(completed[1], "U");
     assert_eq!(completed[3], projection(2));
     assert_eq!(
@@ -396,47 +374,45 @@ fn test_complete_args() {
 }
 
 #[test]
-fn test_complete_args_const_bare_ident_and_errors() {
+fn test_complete_params_const_bare_ident_and_errors() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, const N: usize, U = Rel<T>> {
             fn f(&self);
         }
     );
     let referrer = referrer_of(&tr);
-    let params = &tr.generics.params;
     // A bare identifier for a const parameter is a const argument.
-    let completed = complete(&referrer, params, &args(parse_quote!(<u8, M, u16>))).unwrap();
+    let completed = complete(&referrer, &tr, &args(parse_quote!(<u8, M, u16>))).unwrap();
     assert_eq!(completed, ["u8", "M", "u16"]);
     // Missing and unexpected arguments.
-    let err = complete(&referrer, params, &args(parse_quote!(<u8>))).unwrap_err();
+    let err = complete(&referrer, &tr, &args(parse_quote!(<u8>))).unwrap_err();
     assert!(err.to_string().contains("missing generic argument"));
-    let err = complete(&referrer, params, &args(parse_quote!(<u8, 1, u16, u32>))).unwrap_err();
+    let err = complete(&referrer, &tr, &args(parse_quote!(<u8, 1, u16, u32>))).unwrap_err();
     assert!(err.to_string().contains("unexpected generic argument"));
-    let err = complete(&referrer, params, &args(parse_quote!(<'a, u8, 1>))).unwrap_err();
+    let err = complete(&referrer, &tr, &args(parse_quote!(<'a, u8, 1>))).unwrap_err();
     assert!(err.to_string().contains("unexpected generic argument"));
 }
 
 #[test]
-fn test_complete_args_substitutes_the_copied_part_only() {
+fn test_complete_params_substitutes_the_copied_part_only() {
     // A leaked type inside a type which is copied (it cannot be leaked as a whole), twice.
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, U = ::p::W<Rel<T>, &'_ T, Rel<T>>> {}
     );
     let referrer = referrer_of(&tr);
-    let completed = referrer
-        .complete_args(
-            top_level(&referrer),
-            &tr.generics.params,
-            &args(parse_quote!(<Rel<u8>>)),
-            |ty, ix, _, prefix| {
-                assert_eq!(ix.index(), 0);
-                assert_eq!(s(&ty), "Rel < T >");
-                assert_eq!(prefix.len(), 1);
-                parse_quote!(P<#(#prefix),*>)
-            },
-        )
-        .unwrap();
-    // `T` is substituted in the copied part, but not in the projections.
+    let completed = common::completed_args(
+        &referrer,
+        top_level(&referrer),
+        &tr,
+        &args(parse_quote!(<Rel<u8>>)),
+        |ty, ix, _| {
+            assert_eq!(ix.index(), 0);
+            assert_eq!(s(&ty), "Rel < T >");
+            parse_quote!(P<T>)
+        },
+    )
+    .unwrap();
+    // `T` is substituted in the copied part and in the projections alike.
     assert_eq!(
         completed.iter().map(s).collect::<Vec<_>>(),
         [
@@ -444,18 +420,18 @@ fn test_complete_args_substitutes_the_copied_part_only() {
             ":: p :: W < P < Rel < u8 > > , & '_ Rel < u8 > , P < Rel < u8 > > >"
         ]
     );
-    // The result of `type_fn` may mention the parameter `T` too, and is not substituted either,
-    // unlike the copied part of the default.
-    let completed = referrer
-        .complete_args(
-            top_level(&referrer),
-            &tr.generics.params,
-            &args(parse_quote!(<u8>)),
-            |_, _, _, _| parse_quote!(<T as Proj>::Type),
-        )
-        .unwrap();
+    // What the visitor writes for the entry may be any type that names `T`, and it is substituted
+    // with the rest of the default.
+    let completed = common::completed_args(
+        &referrer,
+        top_level(&referrer),
+        &tr,
+        &args(parse_quote!(<u8>)),
+        |_, _, _| parse_quote!(<T as Proj>::Type),
+    )
+    .unwrap();
     assert_eq!(
         s(&completed[1]),
-        ":: p :: W < < T as Proj > :: Type , & '_ u8 , < T as Proj > :: Type >"
+        ":: p :: W < < u8 as Proj > :: Type , & '_ u8 , < u8 as Proj > :: Type >"
     );
 }

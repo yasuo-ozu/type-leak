@@ -2,8 +2,11 @@
 
 use crate::elided::{fold_bare_fn, fold_bound, Names, Site};
 use crate::util::{parenthesize_pointee, unwrap_type_group, ReplaceSelf};
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream, TokenTree};
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::iter::FromIterator;
+use syn::fold::Fold;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::*;
@@ -12,19 +15,18 @@ use template_quote::quote;
 /// Encodes the const argument `value` of a `usize` parameter as the array type `[(); value]`.
 ///
 /// It is the `const_fn` of [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls)
-/// and [`encode_generics_args_with_params()`] if every const parameter is `usize`.
+/// and [`repeater_projection()`](crate::repeater_projection) if every const parameter is `usize`.
 /// Any other type is an [`EncodeError::UnsupportedConstType`], which fails the call of
 /// `repeater_impls()`: use [`slot_const()`](crate::slot_const).
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// let param: ConstParam = parse_quote!(const N: usize);
-/// assert_eq!(array_const(&parse_quote!(3), &param).unwrap(), parse_quote!([(); 3]));
+/// let n = array_const(&parse_quote!(3), &parse_quote!(const N: usize));
+/// assert_eq!(n.unwrap(), parse_quote!([(); 3]));
 /// // `bool` has no array length.
-/// let param: ConstParam = parse_quote!(const B: bool);
-/// let result = array_const(&parse_quote!(true), &param);
-/// assert!(matches!(result, Err(EncodeError::UnsupportedConstType(_))));
+/// let b = array_const(&parse_quote!(true), &parse_quote!(const B: bool));
+/// assert!(matches!(b, Err(EncodeError::UnsupportedConstType(_))));
 /// ```
 pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type, EncodeError> {
     match const_param_primitive(&param.ty) {
@@ -38,85 +40,27 @@ pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type
     }
 }
 
-/// Returns the first argument of the Repeater for an entry: a tuple type made from the arguments
-/// of the entry's generics.
-///
-/// `iter` are the arguments for `params`, one for each by position and kind, as
-/// [`UseSite::generic_args()`](crate::UseSite::generic_args) writes them; `params` are the
-/// generics of the entry (`Context::generics`, see [`Referrer::iter()`](crate::Referrer::iter)).
-/// It is [`RepeaterImpl::args`](crate::RepeaterImpl::args) with the arguments of a use. The tuple
-/// has an element for each parameter, then the encoded lifetime bounds:
-///
-/// - a lifetime `'a` is `&'a ()`, and a type is itself (`*const T` for a `?Sized` parameter);
-/// - a const is encoded by `const_fn(value, param)`: pass [`array_const`](crate::array_const), or
-///   for the slots of [`repeater_definition()`](crate::repeater_definition)
-///   [`slot_const(&repeater)`](crate::slot_const);
-/// - each bound of a generic on a lifetime (`T: 'a`) is `&'a T`, and so is `Self: 'a`, from
-///   `self_outlives` (`Context::self_outlives`): pass the type that stands for `Self` here
-///   (`Self`, or the host) and the lifetimes. `None` writes no such bounds.
-///
-/// Fails with [`EncodeError::MissingArgument`] if `iter` has too few arguments, with
-/// [`EncodeError::UnboundedTraitObject`] if an argument is a trait object without the lifetime
-/// bound the entry needs, and with the error of `const_fn`.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let tr: ItemTrait = parse_quote! {
-///     trait Tr<'a, T: 'a, const N: usize> { fn f(&self, x: &'a Wrap<T, N>) -> Rel; }
-/// };
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true);
-/// let referrer = leaker.result().finish().unwrap();
-/// let wrap: Type = parse_quote!(&'a Wrap<T, N>);
-/// let (_, _, context) = referrer.iter().find(|(_, ty, _)| **ty == wrap).unwrap();
-/// let self_ty: Type = parse_quote!(Self);
-/// let outlives = Some((&self_ty, &context.self_outlives[..]));
-///
-/// // In the scope of the trait, as in a default method: every generic by its own name.
-/// let args = UseSite::identity().generic_args(&context.generics).unwrap();
-/// let ty = encode_generics_args_with_params(&args, &context.generics.params, outlives, array_const);
-/// assert_eq!(ty.unwrap(), parse_quote!((&'a (), T, [(); N], &'a T)));
-///
-/// // In `impl Tr<'static, u8, 3> for Host`: the arguments of the trait.
-/// let trait_args: Vec<GenericArgument> =
-///     vec![parse_quote!('static), parse_quote!(u8), parse_quote!(3)];
-/// let site = UseSite::substituting(&tr.generics.params, &trait_args);
-/// let args = site.generic_args(&context.generics).unwrap();
-/// let ty = encode_generics_args_with_params(&args, &context.generics.params, outlives, array_const);
-/// assert_eq!(ty.unwrap(), parse_quote!((&'static (), u8, [(); 3], &'static u8)));
-///
-/// // Too few arguments.
-/// let err = encode_generics_args_with_params(&args[..1], &context.generics.params, None, array_const);
-/// assert!(matches!(err, Err(EncodeError::MissingArgument(_))));
-///
-/// // `Self: 'a` is `&'a Self`: the entry `&'a Wrap<Self>` needs it. Name the host at a site where
-/// // `Self` is not available.
-/// let tr: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true);
-/// let referrer = leaker.result().finish().unwrap();
-/// let (_, _, context) = referrer.iter().next().unwrap();
-/// let args = UseSite::identity().generic_args(&context.generics).unwrap();
-/// for (self_ty, expected) in [
-///     (parse_quote!(Self), parse_quote!((&'a (), &'a Self))),
-///     (parse_quote!(Host), parse_quote!((&'a (), &'a Host))),
-/// ] {
-///     let outlives = Some((&self_ty, &context.self_outlives[..]));
-///     let ty = encode_generics_args_with_params(&args, &context.generics.params, outlives, array_const);
-///     assert_eq!(ty.unwrap(), expected);
-/// }
-/// ```
-pub fn encode_generics_args_with_params<'a, 'b>(
+// The first argument of the Repeater for an entry: a tuple type made from the arguments `iter` of
+// the entry's generics `params`, one for each by position and kind. It is `RepeaterImpl::args` for
+// the arguments `params_as_args()` writes. The tuple has an element for each parameter, then the
+// encoded lifetime bounds:
+//
+// - a lifetime `'a` is `&'a ()`, and a type is itself (`*const T` for a `?Sized` parameter);
+// - a const is encoded by `const_fn(value, param)`;
+// - each bound of a generic on a lifetime (`T: 'a`) is `&'a T`, and so is `Self: 'a`, from
+//   `self_outlives` (`Context::self_outlives`) with the type that stands for `Self` (`None`: no
+//   such bounds).
+//
+// Fails with `MissingArgument` if `iter` has too few arguments, with `UnboundedTraitObject` if an
+// argument is a trait object without the lifetime bound the entry needs, and with the error of
+// `const_fn`.
+pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
     self_outlives: Option<(&Type, &[Lifetime])>,
     mut const_fn: impl FnMut(&Expr, &'b ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
-    use syn::fold::Fold;
-    let args = complete_generics_args(iter, params, |_, _, default, substitute, _| {
-        Ok(substitute.fold_type(default.clone()))
-    })?;
+    let args = complete_params(params, iter)?;
     let mut elems = Punctuated::<Type, Token![,]>::new();
     for (param, arg) in params.iter().zip(&args) {
         elems.push(match (param, arg) {
@@ -141,24 +85,50 @@ pub fn encode_generics_args_with_params<'a, 'b>(
     }))
 }
 
-/// Completes `iter` to one argument per parameter. `default_type` makes an omitted type argument.
-pub(crate) fn complete_generics_args<'a>(
-    iter: impl IntoIterator<Item = &'a GenericArgument>,
-    params: &Punctuated<GenericParam, Token![,]>,
-    mut default_type: impl FnMut(
-        usize,
-        &TypeParam,
-        &Type,
-        &mut SubstituteParams,
-        &[GenericArgument],
-    ) -> std::result::Result<Type, EncodeError>,
+/// Returns one argument for each of `params`, in their order: the arguments `given`, and for a
+/// parameter with none its default.
+///
+/// It completes the arguments of an impl of a trait. `params` are the generics of the trait after
+/// [`Referrer::visitor()`](crate::Referrer::visitor) has written its defaults: a leaked type in a
+/// default is already replaced, by a path through the Repeater that names the parameters before
+/// the default. The default of a parameter that has no argument is taken with each of the
+/// parameters before it replaced by its argument, as [`substitute_args()`] does. That copy of the
+/// trait is only a step (rustc does not accept `Self` in a default): the completed arguments go
+/// into the impl.
+///
+/// `given` match `params` by position and kind, lifetimes first: a binding such as `Item = u8` is
+/// skipped, and a bare identifier is a const argument (syn parses it as a type). Fails with
+/// [`EncodeError::UnexpectedArgument`] for an argument of the wrong kind or too many, and with
+/// [`EncodeError::MissingArgument`] for a parameter that has neither an argument nor a default.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let generics: Generics = parse_quote!(<'a, T, U = Vec<T>>);
+///
+/// // `U` takes its default, with `T` as `u8`.
+/// let given: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
+/// let expected: Vec<GenericArgument> =
+///     vec![parse_quote!('static), parse_quote!(u8), parse_quote!(Vec<u8>)];
+/// assert_eq!(complete_params(&generics.params, &given).unwrap(), expected);
+///
+/// // `T` has no default.
+/// let given: Vec<GenericArgument> = vec![parse_quote!('static)];
+/// let err = complete_params(&generics.params, &given).unwrap_err();
+/// assert!(matches!(err, EncodeError::MissingArgument(_)));
+/// ```
+pub fn complete_params<'p, 'a>(
+    params: impl IntoIterator<Item = &'p GenericParam>,
+    given: impl IntoIterator<Item = &'a GenericArgument>,
 ) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
-    use syn::fold::Fold;
+    let params: Vec<&GenericParam> = params.into_iter().collect();
     let mut substitute = SubstituteParams::default();
-    substitute.names.reserve(params);
+    for param in &params {
+        substitute.names.reserve(param);
+    }
     let mut lifetime_args = Vec::new();
     let mut other_args = Vec::new();
-    for arg in iter {
+    for arg in given {
         substitute.names.reserve(arg);
         match arg {
             GenericArgument::Lifetime(_) => lifetime_args.push(arg),
@@ -169,7 +139,7 @@ pub(crate) fn complete_generics_args<'a>(
     let mut lifetime_args = lifetime_args.into_iter();
     let mut other_args = other_args.into_iter();
     let mut completed = Vec::<GenericArgument>::new();
-    for (index, param) in params.iter().enumerate() {
+    for param in params {
         match param {
             GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => match lifetime_args.next() {
                 Some(GenericArgument::Lifetime(arg)) => {
@@ -185,9 +155,7 @@ pub(crate) fn complete_generics_args<'a>(
                         return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
                     }
                     None => match &tp.default {
-                        Some(default) => {
-                            default_type(index, tp, default, &mut substitute, &completed)?
-                        }
+                        Some(default) => substitute.fold_type(default.clone()),
                         None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
                     },
                 };
@@ -227,30 +195,6 @@ fn const_argument(arg: &GenericArgument) -> Option<Expr> {
             Some(parse_quote!(#path))
         }
         _ => None,
-    }
-}
-
-/// Checks that `args` are arguments for the first of `params`, by position: not more than there
-/// are parameters, each of the kind of its parameter. A parameter with no argument is not an
-/// error here: the arguments may be those before a default.
-pub(crate) fn check_root_args(
-    params: &Punctuated<GenericParam, Token![,]>,
-    args: &[GenericArgument],
-) -> std::result::Result<(), EncodeError> {
-    for (param, arg) in params.iter().zip(args) {
-        let fits = match (param, arg) {
-            (GenericParam::Lifetime(_), GenericArgument::Lifetime(_))
-            | (GenericParam::Type(_), GenericArgument::Type(_)) => true,
-            (GenericParam::Const(_), arg) => const_argument(arg).is_some(),
-            _ => false,
-        };
-        if !fits {
-            return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
-        }
-    }
-    match args.get(params.len()) {
-        Some(arg) => Err(EncodeError::UnexpectedArgument(Box::new(arg.clone()))),
-        None => Ok(()),
     }
 }
 
@@ -354,7 +298,7 @@ pub(crate) fn encode_generics_params_with<'a>(
             })
         })
         .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
-    let args = params_as_args(&params);
+    let args: Vec<GenericArgument> = params_as_args(params.iter().copied());
     elems.extend(encode_outlives_bounds(&params, &args)?);
     if let Some((self_ty, lifetimes)) = self_outlives {
         elems.extend(encode_self_outlives(&params, &args, self_ty, lifetimes)?);
@@ -365,12 +309,22 @@ pub(crate) fn encode_generics_params_with<'a>(
     }))
 }
 
-pub(crate) fn params_as_args(params: &[&GenericParam]) -> Vec<GenericArgument> {
-    params.iter().map(|param| param_as_arg(param)).collect()
+// The arguments that pass `params` on, each by its own name: `'a` is `'a`, `T` is `T`, and
+// `const N: usize` is the `Const` argument `N` (syn parses a bare `N` as a type).
+pub(crate) fn params_as_args<I, C>(params: I) -> C
+where
+    I: IntoIterator,
+    I::Item: Borrow<GenericParam>,
+    C: FromIterator<GenericArgument>,
+{
+    params
+        .into_iter()
+        .map(|param| param_as_arg(param.borrow()))
+        .collect()
 }
 
 /// The argument that passes `param` on by its own name.
-pub(crate) fn param_as_arg(param: &GenericParam) -> GenericArgument {
+fn param_as_arg(param: &GenericParam) -> GenericArgument {
     match param {
         GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
             GenericArgument::Lifetime(lifetime.clone())
@@ -564,23 +518,16 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 }
 
 /// Why the generics of an entry cannot be encoded: the error of the call of
-/// `LeakerResult::repeater_impls()`, of [`encode_generics_args_with_params()`] and of
-/// `Referrer::complete_args()`.
+/// `LeakerResult::repeater_impls()`, of [`repeater_projection()`](crate::repeater_projection), of
+/// [`complete_params()`] and of [`substitute_args()`].
 ///
 /// It converts into a `syn::Error` at the offending tokens.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// let tr: ItemTrait = parse_quote!(trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; });
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true);
-/// let result = leaker.result();
-///
-/// // `array_const` encodes `const N: usize` only, so the call fails.
-/// let target = ImplSelf::Param(&parse_quote!(__S));
-/// let repeater: Path = parse_quote!(crate::Repeater);
-/// let err = result.repeater_impls(&repeater, 7, target, array_const).err().unwrap();
+/// // `array_const` encodes `const N: usize` only.
+/// let err = array_const(&parse_quote!(true), &parse_quote!(const B: bool)).unwrap_err();
 /// assert!(matches!(&err, EncodeError::UnsupportedConstType(ty) if **ty == parse_quote!(bool)));
 /// let error: syn::Error = err.into();
 /// assert_eq!(error.to_string(), "unsupported type of const parameter: 'bool'");
@@ -590,12 +537,14 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 pub enum EncodeError {
     /// The type of a const parameter is not a primitive type (e.g. an alias).
     UnsupportedConstType(Box<Type>),
-    /// There are more arguments than parameters.
+    /// An argument that does not fit: there are more arguments than parameters, one is not of the
+    /// kind of its parameter (a lifetime for a type), or a value that [`substitute_args()`] was
+    /// given for a name is not of a kind that fits the place of the name.
     UnexpectedArgument(Box<GenericArgument>),
     /// A parameter that has neither an argument nor a default.
     MissingArgument(Box<GenericParam>),
-    /// The argument of a type parameter with a lifetime bound is a trait object without one
-    /// (`dyn Tr`). Write it, e.g. `dyn Tr + 'static`.
+    /// `Self: 'a` is encoded for a `Self` that is a trait object without a lifetime bound (`dyn
+    /// Tr`). Write it, e.g. `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
     /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) was given and an entry names `Self`, or its
     /// context's generics do. Use [`ImplSelf::Param`](crate::ImplSelf::Param).
@@ -672,41 +621,6 @@ pub(crate) struct SubstituteParams {
 }
 
 impl SubstituteParams {
-    /// The substitution of `params` by `args`, which pair up by position. An argument of another
-    /// kind than its parameter, and a parameter with no argument, are left out.
-    pub(crate) fn of(
-        params: &Punctuated<GenericParam, Token![,]>,
-        args: &[GenericArgument],
-    ) -> Self {
-        let mut substitute = Self::default();
-        substitute.names.reserve(params);
-        for arg in args {
-            substitute.names.reserve(arg);
-        }
-        for (param, arg) in params.iter().zip(args) {
-            match (param, arg) {
-                (
-                    GenericParam::Lifetime(LifetimeParam { lifetime, .. }),
-                    GenericArgument::Lifetime(arg),
-                ) => {
-                    substitute.lifetimes.insert(lifetime.clone(), arg.clone());
-                }
-                (GenericParam::Type(TypeParam { ident, .. }), GenericArgument::Type(ty)) => {
-                    substitute.types.insert(ident.clone(), ty.clone());
-                }
-                (GenericParam::Const(ConstParam { ident, .. }), arg) => {
-                    if let Some(value) = const_argument(arg) {
-                        // `fold_expr()` writes the braces of a value that needs them.
-                        let value = unwrap_block(&value).clone();
-                        substitute.consts.insert(ident.clone(), value);
-                    }
-                }
-                _ => (),
-            }
-        }
-        substitute
-    }
-
     /// The argument that `ty` is the parameter of.
     fn type_argument(&self, ty: &Type) -> Option<Type> {
         match ty {
@@ -785,101 +699,328 @@ impl Site for SubstituteParams {
     }
 }
 
-/// Writes a type at a use site: the substitution of `params`, and `Self` replaced by `self_ty`, in
-/// one pass, so that what replaces a name is not substituted again.
-pub(crate) struct SubstituteSite<'a> {
-    pub(crate) params: SubstituteParams,
-    pub(crate) self_ty: Option<&'a Type>,
+/// Replaces the names in `args` by what `f` gives for them: the arguments of a use site.
+///
+/// `f` is asked for a name and answers the argument that takes its place, or `None` to leave the
+/// name as written (a generic the copy declares itself). It is asked once for each name, in the
+/// order they come in, before anything is replaced; a value is not substituted again. It is
+/// asked for:
+///
+/// - a type `T`, and `T::A` (`<value>::A`, for a `Type`);
+/// - a const `N`, in an expression (`[u8; N]`, `{ N }`) or as an argument;
+/// - a lifetime `'a`, as `a`; `'static` and `'_` are never asked;
+/// - `Self`, in a type and in `Self::A` of an expression (`Self` alone in an expression is a
+///   value), and in the tokens of a macro.
+///
+/// A value must fit the place of its name, or the call fails with
+/// [`EncodeError::UnexpectedArgument`] at the value and `args` stay as they are: a `Type` or a
+/// `Const` where the name is a whole argument (`T` in `Vec<T>`); a `Type` where it is part of a
+/// type (`&T`, `T::A`) or `Self` in a macro; a `Const`, or a `Type` that is one identifier, in an
+/// expression; a `Lifetime` for a lifetime.
+///
+/// A const is braced once (`[u8; { N }]` with `M` is `[u8; { M }]`), a trait object with several
+/// bounds that a reference or pointer points to gets parentheses, and a function pointer or
+/// `Fn(..)` whose output takes an elided lifetime from the one lifetime of its inputs keeps it
+/// where a value adds lifetimes to them: its elided lifetime is named by a `for<'__tl_s0>` binder
+/// (`fn(&U) -> &u8` with `&'static str` is `for<'__tl_s0> fn(&'__tl_s0 &'static str) ->
+/// &'__tl_s0 u8`). A lifetime that a path hides cannot be named.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// // `impl Tr<u8> for Host`, for `trait Tr<T> { fn f(&self) -> Option<(T, Self)>; }`.
+/// let mut args: Vec<GenericArgument> = vec![parse_quote!(Option<(T, Self)>)];
+/// substitute_args(args.iter_mut(), |name: &Ident| match name.to_string().as_str() {
+///     "T" => Some(parse_quote!(u8)),
+///     "Self" => Some(parse_quote!(Host)),
+///     _ => None,
+/// })
+/// .unwrap();
+/// assert_eq!(args, [parse_quote!(Option<(u8, Host)>)]);
+///
+/// // A lifetime for a type is an error, and nothing is replaced.
+/// let mut args: Vec<GenericArgument> = vec![parse_quote!(&T)];
+/// let err = substitute_args(args.iter_mut(), |_: &Ident| Some(parse_quote!('a))).unwrap_err();
+/// assert!(matches!(err, EncodeError::UnexpectedArgument(_)));
+/// assert_eq!(args, [parse_quote!(&T)]);
+/// ```
+pub fn substitute_args<'a>(
+    args: impl IntoIterator<Item = &'a mut GenericArgument>,
+    f: impl FnMut(&Ident) -> Option<GenericArgument>,
+) -> std::result::Result<(), EncodeError> {
+    let mut args: Vec<&'a mut GenericArgument> = args.into_iter().collect();
+    let mut answers = Answers {
+        f,
+        known: HashMap::new(),
+    };
+    // The first pass asks `f` for the names; what it writes is dropped.
+    let mut asking = Substituter {
+        answers: &mut answers,
+        names: Names::default(),
+        naming: false,
+        misfit: None,
+    };
+    for arg in &args {
+        asking.fold_generic_argument((**arg).clone());
+    }
+    // The second writes the arguments, with no lifetime of theirs or of a value taken for a name.
+    let mut names = Names::default();
+    for arg in &args {
+        names.reserve(&**arg);
+    }
+    for value in answers.known.values().flatten() {
+        names.reserve(value);
+    }
+    let mut writing = Substituter {
+        answers: &mut answers,
+        names,
+        naming: true,
+        misfit: None,
+    };
+    let written: Vec<GenericArgument> = args
+        .iter()
+        .map(|arg| writing.fold_generic_argument((**arg).clone()))
+        .collect();
+    if let Some(value) = writing.misfit {
+        return Err(EncodeError::UnexpectedArgument(Box::new(value)));
+    }
+    for (arg, written) in args.iter_mut().zip(written) {
+        **arg = written;
+    }
+    Ok(())
 }
 
-impl<'a> SubstituteSite<'a> {
-    /// Writes `ty`, or a part of it, at a site: `params`, and `Self` replaced by `self_ty` if any.
-    pub(crate) fn new(mut params: SubstituteParams, self_ty: Option<&'a Type>, ty: &Type) -> Self {
-        params.names.reserve(ty);
-        params.names.reserve(self_ty);
-        Self { params, self_ty }
+/// What `f` answered, for each name once.
+struct Answers<F> {
+    f: F,
+    known: HashMap<Ident, Option<GenericArgument>>,
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Answers<F> {
+    fn of(&mut self, name: &Ident) -> Option<GenericArgument> {
+        if let Some(answer) = self.known.get(name) {
+            return answer.clone();
+        }
+        let answer = (self.f)(name);
+        self.known.insert(name.clone(), answer.clone());
+        answer
+    }
+}
+
+/// The fold of [`substitute_args()`].
+struct Substituter<'f, F> {
+    answers: &'f mut Answers<F>,
+    names: Names,
+    /// Whether it names the elided lifetime of a signature. The first pass writes nothing.
+    naming: bool,
+    /// The first value that did not fit its place.
+    misfit: Option<GenericArgument>,
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Substituter<'_, F> {
+    fn misfit(&mut self, value: GenericArgument) {
+        if self.misfit.is_none() {
+            self.misfit = Some(value);
+        }
     }
 
-    /// `T::A` for a type parameter `T` that has an argument is `<arg>::A`.
-    fn projection_of_parameter(&mut self, ty: &Type) -> Option<Type> {
-        let path = match ty {
-            Type::Path(TypePath { qself: None, path }) => path,
-            _ => return None,
-        };
-        let first = path.segments.first()?;
-        if path.leading_colon.is_some() || path.segments.len() < 2 || !first.arguments.is_none() {
-            return None;
+    /// The type for `name`, if there is an answer: only a type fits.
+    fn type_for(&mut self, name: &Ident) -> Option<Type> {
+        match self.answers.of(name)? {
+            GenericArgument::Type(ty) => Some(ty),
+            value => {
+                self.misfit(value);
+                None
+            }
         }
-        let arg = self.params.types.get(&first.ident)?.clone();
+    }
+
+    /// The const for `name`, if there is an answer, written as the expression `{ value }`: a const,
+    /// or a type that is one identifier (a bare const argument is parsed as a type).
+    fn braced_const_for(&mut self, name: &Ident) -> Option<Expr> {
+        match self.answers.of(name)? {
+            GenericArgument::Const(value) => {
+                let value = unwrap_block(&value);
+                Some(parse_quote!({ #value }))
+            }
+            GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
+                if path.get_ident().is_some() =>
+            {
+                Some(parse_quote!({ #path }))
+            }
+            value => {
+                self.misfit(value);
+                None
+            }
+        }
+    }
+
+    /// `<value>::A` for the path `T::A` and the type `value` for `T`.
+    fn projection(&mut self, value: Type, path: &Path) -> TypePath {
         let rest = Path {
             leading_colon: Some(Default::default()),
             segments: path.segments.iter().skip(1).cloned().collect(),
         };
-        Some(Type::Path(TypePath {
+        TypePath {
             qself: Some(QSelf {
                 lt_token: Default::default(),
-                ty: Box::new(arg),
+                ty: Box::new(value),
                 position: 0,
                 as_token: None,
                 gt_token: Default::default(),
             }),
-            path: syn::fold::Fold::fold_path(self, rest),
-        }))
+            path: self.fold_path(rest),
+        }
+    }
+
+    /// The tokens of a macro, or of a type `syn` does not parse, with `Self` replaced.
+    fn tokens(&mut self, tokens: TokenStream) -> TokenStream {
+        if !mentions_self(&tokens) {
+            return tokens;
+        }
+        match self.type_for(&Ident::new("Self", Span::call_site())) {
+            Some(self_ty) => ReplaceSelf { self_ty: &self_ty }.replace_tokens(tokens),
+            None => tokens,
+        }
     }
 }
 
-impl syn::fold::Fold for SubstituteSite<'_> {
+/// The name that a path stands for, as the first segment of `T::A`.
+fn projected_name(path: &Path) -> Option<&Ident> {
+    let first = path.segments.first()?;
+    if path.leading_colon.is_some() || path.segments.len() < 2 || !first.arguments.is_none() {
+        return None;
+    }
+    Some(&first.ident)
+}
+
+/// The name that an argument is as a whole: `T` or `N`.
+fn argument_name(arg: &GenericArgument) -> Option<&Ident> {
+    match arg {
+        GenericArgument::Type(Type::Path(TypePath { qself: None, path })) => path.get_ident(),
+        GenericArgument::Const(Expr::Path(ExprPath {
+            attrs,
+            qself: None,
+            path,
+        })) if attrs.is_empty() => path.get_ident(),
+        _ => None,
+    }
+}
+
+/// The name that an expression is, alone or in braces. `Self` is a value there.
+fn expression_name(expr: &Expr) -> Option<&Ident> {
+    match unwrap_block(expr) {
+        Expr::Path(ExprPath {
+            qself: None, path, ..
+        }) => path.get_ident().filter(|ident| *ident != "Self"),
+        _ => None,
+    }
+}
+
+fn mentions_self(tokens: &TokenStream) -> bool {
+    tokens.clone().into_iter().any(|tree| match tree {
+        TokenTree::Ident(ident) => ident == "Self",
+        TokenTree::Group(group) => mentions_self(&group.stream()),
+        _ => false,
+    })
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> syn::fold::Fold for Substituter<'_, F> {
+    fn fold_generic_argument(&mut self, arg: GenericArgument) -> GenericArgument {
+        let name = match argument_name(&arg) {
+            Some(name) => name,
+            None => return syn::fold::fold_generic_argument(self, arg),
+        };
+        match self.answers.of(name) {
+            Some(GenericArgument::Type(ty)) => GenericArgument::Type(ty),
+            Some(GenericArgument::Const(value)) => {
+                GenericArgument::Const(normalize_const_arg(&value))
+            }
+            Some(value) => {
+                self.misfit(value);
+                arg
+            }
+            None => arg,
+        }
+    }
     fn fold_type(&mut self, ty: Type) -> Type {
-        if let Some(arg) = self.params.type_argument(&ty) {
-            return arg;
+        if let Type::Path(TypePath { qself: None, path }) = &ty {
+            if let Some(name) = path.get_ident() {
+                return self.type_for(name).unwrap_or(ty);
+            }
+            if let Some(value) = projected_name(path).and_then(|name| self.type_for(name)) {
+                return Type::Path(self.projection(value, path));
+            }
         }
-        if let Some(projection) = self.projection_of_parameter(&ty) {
-            return projection;
-        }
-        match self.self_ty {
-            Some(self_ty) => ReplaceSelf { self_ty }.fold_type_with(self, ty),
-            // An argument may be a trait object with several bounds, which needs parentheses
-            // behind a reference or a pointer.
-            None => parenthesize_pointee(syn::fold::fold_type(self, ty)),
+        match ty {
+            Type::Verbatim(tokens) => Type::Verbatim(self.tokens(tokens)),
+            // A value may be a trait object with several bounds, which needs parentheses behind a
+            // reference or a pointer.
+            ty => parenthesize_pointee(syn::fold::fold_type(self, ty)),
         }
     }
     fn fold_expr(&mut self, expr: Expr) -> Expr {
-        if let Some(value) = self.params.const_value(&expr) {
+        if let Some(value) = expression_name(&expr).and_then(|name| self.braced_const_for(name)) {
             return value;
         }
-        match self.self_ty {
-            Some(self_ty) => ReplaceSelf { self_ty }.fold_expr_with(self, expr),
-            None => syn::fold::fold_expr(self, expr),
+        // `Self::A`: only `Self` is a type in an expression.
+        if let Expr::Path(ExprPath {
+            qself: None, path, ..
+        }) = &expr
+        {
+            if let Some(name) = projected_name(path).filter(|name| *name == "Self") {
+                if let Some(value) = self.type_for(name) {
+                    let TypePath { qself, path } = self.projection(value, path);
+                    return Expr::Path(ExprPath {
+                        attrs: Vec::new(),
+                        qself,
+                        path,
+                    });
+                }
+            }
         }
-    }
-    fn fold_generic_argument(&mut self, arg: GenericArgument) -> GenericArgument {
-        match self.params.const_argument_of(&arg) {
-            Some(arg) => arg,
-            None => syn::fold::fold_generic_argument(self, arg),
-        }
+        syn::fold::fold_expr(self, expr)
     }
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
-        self.params.lifetime(lifetime)
-    }
-    fn fold_macro(&mut self, mac: Macro) -> Macro {
-        match self.self_ty {
-            Some(self_ty) => ReplaceSelf { self_ty }.fold_macro(mac),
-            None => mac,
+        if lifetime.ident == "static" || lifetime.ident == "_" {
+            return lifetime;
+        }
+        match self.answers.of(&lifetime.ident) {
+            Some(GenericArgument::Lifetime(value)) => value,
+            Some(value) => {
+                self.misfit(value);
+                lifetime
+            }
+            None => lifetime,
         }
     }
+    fn fold_macro(&mut self, mac: Macro) -> Macro {
+        Macro {
+            tokens: self.tokens(mac.tokens),
+            ..mac
+        }
+    }
+    // The elided lifetime of a signature is named where a value adds lifetimes to its inputs.
     fn fold_type_bare_fn(&mut self, i: TypeBareFn) -> TypeBareFn {
-        fold_bare_fn(self, i)
+        if self.naming {
+            fold_bare_fn(self, i)
+        } else {
+            syn::fold::fold_type_bare_fn(self, i)
+        }
     }
     fn fold_trait_bound(&mut self, i: TraitBound) -> TraitBound {
-        fold_bound(self, i)
+        if self.naming {
+            fold_bound(self, i)
+        } else {
+            syn::fold::fold_trait_bound(self, i)
+        }
     }
 }
 
-impl Site for SubstituteSite<'_> {
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Site for Substituter<'_, F> {
     fn names(&mut self) -> &mut Names {
-        &mut self.params.names
+        &mut self.names
     }
 }
-
 #[cfg(test)]
 mod tests;

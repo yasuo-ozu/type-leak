@@ -3,7 +3,8 @@
 //! encoders and of the Referrer that tests used to call, written over the encoders of this crate.
 
 use super::*;
-use crate::{encode_slot_const, slot_const};
+use crate::repeater::encode_slot_const;
+use crate::slot_const;
 
 fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
     encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
@@ -1140,18 +1141,12 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     let err =
         encode_generics_args_to_ty_with(&args.args, params, |_, _| unreachable!()).unwrap_err();
     assert!(matches!(err, EncodeError::UnexpectedArgument(_)), "{}", err);
-    let completed = parsed
-        .complete_args(
-            parsed_top_level,
-            &tr.generics.params,
-            &args.args,
-            |_, _, _, _| unreachable!(),
-        )
-        .unwrap();
-    let site = UseSite::substituting(&tr.generics.params, &completed);
-    let args = site
-        .generic_args(&context_of(&parsed, all).generics)
-        .unwrap();
+    let completed = complete_params(&tr.generics.params, &args.args).unwrap();
+    let args = generic_args(
+        &context_of(&parsed, all).generics,
+        answers(&tr.generics.params, &completed),
+    )
+    .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
         ["'q", "u16", ":: core :: primitive :: u8", "3"]
@@ -1164,13 +1159,50 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
 
     // The arguments fit the context of every entry.
     for (_, _, context) in parsed.iter() {
-        site.generic_args(&context.generics).unwrap();
+        generic_args(&context.generics, answers(&tr.generics.params, &completed)).unwrap();
     }
 }
 
 // ── The helpers against what a macro wrote by hand before them ───────────────────────────────
 
-use crate::{ErrorItem, ImplSelf, Options, Rules, SelfRequirement, UseSite};
+use crate::{ErrorItem, ImplSelf, Options, Rules, SelfRequirement};
+
+/// What a use site answers for a name: the argument at the position of the parameter of that name
+/// in `params`, if `args` reach it.
+fn answers<'a>(
+    params: &'a Punctuated<GenericParam, Token![,]>,
+    args: &'a [GenericArgument],
+) -> impl Fn(&Ident) -> Option<GenericArgument> + 'a {
+    move |name| {
+        let at = params.iter().position(|param| match param {
+            GenericParam::Lifetime(param) => param.lifetime.ident == *name,
+            GenericParam::Type(param) => param.ident == *name,
+            GenericParam::Const(param) => param.ident == *name,
+        })?;
+        args.get(at).cloned()
+    }
+}
+
+/// `ty` as the argument of a site that answers names with `f`.
+fn substituted(ty: &Type, f: impl FnMut(&Ident) -> Option<GenericArgument>) -> Type {
+    let mut arg = GenericArgument::Type(ty.clone());
+    substitute_args(std::iter::once(&mut arg), f).unwrap();
+    match arg {
+        GenericArgument::Type(ty) => ty,
+        other => panic!("not a type: {}", quote!(#other)),
+    }
+}
+
+/// The arguments for `generics` at a site that answers names with `f`: the generics as arguments,
+/// substituted.
+fn generic_args(
+    generics: &Generics,
+    f: impl FnMut(&Ident) -> Option<GenericArgument>,
+) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
+    let mut args: Vec<GenericArgument> = params_as_args(&generics.params);
+    substitute_args(args.iter_mut(), f)?;
+    Ok(args)
+}
 
 fn t(ty: Type) -> String {
     s(&ty)
@@ -1366,9 +1398,7 @@ fn args_by_hand(
     self_ty: &Type,
 ) -> Type {
     let context = context_of(referrer, ix);
-    let args = UseSite::substituting(root_params, root_args)
-        .generic_args(&context.generics)
-        .unwrap();
+    let args = generic_args(&context.generics, answers(root_params, root_args)).unwrap();
     repeater()
         .encode_generics_args_to_ty_with_self(
             &args,
@@ -1437,16 +1467,16 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
 }
 
 /// The first argument of the Repeater for the entry `n` at `site`, with `self_ty` for `Self: 'a`:
-/// the two steps that a macro writes (`UseSite::generic_args()`, the encoder).
+/// the two steps that a macro writes (`params_as_args()` and `substitute_args()`, the encoder).
 fn args_at(
     referrer: &Referrer,
     n: usize,
-    site: &UseSite,
+    site: impl FnMut(&Ident) -> Option<GenericArgument>,
     self_ty: &Type,
     const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
     let context = context_of(referrer, n);
-    let args = site.generic_args(&context.generics)?;
+    let args = generic_args(&context.generics, site)?;
     encode_generics_args_with_params(
         &args,
         &context.generics.params,
@@ -1468,15 +1498,15 @@ fn the_encoder_is_what_a_macro_writes_by_hand() {
             let what = format!("{}: {}", s(&item), s(entry_ty(&referrer, n)));
             let repeater = repeater();
             // Substituted, with a `Self`.
-            let site = UseSite::substituting(&generics.params, &root_args);
-            let got = args_at(&referrer, n, &site, &host, slot_const(&repeater)).unwrap();
+            let site = answers(&generics.params, &root_args);
+            let got = args_at(&referrer, n, site, &host, slot_const(&repeater)).unwrap();
             let expected = args_by_hand(&referrer, n, &generics.params, &root_args, &host);
             assert_eq!(s(&got), s(&expected), "{}", what);
             // In the scope of the analysis (nothing substituted), with the default `Self`.
             let got = args_at(
                 &referrer,
                 n,
-                &UseSite::identity(),
+                |_: &Ident| None,
                 &parse_quote!(Self),
                 slot_const(&repeater),
             )
@@ -1497,7 +1527,7 @@ fn the_encoder_is_what_a_macro_writes_by_hand() {
             let got = args_at(
                 &referrer,
                 n,
-                &UseSite::identity(),
+                |_: &Ident| None,
                 &self_in_impl,
                 slot_const(&repeater),
             )
@@ -1785,7 +1815,6 @@ fn f09_fn_pointer_self_predicate_print_in_the_generics_of_an_entry() {
 
 #[test]
 fn test_a_braced_const_parameter_is_braced_once_by_the_substitutions() {
-    use syn::fold::Fold;
     let to_string = |ty: &Type| quote!(#ty).to_string();
     let params: Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
     // `{ { M } }` is rejected by rustc for a generic `M`: a braced use of the parameter is a
@@ -1804,7 +1833,10 @@ fn test_a_braced_const_parameter_is_braced_once_by_the_substitutions() {
         let ty: Type = syn::parse_str(written).unwrap();
         let args: Vec<GenericArgument> = vec![syn::parse_str(arg).unwrap()];
         let expected: Type = syn::parse_str(expected).unwrap();
-        let mut params_only = SubstituteParams::of(&params, &args);
+        // What `complete_params()` substitutes: the parameter takes the value of its argument.
+        let mut params_only = SubstituteParams::default();
+        let value = unwrap_block(&const_argument(&args[0]).unwrap()).clone();
+        params_only.consts.insert(parse_quote!(N), value);
         assert_eq!(
             to_string(&params_only.fold_type(ty.clone())),
             to_string(&expected),
@@ -1812,12 +1844,8 @@ fn test_a_braced_const_parameter_is_braced_once_by_the_substitutions() {
             written,
             arg
         );
-        let mut site = SubstituteSite {
-            params: SubstituteParams::of(&params, &args),
-            self_ty: None,
-        };
         assert_eq!(
-            to_string(&site.fold_type(ty)),
+            to_string(&substituted(&ty, answers(&params, &args))),
             to_string(&expected),
             "{} at a site with {}",
             written,
@@ -1826,10 +1854,31 @@ fn test_a_braced_const_parameter_is_braced_once_by_the_substitutions() {
     }
     // A block that does not hold the parameter alone is walked as before.
     let args: Vec<GenericArgument> = vec![parse_quote!(M)];
-    let mut site = SubstituteSite {
-        params: SubstituteParams::of(&params, &args),
-        self_ty: None,
-    };
     let ty: Type = parse_quote!([u8; { N + 1 }]);
-    assert_eq!(to_string(&site.fold_type(ty)), "[u8 ; { ({ M }) + 1 }]");
+    assert_eq!(
+        to_string(&substituted(&ty, answers(&params, &args))),
+        "[u8 ; { ({ M }) + 1 }]"
+    );
+}
+
+#[test]
+fn params_as_args_passes_each_parameter_by_its_name_into_any_collection() {
+    let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, const N: usize, U: ?Sized>);
+    let args: Vec<GenericArgument> = params_as_args(&generics.params);
+    let expected = vec![
+        GenericArgument::Lifetime(parse_quote!('a)),
+        GenericArgument::Lifetime(parse_quote!('b)),
+        GenericArgument::Type(parse_quote!(T)),
+        GenericArgument::Const(parse_quote!(N)),
+        GenericArgument::Type(parse_quote!(U)),
+    ];
+    assert_eq!(args, expected);
+    // By reference or by value, and into a punctuated list.
+    let params: Vec<GenericParam> = generics.params.iter().cloned().collect();
+    assert_eq!(params_as_args::<_, Vec<_>>(params), expected);
+    let list: punctuated::Punctuated<GenericArgument, Token![,]> =
+        params_as_args(generics.params.iter());
+    assert_eq!(list.into_iter().collect::<Vec<_>>(), expected);
+    let none: Vec<GenericArgument> = params_as_args(Vec::<GenericParam>::new());
+    assert!(none.is_empty());
 }

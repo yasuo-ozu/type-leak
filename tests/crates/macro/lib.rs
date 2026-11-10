@@ -432,23 +432,112 @@ pub(crate) fn in_module(context: &Context) -> Option<ContextId> {
     }
 }
 
-/// The first argument of the Repeater for an entry with `context`, as written at `site`: the
-/// arguments of `site` for the generics of the context (`UseSite::generic_args()`), encoded by
-/// `encode_generics_args_with_params()`. `self_ty` is what `Self: 'a` names (`None`: `Self`).
-pub(crate) fn repeater_args(
-    context: &Context,
-    site: &UseSite,
+/// The name of a generic parameter, as `substitute_args()` asks for it.
+pub(crate) fn param_ident(param: &GenericParam) -> &Ident {
+    match param {
+        GenericParam::Lifetime(param) => &param.lifetime.ident,
+        GenericParam::Type(param) => &param.ident,
+        GenericParam::Const(param) => &param.ident,
+    }
+}
+
+/// What a use site answers for a name: the argument at the position of the parameter of that name
+/// in `params`, if `args` reach it.
+pub(crate) fn answers<'a>(
+    params: &'a Punctuated<GenericParam, Token![,]>,
+    args: &'a [GenericArgument],
+) -> impl Fn(&Ident) -> Option<GenericArgument> + 'a {
+    move |name| {
+        let at = params.iter().position(|param| param_ident(param) == name)?;
+        args.get(at).cloned()
+    }
+}
+
+/// `ty` written at a site that answers names with `f` and `Self` with `self_ty` (`None`: `Self`
+/// stays): `substitute_args()` on `ty` as an argument.
+pub(crate) fn substitute_type(
+    ty: &Type,
+    mut f: impl FnMut(&Ident) -> Option<GenericArgument>,
     self_ty: Option<&Type>,
-    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
-    let args = site.generic_args(&context.generics)?;
-    let default: Type = parse_quote!(Self);
-    encode_generics_args_with_params(
-        &args,
-        &context.generics.params,
-        Some((self_ty.unwrap_or(&default), &context.self_outlives)),
-        const_fn,
-    )
+    let mut arg = GenericArgument::Type(ty.clone());
+    substitute_args(std::iter::once(&mut arg), |name: &Ident| {
+        if name == "Self" {
+            self_ty.map(|ty| GenericArgument::Type(ty.clone()))
+        } else {
+            f(name)
+        }
+    })?;
+    match arg {
+        GenericArgument::Type(ty) => Ok(ty),
+        other => Err(EncodeError::UnexpectedArgument(Box::new(other))),
+    }
+}
+
+/// Writes what a site answers into the syntax of a copy: one `substitute_args()` pass for each
+/// type, generic argument, expression and lifetime that it visits (what a visited type holds is
+/// substituted with it, not again). The first error is kept in `error`.
+pub(crate) struct Written<F> {
+    f: F,
+    pub(crate) error: Option<EncodeError>,
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Written<F> {
+    pub(crate) fn new(f: F) -> Self {
+        Written { f, error: None }
+    }
+
+    fn write(&mut self, arg: &mut GenericArgument) {
+        if let Err(error) = substitute_args(std::iter::once(arg), &mut self.f) {
+            self.error.get_or_insert(error);
+        }
+    }
+
+    fn misfit(&mut self, arg: GenericArgument) {
+        self.error
+            .get_or_insert(EncodeError::UnexpectedArgument(Box::new(arg)));
+    }
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> VisitMut for Written<F> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let mut arg = GenericArgument::Type(ty.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Type(written) => *ty = written,
+            other => self.misfit(other),
+        }
+    }
+
+    // A bare const parameter is parsed as a type argument (`N` in `Foo<N>`), and becomes a const.
+    fn visit_generic_argument_mut(&mut self, arg: &mut GenericArgument) {
+        self.write(arg)
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        let mut arg = GenericArgument::Const(expr.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Const(written) => *expr = written,
+            GenericArgument::Type(Type::Path(path)) => {
+                *expr = Expr::Path(ExprPath {
+                    attrs: Vec::new(),
+                    qself: path.qself,
+                    path: path.path,
+                })
+            }
+            other => self.misfit(other),
+        }
+    }
+
+    fn visit_lifetime_mut(&mut self, lifetime: &mut Lifetime) {
+        let mut arg = GenericArgument::Lifetime(lifetime.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Lifetime(written) => *lifetime = written,
+            other => self.misfit(other),
+        }
+    }
 }
 
 /// The context of the entry `ix`.
@@ -840,79 +929,6 @@ impl Parse for Input {
     }
 }
 
-/// Substitutes the trait's generic parameters with the arguments given by the Referrer.
-struct Substitute {
-    types: HashMap<Ident, Type>,
-    consts: HashMap<Ident, Expr>,
-    lifetimes: HashMap<Lifetime, Lifetime>,
-}
-
-impl VisitMut for Substitute {
-    fn visit_type_mut(&mut self, i: &mut Type) {
-        if let Type::Path(TypePath { qself: None, path }) = i {
-            if let Some(ident) = path.get_ident() {
-                if let Some(ty) = self.types.get(ident) {
-                    *i = ty.clone();
-                    return;
-                }
-            }
-        }
-        syn::visit_mut::visit_type_mut(self, i)
-    }
-    fn visit_generic_argument_mut(&mut self, i: &mut GenericArgument) {
-        // A bare const parameter is parsed as a type argument, e.g. `N` in `Foo<N>`.
-        if let GenericArgument::Type(Type::Path(TypePath { qself: None, path })) = i {
-            if let Some(expr) = path.get_ident().and_then(|ident| self.consts.get(ident)) {
-                *i = GenericArgument::Const(parse_quote!({ #expr }));
-                return;
-            }
-        }
-        syn::visit_mut::visit_generic_argument_mut(self, i)
-    }
-    fn visit_expr_mut(&mut self, i: &mut Expr) {
-        if let Expr::Path(ExprPath {
-            qself: None, path, ..
-        }) = i
-        {
-            if let Some(expr) = path.get_ident().and_then(|ident| self.consts.get(ident)) {
-                *i = parse_quote!({ #expr });
-                return;
-            }
-        }
-        syn::visit_mut::visit_expr_mut(self, i)
-    }
-    fn visit_lifetime_mut(&mut self, i: &mut Lifetime) {
-        if let Some(lt) = self.lifetimes.get(i) {
-            *i = lt.clone();
-        }
-    }
-}
-
-/// Replaces placeholder types `__TypeLeakTestPlaceholder<ix>` with the Repeater's projections.
-struct Resolve<'a> {
-    projections: &'a [Type],
-}
-
-impl VisitMut for Resolve<'_> {
-    fn visit_type_mut(&mut self, i: &mut Type) {
-        if let Type::Path(TypePath { qself: None, path }) = i {
-            if path.segments.len() == 1 && path.segments[0].ident == "__TypeLeakTestPlaceholder" {
-                if let PathArguments::AngleBracketed(args) = &path.segments[0].arguments {
-                    if let Some(GenericArgument::Const(Expr::Lit(ExprLit {
-                        lit: Lit::Int(ix),
-                        ..
-                    }))) = args.args.first()
-                    {
-                        *i = self.projections[ix.base10_parse::<usize>().unwrap()].clone();
-                        return;
-                    }
-                }
-            }
-        }
-        syn::visit_mut::visit_type_mut(self, i)
-    }
-}
-
 /// Forwards the receiver of a method to the field `field`.
 fn forward_receiver(receiver: &Receiver, field: &Member) -> Result<TokenStream> {
     let is_self = |ty: &Type| matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
@@ -988,24 +1004,17 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     } = input;
     let id: u64 = id.base10_parse()?;
     let params = &item_trait.generics.params;
-    let trait_params: Vec<GenericArgument> = params
-        .iter()
-        .map(|param| parse2(param_as_arg(param)))
-        .collect::<Result<_>>()?;
     let self_in_copy: Type = self_ty.clone().unwrap_or_else(|| parse_quote!(Self));
     let mut error = None;
     let mut copies = TokenStream::new();
     for mut item in items {
         // `Self` is what the context says: the implementor of the trait.
         let mut visitor = referrer.visitor(context, |_leaked, ix, entry| {
-            let projection = (|| -> Result<Type> {
-                let site = UseSite::substituting(params, &trait_params);
-                let encoded =
-                    repeater_args(entry, &site, Some(&self_in_copy), slot_const(&repeater))?;
-                Ok(repeater_projection(&repeater, &self_in_copy, &encoded, id, ix))
-            })();
+            // The generics of the trait are passed by their own names.
+            let projection =
+                repeater_projection(&repeater, &self_in_copy, entry, id, ix, slot_const(&repeater));
             projection.unwrap_or_else(|e| {
-                error = Some(e);
+                error = Some(Error::from(e));
                 parse_quote!(())
             })
         });
@@ -1049,69 +1058,35 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     let trait_ident = &item_trait.ident;
     let id: u64 = id.base10_parse()?;
 
-    // The projection to the leaked type `ix`: the Repeater is encoded with the arguments of the
-    // generics the type uses, which are those of the trait or are in scope with the same names (the
-    // generics of the method).
-    let projection = |ix: EntryId,
-                      context: &Context,
-                      root_params: &Punctuated<GenericParam, Token![,]>,
-                      root_args: &[GenericArgument]|
-     -> Result<Type> {
-        let encoded = repeater_args(
-            context,
-            &UseSite::substituting(root_params, root_args),
-            None,
-            slot_const(&repeater),
-        )?;
-        Ok(repeater_projection(&repeater, &parse_quote!(Self), &encoded, id, ix))
-    };
-
-    // Complete the arguments: an omitted argument takes the default, which is rewritten in the
-    // Leaker's type context (it may be relative to the Leaker's module), and then the arguments
-    // are encoded as in the Leaker.
+    // 1. Write the entries of the trait with their own generics, the methods and the defaults of
+    // the parameters. `Self` is the implementor.
     let mut encode_error = None;
-    let completed = referrer
-        .complete_args(context, params, &trait_args.args, |_leaked, ix, entry, prefix| {
-            let before: Punctuated<GenericParam, Token![,]> =
-                params.iter().take(prefix.len()).cloned().collect();
-            projection(ix, entry, &before, prefix).unwrap_or_else(|e| {
+    let mut visited = item_trait.clone();
+    referrer
+        .visitor(context, |_leaked, ix, entry| {
+            repeater_projection(
+                &repeater,
+                &parse_quote!(Self),
+                entry,
+                id,
+                ix,
+                slot_const(&repeater),
+            )
+            .unwrap_or_else(|e| {
                 encode_error = Some(e);
                 parse_quote!(())
             })
         })
-        .map_err(Error::from)?;
+        .visit_item_trait_mut(&mut visited);
     if let Some(e) = encode_error {
-        return Err(e);
+        return Err(Error::from(e));
     }
-    // Map the trait's generic parameters to the complete arguments.
-    let mut substitute = Substitute {
-        types: HashMap::new(),
-        consts: HashMap::new(),
-        lifetimes: HashMap::new(),
-    };
-    for (param, arg) in params.iter().zip(&completed) {
-        match (param, arg) {
-            (GenericParam::Lifetime(param), GenericArgument::Lifetime(lt)) => {
-                substitute.lifetimes.insert(param.lifetime.clone(), lt.clone());
-            }
-            (GenericParam::Type(param), GenericArgument::Type(ty)) => {
-                substitute.types.insert(param.ident.clone(), ty.clone());
-            }
-            (GenericParam::Const(param), GenericArgument::Const(expr)) => {
-                substitute.consts.insert(param.ident.clone(), expr.clone());
-            }
-            _ => return Err(Error::new(arg.span(), "unexpected generic argument")),
-        }
-    }
-
-    // Projections to the leaked types. The generics of a method are in scope with the same names.
-    let mut projections = Vec::new();
-    for (ix, _, entry) in referrer.iter() {
-        projections.push(projection(ix, entry, params, &completed)?);
-    }
+    // 2. Complete the arguments: an omitted argument takes its default.
+    let completed =
+        complete_params(&visited.generics.params, &trait_args.args).map_err(Error::from)?;
 
     let mut methods = TokenStream::new();
-    for trait_item in &item_trait.items {
+    for trait_item in &visited.items {
         let trait_fn = match trait_item {
             TraitItem::Fn(trait_fn) => trait_fn,
             // Given verbatim in `extra`.
@@ -1127,22 +1102,14 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         if extra.iter().any(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == trait_fn.sig.ident)) {
             continue;
         }
-        // 1. Replace the leaked types with placeholders, 2. substitute the trait's generic
-        // parameters, and 3. replace the placeholders with the projections. Substituting before
-        // the replacement would break the lookup of leaked types (keyed by the parameters'
-        // names), and substituting after it would rewrite the projections.
+        // 3. Write the arguments of the impl into the signature, in one pass: the generics of the
+        // trait are replaced, also in the paths through the Repeater.
         let mut sig = trait_fn.sig.clone();
-        // The context of the trait says what `Self` is (the implementor) and which generics are in
-        // scope.
-        let mut visitor = referrer.visitor(context, |_leaked, ix, _| {
-            parse_quote!(__TypeLeakTestPlaceholder<#ix>)
-        });
-        visitor.visit_signature_mut(&mut sig);
-        substitute.visit_signature_mut(&mut sig);
-        Resolve {
-            projections: &projections,
+        let mut written = Written::new(answers(params, &completed));
+        written.visit_signature_mut(&mut sig);
+        if let Some(e) = written.error {
+            return Err(Error::from(e));
         }
-        .visit_signature_mut(&mut sig);
 
         // Forward to the field: `Trait::<args>::method::<generics>(&self.field, args..)`.
         let receiver = match sig.receiver() {

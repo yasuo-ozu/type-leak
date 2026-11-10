@@ -48,12 +48,12 @@ use std::hash::{Hash, Hasher};
 use syn::parse::{Parse, ParseStream};
 use syn::visit_mut::VisitMut;
 use syn::{
-    parse_macro_input, parse_quote, GenericArgument, GenericParam, ImplItem, ItemImpl, ItemStruct,
-    ItemTrait, Path, PathArguments, Token, TraitItem, Type,
+    parse_macro_input, parse_quote, GenericArgument, GenericParam, Ident, ImplItem, ItemImpl,
+    ItemStruct, ItemTrait, Path, PathArguments, Token, TraitItem, Type,
 };
 use type_leak::{
-    array_const, encode_generics_args_with_params, repeater_projection, ContextId, EncodeError,
-    ErrorItem, ImplSelf, Leaker, Referrer, UseSite,
+    array_const, complete_params, repeater_projection, substitute_args, Context, ContextId,
+    EncodeError, EntryId, ErrorItem, ImplSelf, Leaker, Referrer,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -238,30 +238,34 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     };
     let generics = &item_trait.generics;
 
-    // Where the copy is: `impl<K> Repo<K> for W` declares the generics of the trait itself
-    // (`UseSite::identity()`). `impl Repo<u8> for W` gives them arguments, which the paths through
-    // the Repeater must carry (`UseSite::substituting(..)`), and which `UseSite::substitute()`
-    // writes in the types that are not leaked (`t: K`).
+    // 1. Write each leaked type with its path through the Repeater, by the names of the generics of
+    //    the entry. The paths come out as the impls of crate A have them, because both encode the
+    //    generics of the same context.
+    let project = |_leaked: Type, ix: EntryId, context: &Context| -> Type {
+        let self_ty: Type = parse_quote!(Self);
+        repeater_projection(&repeater, &self_ty, context, id, ix, array_const)
+            .expect("the arguments can be encoded")
+    };
+
+    // Where the copy is: `impl<K> Repo<K> for W` declares the generics of the trait itself (nothing
+    // is substituted). `impl Repo<u8> for W` gives them arguments, which `substitute_args()` writes
+    // in the types of the copy (`t: K`, and the paths through the Repeater).
     let explicit: Option<Vec<GenericArgument>> =
         match &trait_path.segments.last().unwrap().arguments {
             PathArguments::AngleBracketed(args) => Some(args.args.iter().cloned().collect()),
             _ => None,
         };
-    let (impl_generics, trait_path, site) = match &explicit {
+    let (impl_generics, trait_path, site_args) = match &explicit {
         Some(args) => {
-            // Arguments the copy omits take the defaults of the trait.
-            let completed =
-                referrer.complete_args(top_level, &generics.params, args, |_, _, _, _| {
-                    unreachable!(
-                        "the traits of this example have no default that names a leaked type"
-                    )
-                });
-            let args = enc(completed)?;
-            (
-                quote!(),
-                trait_path,
-                UseSite::substituting(&generics.params, &args),
-            )
+            // 2. Arguments the copy omits take the defaults of the trait, which the visitor writes
+            //    in the trait itself.
+            let mut visited = item_trait.clone();
+            visited.items.clear();
+            referrer
+                .visitor(top_level, project)
+                .visit_item_trait_mut(&mut visited);
+            let args = enc(complete_params(&visited.generics.params, args))?;
+            (quote!(), trait_path, args)
         }
         None => {
             let args: Vec<GenericArgument> = generics.params.iter().map(own_name).collect();
@@ -271,8 +275,16 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                     PathArguments::AngleBracketed(parse_quote!(<#(#args),*>));
             }
             let (impl_generics, _, _) = generics.split_for_impl();
-            (quote!(#impl_generics), path, UseSite::identity())
+            (quote!(#impl_generics), path, Vec::new())
         }
+    };
+    // What the site answers for a name: the argument of the trait's parameter of that name.
+    let site = |name: &Ident| {
+        let at = generics
+            .params
+            .iter()
+            .position(|param| param_ident(param) == name)?;
+        site_args.get(at).cloned()
     };
 
     let mut items: Vec<ImplItem> = vec![];
@@ -284,27 +296,12 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
             }
             TraitItem::Fn(method) => {
                 let mut sig = method.sig.clone();
-                // 3. Replace each leaked type with its path through the Repeater. The visitor
+                // 1. Replace each leaked type with its path through the Repeater. The visitor
                 //    needs the whole signature, and the `ContextId` of the trait.
-                let mut visitor = referrer.visitor(top_level, |_leaked, ix, context| {
-                    // The arguments of the Repeater, as written at this site: those of the site
-                    // for the generics of the entry, encoded. The paths come out as the impls of
-                    // crate A have them, because both encode the generics of the same context.
-                    let self_ty: Type = parse_quote!(Self);
-                    let args = site
-                        .generic_args(&context.generics)
-                        .and_then(|args| {
-                            encode_generics_args_with_params(
-                                &args,
-                                &context.generics.params,
-                                Some((&self_ty, &context.self_outlives)),
-                                array_const,
-                            )
-                        })
-                        .expect("the arguments can be encoded");
-                    repeater_projection(&repeater, &self_ty, &args, id, ix)
-                });
-                visitor.visit_signature_mut(&mut sig);
+                referrer
+                    .visitor(top_level, project)
+                    .visit_signature_mut(&mut sig);
+                // 3. Write the arguments of the impl into the types of the signature.
                 if explicit.is_some() {
                     Written(&site).visit_signature_mut(&mut sig);
                 }
@@ -364,10 +361,23 @@ fn own_name(param: &GenericParam) -> GenericArgument {
 
 /// Writes the types that are not leaked as they are at the site: `K` is `u8` in `impl Repo<u8> for
 /// ..`. (The visitor of `type-leak` replaces only leaked types.)
-struct Written<'a>(&'a UseSite);
+struct Written<F>(F);
 
-impl VisitMut for Written<'_> {
+impl<F: Fn(&Ident) -> Option<GenericArgument>> VisitMut for Written<&F> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        *ty = self.0.substitute(ty, None);
+        let mut arg = GenericArgument::Type(ty.clone());
+        substitute_args(std::iter::once(&mut arg), self.0).expect("a type fits a type");
+        if let GenericArgument::Type(written) = arg {
+            *ty = written;
+        }
+    }
+}
+
+/// The name of a generic parameter, as `substitute_args()` asks for it.
+fn param_ident(param: &GenericParam) -> &Ident {
+    match param {
+        GenericParam::Type(p) => &p.ident,
+        GenericParam::Lifetime(p) => &p.lifetime.ident,
+        GenericParam::Const(p) => &p.ident,
     }
 }

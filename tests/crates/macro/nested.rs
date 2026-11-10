@@ -274,9 +274,10 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let error = std::cell::RefCell::new(None);
     referrer
         .visitor(context, |_leaked, ix, entry| {
-            let args = crate::repeater_args(entry, &UseSite::identity(), None, array_const);
-            match args {
-                Ok(args) => repeater_projection(&repeater, &parse_quote!(()), &args, id, ix),
+            let projection =
+                repeater_projection(&repeater, &parse_quote!(()), entry, id, ix, array_const);
+            match projection {
+                Ok(projection) => projection,
                 Err(e) => {
                     *error.borrow_mut() = Some(e);
                     parse_quote!(())

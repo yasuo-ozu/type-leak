@@ -50,9 +50,10 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
     assert_eq!(path[0], "inner");
 }
 
-/// The encoder passes the generics by name at an identity site, and substitutes them at another.
+/// The encoder passes the generics by name in the scope of the analysis, and `substitute_args()`
+/// writes the arguments of a use site into them.
 #[test]
-fn use_site_identity_and_substituting_give_the_arguments() {
+fn substitute_args_gives_the_arguments_of_a_use_site() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<'a, T: 'a> {
             fn f(&self, x: &'a Wrap<T>);
@@ -64,13 +65,13 @@ fn use_site_identity_and_substituting_give_the_arguments() {
 
     // `impl<'a, T: 'a> Tr<'a, T> for ..` declares the generics: each is passed by its own name.
     let context = common::entry(&referrer, 0);
-    let args = common::repeater_args(context, &UseSite::identity(), None, array_const).unwrap();
+    let args = common::repeater_args(context, common::identity, None, array_const).unwrap();
     assert_eq!(args, parse_quote!((&'a (), T, &'a T)));
 
     // `impl Tr<'static, u8> for ..` gives them arguments.
     let trait_args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
-    let site = UseSite::substituting(&tr.generics.params, &trait_args);
-    let args = common::repeater_args(context, &site, None, array_const).unwrap();
+    let site = common::answers(&tr.generics.params, &trait_args);
+    let args = common::repeater_args(context, site, None, array_const).unwrap();
     assert_eq!(args, parse_quote!((&'static (), u8, &'static u8)));
 }
 
@@ -87,18 +88,17 @@ fn the_self_type_of_the_encoder_names_the_type_in_self_outlives() {
     let referrer = leaker.result().finish().unwrap();
     // The entry `&'a Wrap<Self>` needs `Self: 'a`, which the arguments encode as `&'a Self`.
     let context = common::entry(&referrer, 0);
-    let args = common::repeater_args(context, &UseSite::identity(), None, array_const).unwrap();
+    let args = common::repeater_args(context, common::identity, None, array_const).unwrap();
     assert_eq!(args, parse_quote!((&'a (), &'a Self)));
     // At a site where `Self` is not available, name the type instead.
     let host: Type = parse_quote!(Host);
-    let args =
-        common::repeater_args(context, &UseSite::identity(), Some(&host), array_const).unwrap();
+    let args = common::repeater_args(context, common::identity, Some(&host), array_const).unwrap();
     assert_eq!(args, parse_quote!((&'a (), &'a Host)));
 }
 
-/// `UseSite::generic_args()` takes the trait's argument for `T`, and passes `U` by its name.
+/// `substitute_args()` takes the trait's argument for `T`, and leaves `U` by its name.
 #[test]
-fn use_site_generic_args_passes_method_generics_by_name() {
+fn substitute_args_passes_method_generics_by_name() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T> {
             fn f<U>(&self, t: T, u: U) -> Wrap<T, U>;
@@ -110,9 +110,11 @@ fn use_site_generic_args_passes_method_generics_by_name() {
     // `impl Tr<u8> for ..`: `T` is `u8`. `U` is a generic of the method, passed by its name.
     let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
     let (_, _, context) = referrer.iter().next().unwrap();
-    let args = UseSite::substituting(&tr.generics.params, &trait_args)
-        .generic_args(&context.generics)
-        .unwrap();
+    let args = common::generic_args(
+        &context.generics,
+        common::answers(&tr.generics.params, &trait_args),
+    )
+    .unwrap();
     let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(U)];
     assert_eq!(args, expected);
 }
@@ -311,7 +313,7 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     let trait_args: Vec<GenericArgument> = vec![parse_quote!(true), parse_quote!('x')];
     let args = common::repeater_args(
         common::entry(&referrer, 0),
-        &UseSite::substituting(&tr.generics.params, &trait_args),
+        common::answers(&tr.generics.params, &trait_args),
         None,
         slot_const(&repeater),
     )
@@ -534,4 +536,26 @@ fn repeater_impl_for_each_entry_of_a_trait() {
     };
     assert!(impls.contains(&rel));
     assert!(impls.contains(&wrap2));
+}
+
+/// `slot_const()` encodes `usize` as an array length, `u64` into its slot, and `u128` as the `KEY`.
+#[test]
+fn slot_const_encodes_usize_u64_and_u128() {
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let mut const_fn = slot_const(&repeater);
+    let param: ConstParam = parse_quote!(const N: usize);
+    assert_eq!(
+        const_fn(&parse_quote!(3), &param).unwrap(),
+        parse_quote!([(); 3])
+    );
+    let param: ConstParam = parse_quote!(const K: u64);
+    assert_eq!(
+        const_fn(&parse_quote!(4), &param).unwrap(),
+        parse_quote!(*const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 4, Type = ()>)
+    );
+    let param: ConstParam = parse_quote!(const L: u128);
+    assert_eq!(
+        const_fn(&parse_quote!(5), &param).unwrap(),
+        parse_quote!(*const dyn crate::Repeater<(), 5, Type = ()>)
+    );
 }

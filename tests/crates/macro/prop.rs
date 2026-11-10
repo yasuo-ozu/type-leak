@@ -866,7 +866,16 @@ fn repeater_impls(
         // `ToTokens` writes the `KEY`: the trait path of the written impl is the one that the
         // copy's side writes.
         let tokens = r.to_token_stream();
-        let trait_path = repeater_trait_path(&repeater, &r.args, id, ix);
+        // The impl of an entry that has a type for `Self` is for it, and writes `Self`.
+        let context = crate::entry_context(referrer, ix);
+        let self_in_impl: Type = match context.self_ty {
+            Some(SelfRequirement::Type(_)) => parse_quote!(Self),
+            _ => r.self_ty.clone(),
+        };
+        let trait_path = projected_trait_path(
+            &repeater_projection(&repeater, &self_in_impl, context, id, ix, slot_const(&repeater))
+                .map_err(Error::from)?,
+        )?;
         let written: ItemImpl = parse2(tokens.clone())?;
         match &written.trait_ {
             Some((_, path, _)) if *path == trait_path => (),
@@ -1991,6 +2000,23 @@ fn has_no_witness(pos: &Position) -> bool {
 // The Referrer's side: rewriting a copy.
 // ---------------------------------------------------------------------------------------------
 
+/// The path of the trait in `<S as Repeater<..>>::Type`.
+fn projected_trait_path(projection: &Type) -> Result<Path> {
+    match projection {
+        Type::Path(TypePath {
+            qself: Some(qself),
+            path,
+        }) => Ok(Path {
+            leading_colon: path.leading_colon,
+            segments: path.segments.iter().take(qself.position).cloned().collect(),
+        }),
+        _ => Err(helpers_disagree(format!(
+            "`repeater_projection()` wrote `{}`, not a projection",
+            quote!(#projection)
+        ))),
+    }
+}
+
 /// Builds `<Self as Repeater<..>>::Type` for an entry.
 struct Projector<'a> {
     referrer: &'a Referrer,
@@ -2093,17 +2119,18 @@ impl Projector<'_> {
 
     fn project_with(&self, ix: EntryId, context: &Context, self_ty: Type) -> Result<Type> {
         self.used.borrow_mut().insert(ix);
-        let site = UseSite::substituting(&self.root_params, &self.root_args);
-        // The type of `Self` is written with the generics of the item (`Name<'a, T>`).
-        let self_ty = if self.at_instance {
-            site.substitute(&self_ty, None)
-        } else {
-            self_ty
-        };
-        let encoded =
-            crate::repeater_args(context, &site, Some(&self_ty), slot_const(&self.repeater))
-                .map_err(Error::from)?;
-        Ok(repeater_projection(&self.repeater, &self_ty, &encoded, self.id, ix))
+        // The entry by its own generics, then the arguments of the site in one pass: the type of
+        // `Self` is written with the generics of the item (`Name<'a, T>`) too.
+        let projection = repeater_projection(
+            &self.repeater,
+            &self_ty,
+            context,
+            self.id,
+            ix,
+            slot_const(&self.repeater),
+        )?;
+        let site = crate::answers(&self.root_params, &self.root_args);
+        Ok(crate::substitute_type(&projection, &site, None)?)
     }
 }
 
@@ -2152,12 +2179,14 @@ fn rewrite(
         dyn_host,
         None,
         None,
+        false,
     )
 }
 
 /// [`rewrite()`] for a use of the item at an instantiation of its generics (`inst`: the entries are
 /// written with its arguments, the host of a trait is its own), or inside a module or a block that
-/// declares names (`wrap`: the copy is the item, as the visitor leaves it there).
+/// declares names (`wrap`: the copy is the item, as the visitor leaves it there). With
+/// `instance_host` the host of a trait is that of the instantiation, as with `inst`.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_with(
     referrer: &Referrer,
@@ -2168,6 +2197,7 @@ fn rewrite_with(
     dyn_host: bool,
     inst: Option<&Instance>,
     wrap: Option<&Wrap>,
+    instance_host: bool,
 ) -> Result<Rewritten> {
     let repeater = repeater_path(leaker_path);
     let generics = match item {
@@ -2195,6 +2225,7 @@ fn rewrite_with(
     };
     let host = matches!(item, Item::Trait(_)).then(|| match inst {
         Some(inst) => inst.host(),
+        None if instance_host => ident(&format!("Host{}I", args.id)),
         None => ident(&format!("Host{}", args.id)),
     });
     let mut self_ty = None;
@@ -2596,7 +2627,7 @@ fn concrete_type(traits: &std::collections::BTreeSet<String>, draw: &mut Draw) -
 /// A type that holds a lifetime and has the marker traits and comparisons of [`FRIENDLY`], for a
 /// parameter that [`friendly_type()`] allows: written into a function pointer or `Fn(..)` whose
 /// output has an elided lifetime, it adds one to the inputs, which the copy must still name (the
-/// `for<'e>` binder of `UseSite::substitute()`).
+/// `for<'e>` binder of `substitute_args()`).
 fn lifetime_type(draw: &mut Draw) -> Type {
     let mut choices: Vec<Type> = vec![
         parse_quote!(&'static str),
@@ -2655,7 +2686,7 @@ impl<'ast> Visit<'ast> for SignatureLifetimes {
 /// The names of the parameters among `names` that appear in the inputs of each signature of an item
 /// (a function pointer, or the sugar of `Fn(..)`) whose output has an elided lifetime that the one
 /// lifetime of its inputs gives: the signatures that a use site must keep valid by naming it
-/// (`UseSite::substitute()`).
+/// (`substitute_args()`).
 struct ElidedSignatures {
     names: Vec<String>,
     found: Vec<ElidedSignature>,
@@ -2836,10 +2867,10 @@ fn concrete_const(ty: &Type, draw: &mut Draw) -> GenericArgument {
 ///   in no bound, a value; and otherwise the parameter itself, which the use site declares as the
 ///   item does;
 /// - left out for the defaults at the end of the list (if no predicate or bound names them):
-///   [`Referrer::complete_args()`] gives them.
+///   [`complete_params()`] gives them.
 ///
-/// The copy is written with the arguments ([`encode_generics_args_with_params()`],
-/// [`UseSite::substitute()`]) and compared with the original at them: the witness of each
+/// The copy is written with the arguments ([`repeater_projection()`],
+/// [`substitute_args()`]) and compared with the original at them: the witness of each
 /// position is called with them.
 pub(crate) struct Instance {
     id: u64,
@@ -2865,8 +2896,9 @@ impl Instance {
         ident(&format!("Host{}I", self.id))
     }
 
-    fn site(&self) -> UseSite {
-        UseSite::substituting(&self.params, &self.completed)
+    /// What the use site answers for a name: the argument of the parameter of the item.
+    fn answers(&self) -> impl Fn(&Ident) -> Option<GenericArgument> + '_ {
+        crate::answers(&self.params, &self.completed)
     }
 
     /// How many times a parameter that was given a type with a lifetime is named in the inputs of a
@@ -2988,17 +3020,15 @@ struct InstAsk {
 }
 
 /// Plans the instantiation of `generics` that `ask` draws (see [`Instance`]), or `None` if it has
-/// no generic. `type_fn` writes a type that a default names through the Repeater, for
-/// [`Referrer::complete_args()`].
+/// no generic. `visited` are the parameters of the visited copy, whose defaults name the leaked
+/// types through the Repeater, for [`complete_params()`].
 fn plan_instance(
-    referrer: &Referrer,
-    context: ContextId,
     id: u64,
     item: &Item,
     generics: &Generics,
+    visited: &Punctuated<GenericParam, Token![,]>,
     ask: InstAsk,
     replaced: &[String],
-    type_fn: impl FnMut(Type, EntryId, &Context, &[GenericArgument]) -> Type,
 ) -> Result<Option<Instance>> {
     let params: Vec<&GenericParam> = generics.params.iter().collect();
     let n = params.len();
@@ -3090,9 +3120,7 @@ fn plan_instance(
             }
         }
     }
-    let mut completed = referrer
-        .complete_args(context, &generics.params, given.iter(), type_fn)
-        .map_err(Error::from)?;
+    let mut completed = complete_params(visited, given.iter()).map_err(Error::from)?;
     // A const parameter that is its own argument is written bare (`{ N }` is not allowed in the
     // arguments of a path where `N` is a generic).
     for (param, arg) in generics.params.iter().zip(completed.iter_mut()) {
@@ -3115,9 +3143,9 @@ fn plan_instance(
 }
 
 /// Substitutes the instantiation in the syntax of a copy (a signature, an associated type): the
-/// types by [`UseSite::substitute()`] and the lifetimes that appear outside a type.
+/// types by [`substitute_args()`] and the lifetimes that appear outside a type.
 struct SiteSubst<'a> {
-    site: &'a UseSite,
+    inst: &'a Instance,
     /// What `Self` is written as (`None`: as it is).
     self_ty: Option<&'a Type>,
     lifetimes: &'a [(Lifetime, Lifetime)],
@@ -3127,7 +3155,7 @@ struct SiteSubst<'a> {
 }
 
 impl<'a> SiteSubst<'a> {
-    fn new(site: &'a UseSite, self_ty: Option<&'a Type>, inst: &'a Instance) -> Self {
+    fn new(self_ty: Option<&'a Type>, inst: &'a Instance) -> Self {
         let consts = inst
             .params
             .iter()
@@ -3138,7 +3166,7 @@ impl<'a> SiteSubst<'a> {
             })
             .collect();
         SiteSubst {
-            site,
+            inst,
             self_ty,
             lifetimes: &inst.lifetimes,
             consts,
@@ -3148,7 +3176,9 @@ impl<'a> SiteSubst<'a> {
 
 impl VisitMut for SiteSubst<'_> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        *ty = self.site.substitute(ty, self.self_ty);
+        *ty = crate::substitute_type(ty, self.inst.answers(), self.self_ty).unwrap_or_else(|e| {
+            panic!("test macro: the instance does not fit `{}`: {}", quote!(#ty), e)
+        });
     }
 
     fn visit_generic_argument_mut(&mut self, arg: &mut GenericArgument) {
@@ -3174,9 +3204,8 @@ impl VisitMut for SiteSubst<'_> {
 /// The trait of the copy at the instantiation: the types of the signatures and the associated items
 /// written with the arguments.
 fn substituted_trait(copy: &ItemTrait, inst: &Instance) -> ItemTrait {
-    let site = inst.site();
     let mut copy = copy.clone();
-    let mut subst = SiteSubst::new(&site, None, inst);
+    let mut subst = SiteSubst::new(None, inst);
     for trait_item in copy.items.iter_mut() {
         subst.visit_trait_item_mut(trait_item);
     }
@@ -3202,7 +3231,9 @@ fn instance_check_fn(
     host: Option<&Type>,
 ) -> Option<TokenStream> {
     let (generics, ty) = lowered(pos, Implementor::Fixed);
-    let ty = inst.site().substitute(&ty, None);
+    let ty = crate::substitute_type(&ty, inst.answers(), None).unwrap_or_else(|e| {
+        panic!("test macro: the instance does not fit `{}`: {}", quote!(#ty), e)
+    });
     let mut params: Punctuated<GenericParam, Token![,]> = Punctuated::new();
     let mut targs: Vec<TokenStream> = Vec::new();
     // A parameter of a method that is named like one of the item would hide it.
@@ -3269,8 +3300,7 @@ fn instance_check_fn(
         params.push(param);
     }
     // The bounds name the types and the lifetimes of the item: written with the arguments.
-    let site = inst.site();
-    let mut subst = SiteSubst::new(&site, None, inst);
+    let mut subst = SiteSubst::new(None, inst);
     for param in params.iter_mut() {
         subst.visit_generic_param_mut(param);
     }
@@ -3308,7 +3338,7 @@ fn instance_check_fn(
     })
 }
 
-/// The check that the arguments that `Referrer::complete_args()` gave for the defaults that the use
+/// The check that the arguments that `complete_params()` gave for the defaults that the use
 /// site left out are the defaults that rustc takes: for a struct, an enum or a union, `S<given>` is
 /// `S<completed>` (a function takes one and returns the other); for a trait, the host that
 /// implements `Tr<given>` implements `Tr<completed>`.
@@ -3325,8 +3355,7 @@ fn defaults_check(
     let name = ident(&format!("__tl_def_{}", inst.id));
     // The generics that the use site declares, in a function: `Self` is the type or the host.
     let with_self = |self_ty: Type| -> (Punctuated<GenericParam, Token![,]>, Option<WhereClause>) {
-        let site = inst.site();
-        let mut subst = SiteSubst::new(&site, Some(&self_ty), inst);
+        let mut subst = SiteSubst::new(Some(&self_ty), inst);
         let mut params = inst.declared.params.clone();
         for param in params.iter_mut() {
             subst.visit_generic_param_mut(param);
@@ -3413,10 +3442,12 @@ fn defaults_check(
     }
 }
 
-/// Checks `UseSite::generic_args()` on the arguments of the generics of the item for the
-/// generics of the context of every entry: the identity arguments give the generics' own names,
-/// and a list with one argument too many, or one of the other kind in the first place, or the last
-/// one missing, is refused (the last one missing only where the generics name that parameter).
+/// Checks the refusals of the arguments of the generics of the item. `complete_params()` takes the
+/// generics' own names, and refuses a list with one argument too many (`UnexpectedArgument`), one
+/// with the last missing (`MissingArgument`, unless that parameter has a default) and one of
+/// another kind in the first place. `substitute_args()` on the generics of the context of each
+/// entry that names the first parameter takes the same arguments, and refuses the one of another
+/// kind too (`UnexpectedArgument`).
 fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![,]>) -> Result<()> {
     let (first, last) = match (params.first(), params.last()) {
         (Some(first), Some(last)) => (first, last),
@@ -3437,52 +3468,105 @@ fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![
     };
     let mut short = valid.clone();
     short.pop();
+    // The defaults of the item, if any, are left as they are.
+    match complete_params(params, &valid) {
+        Ok(completed) if completed.len() == valid.len() => (),
+        other => {
+            return Err(fail(format!(
+                "refused the arguments that are the generics' own names in the item: {:?}",
+                other.map(|a| a.len())
+            )))
+        }
+    }
+    match complete_params(params, &extra) {
+        Err(EncodeError::UnexpectedArgument(_)) => (),
+        other => {
+            return Err(fail(format!(
+                "one too many in the item is not an `UnexpectedArgument`: {:?}",
+                other.map(|a| a.len())
+            )))
+        }
+    }
+    let has_default = match last {
+        GenericParam::Lifetime(_) => false,
+        GenericParam::Type(param) => param.default.is_some(),
+        GenericParam::Const(param) => param.default.is_some(),
+    };
+    match (has_default, complete_params(params, &short)) {
+        (false, Err(EncodeError::MissingArgument(_))) | (true, Ok(_)) => (),
+        (_, other) => {
+            return Err(fail(format!(
+                "the last argument missing in the item (`{}` {}) gives {:?}",
+                param_name(last),
+                if has_default { "has a default" } else { "has none" },
+                other.map(|a| a.len())
+            )))
+        }
+    }
+    if complete_params(params, &wrong).is_ok() {
+        return Err(fail(format!(
+            "one of another kind in the item (for `{}`) is accepted",
+            param_name(first)
+        )));
+    }
     let entries = referrer
         .iter()
         .map(|(ix, _, context)| (format!("the context of the entry {}", ix), context));
-    for (context_name, context) in entries {
-        let generics = &context.generics;
-        let own = UseSite::substituting(params, &valid).generic_args(generics);
-        if own.is_err() {
-            return Err(fail(format!(
-                "refused the arguments that are the generics' own names in {}",
-                context_name
-            )));
-        }
-        for (what, args) in [("one too many", &extra), ("one of another kind", &wrong)] {
-            match UseSite::substituting(params, args).generic_args(generics) {
-                Err(EncodeError::UnexpectedArgument(_)) => (),
-                other => {
-                    return Err(fail(format!(
-                        "{} in {} is not an `UnexpectedArgument`: {:?}",
-                        what,
-                        context_name,
-                        other.map(|a| a.len())
-                    )))
-                }
+    for (context_name, entry) in entries {
+        let substituted = |answers: &[GenericArgument]| {
+            let mut args: Vec<GenericArgument> = entry
+                .generics
+                .params
+                .iter()
+                .map(own_name_arg)
+                .collect();
+            substitute_args(args.iter_mut(), crate::answers(params, answers)).map(|()| args)
+        };
+        match substituted(&valid) {
+            Ok(args) if args.len() == entry.generics.params.len() => (),
+            other => {
+                return Err(fail(format!(
+                    "refused the arguments that are the generics' own names in {}: {:?}",
+                    context_name,
+                    other.map(|a| a.len())
+                )))
             }
         }
-        let needs = generics
+        let names_first = entry
+            .generics
             .params
             .iter()
-            .any(|param| param_name(param) == param_name(last));
-        match (
-            needs,
-            UseSite::substituting(params, &short).generic_args(generics),
-        ) {
-            (true, Err(EncodeError::MissingArgument(_))) | (false, Ok(_)) => (),
+            .any(|param| param_name(param) == param_name(first));
+        match (names_first, substituted(&wrong)) {
+            (true, Err(EncodeError::UnexpectedArgument(_))) | (false, Ok(_)) => (),
             (_, other) => {
                 return Err(fail(format!(
-                    "the last argument missing in {} (its generics {} `{}`) gives {:?}",
+                    "one of another kind in {} (its generics {} `{}`) gives {:?}",
                     context_name,
-                    if needs { "name" } else { "do not name" },
-                    param_name(last),
+                    if names_first { "name" } else { "do not name" },
+                    param_name(first),
                     other.map(|a| a.len())
                 )))
             }
         }
     }
     Ok(())
+}
+
+/// The argument that passes `param` on by its own name: a lifetime, a type, or a const (a `Const`
+/// argument, which `substitute_args()` turns into what the site gives).
+fn own_name_arg(param: &GenericParam) -> GenericArgument {
+    match param {
+        GenericParam::Lifetime(param) => GenericArgument::Lifetime(param.lifetime.clone()),
+        GenericParam::Type(param) => {
+            let ident = &param.ident;
+            GenericArgument::Type(parse_quote!(#ident))
+        }
+        GenericParam::Const(param) => {
+            let ident = &param.ident;
+            GenericArgument::Const(parse_quote!(#ident))
+        }
+    }
 }
 
 /// The names of the entries' types that a module or a block can declare again: the first segment of
@@ -3603,6 +3687,7 @@ fn shadow_check(
         dyn_host,
         None,
         Some(&plain_wrap),
+        false,
     )?;
     let shadowed = rewrite_with(
         referrer,
@@ -3613,6 +3698,7 @@ fn shadow_check(
         dyn_host,
         None,
         Some(&shadowing),
+        false,
     )?;
     let declared: std::collections::HashSet<String> =
         shadowing.names.iter().map(|name| name.to_string()).collect();
@@ -3641,8 +3727,9 @@ fn shadow_check(
 }
 
 /// What an invocation of the item with `inst(N)` adds: the checks at an instantiation of its
-/// generics (see [`Instance`]) and of `UseSite::generic_args()`. Returns the tokens, the
-/// number of positions checked at the instantiation, and how many times the instantiation passed an
+/// generics (see [`Instance`]) and of the arguments of the item that the library refuses
+/// (`check_refusals()`). Returns the tokens, the number of positions checked at the instantiation,
+/// and how many times the instantiation passed an
 /// argument that holds a lifetime to a signature that relies on elision, how many of those have
 /// a replaced entry in their inputs, and how many pairs of each kind it could have made
 /// ([`Instance::lifetime_args_in_elided_signatures()`]).
@@ -3668,47 +3755,24 @@ fn instance_part(
         return Ok((TokenStream::new(), 0, [0; 4]));
     }
     check_refusals(referrer, &generics.params)?;
-    let host_name = ident(&format!("Host{}I", args.id));
-    let error = std::cell::RefCell::new(None);
-    let projector_with = |prefix: Vec<GenericArgument>| Projector {
-        referrer,
-        repeater: repeater_path(path),
-        id: args.repeater_id(),
-        root_params: generics.params.clone(),
-        root_args: prefix,
-        bound_self: matches!(item, Item::Trait(_)).then(|| host_type(&host_name, dyn_host)),
-        type_self: None,
-        marker: args.marker.clone(),
-        used: Default::default(),
-        at_instance: true,
-    };
-    let replaced: Vec<String> = rewrite(referrer, context, item, args, path, dyn_host)?
+    // The copy of the item, with the defaults of its parameters written by their own generics, and
+    // the host of the instantiation for `Self`.
+    let visited = rewrite_with(referrer, context, item, args, path, dyn_host, None, None, true)?;
+    let replaced: Vec<String> = visited
         .used
         .iter()
         .filter_map(|ix| referrer.iter().nth(ix.index()))
         .map(|(_, entry, _)| quote!(#entry).to_string())
         .collect();
-    let planned = plan_instance(
-        referrer,
-        context,
-        args.id,
-        item,
-        generics,
-        ask,
-        &replaced,
-        |_leaked, ix, entry, prefix| {
-            // A default kept as written is not substituted again: write it at the site.
-            projector_with(prefix.to_vec())
-                .project(ix, entry)
-                .unwrap_or_else(|e| {
-                    *error.borrow_mut() = Some(e);
-                    parse_quote!(())
-                })
-        },
-    )?;
-    if let Some(e) = error.into_inner() {
-        return Err(e);
-    }
+    let visited_params = match &visited.item {
+        Item::Struct(i) => &i.generics.params,
+        Item::Enum(i) => &i.generics.params,
+        Item::Union(i) => &i.generics.params,
+        Item::Trait(i) => &i.generics.params,
+        Item::Impl(i) => &i.generics.params,
+        _ => return Ok((TokenStream::new(), 0, [0; 4])),
+    };
+    let planned = plan_instance(args.id, item, generics, visited_params, ask, &replaced)?;
     let inst = match planned {
         Some(inst) => inst,
         None => return Ok((TokenStream::new(), 0, [0; 4])),
@@ -3723,6 +3787,7 @@ fn instance_part(
         dyn_host,
         Some(&inst),
         None,
+        false,
     )?;
     match &rewritten.item {
         Item::Struct(i) => inst.declare(&i.generics),

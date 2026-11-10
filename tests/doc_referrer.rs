@@ -127,9 +127,9 @@ fn has_self_is_true_if_some_entry_needs_self() {
     assert!(!referrer.has_self());
 }
 
-/// `complete_args()` adds the omitted defaulted argument, written by `type_fn`.
+/// `complete_params()` adds the omitted defaulted argument, written by the visitor in the default.
 #[test]
-fn complete_args_fills_the_defaulted_parameter() {
+fn complete_params_fills_the_defaulted_parameter() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, U = Rel<T>> {
             fn f(&self, t: T) -> U;
@@ -140,14 +140,14 @@ fn complete_args_fills_the_defaulted_parameter() {
     let referrer = leaker.result().finish().unwrap();
     // For `impl Tr<u8> for ..`, omitting `U`.
     let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
-    let completed = referrer
-        .complete_args(
-            top_level,
-            &tr.generics.params,
-            &args.args,
-            |_, ix, _, _| parse_quote!(Leaked<#ix>),
-        )
-        .unwrap();
+    let completed = common::completed_args(
+        &referrer,
+        top_level,
+        &tr,
+        &args.args,
+        |_, ix, _| parse_quote!(Leaked<#ix>),
+    )
+    .unwrap();
     let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(Leaked<0usize>)];
     assert_eq!(
         quote!(#(#completed),*).to_string(),
@@ -211,14 +211,16 @@ fn with_self_replaces_self_with_the_marker_host() {
     let repeater: Path = parse_quote!(Repeater);
     let referrer = leaker.result().finish().unwrap();
     referrer
-        .visitor(context, |_, ix, _| {
+        .visitor(context, |_, ix, context| {
             repeater_projection(
                 &repeater,
                 &parse_quote!(Marker<__S>),
-                &parse_quote!(()),
+                context,
                 7,
                 ix,
+                array_const,
             )
+            .unwrap()
         })
         .with_self(parse_quote!(__S))
         .visit_signature_mut(&mut sig);
@@ -253,13 +255,13 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
     let repeater: Path = parse_quote!(Repeater);
     let unit: Type = parse_quote!(());
     referrer
-        .visitor(module, |_, ix, _| {
-            repeater_projection(&repeater, &unit, &unit, 7, ix)
+        .visitor(module, |_, ix, context| {
+            repeater_projection(&repeater, &unit, context, 7, ix, array_const).unwrap()
         })
-        .with_nested_self(|nested, _leaked, ix, _| {
+        .with_nested_self(|nested, _leaked, ix, context| {
             let ident = nested.ident.as_ref().unwrap();
             let host = parse_quote!(::leaker::m::#ident<T>);
-            repeater_projection(&repeater, &host, &unit, 7, ix)
+            repeater_projection(&repeater, &host, context, 7, ix, array_const).unwrap()
         })
         .visit_file_mut(&mut file);
     let (ix0, ix1) = (
@@ -269,8 +271,8 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
     let (key0, key1) = (repeater_key(7, ix0), repeater_key(7, ix1));
     let expected: File = parse_quote! {
         struct S<T> {
-            a: <() as Repeater<(), #key0>>::Type,
-            b: <::leaker::m::S<T> as Repeater<(), #key1>>::Type,
+            a: <() as Repeater<(T,), #key0>>::Type,
+            b: <::leaker::m::S<T> as Repeater<(T,), #key1>>::Type,
         }
     };
     assert_eq!(file, expected);
@@ -318,19 +320,20 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .visitor(module, |_, ix, _| {
-            repeater_projection(&repeater, &parse_quote!(()), &parse_quote!(()), 7, ix)
+        .visitor(module, |_, ix, context| {
+            repeater_projection(&repeater, &parse_quote!(()), context, 7, ix, array_const).unwrap()
         })
-        .with_nested_self(|_nested, _leaked, ix, context| {
-            let args =
-                common::repeater_args(context, &UseSite::identity(), None, slot_const(&repeater))
-                    .unwrap();
-            match &context.self_ty {
-                Some(SelfRequirement::Any) => {
-                    repeater_projection(&repeater, &parse_quote!(Self), &args, 7, ix)
-                }
-                _ => unimplemented!("the Leaker's type, from `nested`"),
-            }
+        .with_nested_self(|_nested, _leaked, ix, context| match &context.self_ty {
+            Some(SelfRequirement::Any) => repeater_projection(
+                &repeater,
+                &parse_quote!(Self),
+                context,
+                7,
+                ix,
+                slot_const(&repeater),
+            )
+            .unwrap(),
+            _ => unimplemented!("the Leaker's type, from `nested`"),
         })
         .visit_file_mut(&mut file);
     let expected: File = parse_quote! {
@@ -427,4 +430,115 @@ fn format_version_is_the_serialized_tag_and_another_tag_is_refused() {
     // A Referrer written by another version of `type-leak` is refused with an error that says so.
     let error = parse_str::<Referrer>("\"type-leak-format-0\"").unwrap_err();
     assert!(error.to_string().contains("incompatible type-leak"));
+}
+
+/// `visitor()` writes the entries, `complete_params()` completes the arguments of an impl, and one
+/// `substitute_args()` pass writes them into the types of the copy.
+#[test]
+fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site() {
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            fn f(&self, t: T) -> Wrap<T>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
+
+    // 1. The copy of `f` in `impl Tr<u8> for ..`, with the entry written.
+    let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> Wrap<T>);
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let self_ty: Type = parse_quote!(Self);
+    referrer
+        .visitor(top_level, |_ty, ix, context| {
+            repeater_projection(&repeater, &self_ty, context, 7, ix, slot_const(&repeater)).unwrap()
+        })
+        .visit_signature_mut(&mut sig);
+    let (ix, _, _) = referrer.iter().next().unwrap();
+    let key = repeater_key(7, ix);
+    let expected: Signature = parse_quote!(
+        fn f(&self, t: T) -> <Self as crate::Repeater<(T,), #key>>::Type
+    );
+    assert_eq!(sig, expected);
+
+    // 2. The arguments of the impl.
+    let given: Vec<GenericArgument> = vec![parse_quote!(u8)];
+    let completed = complete_params(&tr.generics.params, &given).unwrap();
+
+    // 3. `T` is `u8` in the types of the copy.
+    struct Site(GenericArgument);
+    impl VisitMut for Site {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            let mut arg = GenericArgument::Type(ty.clone());
+            substitute_args(std::iter::once(&mut arg), |name: &Ident| {
+                (name == "T").then(|| self.0.clone())
+            })
+            .unwrap();
+            if let GenericArgument::Type(written) = arg {
+                *ty = written;
+            }
+        }
+    }
+    Site(completed[0].clone()).visit_signature_mut(&mut sig);
+    let expected: Signature = parse_quote!(
+        fn f(&self, t: u8) -> <Self as crate::Repeater<(u8,), #key>>::Type
+    );
+    assert_eq!(sig, expected);
+}
+
+/// A `Referrer` and the top-level `ContextId` are written one after the other and read back.
+#[test]
+fn referrer_and_context_id_are_read_back_from_tokens() {
+    use syn::parse::Parser;
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_struct(
+        &parse_quote!(
+            struct S<T> {
+                a: Wrap<T>,
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
+
+    // Crate A writes both into the input of the macro of crate B...
+    let tokens = quote!(#referrer, #top_level);
+    // ...which reads them back.
+    let (read, read_top_level) = (|input: parse::ParseStream| -> Result<(Referrer, ContextId)> {
+        let referrer = input.parse()?;
+        input.parse::<Token![,]>()?;
+        Ok((referrer, input.parse()?))
+    })
+    .parse2(tokens)
+    .unwrap();
+    assert_eq!(read, referrer);
+    assert_eq!(read_top_level, top_level);
+}
+
+/// An `EntryId` is written as a `usize` literal and read with or without the suffix.
+#[test]
+fn entry_id_is_written_with_the_usize_suffix_and_read_with_or_without_it() {
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(
+        &parse_quote!(
+            struct S {
+                a: Rel,
+                b: Rel2,
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
+
+    let ids: Vec<EntryId> = referrer.iter().map(|(ix, _, _)| ix).collect();
+    assert_eq!(ids.len(), 2);
+    let ix = ids[1];
+    assert_eq!(ix.index(), 1);
+    assert_eq!(ix.to_string(), "1");
+    assert_eq!(ix.to_token_stream().to_string(), "1usize");
+
+    // With or without the suffix.
+    assert_eq!(parse_str::<EntryId>("1").unwrap(), ix);
+    assert_eq!(parse_str::<EntryId>("1usize").unwrap(), ix);
+    assert!(parse_str::<EntryId>("1u8").is_err());
 }

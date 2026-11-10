@@ -1,4 +1,4 @@
-//! Tests for the Repeater definition, `encode_slot_const()` and `array_const()`, and for the errors
+//! Tests for the Repeater definition, `slot_const()` and `array_const()`, and for the errors
 //! of the encoders and of the helpers that encode (`EncodeError`): their text, the conversion to
 //! `syn::Error`, and the `std::error::Error` impls. The encoders themselves, and the text of
 //! `UnsupportedConstType`, `UnexpectedArgument` and `MissingArgument`, are tested in
@@ -101,7 +101,7 @@ fn the_repeater_definition_has_the_documented_shape() {
         .unwrap();
         let value: Expr = parse_str(value).unwrap();
         assert_eq!(
-            encode_slot_const(&repeater, &value, &ty).unwrap(),
+            common::slot(&repeater, &value, &ty).unwrap(),
             expected,
             "{}",
             quote!(#ty)
@@ -110,39 +110,21 @@ fn the_repeater_definition_has_the_documented_shape() {
     // `u128` uses `KEY`, `usize` the length of an array, and the others are not supported (see
     // `the_text_of_every_variant`).
     assert_eq!(
-        encode_slot_const(&repeater, &parse_quote!(5), &parse_quote!(u128)).unwrap(),
+        common::slot(&repeater, &parse_quote!(5), &parse_quote!(u128)).unwrap(),
         parse_quote!(*const dyn R<(), 5, Type = ()>)
     );
     assert_eq!(
-        encode_slot_const(&repeater, &parse_quote!(5), &parse_quote!(usize)).unwrap(),
+        common::slot(&repeater, &parse_quote!(5), &parse_quote!(usize)).unwrap(),
         parse_quote!([(); 5])
     );
 }
 
-/// `slot_const()` is `encode_slot_const()` on the type of the parameter: as
-/// `encode_generics_args_with_params()` and `LeakerResult::repeater_impls()` take it, for every const type, and
-/// with the error of an unsupported one.
+/// `slot_const()` refuses a const parameter of an alias type, and it is the `const_fn` of the
+/// encoders, as `repeater_projection()` and `LeakerResult::repeater_impls()` take it.
 #[test]
-fn slot_const_is_encode_slot_const_on_the_type_of_the_parameter() {
+fn slot_const_refuses_an_alias_and_encodes_the_consts_of_an_entry() {
     let repeater: Path = parse_quote!(crate::Repeater);
     let mut const_fn = slot_const(&repeater);
-    for (param, value) in [
-        (parse_quote!(const B: bool), "true"),
-        (parse_quote!(const C: char), "'x'"),
-        (parse_quote!(const N: usize), "3"),
-        (parse_quote!(const K: u64), "9"),
-        (parse_quote!(const L: u128), "7"),
-        (parse_quote!(const I: i128), "-1"),
-    ] {
-        let param: ConstParam = param;
-        let value: Expr = parse_str(value).unwrap();
-        assert_eq!(
-            const_fn(&value, &param).unwrap(),
-            encode_slot_const(&repeater, &value, &param.ty).unwrap(),
-            "{}",
-            quote!(#param)
-        );
-    }
     let alias: ConstParam = parse_quote!(const A: Alias);
     assert!(matches!(
         const_fn(&parse_quote!(A), &alias),
@@ -161,7 +143,7 @@ fn slot_const_is_encode_slot_const_on_the_type_of_the_parameter() {
     let ix = common::entry_id_at(&referrer, 0);
     let args = common::repeater_args(
         common::entry(&referrer, ix.index()),
-        &UseSite::identity(),
+        common::identity,
         None,
         slot_const(&repeater),
     )
@@ -187,20 +169,20 @@ fn test_const_args_are_braced_when_needed() {
         (quote!({ FOO }), quote!(FOO)),
         (quote!(-3), quote!(-3)),
     ] {
-        let ty = encode_slot_const(&repeater, &parse2(value).unwrap(), &i32_ty).unwrap();
+        let ty = common::slot(&repeater, &parse2(value).unwrap(), &i32_ty).unwrap();
         let expected: Type = parse_quote! {
             *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, #expected, Type = ()>
         };
         assert_eq!(to_string(&ty), to_string(&expected));
     }
     let u128_ty: Type = parse_quote!(u128);
-    let ty = encode_slot_const(&repeater, &parse_quote!({ m::FOO }), &u128_ty).unwrap();
+    let ty = common::slot(&repeater, &parse_quote!({ m::FOO }), &u128_ty).unwrap();
     let expected: Type = parse_quote!(*const dyn crate::Repeater<(), { m::FOO }, Type = ()>);
     assert_eq!(to_string(&ty), to_string(&expected));
 }
 
 /// `array_const()` encodes a `usize` const as an array length, with the braces that a value needs,
-/// and any other type is an error (`encode_slot_const()` encodes it).
+/// and any other type is an error (`slot_const()` encodes it).
 #[test]
 fn array_const_encodes_usize_consts_only() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
@@ -221,7 +203,7 @@ fn array_const_encodes_usize_consts_only() {
     }
     // The slots encode it.
     let repeater: Path = parse_quote!(crate::Repeater);
-    assert!(encode_slot_const(&repeater, &parse_quote!(true), &bool_param.ty).is_ok());
+    assert!(common::slot(&repeater, &parse_quote!(true), &bool_param.ty).is_ok());
 }
 
 /// `repeater_key()` puts the id in the high half and the index in the low half, so two entries
@@ -257,19 +239,12 @@ fn repeater() -> Path {
     parse_quote!(crate::Repeater)
 }
 
-/// The error of encoding the arguments in `args` for the parameters in `generics`: completing
-/// them, then writing them at a use site of an entry that uses every generic.
+/// The error of completing the arguments in `args` for the parameters in `generics`, then writing
+/// them at a use site of an entry that uses every generic.
 fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
-    let empty = Leaker::new().result().into_referrer();
-    let context = common::context_ids(&empty).into_iter().next().unwrap();
-    let completed = match empty.complete_args(
-        context,
-        &generics.params,
-        &args.args,
-        |_, _, _, _| unreachable!(),
-    ) {
+    let completed = match complete_params(&generics.params, &args.args) {
         Ok(completed) => completed,
         Err(error) => return error,
     };
@@ -284,8 +259,32 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     let referrer = leaker.result().finish().unwrap();
     common::repeater_args(
         common::entry(&referrer, 0),
-        &UseSite::substituting(&generics.params, &completed),
+        common::answers(&generics.params, &completed),
         None,
+        slot_const(&repeater()),
+    )
+    .unwrap_err()
+}
+
+/// The error of writing the path through the Repeater for an entry that needs `Self: 'a`, for
+/// `self_ty` a trait object without a lifetime bound.
+fn unbounded_self_error(self_ty: &str) -> EncodeError {
+    let item: ItemTrait = parse_quote!(
+        trait Tr<'a> {
+            fn f(&self, x: &'a Wrap<Self>);
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    let self_ty: Type = parse_str(self_ty).unwrap();
+    let entry = referrer.iter().next().unwrap();
+    repeater_projection(
+        &repeater(),
+        &self_ty,
+        entry.2,
+        7,
+        entry.0,
         slot_const(&repeater()),
     )
     .unwrap_err()
@@ -302,7 +301,7 @@ fn params_error(generics: &str) -> EncodeError {
             _ => None,
         })
         .unwrap();
-    encode_slot_const(&repeater(), &parse_quote!(N), &param.ty).unwrap_err()
+    common::slot(&repeater(), &parse_quote!(N), &param.ty).unwrap_err()
 }
 
 /// The error of `repeater_impls()` for a marker, which cannot name `Self`: the entry `Wrap<T,
@@ -336,7 +335,7 @@ fn errors() -> Vec<EncodeError> {
         params_error("<const N: MyIdx>"),
         args_error("<T>", "<u8, u16>"),
         args_error("<'a, T>", "<u8>"),
-        args_error("<'a, T: ?Sized + 'a>", "<'x, dyn Tr>"),
+        unbounded_self_error("dyn Tr"),
         needs_self_error(NEEDS_SELF_SOURCE),
     ]
 }
@@ -368,13 +367,12 @@ fn the_text_of_every_variant() {
 #[test]
 fn the_text_of_an_unbounded_trait_object_is_that_of_its_type() {
     // The type is shown as it is written: parenthesized, or with other bounds.
-    let generics = "<'a, T: ?Sized + 'a>";
-    for (arg, shown) in [
+    for (self_ty, shown) in [
         ("dyn Tr", "dyn Tr"),
         ("(dyn Tr)", "(dyn Tr)"),
         ("dyn Tr + Send", "dyn Tr + Send"),
     ] {
-        let err = args_error(generics, &format!("<'x, {}>", arg));
+        let err = unbounded_self_error(self_ty);
         assert_eq!(
             err.to_string(),
             format!(
@@ -449,4 +447,213 @@ fn text_variant(err: &EncodeError) -> String {
         _ => unreachable!(),
     }
     .to_string()
+}
+
+// ── substitute_args() ───────────────────────────────────────────────────
+
+/// The arguments of `texts`, parsed.
+fn arguments(texts: &[&str]) -> Vec<GenericArgument> {
+    texts.iter().map(|text| parse_str(text).unwrap()).collect()
+}
+
+fn strings(args: &[GenericArgument]) -> Vec<String> {
+    args.iter()
+        .map(|arg| quote!(#arg).to_string().replace(' ', ""))
+        .collect()
+}
+
+/// What `f` is asked, in order, for `args`; it answers nothing.
+fn asked(args: &[&str]) -> Vec<String> {
+    let mut args = arguments(args);
+    let mut asked = Vec::new();
+    substitute_args(args.iter_mut(), |name: &Ident| {
+        asked.push(name.to_string());
+        None
+    })
+    .unwrap();
+    asked
+}
+
+#[test]
+fn substitute_args_asks_for_each_name_once_in_order() {
+    // A type (`u8` too), the first segment of a projection, an expression, a lifetime without its
+    // apostrophe, and `Self` in a type and in a macro.
+    assert_eq!(
+        asked(&[
+            "Vec<T>",
+            "&'a (U, T)",
+            "V::A<W>",
+            "[u8; N]",
+            "Rel<{ M }>",
+            "Self::B",
+            "m!(Self, X)",
+            "'b",
+            "'a",
+        ]),
+        ["T", "a", "U", "V", "W", "u8", "N", "M", "Self", "b"]
+    );
+    // Not `'static`, `'_`, a name behind a leading colon, with arguments or a qualified self, nor
+    // a longer path; `Self` alone in an expression is a value.
+    assert_eq!(
+        asked(&[
+            "&'static T",
+            "Rel<'_>",
+            "::p::X",
+            "p::X",
+            "<X as Tr>::A",
+            "Wrap<[u8; Self]>",
+            "[u8; a::B]",
+        ]),
+        ["T", "p", "X", "u8"]
+    );
+    // The tokens of a macro are asked for `Self` only if they name it.
+    assert_eq!(asked(&["m!(T, 'a)"]), Vec::<String>::new());
+    assert_eq!(asked(&["m!((Self))"]), ["Self"]);
+}
+
+#[test]
+fn substitute_args_replaces_each_name_by_the_kind_that_fits_its_place() {
+    let site = |name: &Ident| -> Option<GenericArgument> {
+        match name.to_string().as_str() {
+            "T" => Some(parse_quote!(Vec<u8>)),
+            "N" => Some(parse_quote!(3)),
+            "M" => Some(parse_quote!(K)),
+            "a" => Some(parse_quote!('static)),
+            "Self" => Some(parse_quote!(Host)),
+            _ => None,
+        }
+    };
+    for (written, expected) in [
+        // A whole argument takes a type or a const.
+        ("T", "Vec<u8>"),
+        ("N", "3"),
+        ("Rel<T, N>", "Rel<Vec<u8>, 3>"),
+        // A const in an expression is braced once, and a type that is one identifier is one.
+        ("[u8; N]", "[u8; { 3 }]"),
+        ("[u8; { N }]", "[u8; { 3 }]"),
+        ("[u8; M]", "[u8; { K }]"),
+        ("Rel<{ M }>", "Rel<{ K }>"),
+        // A lifetime, `Self`, a projection.
+        ("&'a T", "&'static Vec<u8>"),
+        ("&'b T", "&'b Vec<u8>"),
+        (
+            "(Self, Self::A, <Self as Tr>::B)",
+            "(Host, <Host>::A, <Host as Tr>::B)",
+        ),
+        ("T::Item<N>", "<Vec<u8>>::Item<3>"),
+        // `Self` in a macro; `Self::A` in an expression; `Self` alone in one is a value.
+        ("m!(Self, T)", "m!(Host, T)"),
+        ("[u8; Self::LEN]", "[u8; <Host>::LEN]"),
+        ("[u8; Self]", "[u8; Self]"),
+        // One pass: a value is not substituted again.
+        ("Rel<M, K>", "Rel<K, K>"),
+    ] {
+        let mut args = arguments(&[written]);
+        substitute_args(args.iter_mut(), site).unwrap();
+        assert_eq!(
+            strings(&args),
+            strings(&arguments(&[expected])),
+            "{}",
+            written
+        );
+    }
+}
+
+#[test]
+fn substitute_args_refuses_a_value_that_does_not_fit_and_changes_nothing() {
+    // (the arguments, the name, its value)
+    for (written, name, value) in [
+        // A whole argument is a type or a const, not a lifetime or a binding.
+        (&["T"][..], "T", "'x"),
+        (&["Rel<T>"][..], "T", "'x"),
+        (&["Rel<T>"][..], "T", "Item = u8"),
+        // Part of a type is a type.
+        (&["&T"][..], "T", "3"),
+        (&["(T,)"][..], "T", "'x"),
+        (&["fn(T)"][..], "T", "3"),
+        (&["T::A"][..], "T", "3"),
+        (&["Rel<Item = T>"][..], "T", "3"),
+        // `Self` in a macro is a type.
+        (&["m!(Self)"][..], "Self", "3"),
+        // An expression takes a const, or a type that is one identifier.
+        (&["[u8; N]"][..], "N", "Vec<u8>"),
+        (&["[u8; { N }]"][..], "N", "'x"),
+        (&["[u8; N]"][..], "N", "::p::M"),
+        // A lifetime takes a lifetime.
+        (&["&'a u8"][..], "a", "u8"),
+        (&["Rel<'a>"][..], "a", "3"),
+        // The first of several arguments is replaced, and then the call fails: no change.
+        (&["Rel<U>", "&'a T", "T"][..], "a", "u8"),
+    ] {
+        let mut args = arguments(written);
+        let before = args.clone();
+        let value: GenericArgument = parse_str(value).unwrap();
+        let err = substitute_args(args.iter_mut(), |asked: &Ident| {
+            if asked == name {
+                Some(value.clone())
+            } else if asked == "U" {
+                Some(parse_quote!(u8))
+            } else {
+                None
+            }
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, EncodeError::UnexpectedArgument(found) if **found == value),
+            "{:?} with {}: {:?}",
+            written,
+            name,
+            err
+        );
+        assert_eq!(args, before, "{:?} with {}", written, name);
+    }
+}
+
+#[test]
+fn substitute_args_changes_nothing_for_an_empty_list_or_no_answer() {
+    substitute_args(std::iter::empty(), |_: &Ident| -> Option<GenericArgument> {
+        unreachable!()
+    })
+    .unwrap();
+    let mut args = arguments(&["Rel<T, 'a, N>", "&'a Self"]);
+    let before = args.clone();
+    substitute_args(args.iter_mut(), |_: &Ident| None).unwrap();
+    assert_eq!(args, before);
+}
+
+// ── repeater_projection() ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn repeater_projection_writes_the_generics_of_the_entry_by_their_names() {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, T: ?Sized + 'a, const N: usize, const B: bool> {
+            fn f(&self, x: &'a Wrap<T, N, B>);
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
+    let (ix, _, context) = referrer.iter().next().unwrap();
+    let repeater = repeater();
+    let key = repeater_key(7, ix);
+    let host: Type = parse_quote!(Host);
+    // Lifetimes, an unsized type, the consts (by name) in the slots, and the bounds of the
+    // generics.
+    let projection =
+        repeater_projection(&repeater, &host, context, 7, ix, slot_const(&repeater)).unwrap();
+    let expected: Type = parse_quote!(<Host as crate::Repeater<(
+        &'a (),
+        *const T,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        [(); N],
+        &'a T
+    ), #key>>::Type);
+    assert_eq!(projection, expected);
+    // The error of `const_fn` is the error of the call: `array_const` has no `bool`.
+    let err = repeater_projection(&repeater, &host, context, 7, ix, array_const).unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnsupportedConstType(_)),
+        "{}",
+        err
+    );
 }

@@ -2390,7 +2390,7 @@ pub mod kinds {
     // that leaves the defaults out (`inst(..)`). Each fails to build on the code before the fix.
 
     /// F65: the default `Defd<T>` of a trait nested in a module, whose bound `T: AsRef<Self>` names
-    /// `Self`. `Referrer::complete_args()` found no entry for it and left it as written, a type that
+    /// `Self`. The completion of the arguments found no entry for it and left it as written, a type that
     /// the Referrer's crate does not import (E0412). The trait is not declared again there: the
     /// use site completes the arguments.
     #[prop_leak(id = 9224, allow_self = true, scope = "mod", prelude = true)]
@@ -2413,7 +2413,7 @@ pub mod kinds {
     );
 
     /// F66: the default of a type parameter that names a braced const parameter, which
-    /// `Referrer::complete_args()` substitutes.
+    /// `complete_params()` substitutes.
     #[prop_leak(id = 9227, allow_self = true, prelude = true)]
     pub struct BracedDefault<const N: usize, T: Into<[u8; N]>, U = [u8; { N }]>(
         pub T,
@@ -2503,7 +2503,7 @@ pub mod kinds {
     }
 
     /// F69: the default of a parameter that is such a function pointer, which
-    /// `Referrer::complete_args()` completes when the use site leaves it out.
+    /// `complete_params()` completes when the use site leaves it out.
     #[prop_leak(id = 9233, allow_self = true, prelude = true)]
     pub struct ElidedDefault<T, U = fn(&T) -> &u8>(pub T, pub U, pub Rel);
 
@@ -2626,7 +2626,7 @@ pub mod kinds {
         pub cl: ClConcrete<U>,
     }
 
-    /// A type with const parameters of the two types that `encode_slot_const()` puts where no other
+    /// A type with const parameters of the two types that `slot_const()` puts where no other
     /// goes.
     pub struct Keyed<const N: u64, const M: u128>;
 
@@ -2634,7 +2634,7 @@ pub mod kinds {
     pub struct Marker9236;
 
     /// 9236: const generics of type `u64` and `u128` in the arguments of the Repeater.
-    /// `encode_slot_const()` puts a `u128` into the `KEY` argument (with the id and the index,
+    /// `slot_const()` puts a `u128` into the `KEY` argument (with the id and the index,
     /// `repeater_key()`) and a `u64` into the slot `U64`, so the entries use one, the other and
     /// both.
     #[prop_leak(

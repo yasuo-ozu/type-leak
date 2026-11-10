@@ -1,15 +1,16 @@
 //! The definition of the Repeater trait, encoding generics into its const slots, and the pieces of
 //! its impls ([`RepeaterImpl`], [`ImplSelf`]).
 
-use crate::context::ModuleScope;
 #[cfg(doc)]
 use crate::context::SelfRequirement;
-use crate::encode::{const_param_primitive, normalize_const_arg, EncodeError};
+use crate::context::{Context, ModuleScope};
+use crate::encode::{
+    const_param_primitive, encode_generics_args_with_params, normalize_const_arg, params_as_args,
+    EncodeError,
+};
 use crate::referrer::EntryId;
 #[cfg(doc)]
 use crate::referrer::Referrer;
-#[cfg(doc)]
-use crate::referrer::UseSite;
 use proc_macro2::{Span, TokenStream};
 use syn::*;
 use template_quote::ToTokens;
@@ -36,9 +37,8 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// // The `EntryId` 3 (a macro gets one from `Referrer::iter()`).
-/// let nth: EntryId = parse_quote!(3);
-/// assert_eq!(repeater_key(7, nth), (7u128 << 64) | 3);
+/// // `3` is an `EntryId`, as a macro gets one from `Referrer::iter()`.
+/// assert_eq!(repeater_key(7, parse_quote!(3)), (7u128 << 64) | 3);
 /// ```
 #[must_use]
 pub fn repeater_key(id: u64, nth: EntryId) -> u128 {
@@ -54,7 +54,7 @@ pub fn repeater_key(id: u64, nth: EntryId) -> u128 {
 /// `T` is the encoding of the generics of an entry and `KEY` is `repeater_key(ID, NTH)` for the
 /// Leaker `ID` and its entry `NTH` ([`repeater_key()`]). A defaulted const slot per other
 /// primitive type (`BOOL`, `CHAR`, `U8`, .., `ISIZE`) carries the other const generics
-/// ([`encode_slot_const()`]), and `Repeater<T, KEY>` still works. `const N: usize` is `[(); N]`
+/// ([`slot_const()`]), and `Repeater<T, KEY>` still works. `const N: usize` is `[(); N]`
 /// ([`array_const()`](crate::array_const)) and a `u128` uses `KEY`, so if every const parameter is
 /// one of these you can write the trait by hand instead:
 /// `pub trait Repeater<T: ?Sized, const KEY: u128> { type Type: ?Sized; }`. The generated trait
@@ -64,12 +64,9 @@ pub fn repeater_key(id: u64, nth: EntryId) -> u128 {
 /// # use type_leak::*;
 /// # use syn::*;
 /// let def = repeater_definition(&parse_quote!(pub), &parse_quote!(Repeater));
+/// assert_eq!(def.ident, "Repeater");
 /// // `T`, `KEY` and a slot for each primitive const type but `usize` and `u128`.
 /// assert_eq!(def.generics.params.len(), 2 + 12);
-/// assert_eq!(def.ident, "Repeater");
-/// // The trait is an `ItemTrait`: write it with `ToTokens`.
-/// # use template_quote::ToTokens;
-/// assert!(def.to_token_stream().to_string().starts_with("pub trait Repeater <"));
 /// ```
 #[must_use]
 pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
@@ -92,76 +89,84 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     }
 }
 
-/// Returns the path of the Repeater with the arguments of the entry `ix` of the Leaker `id`:
-/// `Repeater<args, KEY>` with `KEY` from [`repeater_key(id, ix)`](repeater_key).
-///
-/// `repeater` is the path of the Repeater trait, which [`repeater_definition()`] defines. `args`
-/// is the first argument, as
-/// [`encode_generics_args_with_params()`](crate::encode_generics_args_with_params) writes it for
-/// a use. Write the projection ([`repeater_projection()`]) with this path, so that a change
-/// of the parameters of the Repeater does not reach your macro. `ToTokens` of
-/// [`RepeaterImpl`](crate::RepeaterImpl) writes the impl with the same path, `KEY` included.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let repeater: Path = parse_quote!(crate::Repeater);
-/// let ix: EntryId = parse_quote!(0);
-/// let path = repeater_trait_path(&repeater, &parse_quote!((&'a (), T)), 7, ix);
-/// let key = repeater_key(7, ix);
-/// assert_eq!(path, parse_quote!(crate::Repeater<(&'a (), T), #key>));
-/// ```
-#[must_use]
-pub fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: EntryId) -> Path {
+// The path of the Repeater with the arguments of the entry `ix` of the Leaker `id`:
+// `Repeater<args, KEY>` with `KEY` from `repeater_key(id, ix)`. `args` is the first argument, as
+// `encode_generics_args_with_params()` writes it.
+pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: EntryId) -> Path {
     let key = repeater_key(id, ix);
     parse_quote!(#repeater<#args, #key>)
 }
 
-/// Returns `<self_ty as Repeater<args, KEY>>::Type`: the type that stands for the entry `ix` of
-/// the Leaker `id` at a use ([`repeater_trait_path()`]).
+/// Returns `<self_ty as Repeater<ARGS, KEY>>::Type`: the type that stands for the entry `ix` of
+/// the Leaker `id` in the copy.
 ///
-/// `self_ty` is what the path is written for: `Self` in the copy, or the host.
+/// `repeater` is the path of the Repeater trait ([`repeater_definition()`]), and `self_ty` is what
+/// the path is written for: `Self` in the copy, or the host. `context` is the [`Context`] of the
+/// entry ([`Referrer::iter()`](crate::Referrer::iter) and the closures of
+/// [`Referrer::visitor()`](crate::Referrer::visitor) give it). `KEY` is
+/// [`repeater_key(id, ix)`](repeater_key), and `ARGS` is made from the generics of the entry, each
+/// by its own name, with the encoding that the Leaker's [`RepeaterImpl::args`] has: a lifetime
+/// `'a` is `&'a ()`, a type is itself (`*const T` if it is `?Sized`), a const is
+/// `const_fn(N, param)` ([`array_const`](crate::array_const) or
+/// [`slot_const(&repeater)`](slot_const)), and a bound `T: 'a` or `Self: 'a` adds `&'a T` (with
+/// `self_ty` for `Self`). The copy of a use site gets the arguments of the site by
+/// [`substitute_args()`](crate::substitute_args) afterwards. Fails with the error of `const_fn`, or
+/// with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a lifetime
+/// bound where `Self: 'a` needs one.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Wrap<T>; }), true);
+/// let referrer = leaker.result().finish().unwrap();
+///
+/// // The entry `Wrap<T>`, written with its own generics.
+/// let (ix, _, context) = referrer.iter().next().unwrap();
 /// let repeater: Path = parse_quote!(crate::Repeater);
-/// let ix: EntryId = parse_quote!(1);
-/// let ty = repeater_projection(&repeater, &parse_quote!(Self), &parse_quote!((T,)), 7, ix);
-/// let key = repeater_key(7, ix);
-/// assert_eq!(ty, parse_quote!(<Self as crate::Repeater<(T,), #key>>::Type));
+/// let ty = repeater_projection(&repeater, &parse_quote!(Self), context, 42, ix, array_const);
+/// let key = repeater_key(42, ix);
+/// assert_eq!(ty.unwrap(), parse_quote!(<Self as crate::Repeater<(T,), #key>>::Type));
 /// ```
-#[must_use]
 pub fn repeater_projection(
     repeater: &Path,
     self_ty: &Type,
-    args: &Type,
+    context: &Context,
     id: u64,
     ix: EntryId,
-) -> Type {
-    let path = repeater_trait_path(repeater, args, id, ix);
-    parse_quote!(<#self_ty as #path>::Type)
+    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    let args: Vec<GenericArgument> = params_as_args(&context.generics.params);
+    let args = encode_generics_args_with_params(
+        &args,
+        &context.generics.params,
+        Some((self_ty, &context.self_outlives)),
+        const_fn,
+    )?;
+    let path = repeater_trait_path(repeater, &args, id, ix);
+    Ok(parse_quote!(<#self_ty as #path>::Type))
 }
 
-/// Returns `|value, param| encode_slot_const(repeater, value, &param.ty)`: the `const_fn` of
-/// [`encode_generics_args_with_params()`](crate::encode_generics_args_with_params) and
-/// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls).
+/// Returns the `const_fn` of [`repeater_projection()`] and
+/// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls) for the Repeater at the
+/// path `repeater`: it encodes a const `value` of a parameter `param` into the const slots of the
+/// Repeater from [`repeater_definition()`].
 ///
-/// See [`encode_slot_const()`] for what it writes.
+/// `const N: usize` is `[(); N]`, a `u128` uses `KEY`, and any other primitive type is a trait
+/// object of the Repeater with its slot filled. It fails with [`EncodeError::UnsupportedConstType`]
+/// if the type of `param` is not a primitive type (also an alias of one: it cannot tell the slot).
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
 /// let repeater: Path = parse_quote!(crate::Repeater);
 /// let mut const_fn = slot_const(&repeater);
-/// // `usize` is an array length, and `bool` fills its slot of the Repeater.
-/// let param: ConstParam = parse_quote!(const N: usize);
-/// assert_eq!(const_fn(&parse_quote!(3), &param).unwrap(), parse_quote!([(); 3]));
-/// let param: ConstParam = parse_quote!(const B: bool);
-/// assert_eq!(
-///     const_fn(&parse_quote!(true), &param).unwrap(),
-///     parse_quote!(*const dyn crate::Repeater<(), 0, true, Type = ()>)
-/// );
+/// // `bool` fills its slot of the Repeater.
+/// let slot = const_fn(&parse_quote!(true), &parse_quote!(const B: bool));
+/// assert_eq!(slot.unwrap(), parse_quote!(*const dyn crate::Repeater<(), 0, true, Type = ()>));
+/// // An alias is not supported.
+/// let alias = const_fn(&parse_quote!(1), &parse_quote!(const A: Alias));
+/// assert!(matches!(alias, Err(EncodeError::UnsupportedConstType(_))));
 /// ```
 pub fn slot_const(
     repeater: &Path,
@@ -169,36 +174,9 @@ pub fn slot_const(
     move |value, param| encode_slot_const(repeater, value, &param.ty)
 }
 
-/// Encodes the const `value` of type `ty` for the Repeater at the path `repeater`. Fails with
-/// [`EncodeError::UnsupportedConstType`] if `ty` is not a primitive type.
-///
-/// It is the encoding of the const slots of the Repeater from [`repeater_definition()`]:
-/// `const N: usize` is `[(); N]`, `const X: u128` uses `KEY`, and any other primitive is a trait
-/// object of the Repeater with its slot filled. A const parameter of an alias type is an
-/// [`EncodeError::UnsupportedConstType`]. Pass [`slot_const()`] as the `const_fn` of
-/// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls) and
-/// [`encode_generics_args_with_params()`](crate::encode_generics_args_with_params).
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let repeater: Path = parse_quote!(crate::Repeater);
-/// // The `bool` value goes into the slot of the Repeater for `bool`.
-/// let ty = encode_slot_const(&repeater, &parse_quote!(true), &parse_quote!(bool)).unwrap();
-/// assert_eq!(ty, parse_quote!(*const dyn crate::Repeater<(), 0, true, Type = ()>));
-/// // `u64` has a slot, and `u128` is the `KEY` itself.
-/// let ty = encode_slot_const(&repeater, &parse_quote!(4), &parse_quote!(u64)).unwrap();
-/// assert_eq!(
-///     ty,
-///     parse_quote!(*const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 4, Type = ()>)
-/// );
-/// let ty = encode_slot_const(&repeater, &parse_quote!(5), &parse_quote!(u128)).unwrap();
-/// assert_eq!(ty, parse_quote!(*const dyn crate::Repeater<(), 5, Type = ()>));
-/// // `usize` needs no slot: it is an array length.
-/// let ty = encode_slot_const(&repeater, &parse_quote!(3), &parse_quote!(usize)).unwrap();
-/// assert_eq!(ty, parse_quote!([(); 3]));
-/// ```
-pub fn encode_slot_const(
+/// Encodes the const `value` of type `ty` into the const slots of the Repeater at the path
+/// `repeater` ([`slot_const()`] writes what).
+pub(crate) fn encode_slot_const(
     repeater: &Path,
     value: &Expr,
     ty: &Type,
@@ -267,28 +245,23 @@ pub enum ImplSelf<'a> {
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// # use template_quote::{quote, ToTokens};
-/// let item: ItemStruct = parse_quote!(struct S<T> { a: Wrap<T> });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&item, false);
+/// leaker.intern_struct(&parse_quote!(struct S(Rel);), true);
 /// let result = leaker.result();
 ///
 /// let repeater: Path = parse_quote!(crate::Repeater);
-/// let param: Ident = parse_quote!(__S);
 /// let r = result
-///     .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+///     .repeater_impls(&repeater, 7, ImplSelf::Param(&parse_quote!(__S)), array_const)
 ///     .unwrap()
 ///     .next()
 ///     .unwrap();
 ///
 /// // `ToTokens` writes the `KEY` of the entry 0 of the id 7.
 /// let key = repeater_key(7, r.entry);
-/// let expected: ItemImpl = parse_quote! {
-///     impl<T, __S: ?::core::marker::Sized> crate::Repeater<(T,), #key> for __S {
-///         type Type = Wrap<T>;
-///     }
-/// };
-/// assert_eq!(parse2::<ItemImpl>(quote!(#r)).unwrap(), expected);
+/// let imp: ItemImpl = parse_quote!(#r);
+/// assert_eq!(imp, parse_quote! {
+///     impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S { type Type = Rel; }
+/// });
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -328,10 +301,8 @@ pub struct RepeaterImpl {
     /// crate::Repeater<(T,)>
     /// ```
     pub path: Path,
-    /// The first argument of the Repeater: what
-    /// [`encode_generics_args_with_params()`](crate::encode_generics_args_with_params) writes for
-    /// the arguments of [`UseSite::identity()`], but with the self type of the impl for `Self`
-    /// (`&'a __S`, not `&'a Self`, for `Self: 'a`).
+    /// The first argument of the Repeater: what [`repeater_projection()`] writes for the entry,
+    /// but with the self type of the impl for `Self` (`&'a __S`, not `&'a Self`, for `Self: 'a`).
     pub args: Type,
     /// The leaked type, which is the `Type` of the impl.
     pub ty: Type,
@@ -342,11 +313,7 @@ pub struct RepeaterImpl {
     ///
     /// ```ignore
     /// // In crate a, analyzed with `intern_mod()`: the entry `Rel`.
-    /// pub mod outer {
-    ///     pub mod inner {
-    ///         pub struct S { a: Rel }
-    ///     }
-    /// }
+    /// pub mod outer { pub mod inner { pub struct S { a: Rel } } }
     ///
     /// // `module` of the impl of `Rel`, which is in `inner` (context 1):
     /// Some(Itself { id: 1, path: Some([inner]), hint: None, parent: Some(0) })
@@ -392,21 +359,19 @@ impl RepeaterImpl {
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S<T> { a: Wrap<T> }), true);
+/// leaker.intern_struct(&parse_quote!(struct S(Rel);), true);
 /// let result = leaker.result();
 /// let repeater: Path = parse_quote!(crate::Repeater);
-/// let param: Ident = parse_quote!(__S);
-/// let target = ImplSelf::Param(&param);
-/// let r = result.repeater_impls(&repeater, 7, target, array_const).unwrap().next().unwrap();
+/// let marker: Type = parse_quote!(Marker);
+/// let r = result
+///     .repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const)
+///     .unwrap()
+///     .next()
+///     .unwrap();
 /// let key = repeater_key(7, r.entry);
-///
-/// let imp = ItemImpl::from(r);
-/// let expected: ItemImpl = parse_quote! {
-///     impl<T, __S: ?::core::marker::Sized> crate::Repeater<(T,), #key> for __S {
-///         type Type = Wrap<T>;
-///     }
-/// };
-/// assert_eq!(imp, expected);
+/// let expected: ItemImpl =
+///     parse_quote!(impl crate::Repeater<(), #key> for Marker { type Type = Rel; });
+/// assert_eq!(ItemImpl::from(r), expected);
 /// ```
 impl From<RepeaterImpl> for ItemImpl {
     fn from(r: RepeaterImpl) -> Self {

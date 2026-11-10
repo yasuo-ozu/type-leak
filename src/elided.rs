@@ -5,7 +5,7 @@
 //! a type with lifetimes adds some, and rustc cannot tell which one the output has (E0106). That is
 //! `Self` for `Visitor::with_self()`: `fn(&Self) -> &u8` is valid in `struct S<'a>`, but
 //! `fn(&::p::S<'a>) -> &u8` has two lifetimes in its inputs. It is a type parameter that
-//! `UseSite::substitute()` or `Referrer::complete_args()` replaces, too: `fn(&U) -> &u8` with
+//! `substitute_args()` or `complete_params()` replaces, too: `fn(&U) -> &u8` with
 //! `U := &'static str`. And it is the path through the Repeater that replaces an entry, whose
 //! arguments name the lifetimes of the site: `fn(&Vec<U>) -> &u8` with the entry `Vec<U>` is
 //! `fn(&<X as Repeater<(&'static str,), ..>>::Type) -> &u8`, which the Visitor cannot know until
@@ -123,11 +123,11 @@ fn collect_lifetimes(tokens: TokenStream, names: &mut HashSet<String>) {
     }
 }
 
-/// The fresh lifetimes of the copy of a type at a use site (`UseSite::substitute()`,
-/// `Referrer::complete_args()`).
+/// The fresh lifetimes of the copy of a type at a use site (`substitute_args()`,
+/// `complete_params()`).
 ///
 /// The generics in scope there are not known, so a name is `'__tl_s<n>` for the first `n` that no
-/// lifetime in what the copy is made of (the type, the arguments, the parameters, `Self`) is named
+/// lifetime in what the copy is made of (the arguments, what replaces a name) is named
 /// like ([`Names::reserve()`]); the prefix keeps it from the lifetimes that a macro declares and
 /// from the Visitor's (`'__tl_e<n>`). `n` counts the signatures around, so that a signature inside
 /// the binder of another gets another name (E0496), and the output is the same for the same input.

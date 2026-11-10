@@ -1684,14 +1684,14 @@ mod limits {
             Ok(vec!["RelType".to_string()].into_iter().collect())
         );
 
-        // `encode_slot_const()` cannot encode an alias (relative or absolute), because it cannot
+        // `slot_const()` cannot encode an alias (relative or absolute), because it cannot
         // know which slot to use.
         let repeater: Path = parse2(quote!(crate::Repeater)).unwrap();
         let alias = match &abs_item.generics.params[0] {
             GenericParam::Const(param) => param,
             _ => unreachable!(),
         };
-        let err = encode_slot_const(&repeater, &parse_quote!(N), &alias.ty).unwrap_err();
+        let err = slot_const(&repeater)(&parse_quote!(N), alias).unwrap_err();
         assert_eq!(
             err.to_string(),
             "unsupported type of const parameter: ':: my_crate :: Idx'"

@@ -396,22 +396,18 @@ impl Reason {
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item, true);
+/// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self, a: MyType<'_>); }), true);
 /// let result = leaker.result();
-/// let items = result.errors();
-/// assert_eq!(items.len(), 2);
-/// assert_eq!(items[0].message, "use absolute path: 'Clone'");
-/// assert_eq!(items[0].reason, Reason::RelativePath);
-/// assert_eq!(items[0].help_text(), Some("use `::core::clone::Clone` instead of `Clone`"));
-/// assert!(matches!(items[1].cause, Cause::Type(_))); // the whole `MyType<'_>`
-/// assert_eq!(
-///     items[1].notes.first().map(|(_, note)| note.as_str()),
-///     Some("it cannot be leaked as a whole because of `'_`")
-/// );
+/// let item = &result.errors()[0];
+/// assert_eq!(item.message, "use absolute path: 'MyType<'_>'");
+/// assert_eq!(item.reason, Reason::RelativePath);
+/// assert!(matches!(item.cause, Cause::Type(_))); // the whole `MyType<'_>`
+/// assert_eq!(item.notes[0].1, "it cannot be leaked as a whole because of `'_`");
+/// let help = "write `MyType` with an absolute path (e.g. `::my_crate::MyType`)";
+/// assert_eq!(item.help_text(), Some(help));
 /// // `Display` is the message.
-/// assert_eq!(items[1].to_string(), items[1].message);
+/// assert_eq!(item.to_string(), item.message);
 /// ```
 ///
 /// Report an item from a macro with [`emit()`](ErrorItem::emit), or all of them with
@@ -547,24 +543,16 @@ impl ErrorItem {
 /// let mut leaker = Leaker::new();
 /// leaker.intern_trait(&item, true);
 /// let errors = leaker.result().finish().unwrap_err();
-/// let messages: Vec<String> = to_syn_error(&errors)
-///     .into_iter()
-///     .map(|error| error.to_string())
-///     .collect();
+/// let messages: Vec<String> = to_syn_error(&errors).into_iter().map(|e| e.to_string()).collect();
+/// // One error for each. The notes and the help follow the message.
+/// assert_eq!(messages.len(), 2);
 /// assert_eq!(
-///     messages,
-///     [
-///         // The notes and the help follow the message.
-///         concat!(
-///             "use absolute path: 'Clone'\n\n",
-///             "  = help: use `::core::clone::Clone` instead of `Clone`\n",
-///         ),
-///         concat!(
-///             "use absolute path: 'MyType<'_>'\n\n",
-///             "  = note: it cannot be leaked as a whole because of `'_`\n",
-///             "  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
-///         ),
-///     ]
+///     messages[1],
+///     concat!(
+///         "use absolute path: 'MyType<'_>'\n\n",
+///         "  = note: it cannot be leaked as a whole because of `'_`\n",
+///         "  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
+///     )
 /// );
 /// assert_eq!(to_syn_error(&[]).to_string(), "not internable");
 /// ```

@@ -1990,7 +1990,6 @@ mod self_outlives {
     use template_quote::{quote, ToTokens};
     use type_leak::{
         array_const, Context, ContextId, ImplSelf, Leaker, LeakerResult, Referrer, SelfRequirement,
-        UseSite,
     };
 
     /// The tag of the format of a serialized Referrer, which it starts with.
@@ -2231,7 +2230,7 @@ mod self_outlives {
         };
         let encoded = common::repeater_args(
             common::entry(&referrer, 0),
-            &UseSite::identity(),
+            common::identity,
             Some(self_ty),
             array_const,
         )

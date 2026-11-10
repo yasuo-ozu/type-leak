@@ -42,23 +42,13 @@ mod forward;
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// let sig: Signature = parse_quote!(fn f<T>(x: Rel<T>) -> Rel2<T> where T: ::p::Bound<Rel3>);
+/// let sig: Signature = parse_quote!(fn f<T>(x: Rel<T>) where T: ::p::Bound<Rel2>);
 /// let mut leaker = Leaker::new();
-/// leaker
-///     .enter_generics(&sig.generics, |view| {
-///         for input in &sig.inputs {
-///             if let FnArg::Typed(arg) = input {
-///                 view.visit_type(&arg.ty);
-///             }
-///         }
-///         if let ReturnType::Type(_, ty) = &sig.output {
-///             view.visit_type(ty);
-///         }
-///         if let Some(where_clause) = &sig.generics.where_clause {
-///             view.visit_where_clause(where_clause);
-///         }
-///     });
-/// assert_eq!(leaker.result().finish().unwrap().iter().count(), 3);
+/// leaker.enter_generics(&sig.generics, |view| {
+///     view.visit_type(&parse_quote!(Rel<T>)); // the type of `x`
+///     view.visit_where_clause(sig.generics.where_clause.as_ref().unwrap());
+/// });
+/// assert_eq!(leaker.result().finish().unwrap().iter().count(), 2);
 /// ```
 pub struct View<'v, 'a, A = ()> {
     visitor: &'v mut AnalyzeVisitor<'a, A>,

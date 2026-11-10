@@ -15,42 +15,23 @@ fn repeater() -> Path {
     parse_quote!(crate::Repeater)
 }
 
-/// The error of encoding the arguments in `args` for the parameters in `generics`: completing
-/// them, then writing them at a use site of an entry that uses every generic.
+/// The error of completing the arguments in `args` for the parameters in `generics`.
 fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
-    let empty = Leaker::new().result().into_referrer();
-    // The only context of a Referrer with no entry.
-    let context: ContextId = parse_str("0").unwrap();
-    let completed =
-        match empty.complete_args(context, &generics.params, &args.args, |_, _, _, _| {
-            unreachable!()
-        }) {
-            Ok(completed) => completed,
-            Err(error) => return error,
-        };
-    let used = generics.params.iter().map(|param| match param {
-        GenericParam::Lifetime(param) => param.lifetime.to_token_stream(),
-        GenericParam::Type(param) => param.ident.to_token_stream(),
-        GenericParam::Const(param) => param.ident.to_token_stream(),
-    });
-    let item: ItemTrait = parse_quote!(trait Tr #generics { fn f(&self) -> Wrap<#(#used),*>; });
+    complete_params(&generics.params, &args.args).unwrap_err()
+}
+
+/// The error of writing the path through the Repeater for an entry that needs `Self: 'a`, for the
+/// type in `source` as `Self`, a trait object without a lifetime bound.
+fn unbounded_self_error(source: &str) -> EncodeError {
+    let item: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    let (_, _, context) = referrer.iter().next().unwrap();
-    let self_ty: Type = parse_quote!(Self);
-    UseSite::substituting(&generics.params, &completed)
-        .generic_args(&context.generics)
-        .and_then(|args| {
-            encode_generics_args_with_params(
-                &args,
-                &context.generics.params,
-                Some((&self_ty, &context.self_outlives)),
-                slot_const(&repeater()),
-            )
-        })
+    let self_ty: Type = parse_str(source).unwrap();
+    let (ix, _, context) = referrer.iter().next().unwrap();
+    repeater_projection(&repeater(), &self_ty, context, 7, ix, slot_const(&repeater()))
         .unwrap_err()
 }
 
@@ -65,8 +46,7 @@ fn params_error(generics: &str) -> EncodeError {
             _ => None,
         })
         .unwrap();
-    encode_slot_const(&repeater(), &parse_quote!(N), &param.ty)
-        .unwrap_err()
+    slot_const(&repeater())(&parse_quote!(N), param).unwrap_err()
 }
 
 /// The error of `repeater_impls()` for a marker, which cannot name `Self`: the entry `Wrap<T,
@@ -100,12 +80,7 @@ fn errors() -> Vec<(EncodeError, &'static str, &'static str, usize)> {
         ),
         (args_error("<T>", "<u8, u16>"), "<u8, u16>", "u16", 0),
         (args_error("<'a, T>", "<u8>"), "<'a, T>", "'a", 0),
-        (
-            args_error("<'a, T: ?Sized + 'a>", "<'x, dyn Tr>"),
-            "<'x, dyn Tr>",
-            "dyn Tr",
-            0,
-        ),
+        (unbounded_self_error("dyn Tr"), "dyn Tr", "dyn Tr", 0),
         (
             needs_self_error(NEEDS_SELF_SOURCE),
             NEEDS_SELF_SOURCE,

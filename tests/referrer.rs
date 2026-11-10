@@ -7,7 +7,7 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
     array_const, repeater_key, repeater_projection, Context, ContextId, EntryId, ImplSelf, Leaker,
-    LeakerResult, ModuleScope, Referrer, SelfRequirement, UseSite,
+    LeakerResult, ModuleScope, Referrer, SelfRequirement,
 };
 
 /// The tag of the format of a serialized Referrer, which it starts with.
@@ -1265,8 +1265,7 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
     let mut first = referrer.visitor(top_level, |_, ix, context| {
         // The Referrer is usable here, as the context is.
         assert!(referrer.bucket_self(ix, 7).is_some());
-        let args = common::repeater_args(context, &UseSite::identity(), None, array_const).unwrap();
-        repeater_projection(&repeater, &parse_quote!(Self), &args, 7, ix)
+        repeater_projection(&repeater, &parse_quote!(Self), context, 7, ix, array_const).unwrap()
     });
     let mut second = referrer.visitor(top_level, |_, ix, _| parse_quote!(P<#ix>));
     first.visit_item_trait_mut(&mut with_args);

@@ -269,12 +269,12 @@
 //! - **Use sites with arguments** (`inst(N)`, `prop.rs: Instance`): the item is also used at an
 //!   instantiation of its generics (lifetimes `'static` or named by the use site, types `(u8, u16)`,
 //!   `Vec<u8>`, `str`, consts `3`, `{ 2 + 1 }`, the defaults at the end left out for
-//!   `Referrer::complete_args()`): a trait is implemented for a host with them, each position is
-//!   compared with the witness called with them, `S<given>` must be `S<completed>`, and
-//!   `UseSite::generic_args()` must refuse a list with an argument too many, of another
-//!   kind or missing. A parameter that a function pointer or `Fn(..)` with an elided output names in
+//!   `complete_params()`): a trait is implemented for a host with them, each position is
+//!   compared with the witness called with them, `S<given>` must be `S<completed>`, and the library
+//!   must refuse a list with an argument too many or the last missing (`complete_params()`),
+//!   or one of another kind (`substitute_args()`). A parameter that a function pointer or `Fn(..)` with an elided output names in
 //!   its inputs is given a type that holds a lifetime (`&'static str`) in a share of the items, and
-//!   the copy must name the elided lifetime there (F69, `UseSite::substitute()`, and F70 where the
+//!   the copy must name the elided lifetime there (F69, `substitute_args()`, and F70 where the
 //!   path through the Repeater that replaces an entry in the inputs names it): the summary counts the
 //!   pairs of a parameter and a signature (`inst_elided`), and those with a replaced entry in the
 //!   inputs (`inst_elided_entry`), each with the pairs the instantiation could have made

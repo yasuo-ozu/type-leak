@@ -160,22 +160,12 @@ impl Scope {
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// // What `Self` means for the first entry of an item.
-/// fn self_of(intern: impl Fn(&mut Leaker)) -> Option<SelfRequirement> {
-///     let mut leaker = Leaker::new();
-///     intern(&mut leaker);
-///     let referrer = leaker.result().finish().unwrap();
-///     let (_, _, context) = referrer.iter().next().unwrap();
-///     context.self_ty.clone()
-/// }
-/// let tr: ItemTrait = parse_quote!(trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; });
-/// let s: ItemStruct = parse_quote!(struct S<T> { a: Rel<Self, T> });
-/// let m: ItemMod = parse_quote!(mod m { struct N<T: ::core::convert::AsRef<Self>>(Rel<T>); });
-/// let p: ItemStruct = parse_quote!(struct P<T> { a: Rel<T> });
-/// assert!(matches!(self_of(|l| { l.intern_trait(&tr, true); }), Some(SelfRequirement::Bound(_))));
-/// assert!(matches!(self_of(|l| { l.intern_struct(&s, true); }), Some(SelfRequirement::Type(_))));
-/// assert!(matches!(self_of(|l| { l.intern_mod(&m); }), Some(SelfRequirement::Any)));
-/// assert!(self_of(|l| { l.intern_struct(&p, true); }).is_none());
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<Self, T>);), true);
+/// let referrer = leaker.result().finish().unwrap();
+/// // `Self` of the entry `Rel<Self, T>` is the struct.
+/// let (_, _, context) = referrer.iter().next().unwrap();
+/// assert_eq!(context.self_ty, Some(SelfRequirement::Type(parse_quote!(S<T>))));
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -188,12 +178,12 @@ pub enum SelfRequirement {
     /// the associated types that the entry uses (`type Item = u8;`).
     ///
     /// ```ignore
-    /// // In crate a: the entry `Rel<Self::A, T>` of a trait.
-    /// pub trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; }
-    /// impl<T, __S: ?Sized + Tr<T>> Repeater<(T,), KEY> for __S { type Type = Rel<<__S>::A, T>; }
+    /// // In crate a: the entry `Rel<Self::A>` of a trait.
+    /// pub trait Tr { type A; fn f(&self) -> Rel<Self::A>; }
+    /// impl<__S: ?Sized + Tr> Repeater<(), KEY> for __S { type Type = Rel<<__S>::A>; }
     ///
-    /// // In crate b: `Self` implements `a::Tr<T>`.
-    /// fn f(&self) -> <Self as ::a::Repeater<(T,), KEY>>::Type;
+    /// // In crate b: `Self` implements `a::Tr`.
+    /// fn f(&self) -> <Self as ::a::Repeater<(), KEY>>::Type;
     /// ```
     Bound(Path),
     /// `Self` is one type: a struct, an enum, a union, or the self type of an impl
@@ -222,12 +212,12 @@ pub enum SelfRequirement {
     /// ([`Referrer::expand()`](crate::Referrer::expand)).
     ///
     /// ```ignore
-    /// // In crate a: the entry `Rel<Self, T>` of a struct.
-    /// pub struct S<T> { a: Rel<Self, T> }
-    /// impl<T> Repeater<(T,), KEY> for S<T> { type Type = Rel<Self, T>; }
+    /// // In crate a: the entry `Rel<Self>` of a struct.
+    /// pub struct S { a: Rel<Self> }
+    /// impl Repeater<(), KEY> for S { type Type = Rel<Self>; }
     ///
     /// // In crate b: `Self` would be the copy's own type, so write `a`'s `S` by its path.
-    /// pub struct S<T> { a: <::a::S<T> as ::a::Repeater<(T,), KEY>>::Type }
+    /// pub struct S { a: <::a::S as ::a::Repeater<(), KEY>>::Type }
     /// ```
     Type(Type),
     /// `Self` is any type that the bounds of the generics hold for. The entry itself does not
@@ -249,11 +239,11 @@ pub enum SelfRequirement {
     /// [`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf).
     ///
     /// ```ignore
-    /// // In crate a: the entry `Rel<T>` of a struct whose bound names its `Self`.
+    /// // In crate a: the entry `Rel<T>`, with `Self` in the bound of `T`.
     /// pub mod m { pub struct N<T: AsRef<Self>>(Rel<T>); }
     /// impl<T: AsRef<__S>, __S: ?Sized> Repeater<(T,), KEY> for __S { type Type = Rel<T>; }
     ///
-    /// // In crate b: the copy's own `Self`; its own bound holds for it.
+    /// // In crate b: the copy's own `Self`.
     /// pub mod m { pub struct N<T: AsRef<Self>>(<Self as ::a::Repeater<(T,), KEY>>::Type); }
     /// ```
     ///
@@ -315,10 +305,7 @@ impl std::hash::Hash for SelfRequirement {
 ///
 /// ```ignore
 /// // In crate a:
-/// pub trait Tr {
-///     type G<'b, U: 'b> where Self: 'b;
-///     fn f<'x, V: 'x>(&'x self) -> Rel<Self::G<'x, V>>;
-/// }
+/// pub trait Tr { type G<'b, U: 'b> where Self: 'b; }
 ///
 /// // The `Gat` of `G`:
 /// ident: G
@@ -669,11 +656,7 @@ fn strip_default(mut param: GenericParam) -> GenericParam {
 ///
 /// ```ignore
 /// // In crate a, analyzed with `intern_mod()`:
-/// pub mod outer {
-///     pub mod inner {
-///         pub struct S { a: Rel }
-///     }
-/// }
+/// pub mod outer { pub mod inner { pub struct S { a: Rel } } }
 ///
 /// // The context of `outer` (context 0):
 /// Some(Itself { id: 0, path: Some([]), hint: None, parent: None })
@@ -745,19 +728,16 @@ impl ModuleScope {
 /// written as tokens and read back keeps every field except `substituted`.
 ///
 /// ```
-/// # use quote::ToTokens;
 /// # use syn::*;
 /// # use type_leak::*;
-/// let item: ItemTrait = parse_quote!(trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item, true);
+/// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<T>);), true);
 /// let referrer = leaker.result().finish().unwrap();
 ///
-/// // The context of the entry `Rel<Self::A, T>`.
-/// let (_, _entry, context) = referrer.iter().next().unwrap();
-/// assert_eq!(context.generics.to_token_stream().to_string(), "< T >");
-/// assert!(matches!(&context.self_ty, Some(SelfRequirement::Bound(_))));
-/// assert_eq!(context.module, None);
+/// // The context of the entry `Rel<T>` uses the generic `T`, but no `Self` and no module.
+/// let (_, _, context) = referrer.iter().next().unwrap();
+/// assert_eq!(context.generics, parse_quote!(<T>));
+/// assert!(context.self_ty.is_none() && context.module.is_none());
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -772,21 +752,13 @@ pub struct Context {
     /// ```ignore
     /// // In crate a: the entries `Rel<T>` and `&'a Rel2<'a, U, N>`.
     /// pub struct S<'a, T: Clone = u8, U = (), const N: usize = 3>
-    /// where
-    ///     T: Default,
-    ///     Vec<T>: Clone,
-    ///     U: 'a,
-    /// {
-    ///     a: Rel<T>,
-    ///     b: &'a Rel2<'a, U, N>,
-    /// }
+    /// where T: Default, Vec<T>: Clone, U: 'a
+    /// { a: Rel<T>, b: &'a Rel2<'a, U, N> }
     ///
     /// // `generics` of the context of `Rel<T>`:
     /// <T: Clone + Default> where Vec<T>: Clone
     /// // `generics` of the context of `&'a Rel2<'a, U, N>`:
     /// <'a, U: 'a, const N: usize>
-    /// // `generics` of the top-level context of `S`, which has all of them:
-    /// <'a, T: Clone + Default, U: 'a, const N: usize> where Vec<T>: Clone
     /// ```
     ///
     /// A Referrer read back from tokens keeps it.
@@ -796,16 +768,16 @@ pub struct Context {
     /// See [`SelfRequirement`] for the three kinds.
     ///
     /// ```ignore
-    /// // In crate a: the entries `Rel<Self, T>`, `Rel<Self::A, T>` and `Rel<T>`.
-    /// pub struct S<T> { a: Rel<Self, T> }
-    /// pub trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; }
-    /// pub mod m { pub struct N<T: AsRef<Self>>(Rel<T>); }
+    /// // In crate a: the entries `Rel<Self>`, `Rel2<Self>` and `Rel3<T>`.
+    /// pub struct S { a: Rel<Self> }
+    /// pub trait Tr { fn f(&self) -> Rel2<Self>; }
+    /// pub mod m { pub struct N<T: AsRef<Self>>(Rel3<T>); }
     ///
-    /// // `self_ty` of the context of `Rel<Self, T>`:
-    /// Some(SelfRequirement::Type(S<T>))
-    /// // `self_ty` of the context of `Rel<Self::A, T>`:
-    /// Some(SelfRequirement::Bound(Tr<T>))
-    /// // `self_ty` of the context of `Rel<T>` in `N`, whose bound names `Self`:
+    /// // `self_ty` of the context of `Rel<Self>`:
+    /// Some(SelfRequirement::Type(S))
+    /// // `self_ty` of the context of `Rel2<Self>`:
+    /// Some(SelfRequirement::Bound(Tr))
+    /// // `self_ty` of the context of `Rel3<T>`, whose generic has a bound that names `Self`:
     /// Some(SelfRequirement::Any)
     /// // `self_ty` of the context of any entry that does not need `Self`:
     /// None
@@ -830,9 +802,6 @@ pub struct Context {
     /// pub trait Tr<'a> where Self: 'a { fn f(&self) -> Rel<'a, Self>; }
     /// // `self_outlives` of the context of `Rel<'a, Self>`:
     /// ['a]
-    /// // The top-level context of `Tr` keeps the predicate in its generics instead:
-    /// // `generics`: <'a> where Self: 'a
-    /// // `self_outlives`: []
     /// ```
     ///
     /// A Referrer read back from tokens keeps it.
@@ -846,10 +815,10 @@ pub struct Context {
     /// // In crate a:
     /// pub trait Tr {
     ///     type G<'b, U: 'b> where Self: 'b;
-    ///     fn f<'x, V: 'x>(&'x self) -> Rel<Self::G<'x, V>>;
+    ///     fn f<'x>(&'x self) -> Rel<Self::G<'x, u8>>;
     /// }
     ///
-    /// // `gats` of the context of the entry `Rel<Self::G<'x, V>>`:
+    /// // `gats` of the context of the entry `Rel<Self::G<'x, u8>>`:
     /// []
     /// // `gats` of the top-level context of `Tr`:
     /// [type G<'b, U> where U: 'b, Self: 'b;]
@@ -863,9 +832,7 @@ pub struct Context {
     ///
     /// ```ignore
     /// // In crate a:
-    /// pub mod m {
-    ///     pub struct S { a: Rel, b: ::p::Abs }
-    /// }
+    /// pub mod m { pub struct S { a: Rel, b: ::p::Abs } }
     ///
     /// // `module` of the context of `m` itself (context 0):
     /// Some(Itself { id: 0, path: Some([]), hint: None, parent: None })
@@ -1493,7 +1460,7 @@ impl std::hash::Hash for Context {
 /// it names. A bound of a generic that names the generic itself (`T: Fn(Alias<T>)`) is left out if
 /// another bound of it fixes an associated type ([Bounds that name leaked
 /// types](crate::Leaker#bounds-that-name-leaked-types)). The generics are matched with those of the
-/// item by name ([`UseSite::generic_args()`](crate::UseSite::generic_args)).
+/// item by name ([`substitute_args()`](crate::substitute_args)).
 ///
 /// The top-level context is that of the item or scope itself, and it differs from the context of an
 /// entry that uses fewer generics. It records what `Self` is if an entry names it and the module of

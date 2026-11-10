@@ -4,7 +4,7 @@
 //! `announce` is a macro crate which re-emits an item in another crate. It found that its own
 //! table of Repeater impls chose the generics of an entry by name across all the scopes of the item
 //! (findings A, 1, 2, 3 and 4), which `type-leak` 0.8 does not do: `LeakerResult::repeater_impls()`
-//! and `encode_generics_args_with_params()` give every entry the generics, bounds and where clause of the scope in
+//! and `repeater_projection()` give every entry the generics, bounds and where clause of the scope in
 //! which it is written. The tests here pin that for each repro of the report, so a macro that
 //! builds its impls from them gets them right:
 //!
@@ -130,7 +130,7 @@ fn impl_and_args(result: &LeakerResult, ty: Type) -> ItemImpl {
     assert_eq!(
         common::repeater_args(
             common::entry(&referrer, ix),
-            &UseSite::identity(),
+            common::identity,
             None,
             array_const
         )
@@ -320,7 +320,7 @@ fn one_a_method_bound_naming_a_trait_parameter_brings_it_in() {
     assert_eq!(
         common::repeater_args(
             common::entry(&referrer, ix.index()),
-            &UseSite::identity(),
+            common::identity,
             None,
             array_const
         )

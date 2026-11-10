@@ -67,18 +67,18 @@
 //! | `f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value` | a relative macro or struct literal in an enum discriminant or the default of a const parameter was no error, and a `let` or closure binding in one was a false error: they are read by the walk of a value (`ValueWalk`), with or without `check_values` | fixed |
 //! | `f57_the_primitive_names_in_a_part_copied_as_written_are_asserted` | `Leaker::assertions()` left out the primitive names in a type, bound or value path that an error makes a part copied as written (`Rel<'_, u8>`, `&dyn RelTr<u8>`, `T: Into<u32>`) | fixed |
 //! | `f58_enter_impl_is_told_the_trait_of_the_impl` | `enter_impl()` could not say that the impl is inherent (E0195 for a method lifetime, entries lost) nor of which trait (a relative path was not checked, the help for `Self::A` had a placeholder) | fixed |
-//! | `f59_the_arguments_of_a_use_site_are_checked_against_the_parameters` | `UseSite::substituting()` took the arguments by position and checked nothing: `Rel<U>` was encoded as `(u8,)`, the argument of `T`, for the raw arguments `['static, Item = u8, u8]` of `trait Tr<'a, T, U = Rel2<T>>`, and more arguments than parameters, or one of another kind, were taken as they came | fixed |
-//! | `f60_a_type_is_written_at_the_use_site` | a macro had no way to write the types of a copy that are not entries with the arguments of the site: `UseSite::substitute()` replaces the generics and `Self` in one pass, and parenthesizes a trait object behind a reference | fixed |
-//! | `f61_complete_args_looks_the_default_up_in_the_module_of_the_trait` | `Referrer::complete_args()` took no context and looked the default up as the item of no module: for a trait of `intern_mod()` whose default `U = Rel2<T>` names an item imported in the module it returned the relative `Rel2<u8>` and never called `type_fn` | fixed |
-//! | `f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand` | macros wrote `Repeater<#args, #id, #ix>` by hand, so a change of the parameters of the Repeater breaks them in the crates of their users: `repeater_trait_path()` and `repeater_projection()` write it, as the macros did | fixed |
+//! | `f59_the_arguments_of_a_use_site_are_checked_against_the_parameters` | the use site took the arguments by position and checked nothing: `Rel<U>` was encoded as `(u8,)`, the argument of `T`, for the raw arguments `['static, Item = u8, u8]` of `trait Tr<'a, T, U = Rel2<T>>`, and more arguments than parameters, or one of another kind, were taken as they came | fixed |
+//! | `f60_a_type_is_written_at_the_use_site` | a macro had no way to write the types of a copy that are not entries with the arguments of the site: `substitute_args()` replaces the generics and `Self` in one pass, and parenthesizes a trait object behind a reference | fixed |
+//! | `f61_complete_params_looks_the_default_up_in_the_module_of_the_trait` | the completion of the arguments took no context and looked the default up as the item of no module: for a trait of `intern_mod()` whose default `U = Rel2<T>` names an item imported in the module it returned the relative `Rel2<u8>` and never called `type_fn` | fixed |
+//! | `f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand` | macros wrote `Repeater<#args, #id, #ix>` by hand, so a change of the parameters of the Repeater breaks them in the crates of their users: `repeater_projection()` writes it, as the macros did | fixed |
 //! | `f63_the_types_that_hold_a_method_lifetime_inside_a_type_written_as_it_is_are_errors_too` | the check of a method lifetime that only leaked types hold reported the outermost type only, and the types in it that hold it too were still entries: the copy had it in a projection (E0195) although every cause was allowed | fixed |
 //! | `f64_an_alias_in_a_bound_that_the_context_keeps_is_rejected_in_a_predicate` | a bound that names its generic through a type alias, next to an equation of it, stays in the context of an entry that names `Self` (F26 leaves it out of the others), and the copy is E0277 where the entry is in a predicate: the Leaker now rejects it, as it rejects the projection written | fixed |
-//! | `f65_complete_args_finds_the_default_of_a_trait_nested_in_a_module` | `Referrer::complete_args()` returned the default of a trait nested in a module as written (`U = R1<T>` with `T: AsRef<Self>`) and never called `type_fn`: the walk analyzed the default with the trait's `Self`, an entry that names the parameter it completes; it is analyzed alone, as the default of the trait itself is | fixed |
-//! | `f66_a_braced_const_parameter_is_braced_once_at_a_use_site` | `UseSite::substitute()` and `complete_args()` wrote `[u8; { { M } }]` for `[u8; { N }]` (rustc rejects it for a generic `M`): a block that holds only the parameter was walked into, and the path in it braced again | fixed |
+//! | `f65_complete_params_finds_the_default_of_a_trait_nested_in_a_module` | the completion of the arguments returned the default of a trait nested in a module as written (`U = R1<T>` with `T: AsRef<Self>`) and never called `type_fn`: the walk analyzed the default with the trait's `Self`, an entry that names the parameter it completes; it is analyzed alone, as the default of the trait itself is | fixed |
+//! | `f66_a_braced_const_parameter_is_braced_once_at_a_use_site` | `substitute_args()` and `complete_params()` wrote `[u8; { { M } }]` for `[u8; { N }]` (rustc rejects it for a generic `M`): a block that holds only the parameter was walked into, and the path in it braced again | fixed |
 //! | `f67_the_optional_types_on_the_way_to_a_method_lifetime_are_all_written_as_they_are` | the types of a crate around a trait object bounded by a method lifetime (`Vec<Box<dyn Fn(R0) + 'x>>`): only the outermost was kept from being an optional entry, so the box was one, held `'x` in a projection only, and the copy was E0195 | fixed |
 //! | `f68_every_unstable_bound_keeps_an_optional_self_type_from_being_an_entry` | the optional self type of an impl, next to an entry in a predicate whose context has a bound that names `Self`, stayed an optional entry when another bound of the context names a leaked or optional type (`X: AsRef<(&'static ::ext::B0, bool)>`): only the first unstable bound was looked at, so the copy replaced it and was E0277; every unstable bound counts now, and it is written as it is | fixed |
-//! | `f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetimes` | `UseSite::substitute()` and `complete_args()` wrote an argument with lifetimes into `fn(&Cell<[U; 1]>) -> &u8` (or `Fn(&U) -> &u8`, `Self` with lifetimes): two lifetimes in the inputs, E0106; the elided one is named with a `for<'e>` binder | fixed |
-//! | `f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_lifetimes_into_its_inputs` | the Visitor wrote the path through the Repeater of an entry whose arguments name lifetimes (`encode_generics_args_with_params()` at a use site with `&'static str`) into `fn(&Vec<T>) -> &u8` (or `Fn(&Vec<T>) -> &u8`): two lifetimes in the inputs, E0106; the elided one is named after `type_fn` has written | fixed |
+//! | `f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetimes` | `substitute_args()` and `complete_params()` wrote an argument with lifetimes into `fn(&Cell<[U; 1]>) -> &u8` (or `Fn(&U) -> &u8`, `Self` with lifetimes): two lifetimes in the inputs, E0106; the elided one is named with a `for<'e>` binder | fixed |
+//! | `f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_lifetimes_into_its_inputs` | the Visitor wrote the path through the Repeater of an entry whose arguments name lifetimes (the arguments of a use site, `&'static str` for `T`) into `fn(&Vec<T>) -> &u8` (or `Fn(&Vec<T>) -> &u8`): two lifetimes in the inputs, E0106; the elided one is named after `type_fn` has written | fixed |
 //! | `f71_an_optional_type_in_a_where_predicate_that_a_context_carries_is_written_as_it_is` | an optional type (a type of another crate) in a where predicate that is not a bound of a generic (`::std::vec::Vec<T>: Clone`), carried by the context of an entry, was an optional entry that the copy replaced: the Repeater's impl of the entry needs the predicate, which the copy's environment has only in the form that names the path, so E0277 (the fixture 9005 allowed `::std` to hide it); it is written as it is, as for the bound cycles of F17, F18 and F68 | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
@@ -653,7 +653,7 @@ fn f01_unsized_type_param_encoding() {
                     string(&encoded)
                 );
                 // The Referrer passes each parameter by its own name: the same encoding.
-                let on_referrer_side = common::repeater_args(common::entry(&referrer, ix), &UseSite::identity(), None, array_const)
+                let on_referrer_side = common::repeater_args(common::entry(&referrer, ix), common::identity, None, array_const)
                     .unwrap();
                 assert_eq!(string(&on_referrer_side), string(&encoded), "{}", what);
             }
@@ -1612,8 +1612,7 @@ fn f11_copied_impl_param_constrained_only_by_leaked_type() {
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Imp < T >");
     assert_eq!(context_text(&referrer, ix), "< T >");
-    let args = UseSite::identity()
-        .generic_args(&common::entry(&referrer, ix).generics)
+    let args = common::generic_args(&common::entry(&referrer, ix).generics, common::identity)
         .unwrap()
         .iter()
         .map(string)
@@ -1747,15 +1746,12 @@ fn f12_copy_with<A: Allow>(
 ) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
     let context = leaker.intern_trait(item, true);
     let referrer = leaker.result().finish()?;
-    let root_args: Vec<GenericArgument> = item.generics.params.iter().map(param_arg).collect();
     let mut copy = item.clone();
     let repeater: Path = parse_quote!(crate::Repeater);
     referrer
         .visitor(context, |_, ix, entry| {
-            let site = UseSite::substituting(&item.generics.params, &root_args);
             let self_ty: Type = parse_quote!(());
-            let encoded = common::repeater_args(entry, &site, Some(&self_ty), array_const).unwrap();
-            repeater_projection(&repeater, &self_ty, &encoded, 0, ix)
+            repeater_projection(&repeater, &self_ty, entry, 0, ix, array_const).unwrap()
         })
         .visit_item_trait_mut(&mut copy);
     Ok((common::types(&referrer).map(string).collect(), copy))
@@ -2938,7 +2934,7 @@ fn f16_implied_outlives_of_self_projection_lost() {
             }
             let arguments = common::repeater_args(
                 common::entry(&referrer, ix),
-                &UseSite::identity(),
+                common::identity,
                 None,
                 array_const,
             )
@@ -4587,18 +4583,15 @@ fn macro_copy(referrer: &Referrer, context: ContextId, item: &Item, id: u64) -> 
     let mut copy = file_of(vec![item.clone()]);
     let repeater: Path = parse_quote!(Repeater);
     referrer
-        .visitor(context, |_, ix, _| {
-            repeater_projection(&repeater, &parse_quote!(()), &parse_quote!(()), id, ix)
+        .visitor(context, |_, ix, context| {
+            repeater_projection(&repeater, &parse_quote!(()), context, id, ix, array_const).unwrap()
         })
         .with_nested_self(|_, _, ix, context| {
             let self_ty: Type = match context.self_ty.as_ref() {
                 Some(SelfRequirement::Any) => parse_quote!(Self),
                 other => panic!("{:?}", other),
             };
-            let args =
-                common::repeater_args(context, &UseSite::identity(), Some(&self_ty), array_const)
-                    .unwrap();
-            repeater_projection(&repeater, &self_ty, &args, id, ix)
+            repeater_projection(&repeater, &self_ty, context, id, ix, array_const).unwrap()
         })
         .visit_file_mut(&mut copy);
     copy
@@ -5738,7 +5731,7 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
             .unwrap();
         let arguments = common::repeater_args(
             common::entry(&referrer, ix),
-            &UseSite::identity(),
+            common::identity,
             None,
             array_const,
         )
@@ -5983,14 +5976,8 @@ fn f32_parentheses_only_where_rustc_needs_them() {
     let unsized_referrer = unsized_result.clone().finish().unwrap();
     let encode = |arg: Type| -> Type {
         let args = [GenericArgument::Type(arg)];
-        let site = UseSite::substituting(&unsized_trait.generics.params, &args);
-        common::repeater_args(
-            common::entry(&unsized_referrer, 0),
-            &site,
-            None,
-            array_const,
-        )
-        .unwrap()
+        let site = common::answers(&unsized_trait.generics.params, &args);
+        common::repeater_args(common::entry(&unsized_referrer, 0), site, None, array_const).unwrap()
     };
     // The parentheses that are needed are there, and are not reported.
     for (arg, expected) in [
@@ -6005,7 +5992,6 @@ fn f32_parentheses_only_where_rustc_needs_them() {
         (parse_quote!(str), "(* const str ,)"),
         // One bound, with the parentheses that rustc does not need, or none.
         (parse_quote!(dyn ::p::A), "(* const dyn :: p :: A ,)"),
-        (parse_quote!((dyn ::p::A)), "(* const dyn :: p :: A ,)"),
         (
             parse_quote!(dyn for<'a> ::p::B<'a>),
             "(* const dyn for < 'a > :: p :: B < 'a > ,)",
@@ -6019,6 +6005,11 @@ fn f32_parentheses_only_where_rustc_needs_them() {
         assert_eq!(string(&encoded), expected);
         assert_eq!(needless_parens(&encoded), Vec::<String>::new());
     }
+    // The parentheses of an argument are the site's own: they stay (the encoder used to drop them).
+    assert_eq!(
+        string(&encode(parse_quote!((dyn ::p::A)))),
+        "(* const (dyn :: p :: A) ,)"
+    );
     let with_lifetime: ItemTrait = parse_quote!(
         pub trait Tr<'a, T: ?Sized + 'a> {
             fn f(&self, x: &'a Rel<T>);
@@ -6031,10 +6022,10 @@ fn f32_parentheses_only_where_rustc_needs_them() {
         parse_quote!('x),
         GenericArgument::Type(parse_quote!(dyn ::p::A + 'x)),
     ];
-    let site = UseSite::substituting(&with_lifetime.generics.params, &args);
+    let site = common::answers(&with_lifetime.generics.params, &args);
     let encoded = common::repeater_args(
         common::entry(&with_lifetime_referrer, 0),
-        &site,
+        site,
         None,
         array_const,
     )
@@ -6670,7 +6661,7 @@ fn check_outlives_case(case: &OutlivesCase) -> (Referrer, ContextId) {
     }
     let arguments = common::repeater_args(
         common::entry(&referrer, ix),
-        &UseSite::identity(),
+        common::identity,
         None,
         array_const,
     )
@@ -8429,7 +8420,7 @@ fn f37_the_copy_passes_its_own_type() {
     let c = entry(&referrer, "Wrap < U >");
     assert!(
         text.contains(&format!(
-            "c : < () as Repeater < () , {} > > :: Type",
+            "c : < () as Repeater < (U ,) , {} > > :: Type",
             string(&repeater_key(7, common::entry_id_at(&referrer, c)))
         )),
         "{}",
@@ -9145,7 +9136,7 @@ fn f38_the_relative_types_and_the_other_items_are_unchanged() {
 /// cross-crate fixtures in `tests/cross_crate.rs`, which compile in the Referrer's crate).
 ///
 /// Since F65 that entry exists only for a default that names `Self` (`U = Rel<Self>`): the other
-/// defaults of a nested trait are analyzed alone, as those of the trait itself, so `complete_args()`
+/// defaults of a nested trait are analyzed alone, as those of the trait itself, so `complete_params()`
 /// finds them, and the test below follows both.
 ///
 /// The property test generates the shape with the feature `trait_self_defaults` (on by default):
@@ -9206,8 +9197,8 @@ fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_
     let mut file = file_of(vec![item.clone()]);
     let repeater: Path = parse_quote!(Repeater);
     referrer
-        .visitor(context, |_, ix, _| {
-            repeater_projection(&repeater, &parse_quote!(()), &parse_quote!((T,)), 7, ix)
+        .visitor(context, |_, ix, context| {
+            repeater_projection(&repeater, &parse_quote!(()), context, 7, ix, array_const).unwrap()
         })
         .with_nested_self(|_, _, _, _| unreachable!())
         .visit_file_mut(&mut file);
@@ -9220,7 +9211,7 @@ fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_
     assert_eq!(string(&file.items[0]), string(&expected));
     let args = common::repeater_args(
         common::entry(&referrer, 0),
-        &UseSite::identity(),
+        common::identity,
         None,
         array_const,
     )
@@ -10519,17 +10510,10 @@ fn f41_the_copy_writes_an_ordinary_default() {
     let (context, ()) = leaker.enter_mod("m", names(&["S"]), |view| view.visit_item(&item));
     let referrer = leaker.result().finish().unwrap();
     let mut file = file_of(vec![item.clone()]);
-    let args = common::repeater_args(
-        common::entry(&referrer, 0),
-        &UseSite::identity(),
-        None,
-        array_const,
-    )
-    .unwrap();
     let repeater: Path = parse_quote!(Repeater);
     referrer
-        .visitor(context, |_, ix, _| {
-            repeater_projection(&repeater, &parse_quote!(()), &args, 7, ix)
+        .visitor(context, |_, ix, context| {
+            repeater_projection(&repeater, &parse_quote!(()), context, 7, ix, array_const).unwrap()
         })
         .visit_file_mut(&mut file);
     // (Parsed from text: a formatter would add a comma after the last generic.)
@@ -13398,8 +13382,9 @@ fn f59_args(args: &[&str]) -> Vec<GenericArgument> {
     args.iter().map(|arg| parse_str(arg).unwrap()).collect()
 }
 
-/// The entries of `trait Tr<'a, T, U = Rel2<T>>`, which use `'a`, `T` and `U` (and `T` alone).
-fn f59_trait() -> (ItemTrait, Referrer) {
+/// The entries of `trait Tr<'a, T, U = Rel2<T>>`, which use `'a`, `T` and `U` (and `T` alone), and
+/// the context of the trait.
+fn f59_trait() -> (ItemTrait, Referrer, ContextId) {
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, T, U = Rel2<T>> {
             type Item;
@@ -13409,12 +13394,11 @@ fn f59_trait() -> (ItemTrait, Referrer) {
         }
     };
     let mut leaker = new_leaker();
-    leaker.intern_trait(&tr, true);
-    (tr, leaker.result().finish().unwrap())
+    let context = leaker.intern_trait(&tr, true);
+    (tr, leaker.result().finish().unwrap(), context)
 }
 
-/// F59 (fixed): `UseSite::substituting()` and `UseSite::generic_args()` (then
-/// `Referrer::context_generic_args()`) took the arguments by position and checked nothing.
+/// F59 (fixed): the arguments of a use site were taken by position and checked nothing.
 ///
 /// Trigger: `trait Tr<'a, T, U = Rel2<T>>` and the arguments of `impl Tr<'static, Item = u8, u8>`
 /// as written, not completed (`['static, Item = u8, u8]`): `Rel<U>` was encoded as `(u8,)`, the
@@ -13422,37 +13406,77 @@ fn f59_trait() -> (ItemTrait, Referrer) {
 /// and an argument of another kind (a lifetime for a type, a const for a type), were taken as they
 /// came too.
 ///
-/// Fix: `generic_args()`, and so the arguments of the Repeater, fails with `UnexpectedArgument` if
-/// the arguments are more than the parameters, or one is not of the kind of its parameter (a
-/// binding is none). A parameter with no argument is still `MissingArgument` where an entry uses
-/// it: the arguments may stop early, as the `prefix` that `complete_args()` gives `type_fn` does.
+/// Fix: the check is in two steps. `complete_params()` takes the arguments as written and
+/// fails with `UnexpectedArgument` if they are more than the parameters, or an argument is not of
+/// the kind of its parameter, and with `MissingArgument` if one has no default; a binding is none.
+/// `substitute_args()` fails with `UnexpectedArgument` for a value that does not fit the place of
+/// its name (a lifetime for a type), and the encoder for a const where a type goes. A name that has
+/// no answer stays.
 #[test]
 fn f59_the_arguments_of_a_use_site_are_checked_against_the_parameters() {
-    let (tr, referrer) = f59_trait();
+    let (tr, referrer, context) = f59_trait();
     let params = &tr.generics.params;
     let g = entry(&referrer, "Rel < U >");
     let h = entry(&referrer, "Rel3 < T >");
     let f = entry(&referrer, "Wrap < 'a , T , U >");
+    // The arguments as written: completed (the default is written by the visitor, and the
+    // parameters before it are replaced), then written at the site.
+    let written = |ix: usize, args: &[&str]| {
+        let completed =
+            common::completed_args(&referrer, context, &tr, &f59_args(args), |ty, _, _| ty)?;
+        common::repeater_args(
+            common::entry(&referrer, ix),
+            common::answers(params, &completed),
+            None,
+            array_const,
+        )
+    };
+    // The arguments as completed.
     let encode = |ix: usize, args: &[&str]| {
         let args = f59_args(args);
-        let site = UseSite::substituting(params, &args);
-        common::repeater_args(common::entry(&referrer, ix), &site, None, array_const)
+        common::repeater_args(
+            common::entry(&referrer, ix),
+            common::answers(params, &args),
+            None,
+            array_const,
+        )
     };
     let unexpected = |result: std::result::Result<Type, EncodeError>, arg: &str| match result {
         Err(EncodeError::UnexpectedArgument(found)) => assert_eq!(string(&*found), arg),
         other => panic!("{:?}, not an unexpected `{}`", other, arg),
     };
 
-    // The arguments as written, with a binding: it was `(u8,)` for `Rel<U>`.
-    for ix in [f, g, h] {
-        unexpected(encode(ix, &["'static", "Item = u8", "u8"]), "Item = u8");
-    }
-    // Too many, and in the wrong order or of the wrong kind.
-    unexpected(encode(g, &["'static", "u8", "u16", "u32"]), "u32");
-    unexpected(encode(g, &["u8", "'static", "u16"]), "u8");
-    unexpected(encode(g, &["'static", "3", "u16"]), "3");
-    unexpected(encode(g, &["'static", "'static", "u16"]), "'static");
-    unexpected(encode(g, &["u8", "u8", "u16"]), "u8");
+    // The arguments as written, with a binding: it was `(u8,)` for `Rel<U>`. A binding is no
+    // argument, so `U` takes its default.
+    assert_eq!(
+        written(g, &["'static", "Item = u8", "u8"]).unwrap(),
+        parse_quote!((Rel2<u8>,))
+    );
+    assert_eq!(
+        written(h, &["'static", "Item = u8", "u8"]).unwrap(),
+        parse_quote!((u8,))
+    );
+    // Too many.
+    unexpected(written(g, &["'static", "u8", "u16", "u32"]), "u32");
+    unexpected(written(g, &["'static", "'static", "u8", "u16"]), "'static");
+    unexpected(written(g, &["'static", "u8", "u16", "'x"]), "'x");
+    // A parameter with no default and no argument is missing.
+    assert!(matches!(
+        written(g, &["'static"]),
+        Err(EncodeError::MissingArgument(_))
+    ));
+    assert!(matches!(
+        written(g, &[]),
+        Err(EncodeError::MissingArgument(_))
+    ));
+
+    // The arguments as completed, with a value that does not fit its place: it was taken as it came.
+    unexpected(encode(f, &["'static", "Item = u8", "u8"]), "Item = u8");
+    unexpected(encode(h, &["'static", "Item = u8", "u8"]), "Item = u8");
+    unexpected(encode(f, &["u8", "'static", "u16"]), "u8");
+    unexpected(encode(f, &["'static", "3", "u16"]), "3");
+    unexpected(encode(f, &["'static", "'static", "u16"]), "'static");
+    unexpected(encode(f, &["u8", "u8", "u16"]), "u8");
 
     // The right arguments, as before.
     assert_eq!(
@@ -13463,21 +13487,16 @@ fn f59_the_arguments_of_a_use_site_are_checked_against_the_parameters() {
         encode(f, &["'static", "u8", "u16"]).unwrap(),
         parse_quote!((&'static (), u8, u16))
     );
-    // They may stop early: an entry that uses what is given is encoded, the others have none.
+    // They may stop early: an entry that uses what is given is encoded, and a name that has no
+    // answer stays.
     assert_eq!(encode(h, &["'static", "u8"]).unwrap(), parse_quote!((u8,)));
-    assert!(matches!(
-        encode(g, &["'static", "u8"]),
-        Err(EncodeError::MissingArgument(_))
-    ));
-    assert!(matches!(
-        encode(g, &[]),
-        Err(EncodeError::MissingArgument(_))
-    ));
+    assert_eq!(encode(g, &["'static", "u8"]).unwrap(), parse_quote!((U,)));
+    assert_eq!(encode(g, &[]).unwrap(), parse_quote!((U,)));
     // The scope of the analysis has no root parameter.
     assert_eq!(
         common::repeater_args(
             common::entry(&referrer, g),
-            &UseSite::identity(),
+            common::identity,
             None,
             array_const
         )
@@ -13485,20 +13504,25 @@ fn f59_the_arguments_of_a_use_site_are_checked_against_the_parameters() {
         parse_quote!((U,))
     );
 
-    // `generic_args()` is what the encoder is given, and fails alike.
+    // The arguments of the generics of an entry are what the encoder is given, and fail alike.
     let args = f59_args(&["'static", "Item = u8", "u8"]);
     assert!(matches!(
-        UseSite::substituting(params, &args).generic_args(&common::entry(&referrer, h).generics),
+        common::generic_args(
+            &common::entry(&referrer, h).generics,
+            common::answers(params, &args)
+        ),
         Err(EncodeError::UnexpectedArgument(_))
     ));
     let args = f59_args(&["'static", "u8"]);
-    let generic_args = UseSite::substituting(params, &args)
-        .generic_args(&common::entry(&referrer, h).generics)
-        .unwrap();
+    let generic_args = common::generic_args(
+        &common::entry(&referrer, h).generics,
+        common::answers(params, &args),
+    )
+    .unwrap();
     assert_eq!(generic_args, [parse_quote!(u8)]);
 }
 
-/// F59 (fixed): a const parameter takes what `complete_args()` takes for it: a const argument, a
+/// F59 (fixed): a const parameter takes what `complete_params()` takes for it: a const argument, a
 /// block, and a bare identifier, which syn parses as a type. Anything else is unexpected.
 #[test]
 fn f59_a_const_parameter_takes_a_const_a_block_or_an_identifier() {
@@ -13512,14 +13536,18 @@ fn f59_a_const_parameter_takes_a_const_a_block_or_an_identifier() {
     let referrer = leaker.result().finish().unwrap();
     let encode = |args: &[&str]| {
         let args = f59_args(args);
-        let site = UseSite::substituting(&tr.generics.params, &args);
-        common::repeater_args(common::entry(&referrer, 0), &site, None, array_const)
-            .map(|ty| string(&ty))
+        common::repeater_args(
+            common::entry(&referrer, 0),
+            common::answers(&tr.generics.params, &args),
+            None,
+            array_const,
+        )
+        .map(|ty| string(&ty))
     };
     for (written, encoded) in [
-        ("3", "(& 'x () , [() ; 3])"),
+        ("3", "(& 'x () , [() ; { 3 }])"),
         ("{ 1 + 1 }", "(& 'x () , [() ; { 1 + 1 }])"),
-        ("M", "(& 'x () , [() ; M])"),
+        ("M", "(& 'x () , [() ; { M }])"),
     ] {
         assert_eq!(encode(&["'x", written]).unwrap(), encoded, "{}", written);
     }
@@ -13531,8 +13559,18 @@ fn f59_a_const_parameter_takes_a_const_a_block_or_an_identifier() {
             other => panic!("{}: {:?}", written, other),
         }
     }
+    // `complete_params()` refuses the same, and a third argument.
+    let complete = |args: &[&str]| complete_params(&tr.generics.params, &f59_args(args));
+    for written in ["Vec<u8>", "::m::M", "&u8"] {
+        match complete(&["'x", written]) {
+            Err(EncodeError::UnexpectedArgument(found)) => {
+                assert_eq!(string(&*found).replace(' ', ""), written)
+            }
+            other => panic!("{}: {:?}", written, other),
+        }
+    }
     assert!(matches!(
-        encode(&["'x", "3", "4"]),
+        complete(&["'x", "3", "4"]),
         Err(EncodeError::UnexpectedArgument(_))
     ));
 }
@@ -13542,16 +13580,23 @@ fn f59_a_const_parameter_takes_a_const_a_block_or_an_identifier() {
 /// every macro wrote its own substitution (the test macro and `examples/two-macros` do), each
 /// with its own gaps (lifetimes, consts, `Self`, a trait object behind a reference).
 ///
-/// Fix: `UseSite::substitute(&Type, Option<&Type>)` writes a type at the site: the root parameters
-/// replaced by the arguments, `Self` by the second argument, in one pass (what replaces a name is not substituted
-/// again), with the parentheses of a trait object behind a reference or a pointer.
+/// Fix: `substitute_args()` writes a type at the site: the names replaced by what the site answers
+/// (the root parameters by their arguments, `Self` by the self type), in one pass (what replaces a
+/// name is not substituted again), with the parentheses of a trait object behind a reference or a
+/// pointer.
 #[test]
 fn f60_a_type_is_written_at_the_use_site() {
     let params: Punctuated<GenericParam, Token![,]> = parse_quote!('a, T, const N: usize);
-    let site = |args: &[&str]| UseSite::substituting(&params, &f59_args(args));
-    let write = |site: &UseSite, ty: Type| string(&site.substitute(&ty, None));
-    let write_as =
-        |site: &UseSite, ty: Type, self_ty: &Type| string(&site.substitute(&ty, Some(self_ty)));
+    // The site: the arguments of the root parameters (none: the scope of the analysis).
+    let site = |args: &[&str]| f59_args(args);
+    let write = |site: &[GenericArgument], ty: Type| {
+        string(&common::substitute_type(&ty, common::answers(&params, site), None).unwrap())
+    };
+    let write_as = |site: &[GenericArgument], ty: Type, self_ty: &Type| {
+        string(
+            &common::substitute_type(&ty, common::answers(&params, site), Some(self_ty)).unwrap(),
+        )
+    };
     let given = site(&["'static", "Vec<u8>", "3"]);
 
     // Lifetimes, types and consts.
@@ -13587,7 +13632,7 @@ fn f60_a_type_is_written_at_the_use_site() {
         ty(parse_quote!(&'static Wrap<T, U>))
     );
     assert_eq!(
-        write(&UseSite::identity(), parse_quote!(&'a Wrap<T, Self::A>)),
+        write(&[], parse_quote!(&'a Wrap<T, Self::A>)),
         ty(parse_quote!(&'a Wrap<T, Self::A>))
     );
 
@@ -13641,26 +13686,26 @@ fn f60_a_type_is_written_at_the_use_site() {
     // `Self` is a trait object too.
     let object: Type = parse_quote!(dyn Send + Sync);
     assert_eq!(
-        write_as(&UseSite::identity(), parse_quote!(&'a Self), &object),
+        write_as(&[], parse_quote!(&'a Self), &object),
         ty(parse_quote!(&'a (dyn Send + Sync)))
     );
 }
 
 // ── F61 ──────────────────────────────────────────────────────────────────────
 
-/// F61 (fixed): `Referrer::complete_args()` took no context, and looked the default of a parameter
+/// F61 (fixed): the completion of the arguments took no context, and looked the default of a parameter
 /// up as if the trait were in no module.
 ///
 /// Trigger: a trait of `intern_mod()` whose default names an item that means something in the module
 /// only (`U = Rel2<T>`, `Rel2` imported there). The entry of the default has the module, and was
-/// never found: `complete_args()` returned the relative `Rel2<u8>` and did not call `type_fn`, so
+/// never found: `complete_params()` returned the relative `Rel2<u8>` and did not call `type_fn`, so
 /// the copy named `Rel2` where the Referrer's crate has none.
 ///
-/// Fix: `complete_args()` takes the context of the trait first, and looks up the entries of its
+/// Fix: `complete_params()` takes the context of the trait first, and looks up the entries of its
 /// module (and those of no module) as the visitor does. For a trait that is in no module nothing
 /// changes.
 #[test]
-fn f61_complete_args_looks_the_default_up_in_the_module_of_the_trait() {
+fn f61_complete_params_looks_the_default_up_in_the_module_of_the_trait() {
     let item: ItemMod = parse_quote! {
         mod m {
             use super::Rel2;
@@ -13684,35 +13729,26 @@ fn f61_complete_args_looks_the_default_up_in_the_module_of_the_trait() {
     );
 
     let mut calls = Vec::new();
-    let completed = referrer
-        .complete_args(
-            module,
-            &tr.generics.params,
-            &f59_args(&["u8"]),
-            |ty, ix, _, prefix| {
-                let prefix: Vec<String> = prefix.iter().map(string).collect();
-                calls.push((string(&ty), ix.index(), prefix));
-                parse_quote!(<Self as R<#ix>>::Type)
-            },
-        )
+    let completed =
+        common::completed_args(&referrer, module, &tr, &f59_args(&["u8"]), |ty, ix, _| {
+            calls.push((string(&ty), ix.index()));
+            parse_quote!(<Self as R<#ix>>::Type)
+        })
         .unwrap();
-    assert_eq!(
-        calls,
-        [("Rel2 < T >".to_string(), ix, vec!["u8".to_string()])]
-    );
+    assert_eq!(calls, [("Rel2 < T >".to_string(), ix)]);
     let expected: Vec<GenericArgument> =
         vec![parse_quote!(u8), parse_quote!(<Self as R<0usize>>::Type)];
     assert_eq!(completed, expected);
 
-    // An argument that is given is not completed.
-    let completed = referrer
-        .complete_args(
-            module,
-            &tr.generics.params,
-            &f59_args(&["u8", "u16"]),
-            |_, _, _, _| unreachable!(),
-        )
-        .unwrap();
+    // An argument that is given is not completed (the visitor writes the default all the same).
+    let completed = common::completed_args(
+        &referrer,
+        module,
+        &tr,
+        &f59_args(&["u8", "u16"]),
+        |_, ix, _| parse_quote!(<Self as R<#ix>>::Type),
+    )
+    .unwrap();
     assert_eq!(string(&completed[1]), "u16");
 
     // The same trait outside a module has an entry of no module, which is found as before.
@@ -13721,14 +13757,14 @@ fn f61_complete_args_looks_the_default_up_in_the_module_of_the_trait() {
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Rel2 < T >");
     assert_eq!(common::in_module(common::entry(&referrer, ix)), None);
-    let completed = referrer
-        .complete_args(
-            top_level,
-            &tr.generics.params,
-            &f59_args(&["u8"]),
-            |_, ix, _, _| parse_quote!(<Self as R<#ix>>::Type),
-        )
-        .unwrap();
+    let completed = common::completed_args(
+        &referrer,
+        top_level,
+        &tr,
+        &f59_args(&["u8"]),
+        |_, ix, _| parse_quote!(<Self as R<#ix>>::Type),
+    )
+    .unwrap();
     assert_eq!(completed, expected);
 }
 
@@ -13738,10 +13774,18 @@ fn f61_complete_args_looks_the_default_up_in_the_module_of_the_trait() {
 /// #ix> for ..` and `<X as Repeater<#args, #id, #ix>>::Type`, so a change of the parameters of the
 /// Repeater (`ID` and `NTH` became one `KEY`) breaks them, in the crates of their users.
 ///
-/// Fix: `repeater_trait_path()` and `repeater_projection()` write them: `Repeater<args, KEY>` with
-/// the `u128` literal `repeater_key(id, ix)`, for the path that they were given.
+/// Fix: `repeater_projection()` writes the projection (and the path of the Repeater in it):
+/// `Repeater<args, KEY>` with the `u128` literal `repeater_key(id, ix)`, for the path that it was
+/// given.
 #[test]
 fn f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand() {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, T: 'a, const N: usize> { fn f(&self, x: &'a Wrap<T, N>) -> Rel; }
+    };
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
+    let entry = common::entry(&referrer, entry(&referrer, "& 'a Wrap < T , N >"));
     let args: Type = parse_quote!((&'a (), T, [(); N], &'a T));
     let host: Type = parse_quote!(Host<T>);
     for repeater in [
@@ -13753,16 +13797,11 @@ fn f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand() {
         let repeater: Path = parse_str(repeater).unwrap();
         for (id, ix) in [(7u64, 3usize), (0, 0), (u64::MAX, 1000)] {
             let ix: EntryId = parse_quote!(#ix);
-            // As a macro writes them by hand, with the key of `id` and `ix`.
+            // As a macro writes it by hand, with the key of `id` and `ix`.
             let key = repeater_key(id, ix);
-            let by_hand = quote!(#repeater<#args, #key>);
-            assert_eq!(
-                repeater_trait_path(&repeater, &args, id, ix),
-                parse2::<Path>(by_hand).unwrap()
-            );
             let by_hand = quote!(<#host as #repeater<#args, #key>>::Type);
             assert_eq!(
-                repeater_projection(&repeater, &host, &args, id, ix),
+                repeater_projection(&repeater, &host, entry, id, ix, array_const).unwrap(),
                 parse2::<Type>(by_hand).unwrap()
             );
         }
@@ -13772,18 +13811,13 @@ fn f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand() {
     let three: EntryId = parse_quote!(3);
     let key = repeater_key(7, three);
     assert_eq!(
-        repeater_trait_path(&repeater, &args, 7, three),
-        parse_quote!(crate::Repeater<(&'a (), T, [(); N], &'a T), #key>)
-    );
-    assert_eq!(
-        repeater_projection(&repeater, &parse_quote!(Self), &args, 7, three),
+        repeater_projection(&repeater, &parse_quote!(Self), entry, 7, three, array_const).unwrap(),
         parse_quote!(<Self as crate::Repeater<(&'a (), T, [(); N], &'a T), #key>>::Type)
     );
 }
 
-/// F62 (fixed): the impl of every entry written through `repeater_trait_path()`, or by `ToTokens`
-/// of the `RepeaterImpl` (which writes the `KEY`), is the impl that the macros wrote by hand, for
-/// each kind of impl.
+/// F62 (fixed): the impl of every entry written by `ToTokens` of the `RepeaterImpl` (which writes
+/// the `KEY`) is the impl that the macros wrote by hand, for each kind of impl.
 ///
 /// A trait with an entry that names `Self` has no impl for a marker (the call fails), so the impls
 /// for a marker are those of the same trait without it.
@@ -13832,13 +13866,6 @@ fn f62_the_impl_written_through_the_path_is_the_impl_written_by_hand() {
                         type Type = #ty;
                     }
                 };
-                let path = repeater_trait_path(&repeater, &r.args, id, entry);
-                let through_the_path: ItemImpl = parse_quote! {
-                    impl #impl_generics #path for #self_ty #where_clause {
-                        type Type = #ty;
-                    }
-                };
-                assert_eq!(through_the_path, by_hand, "{} {:?}", entry, target);
                 // `ToTokens` of the impl writes it too, with the `KEY`, which `path` has not.
                 assert_eq!(
                     r.path,
@@ -14375,7 +14402,7 @@ fn f64_what_compiles_stays_accepted() {
 
 // ── F65 ──────────────────────────────────────────────────────────────────────
 
-/// How `f65_complete_args_finds_the_default_of_a_trait_nested_in_a_module` analyzes the trait.
+/// How `f65_complete_params_finds_the_default_of_a_trait_nested_in_a_module` analyzes the trait.
 #[derive(Clone, Copy, Debug)]
 enum F65Shape {
     /// `intern_trait()`: the trait itself.
@@ -14392,7 +14419,8 @@ const F65_SHAPES: [F65Shape; 3] = [
     F65Shape::EnterMod,
 ];
 
-/// Analyzes `tr` as `shape` says and returns the result and the context for `complete_args()`.
+/// Analyzes `tr` as `shape` says and returns the result and the context of the visitor that writes
+/// the defaults for `complete_params()`.
 fn f65_analysis(shape: F65Shape, tr: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = new_leaker();
     let context = match shape {
@@ -14408,10 +14436,10 @@ fn f65_analysis(shape: F65Shape, tr: &ItemTrait) -> (Referrer, ContextId) {
     (leaker.result().finish().unwrap(), context)
 }
 
-/// F65 (fixed): `Referrer::complete_args()` did not complete the default of a trait nested in a
+/// F65 (fixed): the completion of the arguments did not complete the default of a trait nested in a
 /// module (`intern_mod()`, `view.visit_item()`) when a bound of an earlier parameter names `Self`.
 ///
-/// Trigger: `mod h { trait Tr<T: AsRef<Self>, U = R1<T>> {} }` and `complete_args(context, params,
+/// Trigger: `mod h { trait Tr<T: AsRef<Self>, U = R1<T>> {} }` and `complete_params(context, params,
 /// [T], type_fn)`: it returned `[T, R1<T>]` and never called `type_fn`, so the copy named `R1`
 /// where the Referrer's crate has none. The trait analyzed by itself (`intern_trait()`) gave `[T,
 /// type_fn(..)]`, and so did the module with `T: Clone`. The list of entries was the same
@@ -14421,7 +14449,7 @@ fn f65_analysis(shape: F65Shape, tr: &ItemTrait) -> (Referrer, ContextId) {
 /// the trait's own `Self`, where the default of a trait that a scope was entered for (`intern_trait()`,
 /// `enter_trait()`) is analyzed alone, without `Self`. Its entry was for the implementors,
 /// `Self: Tr<T, U>`, and that names `U`, the parameter that the default completes: it cannot be
-/// written before `U` exists, so `complete_args()` skipped every entry that has a `Self` (the
+/// written before `U` exists, so `complete_params()` skipped every entry that has a `Self` (the
 /// rule for an entry that does not name only the parameters before the default). `T: Clone` gives
 /// the entry no `Self`, which is why that case worked.
 ///
@@ -14432,13 +14460,13 @@ fn f65_analysis(shape: F65Shape, tr: &ItemTrait) -> (Referrer, ContextId) {
 /// entries is the same. The Visitor already looked that entry up first (F39), and writes it with
 /// the ordinary closure, as it does the default of the trait itself. A default that names `Self`
 /// (`Rhs = Self`) keeps its entry for the trait's `Self`, written by `with_nested_self()`, and
-/// `complete_args()` returns it as written. The format is unchanged: a Referrer of the earlier
+/// `complete_params()` returns it as written. The format is unchanged: a Referrer of the earlier
 /// code finds the entry the same way, and one that finds the old entry reads it as before.
 ///
 /// The property test shows it (the item is used at an instantiation that leaves the default
 /// out: `inst`) once the generator no longer gates it.
 #[test]
-fn f65_complete_args_finds_the_default_of_a_trait_nested_in_a_module() {
+fn f65_complete_params_finds_the_default_of_a_trait_nested_in_a_module() {
     for bound in ["AsRef<Self>", "Clone"] {
         let tr: ItemTrait = parse_str(&format!(
             "pub trait Tr<T: {}, U = R1<T>> {{ fn f(&self, u: U); }}",
@@ -14462,37 +14490,26 @@ fn f65_complete_args_finds_the_default_of_a_trait_nested_in_a_module() {
             );
 
             let mut calls = Vec::new();
-            let completed = referrer
-                .complete_args(
-                    context,
-                    &tr.generics.params,
-                    &f59_args(&["u8"]),
-                    |ty, ix, _, prefix| {
-                        let prefix: Vec<String> = prefix.iter().map(string).collect();
-                        calls.push((string(&ty), ix.index(), prefix));
-                        parse_quote!(<Self as R<#ix>>::Type)
-                    },
-                )
+            let completed =
+                common::completed_args(&referrer, context, &tr, &f59_args(&["u8"]), |ty, ix, _| {
+                    calls.push((string(&ty), ix.index()));
+                    parse_quote!(<Self as R<#ix>>::Type)
+                })
                 .unwrap();
-            assert_eq!(
-                calls,
-                [("R1 < T >".to_string(), ix, vec!["u8".to_string()])],
-                "{}",
-                what
-            );
+            assert_eq!(calls, [("R1 < T >".to_string(), ix)], "{}", what);
             let expected: Vec<GenericArgument> =
                 vec![parse_quote!(u8), parse_quote!(<Self as R<0usize>>::Type)];
             assert_eq!(completed, expected, "{}", what);
 
             // A default that is given is not completed.
-            let completed = referrer
-                .complete_args(
-                    context,
-                    &tr.generics.params,
-                    &f59_args(&["u8", "u16"]),
-                    |_, _, _, _| unreachable!(),
-                )
-                .unwrap();
+            let completed = common::completed_args(
+                &referrer,
+                context,
+                &tr,
+                &f59_args(&["u8", "u16"]),
+                |_, ix, _| parse_quote!(<Self as R<#ix>>::Type),
+            )
+            .unwrap();
             assert_eq!(string(&completed[1]), "u16", "{}", what);
         }
     }
@@ -14510,23 +14527,23 @@ fn f65_complete_args_finds_the_default_of_a_trait_nested_in_a_module() {
         common::entry(&referrer, ix).self_ty.as_ref(),
         Some(SelfRequirement::Bound(_))
     ));
-    let completed = referrer
-        .complete_args(
-            context,
-            &tr.generics.params,
-            &f59_args(&["u8"]),
-            |_, _, _, _| unreachable!(),
-        )
-        .unwrap();
+    let completed = common::completed_args(
+        &referrer,
+        context,
+        &tr,
+        &f59_args(&["u8"]),
+        |_, _, _| unreachable!(),
+    )
+    .unwrap();
     assert_eq!(string(&completed[1]), "R1 < Self >");
 }
 
 // ── F66 ──────────────────────────────────────────────────────────────────────
 
-/// F66 (fixed): `UseSite::substitute()` and `Referrer::complete_args()` doubled the braces of a
+/// F66 (fixed): `substitute_args()` and `complete_params()` doubled the braces of a
 /// braced use of a const parameter.
 ///
-/// Trigger: `UseSite::substituting(<const N: usize>, [M])`: `substitute()` of `[u8; { N }]` gave
+/// Trigger: the site `<const N: usize>` with `[M]`: the substitution of `[u8; { N }]` gave
 /// `[u8; { { M } }]`, and `Rel<{ N }>` gave `Rel<{ { M } }>`. rustc rejects `{ { M } }` for a generic
 /// `M` ("generic parameters may not be used in const operations"); `[u8; { M }]` and `Rel<M>` are
 /// accepted (checked on stable and 1.56). `[u8; N]` gave `[u8; { M }]`, which is fine. A
@@ -14543,10 +14560,10 @@ fn f65_complete_args_finds_the_default_of_a_trait_nested_in_a_module() {
 #[test]
 fn f66_a_braced_const_parameter_is_braced_once_at_a_use_site() {
     let params: Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
-    let site = |arg: &str| UseSite::substituting(&params, &f59_args(&[arg]));
-    let substituted = |site: &UseSite, written: &str| {
+    let site = |arg: &str| f59_args(&[arg]);
+    let substituted = |site: &[GenericArgument], written: &str| {
         let ty: Type = parse_str(written).unwrap();
-        string(&site.substitute(&ty, None))
+        string(&common::substitute_type(&ty, common::answers(&params, site), None).unwrap())
     };
     for (written, arg, expected) in [
         ("[u8; { N }]", "M", "[u8 ; { M }]"),
@@ -14574,14 +14591,14 @@ fn f66_a_braced_const_parameter_is_braced_once_at_a_use_site() {
     let mut leaker = new_leaker();
     let context = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    let completed = referrer
-        .complete_args(
-            context,
-            &tr.generics.params,
-            &f59_args(&["M"]),
-            |_, _, _, _| unreachable!(),
-        )
-        .unwrap();
+    let completed = common::completed_args(
+        &referrer,
+        context,
+        &tr,
+        &f59_args(&["M"]),
+        |_, _, _| unreachable!(),
+    )
+    .unwrap();
     let completed: Vec<String> = completed.iter().map(string).collect();
     assert_eq!(completed, ["M", "[u8 ; { M }]"]);
 }
@@ -14917,16 +14934,16 @@ fn f68_every_unstable_bound_keeps_an_optional_self_type_from_being_an_entry() {
 
 // ── F69 ──────────────────────────────────────────────────────────────────────
 
-/// F69 (fixed): `UseSite::substitute()` and `Referrer::complete_args()` wrote an argument that has
+/// F69 (fixed): `substitute_args()` and `complete_params()` wrote an argument that has
 /// lifetimes into a function pointer or `Fn(..)` whose output has an elided lifetime, and the copy
 /// was E0106.
 ///
-/// Trigger: `UseSite::substituting(<U>, [&'static str])`: `substitute()` of `fn(&::core::cell::Cell<[U;
+/// Trigger: the site `<U>` with `[&'static str]`: the substitution of `fn(&::core::cell::Cell<[U;
 /// 1]>) -> &u8` gave `fn(&::core::cell::Cell<[&'static str; 1]>) -> &u8`, and `&dyn Fn(&U) -> &u8` gave
 /// `&dyn Fn(&&'static str) -> &u8`: rustc cannot tell which of the 2 lifetimes of the inputs the
 /// output has (checked on stable and 1.56). So did an argument with a named lifetime (`Wrap<'a>`), a
-/// `Self` with lifetimes of `UseSite::substitute()` (`fn(&Self) -> &u8`), and the default of a
-/// parameter that `complete_args()` completes (`U = fn(&T) -> &u8`). The original instantiated with
+/// `Self` with lifetimes of `substitute_args()` (`fn(&Self) -> &u8`), and the default of a
+/// parameter that `complete_params()` completes (`U = fn(&T) -> &u8`). The original instantiated with
 /// the same argument is valid, as rustc resolves the elision before it substitutes. rustc accepts
 /// the copy with the lifetime named by a binder: `for<'e> fn(&'e ::core::cell::Cell<[&'static str;
 /// 1]>) -> &'e u8`.
@@ -14956,16 +14973,18 @@ fn f68_every_unstable_bound_keeps_an_optional_self_type_from_being_an_entry() {
 #[test]
 fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetimes() {
     let params: Punctuated<GenericParam, Token![,]> = parse_quote!(U);
-    let site = |arg: &str| UseSite::substituting(&params, &f59_args(&[arg]));
-    let same_as = |site: &UseSite, self_ty: Option<&Type>, ty: &str, expected: &str| {
+    let site = |arg: &str| f59_args(&[arg]);
+    let same_as = |site: &[GenericArgument], self_ty: Option<&Type>, ty: &str, expected: &str| {
+        let ty = parse_str::<Type>(ty).unwrap();
         assert_eq!(
-            string(&site.substitute(&parse_str::<Type>(ty).unwrap(), self_ty)),
+            string(&common::substitute_type(&ty, common::answers(&params, site), self_ty).unwrap()),
             string(&parse_str::<Type>(expected).unwrap()),
             "{}",
-            ty
+            string(&ty)
         )
     };
-    let same = |site: &UseSite, ty: &str, expected: &str| same_as(site, None, ty, expected);
+    let same =
+        |site: &[GenericArgument], ty: &str, expected: &str| same_as(site, None, ty, expected);
 
     // The inputs show one lifetime and the argument adds one: named.
     let site_static = site("&'static str");
@@ -15044,13 +15063,13 @@ fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetim
     // `Self` with lifetimes, as `Visitor::with_self()` does.
     let with_self: Type = parse_quote!(::p::S<'a>);
     same_as(
-        &UseSite::identity(),
+        &[],
         Some(&with_self),
         "fn(&Self) -> &u8",
         "for<'__tl_s0> fn(&'__tl_s0 ::p::S<'a>) -> &'__tl_s0 u8",
     );
     same_as(
-        &UseSite::identity(),
+        &[],
         Some(&with_self),
         "dyn Fn(&Self::A) -> &u8",
         "dyn for<'__tl_s0> Fn(&'__tl_s0 <::p::S<'a>>::A) -> &'__tl_s0 u8",
@@ -15086,9 +15105,9 @@ fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetim
         "fn(::core::cell::Ref<U>) -> &u8",
         "fn(::core::cell::Ref<&'static str>) -> &u8",
     );
-    same(&UseSite::identity(), "fn(&U) -> &u8", "fn(&U) -> &u8");
+    same(&[], "fn(&U) -> &u8", "fn(&U) -> &u8");
 
-    // `complete_args()` completes the default that is such a signature.
+    // `complete_params()` completes the default that is such a signature.
     let tr: ItemTrait = parse_quote!(
         pub trait Tr<T, U = fn(&T) -> &u8, V = Box<dyn Fn(&T, &T) -> u8>> {
             fn f(&self, t: T) -> U;
@@ -15098,14 +15117,14 @@ fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetim
     let context = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     let complete = |arg: &str| -> Vec<GenericArgument> {
-        referrer
-            .complete_args(
-                context,
-                &tr.generics.params,
-                &f59_args(&[arg]),
-                |_, _, _, _| unreachable!(),
-            )
-            .unwrap()
+        common::completed_args(
+            &referrer,
+            context,
+            &tr,
+            &f59_args(&[arg]),
+            |_, _, _| unreachable!(),
+        )
+        .unwrap()
     };
     let strings = |args: Vec<GenericArgument>| -> Vec<String> { args.iter().map(string).collect() };
     assert_eq!(
@@ -15129,27 +15148,28 @@ fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetim
 // ── F70 ──────────────────────────────────────────────────────────────────────
 
 /// The copy of `item`, a struct that has the entry `::std::vec::Vec<T>`, that a macro makes at a
-/// use site: the generics of the item take `args`, and `type_fn` writes the path through the
-/// Repeater with the arguments that the encoder gives (`Self` is written as `self_ty` if
-/// given).
+/// use site: the visitor writes the path through the Repeater by the generics of the entry (`Self`
+/// is written as `self_ty` if given), and one pass writes the arguments `args` of the site into the
+/// fields (`self_ty` is a type at the site).
 fn f70_copy(item: &ItemStruct, args: &[&str], self_ty: Option<Type>) -> ItemStruct {
     let mut leaker = new_leaker();
     let context = leaker.intern_struct(item, true);
     let referrer = leaker.result().finish().unwrap();
     let entries: Vec<String> = common::types(&referrer).map(string).collect();
     assert_eq!(entries, [":: std :: vec :: Vec < T >"], "{}", string(item));
-    let site = UseSite::substituting(&item.generics.params, &f59_args(args));
+    let given = f59_args(args);
     let repeater: Path = parse_quote!(crate::Repeater);
     let mut copy = item.clone();
     let mut visitor = referrer.visitor(context, |_, ix, entry| {
-        let args = common::repeater_args(entry, &site, None, slot_const(&repeater)).unwrap();
-        repeater_projection(&repeater, &parse_quote!(Self), &args, 7, ix)
+        let self_ty: Type = parse_quote!(Self);
+        repeater_projection(&repeater, &self_ty, entry, 7, ix, slot_const(&repeater)).unwrap()
     });
     if let Some(self_ty) = self_ty {
         visitor = visitor.with_self(self_ty);
     }
     visitor.visit_item_struct_mut(&mut copy);
-    copy
+    // The arguments of the site, in one pass over the types of the copy.
+    common::Written::new(common::answers(&item.generics.params, &given)).item(copy)
 }
 
 /// F70 (fixed): the Visitor wrote the path through the Repeater of an entry into the inputs of a
@@ -15158,29 +15178,36 @@ fn f70_copy(item: &ItemStruct, args: &[&str], self_ty: Option<Type>) -> ItemStru
 ///
 /// Trigger: `struct S<T> { f: fn(&::std::vec::Vec<T>) -> &u8 }` and a Leaker that does not allow
 /// `::std`, so the copy replaces the optional entry `::std::vec::Vec<T>` (`inst(..)` of a macro,
-/// the encoder at the site `T := &'static str`): the copy has `fn(&<Self as Repeater<(&'static str,), ..>>::Type) ->
+/// the site `T := &'static str`): the copy has `fn(&<Self as Repeater<(&'static str,), ..>>::Type) ->
 /// &u8`, whose inputs have two lifetimes, and rustc cannot tell which one the output has (checked
 /// on stable and 1.56). The same for the sugar of `Fn(..)` in a trait object
 /// (`PhantomData<dyn Fn(&Vec<T>) -> &u8>`), and for the inputs that name their lifetime (`for<'x>
 /// fn(&'x Vec<T>) -> &u8`: the output takes `'x`, and the path adds `'static`). The Leaker leaks
 /// `Vec<T>` alone: it adds no lifetime that the Leaker can know, the arguments of the site are the
 /// macro's. The entry of a relative path (`Rel<T>`) may hide a lifetime, so the whole signature is
-/// leaked there. The path that replaces a default in `Referrer::complete_args()` is the same.
+/// leaked there. The path that replaces a default in `complete_params()` is the same.
 ///
 /// Cause: the Visitor named the elided lifetime only for `Self`, before it folded the signature
 /// (F15, F23): what `type_fn` returns is not known until then. F69 named it for the substitutions
 /// of a use site, which know their arguments.
 ///
+/// Since the arguments of a site are written after the visit (`substitute_args()`, one pass over
+/// the types of the copy), the path through the Repeater that the visitor writes names the
+/// generics of the entry, and it is that pass that names the lifetime (`'__tl_s<n>`, outer
+/// signature first). The visitor still names one that `type_fn` writes (the generics of the entry
+/// have lifetimes of their own), and the one that `Self` adds (`'__tl_e<n>`).
+///
 /// Fix: the Visitor reads what the original relies on before it folds a function pointer or `Fn(..)`
 /// (`Elision`: the inputs show their one lifetime, elided or named, and the output elides), and after
 /// it, if the written inputs show more than one lifetime, names it with a fresh binder (`'__tl_e<n>`,
-/// none that the signature names). The same for the paths that `complete_args()` writes for the
+/// none that the signature names). The same for the paths that `complete_params()` writes for the
 /// entries of a default (`'__tl_s<n>`, as a use site). `type_fn` is called once, as before. A
 /// signature that `Self` already made name its lifetime (F15) has a named output and is left.
 ///
 /// Limitations: only the elided lifetime that the original had is named. If `type_fn` wrote an
 /// elided lifetime of its own (`&str` as an argument, which is no lifetime a site can name), the
-/// two cannot be told apart, and the copy is as written. If the lifetime that the inputs named is in
+/// two cannot be told apart, and the copy is as written (the pass of a site does tell them, and
+/// names the original's). If the lifetime that the inputs named is in
 /// an entry (`fn(&'a Vec<T>) -> &u8`, the entry `&'a Vec<T>`), the name that the site gives it is
 /// not known to the Visitor, and the copy is as written. A lifetime that a path hides is not named
 /// (F69).
@@ -15220,7 +15247,7 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         "fn(&::std::vec::Vec<T>) -> &u8",
         lt,
         None,
-        &format!("for<'__tl_e0> fn(&'__tl_e0 {}) -> &'__tl_e0 u8", p),
+        &format!("for<'__tl_s0> fn(&'__tl_s0 {}) -> &'__tl_s0 u8", p),
     );
     same(
         t,
@@ -15228,8 +15255,8 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         lt,
         None,
         &format!(
-            "::core::marker::PhantomData<dyn for<'__tl_e0> ::core::ops::Fn(&'__tl_e0 {}) -> \
-             &'__tl_e0 u8 + 'static>",
+            "::core::marker::PhantomData<dyn for<'__tl_s0> ::core::ops::Fn(&'__tl_s0 {}) -> \
+             &'__tl_s0 u8 + 'static>",
             p
         ),
     );
@@ -15238,7 +15265,7 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         "fn(&::std::vec::Vec<T>, u8) -> &u8",
         lt,
         None,
-        &format!("for<'__tl_e0> fn(&'__tl_e0 {}, u8) -> &'__tl_e0 u8", p),
+        &format!("for<'__tl_s0> fn(&'__tl_s0 {}, u8) -> &'__tl_s0 u8", p),
     );
     // The inputs name their lifetime: the output takes it.
     same(
@@ -15255,8 +15282,8 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         lt,
         None,
         &format!(
-            "for<'__tl_e1> fn(&'__tl_e1 {p}, for<'__tl_e0> fn(&'__tl_e0 {p}) -> &'__tl_e0 u8) -> \
-             &'__tl_e1 u8",
+            "for<'__tl_s0> fn(&'__tl_s0 {p}, for<'__tl_s1> fn(&'__tl_s1 {p}) -> &'__tl_s1 u8) -> \
+             &'__tl_s0 u8",
             p = p
         ),
     );
@@ -15266,7 +15293,7 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         lt,
         None,
         &format!(
-            "for<'__tl_e0> fn(&'__tl_e0 {}, fn(&u8) -> &u8) -> &'__tl_e0 u8",
+            "for<'__tl_s0> fn(&'__tl_s0 {}, fn(&u8) -> &u8) -> &'__tl_s0 u8",
             p
         ),
     );
@@ -15276,9 +15303,9 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         t,
         "fn(&(Self, ::std::vec::Vec<T>)) -> &u8",
         lt,
-        Some("::p::S<T>"),
+        Some("::p::S<u8>"),
         &format!(
-            "for<'__tl_e0> fn(&'__tl_e0 (::p::S<T>, {})) -> &'__tl_e0 u8",
+            "for<'__tl_s0> fn(&'__tl_s0 (::p::S<u8>, {})) -> &'__tl_s0 u8",
             p
         ),
     );
@@ -15286,15 +15313,14 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         "<'a, T>",
         "fn(&(Self, ::std::vec::Vec<T>)) -> &u8",
         &["'static", "&'static str"],
-        Some("::p::S<'a, T>"),
+        Some("::p::S<'static, u8>"),
         &format!(
-            "for<'__tl_e0> fn(&'__tl_e0 (::p::S<'a, T>, {})) -> &'__tl_e0 u8",
+            "for<'__tl_e0> fn(&'__tl_e0 (::p::S<'static, u8>, {})) -> &'__tl_e0 u8",
             p
         ),
     );
 
-    // Unchanged: no lifetime added, the lifetime already named, an output that does not elide, and
-    // an argument that has an elided lifetime of its own.
+    // Unchanged: no lifetime added, the lifetime already named, an output that does not elide.
     same(
         t,
         "fn(&::std::vec::Vec<T>) -> &u8",
@@ -15316,15 +15342,20 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         None,
         &format!("fn(&{}) -> u8", p),
     );
+    // (The site's one pass names the elided lifetime of the original even if the argument has an
+    // elided lifetime of its own: it is not the Visitor that writes the argument.)
     same(
         t,
         "fn(&::std::vec::Vec<T>) -> &u8",
         &["&str"],
         None,
-        &format!("fn(&{}) -> &u8", projection("&str")),
+        &format!(
+            "for<'__tl_s0> fn(&'__tl_s0 {}) -> &'__tl_s0 u8",
+            projection("&str")
+        ),
     );
 
-    // `complete_args()` writes the path for the entry of a default the same way.
+    // `complete_params()` writes the path for the entry of a default the same way.
     let tr: ItemTrait = parse_quote!(
         pub trait Tr<T, U = fn(&::std::vec::Vec<T>) -> &u8> {
             fn f(&self, t: T) -> U;
@@ -15335,22 +15366,21 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
     let referrer = leaker.result().finish().unwrap();
     let repeater: Path = parse_quote!(crate::Repeater);
     let complete = |arg: &str| -> Vec<String> {
-        referrer
-            .complete_args(
-                context,
-                &tr.generics.params,
-                &f59_args(&[arg]),
-                |_, ix, entry, completed| {
-                    let site = UseSite::substituting(&tr.generics.params, completed);
-                    let args =
-                        common::repeater_args(entry, &site, None, slot_const(&repeater)).unwrap();
-                    repeater_projection(&repeater, &parse_quote!(Self), &args, 7, ix)
-                },
-            )
-            .unwrap()
-            .iter()
-            .map(string)
-            .collect()
+        common::completed_args(
+            &referrer,
+            context,
+            &tr,
+            &f59_args(&[arg]),
+            |_, ix, entry| {
+                let self_ty: Type = parse_quote!(Self);
+                repeater_projection(&repeater, &self_ty, entry, 7, ix, slot_const(&repeater))
+                    .unwrap()
+            },
+        )
+        .unwrap()
+        .iter()
+        .map(string)
+        .collect()
     };
     let expected = |texts: &[&str]| -> Vec<String> { f59_args(texts).iter().map(string).collect() };
     assert_eq!(

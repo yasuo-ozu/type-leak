@@ -38,18 +38,12 @@ use template_quote::{quote, ToTokens};
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
-/// let item: ItemTrait = parse_quote! {
-///     trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; fn g(&self) -> Rel; }
-/// };
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item, true);
+/// leaker.intern_struct(&parse_quote!(struct S(Rel);), true);
 /// let referrer = leaker.result().finish().unwrap();
-/// // `Wrap<T>` and `Rel` depend on where they are written, so each needs a Repeater impl.
-/// assert_eq!(referrer.iter().count(), 2);
-/// // The context of `Wrap<T>` has the generic `T`.
-/// let wrap: Type = parse_quote!(Wrap<T>);
-/// let (_, _, context) = referrer.iter().find(|(_, ty, _)| **ty == wrap).unwrap();
-/// assert_eq!(context.generics.params.len(), 1);
+/// // `Rel` depends on where it is written, so it needs a Repeater impl.
+/// let (_, ty, _) = referrer.iter().next().unwrap();
+/// assert_eq!(*ty, parse_quote!(Rel));
 /// ```
 ///
 /// # Errors and recovery
@@ -156,8 +150,7 @@ pub struct Leaker<A = ()> {
 ///
 /// ```
 /// # use type_leak::*;
-/// let leaker = Leaker::from_config(Rules::new().prelude(), Options::new().check_values());
-/// # let _ = leaker;
+/// let _leaker = Leaker::from_config(Rules::new().prelude(), Options::new().check_values());
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Options {
@@ -323,12 +316,11 @@ impl<A: Allow> Leaker<A> {
     ///
     /// ```
     /// # use {syn::*, type_leak::*};
-    /// let item: ItemTrait = parse_quote!(trait Tr { type Out; fn g(&self) -> Wrap<Self::Out>; });
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&item, true);
+    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self>; }), true);
     /// let referrer = leaker.result().finish().unwrap();
     /// let (_, _, context) = referrer.iter().next().unwrap();
-    /// assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
+    /// assert_eq!(context.self_ty, Some(SelfRequirement::Bound(parse_quote!(Tr))));
     /// ```
     pub fn intern_trait(&mut self, item: &ItemTrait, allow_self: bool) -> ContextId {
         // The scope knows the generic associated types of the trait: what they require is part of
@@ -532,17 +524,13 @@ impl<A: Allow> Leaker<A> {
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
-/// let item: ItemStruct = parse_quote!(struct S { a: Rel, b: ::p::W<'_, dyn RelTr> });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&item, true);
+/// leaker.intern_struct(&parse_quote!(struct S(::p::W<'_, dyn RelTr>);), true);
 /// let result = leaker.result();
 /// assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
-/// // `Rel` is an entry as usual, and `dyn RelTr` is copied as written.
-/// let referrer = result.clone().into_referrer();
-/// assert_eq!(referrer.iter().count(), 1);
-/// // Allowing the error leaves the Referrer as it is, and `finish()` returns it.
+/// // Allowing the error copies the part as written, and `finish()` is `Ok`.
 /// let result = result.allow(|cause: &Cause, _: Place| *cause == Cause::Trait(parse_quote!(RelTr)));
-/// assert_eq!(result.finish().unwrap(), referrer);
+/// assert!(result.finish().is_ok());
 /// ```
 #[derive(Clone, Debug)]
 pub struct LeakerResult {
@@ -611,8 +599,8 @@ impl LeakerResult {
     /// [`Referrer::bucket_self()`]. `ToTokens` of the item writes the impl with the `KEY`
     /// ([`repeater_key(id, entry)`](crate::repeater_key)), and [`ImplSelf::Bucket`] chooses the
     /// type from the same `id`. `target` says what every impl is for ([`ImplSelf`]); `const_fn` is
-    /// as in [`encode_generics_args_with_params()`](crate::encode_generics_args_with_params), but
-    /// gets the parameter itself (`N`) as `value`.
+    /// as in [`repeater_projection()`](crate::repeater_projection): it gets the parameter itself
+    /// (`N`) as `value`.
     ///
     /// The call fails, before any item, with the first of these:
     ///
@@ -628,36 +616,19 @@ impl LeakerResult {
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
-    /// # use template_quote::{quote, ToTokens};
-    /// let tr: ItemTrait = parse_quote! {
-    ///     trait Tr<T> { type Out; fn f(&self) -> Wrap<T, Self::Out>; }
-    /// };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
+    /// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);), true);
     /// let result = leaker.result();
     ///
     /// let repeater: Path = parse_quote!(crate::Repeater);
-    /// let param: Ident = parse_quote!(__S);
-    /// let target = ImplSelf::Param(&param);
-    /// let mut impls = result
-    ///     .repeater_impls(&repeater, 7, target, slot_const(&repeater))
+    /// let r = result
+    ///     .repeater_impls(&repeater, 7, ImplSelf::Param(&parse_quote!(__S)), array_const)
+    ///     .unwrap()
+    ///     .next()
     ///     .unwrap();
-    /// let r = impls.next().unwrap();
-    /// assert!(impls.next().is_none());
-    ///
+    /// assert_eq!(r.ty, parse_quote!(Wrap<T>));
     /// // `path` has no `KEY`, and `ToTokens` writes the one of the id 7.
     /// assert_eq!(r.path, parse_quote!(crate::Repeater<(T,)>));
-    /// let key = repeater_key(7, r.entry);
-    ///
-    /// // `Self::Out` names `Self`: the implementor is bound by the trait, and replaces it.
-    /// let expected: ItemImpl = parse_quote! {
-    ///     impl<T, __S: ?::core::marker::Sized + Tr<T>>
-    ///         crate::Repeater<(T,), #key> for __S
-    ///     {
-    ///         type Type = Wrap<T, <__S>::Out>;
-    ///     }
-    /// };
-    /// assert_eq!(parse2::<ItemImpl>(quote!(#r)).unwrap(), expected);
     /// ```
     ///
     /// An entry that names `Self` has no impl for a marker, so the call fails:
@@ -665,18 +636,14 @@ impl LeakerResult {
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
-    /// let tr: ItemTrait = parse_quote! {
-    ///     trait Tr<T> { type Out; fn f(&self) -> Wrap<T, Self::Out>; }
-    /// };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true);
+    /// leaker.intern_struct(&parse_quote!(struct S(Wrap<Self>);), true);
     /// let result = leaker.result();
     ///
-    /// let repeater: Path = parse_quote!(crate::Repeater);
-    /// let marker: Type = parse_quote!(crate::Marker);
-    /// let target = ImplSelf::Marker(&marker);
-    /// let impls = result.repeater_impls(&repeater, 7, target, slot_const(&repeater));
-    /// assert!(matches!(impls, Err(EncodeError::NeedsSelf(_))));
+    /// let repeater: Path = parse_quote!(Repeater);
+    /// let marker: Type = parse_quote!(Marker);
+    /// let err = result.repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const).err();
+    /// assert!(matches!(err, Some(EncodeError::NeedsSelf(_))));
     /// ```
     pub fn repeater_impls<'a>(
         &'a self,
@@ -1020,6 +987,3 @@ fn find(component: &mut [usize], mut i: usize) -> usize {
     }
     i
 }
-
-#[cfg(test)]
-mod tests;

@@ -4605,8 +4605,9 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         self.with_item_of(&i.generics, Some(self_ty), false, gats, |visitor| {
             // A trait that is nested in the walk analyzes the defaults that do not name `Self`
             // alone too, as a trait that a scope was entered for does: that is the entry
-            // `Referrer::complete_args()` looks up, which cannot use one for the implementors of
-            // the trait (`Self: Tr<T, U>` names the parameter that it is the default of).
+            // the visitor looks up for the defaults of a copy of the trait, which `complete_params()`
+            // takes: an impl cannot use one for the implementors of the trait (`Self: Tr<T, U>`
+            // names the parameter that it is the default of).
             let idents = alone.unwrap_or_else(|| visitor.analyze_defaults_alone(&i.generics));
             visitor.alone_defaults.push(AloneDefaults {
                 scopes: visitor.scopes.len(),

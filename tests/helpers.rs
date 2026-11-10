@@ -1,6 +1,6 @@
 //! Tests for the helpers for macro authors: the order of the entries, the description of the Repeater
-//! impl of an entry (`LeakerResult::repeater_impls()`), the arguments of an entry at a use site
-//! (`encode_generics_args_with_params()`), and the items of the errors of the analysis (`Vec<ErrorItem>`).
+//! impl of an entry (`LeakerResult::repeater_impls()`), the path of an entry through the Repeater
+//! (`repeater_projection()`), and the items of the errors of the analysis (`Vec<ErrorItem>`).
 //!
 //! The impl and the arguments are compared with what a macro wrote by hand before the helpers
 //! (the replacement of `Self`, `without_encoded_bounds()` and the encoders, and the arguments of a
@@ -519,8 +519,9 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
         .next()
         .unwrap();
     assert_eq!(s(&r.args), t(parse_quote!(([(); N],))));
-    let site = UseSite::substituting(&parse_quote!(const N: usize), &[parse_quote!(3)]);
-    // The same closure encodes the parameter and the argument.
+    let params: punctuated::Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
+    let values: Vec<GenericArgument> = vec![parse_quote!(3)];
+    // The same closure encodes the parameter in the impl and in the projection.
     let calls = std::cell::RefCell::new(Vec::new());
     let mut encode = |value: &Expr, param: &ConstParam| {
         calls.borrow_mut().push((s(value), s(&param.ty)));
@@ -540,19 +541,21 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     let first = common::entry_id_at(&referrer, 0);
     let args = common::repeater_args(
         common::entry(&referrer, first.index()),
-        &site,
+        common::answers(&params, &values),
         None,
         &mut encode,
     )
     .unwrap();
     assert_eq!(s(&args), t(parse_quote!((Const<3>,))));
-    // The call checks the parameter before it iterates, and the item encodes it again.
+    // The call checks the parameter before it iterates, the item encodes it again, and so does the
+    // projection: the closure always gets the parameter (`N`), and the argument of the site is
+    // written afterwards.
     assert_eq!(
         *calls.borrow(),
         [
             ("N".to_string(), "usize".to_string()),
             ("N".to_string(), "usize".to_string()),
-            ("3".to_string(), "usize".to_string())
+            ("N".to_string(), "usize".to_string())
         ]
     );
     // Without a closure, only `usize` has an encoding.
@@ -574,10 +577,11 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
         "{}",
         err
     );
-    let site = UseSite::substituting(&parse_quote!(const B: bool), &[parse_quote!(true)]);
+    let params: punctuated::Punctuated<GenericParam, Token![,]> = parse_quote!(const B: bool);
+    let values: Vec<GenericArgument> = vec![parse_quote!(true)];
     let err = common::repeater_args(
         common::entry(&referrer, first.index()),
-        &site,
+        common::answers(&params, &values),
         None,
         array_const,
     )
@@ -596,7 +600,7 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
         .unwrap();
     let args = common::repeater_args(
         common::entry(&referrer, 0),
-        &UseSite::identity(),
+        common::identity,
         None,
         slot_const(&repeater),
     )
@@ -786,7 +790,7 @@ fn the_generics_of_every_impl_are_declared_in_the_order_of_every_rustc() {
 }
 
 /// `ToTokens` (and `ItemImpl::from(r)`, which it writes) is the impl written by hand from the
-/// pieces, with the path of `repeater_trait_path()`, token for token, for every target.
+/// pieces, with the path `Repeater<args, KEY>`, token for token, for every target.
 #[test]
 fn the_tokens_of_a_repeater_impl_are_the_impl_written_by_hand() {
     let param: Ident = parse_quote!(__S);
@@ -804,7 +808,8 @@ fn the_tokens_of_a_repeater_impl_are_the_impl_written_by_hand() {
                 for r in impls {
                     let what = format!("{}: {} {:?}", s(&item), r.entry, target);
                     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-                    let path = repeater_trait_path(&repeater, &r.args, 5, r.entry);
+                    let (args, key) = (&r.args, repeater_key(5, r.entry));
+                    let path: Path = parse_quote!(#repeater<#args, #key>);
                     let (self_ty, ty) = (&r.self_ty, &r.ty);
                     let by_hand = quote! {
                         impl #impl_generics #path for #self_ty #where_clause {
@@ -839,11 +844,11 @@ fn the_encoder_substitutes_the_generics_of_the_trait_and_not_those_of_a_method()
         .position(|ty| s(ty) == "Wrap2 < T , U >")
         .unwrap();
     let args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(Vec<u8>)];
-    let site = UseSite::substituting(&tr.generics.params, &args);
+    let site = common::answers(&tr.generics.params, &args);
     // `'b` and `U` are the method's, passed by their own names.
     assert_eq!(
         s(
-            &common::repeater_args(common::entry(&referrer, wrap2), &site, None, array_const)
+            &common::repeater_args(common::entry(&referrer, wrap2), site, None, array_const)
                 .unwrap()
         ),
         t(parse_quote!((
@@ -856,12 +861,23 @@ fn the_encoder_substitutes_the_generics_of_the_trait_and_not_those_of_a_method()
             &'b U
         )))
     );
-    // Too few arguments.
-    let site = UseSite::substituting(&tr.generics.params, &args[..1]);
-    assert!(matches!(
-        common::repeater_args(common::entry(&referrer, wrap2), &site, None, array_const),
-        Err(EncodeError::MissingArgument(_))
-    ));
+    // Too few arguments: a name that has no answer stays.
+    let site = common::answers(&tr.generics.params, &args[..1]);
+    assert_eq!(
+        s(
+            &common::repeater_args(common::entry(&referrer, wrap2), site, None, array_const)
+                .unwrap()
+        ),
+        t(parse_quote!((
+            &'static (),
+            &'b (),
+            T,
+            U,
+            &'static T,
+            &'b T,
+            &'b U
+        )))
+    );
 }
 
 #[test]
@@ -873,19 +889,20 @@ fn the_encoder_with_the_defaults_completed() {
     };
     let (referrer, context) = analyze(&Item::Trait(tr.clone()));
     let written: AngleBracketedGenericArguments = parse_quote!(<u8>);
-    let completed = referrer
-        .complete_args(
-            context,
-            &tr.generics.params,
-            &written.args,
-            |_, ix, context, completed| {
-                // The parameters of the trait can all be given: the entry of a default uses only the
-                // ones before it.
-                let site = UseSite::substituting(&tr.generics.params, completed);
-                let args = common::repeater_args(context, &site, None, array_const).unwrap();
-                repeater_projection(&repeater(), &parse_quote!(Self), &args, 1, ix)
-            },
-        )
+    let completed =
+        common::completed_args(&referrer, context, &tr, &written.args, |_, ix, context| {
+            // The entry of the default is written by its own generics (`(T,)`), which
+            // `complete_params()` replaces by the argument.
+            repeater_projection(
+                &repeater(),
+                &parse_quote!(Self),
+                context,
+                1,
+                ix,
+                array_const,
+            )
+            .unwrap()
+        })
         .unwrap();
     let key = repeater_key(1, common::entry_id_at(&referrer, 0));
     assert_eq!(

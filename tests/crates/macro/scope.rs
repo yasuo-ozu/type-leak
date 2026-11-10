@@ -21,8 +21,7 @@
 //! In the Referrer's crate, `leaker::__scope_apply_7001!(path = ::leaker::m)` expands
 //! `__scope_apply!`: it rewrites the self type, the trait path and the type arguments with
 //! `Referrer::visitor(context, ..)`, whose closure writes the path through the Repeater with
-//! `encode_generics_args_with_params()` on the generics of the entry's context at
-//! `UseSite::identity()`, and emits
+//! `repeater_projection()` on the entry's context, and emits
 //!
 //! - `fn __tl_chk_<id>_<j>() -> PhantomData<rewritten>`, which compiles only if the rewritten type
 //!   is the original one (the witness of the Leaker's crate returns the original),
@@ -470,13 +469,14 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             } else {
                 marker_ty.clone()
             };
-            let args = crate::repeater_args(
+            Ok(repeater_projection(
+                &repeater,
+                &owner,
                 entry,
-                &UseSite::identity(),
-                Some(&owner),
+                id,
+                ix,
                 slot_const(&repeater),
-            )?;
-            Ok(repeater_projection(&repeater, &owner, &args, id, ix))
+            )?)
         })();
         result.unwrap_or_else(|e| {
             *error.borrow_mut() = Some(e);

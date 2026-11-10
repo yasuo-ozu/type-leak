@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    to_syn_error, Allow, Context, ContextId, EntryId, ErrorItem, Leaker, Options, Referrer, Rules,
-    SelfRequirement,
+    to_syn_error, Allow, Cause, Context, ContextId, EntryId, ErrorItem, Leaker, Options, Place,
+    Referrer, Rules, SelfRequirement, View,
 };
 
 fn s(x: &impl ToTokens) -> String {
@@ -614,6 +614,207 @@ fn test_finish_reduces_and_accumulates() {
         .map(|(_, t, _)| quote!(#t).to_string())
         .collect();
     assert_eq!(leaked, strings(&["A", "B"]));
+}
+
+// ── the entries that reduce_roots() keeps ────────────────────────────────────
+//
+// `reduce_roots()` prunes the Leaker to the entries it chose, and what is analyzed afterwards is
+// added to them: a kept entry stays one, of the kind it was kept as. The tests of `tests/
+// reduce_roots.rs` show the pruning for the usual items; these show it against a later scope that
+// changes the verdict on a kept entry.
+
+/// The types of the entries, in the order of the Referrer.
+fn listed(referrer: &Referrer) -> Vec<String> {
+    common::types(referrer).map(s).collect()
+}
+
+/// The entries after two scopes in `generics`, with `reduce_roots()` between them if `reduce`.
+fn two_scopes(
+    generics: &Generics,
+    first: impl Fn(&mut View<'_, '_, ()>),
+    second: impl Fn(&mut View<'_, '_, ()>),
+    reduce: bool,
+) -> Vec<String> {
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(generics, |view| first(view));
+    if reduce {
+        leaker.reduce_roots();
+    }
+    leaker.enter_generics(generics, |view| second(view));
+    listed(&leaker.result().finish().unwrap())
+}
+
+/// A scope that adds no entry leaves the entries as `reduce_roots()` left them, and so does one
+/// that names a kept entry again (the pair): a reduction after either changes nothing.
+#[test]
+fn a_scope_that_adds_no_entry_after_reduce_roots_changes_nothing() {
+    let first: ItemStruct = parse_quote! { struct S1 { a: (R1, R2), b: ::ext::X } };
+    let plain: ItemStruct = parse_quote! { struct S2 { a: u8 } };
+    let again: ItemStruct = parse_quote! { struct S3 { a: (R1, R2) } };
+    let run = |later: &[&ItemStruct], reduce_after: bool| -> Referrer {
+        let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
+        leaker.intern_struct(&first, true);
+        leaker.reduce_roots();
+        for item in later {
+            leaker.intern_struct(item, true);
+        }
+        if reduce_after {
+            leaker.reduce_roots();
+        }
+        leaker.result().finish().unwrap()
+    };
+    let kept = run(&[], false);
+    assert_eq!(listed(&kept), ["(R1 , R2)", ":: ext :: X"]);
+    for (later, reduce_after) in [
+        (vec![&plain], false),
+        (vec![&plain], true),
+        (vec![&again], false),
+        (vec![&again], true),
+        (vec![&plain, &again, &plain], true),
+    ] {
+        let case = format!(
+            "{} later items, reduced after: {}",
+            later.len(),
+            reduce_after
+        );
+        assert_eq!(run(&later, reduce_after), kept, "{}", case);
+    }
+}
+
+// The generics of the next tests: the bound of `T` names `::ext::X`, a type of another crate, so
+// in a predicate a type that uses `T` cannot be an optional entry: the Referrer would write `X` of
+// the bound as a path through the Repeater, where the impl of the entry needs it as written
+// (`tests/bound_cycles.rs`). In a field it can. The pair is one entry in a field (cheaper than
+// `A<U>` and `B<T>`), and the same type in a predicate, in the same context, cannot be one.
+
+fn pair_generics() -> Generics {
+    parse_quote! { <T: ::core::ops::Fn(::ext::X), U> }
+}
+
+fn pair() -> Type {
+    parse_quote! { (::ext::A<U>, ::ext::B<T>) }
+}
+
+fn pair_in_a_predicate() -> WhereClause {
+    parse_quote! { where (::ext::A<U>, ::ext::B<T>): ::core::marker::Sized }
+}
+
+/// A later scope may forbid an optional entry that an earlier one kept: it stays an entry, as the
+/// copy of the earlier scope is built from it. The later scope may get a copy that does not
+/// compile; that is the price of pruning.
+#[test]
+fn a_kept_optional_entry_stays_when_a_later_scope_forbids_it() {
+    let (generics, pair, predicate) = (pair_generics(), pair(), pair_in_a_predicate());
+    let in_field = |view: &mut View<'_, '_, ()>| view.visit_type(&pair);
+    let in_predicate = |view: &mut View<'_, '_, ()>| view.visit_where_clause(&predicate);
+    let nothing = |_: &mut View<'_, '_, ()>| {};
+    // Each scope alone: the pair in a field is one entry; in a predicate its parts are the entries,
+    // and `B<T>`, which the bound of `T` forbids, is written as it is.
+    assert_eq!(
+        two_scopes(&generics, nothing, in_field, false),
+        ["(:: ext :: A < U > , :: ext :: B < T >)"]
+    );
+    assert_eq!(
+        two_scopes(&generics, nothing, in_predicate, false),
+        [":: ext :: A < U >"]
+    );
+    // One reduction at the end has the parts of the pair for both scopes.
+    assert_eq!(
+        two_scopes(&generics, in_field, in_predicate, false),
+        [":: ext :: A < U >", ":: ext :: B < T >"]
+    );
+    // After `reduce_roots()` the pair is kept as the entry that it was.
+    assert_eq!(
+        two_scopes(&generics, in_field, in_predicate, true),
+        ["(:: ext :: A < U > , :: ext :: B < T >)"]
+    );
+}
+
+/// A later type that has the kept pair as a component does not replace it, whether or not the later
+/// scope forbids the pair: the parent is built from it.
+#[test]
+fn a_kept_entry_stays_when_a_later_type_holds_it() {
+    let (generics, pair, predicate) = (pair_generics(), pair(), pair_in_a_predicate());
+    let parent: Type = parse_quote! { ((::ext::A<U>, ::ext::B<T>), ::ext::C<U>) };
+    let in_field = |view: &mut View<'_, '_, ()>| view.visit_type(&pair);
+    let parent_alone = |view: &mut View<'_, '_, ()>| view.visit_type(&parent);
+    let with_predicate = |view: &mut View<'_, '_, ()>| {
+        view.visit_where_clause(&predicate);
+        view.visit_type(&parent);
+    };
+    let nothing = |_: &mut View<'_, '_, ()>| {};
+    // Alone, the parent is the one entry. After `reduce_roots()` the pair is kept, and the parent,
+    // which the pair and `C<U>` build, is not one: two entries.
+    assert_eq!(
+        two_scopes(&generics, nothing, parent_alone, false),
+        ["((:: ext :: A < U > , :: ext :: B < T >) , :: ext :: C < U >)"]
+    );
+    assert_eq!(
+        two_scopes(&generics, in_field, parent_alone, true),
+        [
+            "(:: ext :: A < U > , :: ext :: B < T >)",
+            ":: ext :: C < U >"
+        ]
+    );
+    // The same where the later scope forbids the pair (in a predicate, as well as a part of the
+    // parent): alone, its parts are the entries.
+    assert_eq!(
+        two_scopes(&generics, nothing, with_predicate, false),
+        [":: ext :: A < U >", ":: ext :: C < U >"]
+    );
+    assert_eq!(
+        two_scopes(&generics, in_field, with_predicate, true),
+        [
+            "(:: ext :: A < U > , :: ext :: B < T >)",
+            ":: ext :: C < U >"
+        ]
+    );
+}
+
+/// A kept optional entry that a later scope shows to hold a required type is a required entry.
+///
+/// The rule allows `Rel` in a default only, so `::ext::X<(Rel,)>` in a default holds no required
+/// type and is an optional entry, and in a field it holds `Rel`, which is required. The required
+/// entries come before the optional ones in the Referrer.
+#[test]
+fn a_kept_optional_entry_becomes_required_when_it_holds_a_required_type() {
+    let rule =
+        |cause: &Cause, place: Place| place.in_default && *cause == Cause::Type(parse_quote!(Rel));
+    let in_default: ItemStruct = parse_quote! { struct S1<T = ::ext::X<(Rel,)>>(T); };
+    let in_field: ItemStruct = parse_quote! { struct S2 { a: ::ext::X<(Rel,)> } };
+    let other: ItemStruct = parse_quote! { struct S3 { b: Rel2 } };
+    let run = |items: &[&ItemStruct], reduce: bool| -> Vec<String> {
+        let mut leaker = Leaker::from_config(rule, Options::new());
+        for (ix, item) in items.iter().enumerate() {
+            leaker.intern_struct(item, true);
+            if reduce && ix == 0 {
+                leaker.reduce_roots();
+            }
+        }
+        listed(&leaker.result().finish().unwrap())
+    };
+    // In a default, `X<(Rel,)>` is an optional entry: it comes after `Rel2`, kept or not.
+    for reduce in [false, true] {
+        assert_eq!(
+            run(&[&in_default, &other], reduce),
+            ["Rel2", ":: ext :: X < (Rel ,) >"]
+        );
+    }
+    // In a field it is a required entry, and comes first (the entries are sorted by their tokens).
+    assert_eq!(
+        run(&[&in_field, &other], false),
+        [":: ext :: X < (Rel ,) >", "Rel2"]
+    );
+    // Kept as an optional entry, and then shown to hold `Rel`: it is a required one, as it is for
+    // one reduction at the end.
+    for reduce in [false, true] {
+        assert_eq!(
+            run(&[&in_default, &in_field, &other], reduce),
+            [":: ext :: X < (Rel ,) >", "Rel2"],
+            "reduced in between: {}",
+            reduce
+        );
+    }
 }
 
 #[test]

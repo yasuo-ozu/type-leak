@@ -43,10 +43,10 @@ A name in Rust means something only where it is written. When a proc macro copie
 
 ```rust
 use syn::visit_mut::VisitMut;
-use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Path, Signature, Type};
+use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Path, Type};
 use type_leak::{
-    encode_generics_args_with_params, repeater_key, repeater_projection, slot_const, ImplSelf,
-    Leaker, UseSite,
+    complete_params, repeater_key, repeater_projection, slot_const, substitute_args, ImplSelf,
+    Leaker,
 };
 
 let item: ItemTrait = parse_quote! {
@@ -56,52 +56,59 @@ let item: ItemTrait = parse_quote! {
     }
 };
 
-// Crate A, step 1: analyze the trait.
+// Crate A: analyze the trait, and write one Repeater impl per entry (`42` is the ID).
 let mut leaker = Leaker::new();
 let top_level = leaker.intern_trait(&item, true);
 let result = leaker.result();
-
-// Crate A, step 2: one Repeater impl per entry (`42` is the ID). `ToTokens` writes the impl with
-// its `KEY`.
 let repeater: Path = parse_quote!(path::Repeater);
-let self_param: Ident = parse_quote!(__S);
 let impls: Vec<ItemImpl> = result
-    .repeater_impls(&repeater, 42, ImplSelf::Param(&self_param), slot_const(&repeater))
+    .repeater_impls(&repeater, 42, ImplSelf::Param(&parse_quote!(__S)), slot_const(&repeater))
     .unwrap()
     .map(|r| parse_quote!(#r))
     .collect();
 assert_eq!(impls.len(), 2);
 let referrer = result.finish().unwrap();
 
-// Crate B, step 3: rewrite a copy of `f` for `impl MyLeaker<u8> for ..`.
-let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
-let site = UseSite::substituting(&item.generics.params, &trait_args);
-let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
+// Crate B: copy the methods of the trait into `impl<U> MyLeaker<U> for Foo`. The visitor writes
+// each entry, by the names of its own generics.
+let mut imp: ItemImpl = parse_quote! {
+    impl<U> MyLeaker<U> for Foo {
+        fn f(&self, t: T) -> MyWrap<T> { todo!() }
+        fn g(&self) -> MyType { todo!() }
+    }
+};
 referrer
     .visitor(top_level, |_ty, ix, context| {
-        // The arguments of the Repeater: those of the site for the generics of the entry, encoded.
-        let self_ty: Type = parse_quote!(Self);
-        let args = site.generic_args(&context.generics).unwrap();
-        let args = encode_generics_args_with_params(
-            &args,
-            &context.generics.params,
-            Some((&self_ty, &context.self_outlives)),
-            slot_const(&repeater),
-        )
-        .unwrap();
-        repeater_projection(&repeater, &self_ty, &args, 42, ix)
+        let self_ty = parse_quote!(Self);
+        repeater_projection(&repeater, &self_ty, context, 42, ix, slot_const(&repeater)).unwrap()
     })
-    .visit_signature_mut(&mut sig);
-let (ix, _, _) = referrer.iter().next().unwrap();
-let key = repeater_key(42, ix);
+    .visit_item_impl_mut(&mut imp);
+
+// One pass writes the arguments of the impl into the types of the copy: the trait's `T` is `U`.
+struct Site(GenericArgument);
+impl VisitMut for Site {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let mut arg = GenericArgument::Type(ty.clone());
+        substitute_args([&mut arg], |name: &Ident| (name == "T").then(|| self.0.clone())).unwrap();
+        *ty = parse_quote!(#arg);
+    }
+}
+let completed = complete_params(&item.generics.params, &[parse_quote!(U)]).unwrap();
+Site(completed[0].clone()).visit_item_impl_mut(&mut imp);
+
+let (wrap, my_type) = (repeater_key(42, parse_quote!(0)), repeater_key(42, parse_quote!(1)));
 assert_eq!(
-    sig,
-    parse_quote!(fn f(&self, t: T) -> <Self as path::Repeater<(u8,), #key>>::Type)
+    imp,
+    parse_quote! {
+        impl<U> MyLeaker<U> for Foo {
+            fn f(&self, t: U) -> <Self as path::Repeater<(U,), #wrap>>::Type { todo!() }
+            fn g(&self) -> <Self as path::Repeater<(), #my_type>>::Type { todo!() }
+        }
+    }
 );
-assert_eq!(site.substitute(&parse_quote!(T), None), parse_quote!(u8));
 ```
 
-Only the entries are rewritten: `t: T` is left for you to write, and `site.substitute(&parse_quote!(T), None)` writes `u8`.
+The visitor rewrites only the entries. The other types of the copy are yours to write: `substitute_args` writes the arguments of the impl into a type, also into the arguments of the paths through the Repeater (`(T,)` is `(U,)`). A trait with defaults (`trait MyLeaker<T, D = MyWrap<T>>`) is visited too, and `complete_params` takes the default of an argument the impl leaves out from the visited parameters.
 
 If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err`, and `into_referrer()` is still the `Referrer` of the rest. Report each with `ErrorItem::emit()` (on nightly, a diagnostic with the notes and the help at their own spans), or all with `to_syn_error()`.
 
@@ -112,7 +119,7 @@ In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (
 - [API docs](https://docs.rs/type-leak/latest/type_leak/). Start with:
   - [`Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html), which analyzes an item: [`intern_trait`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.intern_trait) and the other `intern_*` methods for a whole item, [`enter_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.enter_impl) and the other `enter_*` methods for parts of one.
   - [`LeakerResult`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html), what `Leaker::result()` returns: the `Referrer` and the errors, and [`repeater_impls`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.repeater_impls) in crate A.
-  - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html): [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) in crate B, with [`encode_generics_args_with_params`](https://docs.rs/type-leak/latest/type_leak/fn.encode_generics_args_with_params.html) for the first argument of the Repeater. An entry is named by its [`EntryId`](https://docs.rs/type-leak/latest/type_leak/struct.EntryId.html).
+  - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html): [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) in crate B, with [`repeater_projection`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_projection.html) for the path through the Repeater, [`complete_params`](https://docs.rs/type-leak/latest/type_leak/fn.complete_params.html) and [`substitute_args`](https://docs.rs/type-leak/latest/type_leak/fn.substitute_args.html) for the arguments of an impl. An entry is named by its [`EntryId`](https://docs.rs/type-leak/latest/type_leak/struct.EntryId.html).
   - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait, and [`repeater_key`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_key.html), its `KEY`.
   - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`. The `Leaker` [recovers from errors](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery) and goes on.
 - [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked. An error carries a `help` that says what to write instead.

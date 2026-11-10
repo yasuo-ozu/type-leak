@@ -6,10 +6,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{
-    Context, ContextId, EncodeError, EntryId, Leaker, Reason, Referrer, SelfRequirement, UseSite,
-    Visitor,
-};
+use type_leak::{Context, ContextId, EntryId, Leaker, Reason, Referrer, SelfRequirement, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -607,9 +604,11 @@ fn generic_args_of_the_root_and_local_generics() {
     // their names.
     let completed: Vec<GenericArgument> =
         vec![parse_quote!('x), parse_quote!(u8), parse_quote!(u16)];
-    let args = UseSite::substituting(&tr.generics.params, &completed)
-        .generic_args(&common::entry(&referrer, 0).generics)
-        .unwrap();
+    let args = common::generic_args(
+        &common::entry(&referrer, 0).generics,
+        common::answers(&tr.generics.params, &completed),
+    )
+    .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
         ["'x", "'b", "u8", "V", "B"]
@@ -622,20 +621,22 @@ fn generic_args_of_the_root_and_local_generics() {
     };
     let referrer = leak_trait(tr.clone());
     let completed: Vec<GenericArgument> = vec![parse_quote!({ 1 + 2 }), parse_quote!(u16)];
-    let args = UseSite::substituting(&tr.generics.params, &completed)
-        .generic_args(&common::entry(&referrer, 0).generics)
-        .unwrap();
+    let args = common::generic_args(
+        &common::entry(&referrer, 0).generics,
+        common::answers(&tr.generics.params, &completed),
+    )
+    .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "{ 1 + 2 }"]);
-    // Too few arguments.
-    assert!(matches!(
-        UseSite::substituting(&tr.generics.params, &[])
-            .generic_args(&common::entry(&referrer, 0).generics),
-        Err(EncodeError::MissingArgument(_))
-    ));
+    // A name with no answer stays, whatever the arguments reach: `N` has none.
+    let args = common::generic_args(
+        &common::entry(&referrer, 0).generics,
+        common::answers(&tr.generics.params, &[]),
+    )
+    .unwrap();
+    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
     // Without the parameters of the trait, everything is passed by name.
-    let args = UseSite::identity()
-        .generic_args(&common::entry(&referrer, 0).generics)
-        .unwrap();
+    let args =
+        common::generic_args(&common::entry(&referrer, 0).generics, common::identity).unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }
 

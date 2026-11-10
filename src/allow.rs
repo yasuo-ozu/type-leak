@@ -49,14 +49,10 @@ pub struct Place {
 /// # use type_leak::*;
 /// # use syn::*;
 /// // You promise that `::serde` is the same crate on both sides.
-/// let allow = Rules::new()
-///     .primitive()
-///     .prelude()
-///     .or_if(|cause, _| cause.starts_with(&parse_quote!(::serde)));
+/// let allow = Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(::serde)));
 /// let mut leaker = Leaker::from_config(allow, Options::new());
-/// // `Vec` and `u8` are allowed, so only `MyType` is leaked.
-/// let item: ItemStruct = parse_quote!(struct S { a: Vec<u8>, b: MyType });
-/// leaker.intern_struct(&item, true);
+/// leaker.intern_struct(&parse_quote!(struct S { a: ::serde::Value, b: MyType }), true);
+/// // Only `MyType` is leaked.
 /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 /// ```
 pub trait Allow {
@@ -97,11 +93,8 @@ impl<A: Allow, B: Allow> Allow for (A, B) {
 /// # let flag = true;
 /// let mut rules = Rules::new().primitive();
 /// if flag {
-///     rules = rules.prelude();
+///     rules = rules.prelude(); // the same type
 /// }
-/// // A rule of your own; `or_if()` needs no annotations.
-/// let rules = rules.or_if(|cause, place| place.in_default && cause.path().is_some());
-/// # let _ = rules;
 /// ```
 ///
 /// [`or()`]: Rules::or

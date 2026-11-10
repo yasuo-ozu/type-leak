@@ -1,12 +1,13 @@
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::parse::{ParseStream, Parser};
+use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    array_const, encode_generics_args_with_params, Allow, Cause, CheckResult, Context, ContextId,
-    EncodeError, EntryId, ErrorItem, ImplSelf, Leaker, LeakerResult, ModuleScope, Options, Place,
-    Referrer, Rules, UseSite, View,
+    array_const, complete_params, repeater_projection, slot_const, substitute_args, Allow, Cause,
+    CheckResult, Context, ContextId, EncodeError, EntryId, ErrorItem, ImplSelf, Leaker,
+    LeakerResult, ModuleScope, Options, Place, Referrer, Rules, View,
 };
 
 /// Converts the types of a `Referrer` to a `BTreeSet<String>` for order-independent comparison.
@@ -43,24 +44,240 @@ pub fn entry(referrer: &Referrer, ix: usize) -> &Context {
     referrer.iter().nth(ix).expect("no such entry").2
 }
 
-/// The first argument of the Repeater for an entry with `context`, as written at `site`: the
-/// arguments of `site` for the generics of the context (`UseSite::generic_args()`), encoded by
-/// `encode_generics_args_with_params()`. `self_ty` is what `Self: 'a` names (`None`: `Self`).
+/// The name of a generic parameter, as `substitute_args()` asks for it.
+#[allow(dead_code)]
+pub fn param_ident(param: &GenericParam) -> &Ident {
+    match param {
+        GenericParam::Lifetime(param) => &param.lifetime.ident,
+        GenericParam::Type(param) => &param.ident,
+        GenericParam::Const(param) => &param.ident,
+    }
+}
+
+/// `slot_const(repeater)` for a const `value` of a parameter of type `ty`.
+#[allow(dead_code)]
+pub fn slot(repeater: &Path, value: &Expr, ty: &Type) -> std::result::Result<Type, EncodeError> {
+    let param: ConstParam = parse_quote!(const N: #ty);
+    slot_const(repeater)(value, &param)
+}
+
+/// A site where every generic is passed by its own name (the scope of the analysis).
+#[allow(dead_code)]
+pub fn identity(_: &Ident) -> Option<GenericArgument> {
+    None
+}
+
+/// What a site answers for a name: the argument at the position of the parameter of that name in
+/// `params`, if `args` reach it. Pass it to `substitute_args()`.
+#[allow(dead_code)]
+pub fn answers<'a>(
+    params: &'a Punctuated<GenericParam, Token![,]>,
+    args: &'a [GenericArgument],
+) -> impl Fn(&Ident) -> Option<GenericArgument> + 'a {
+    move |name| {
+        let at = params.iter().position(|param| param_ident(param) == name)?;
+        args.get(at).cloned()
+    }
+}
+
+/// The argument that passes `param` on by its own name.
+#[allow(dead_code)]
+pub fn own_name_arg(param: &GenericParam) -> GenericArgument {
+    match param {
+        GenericParam::Lifetime(param) => GenericArgument::Lifetime(param.lifetime.clone()),
+        GenericParam::Type(param) => {
+            let ident = &param.ident;
+            GenericArgument::Type(parse_quote!(#ident))
+        }
+        GenericParam::Const(param) => {
+            let ident = &param.ident;
+            GenericArgument::Const(parse_quote!(#ident))
+        }
+    }
+}
+
+/// The arguments for `generics` at a site that answers names with `f`: the generics as arguments,
+/// each by its own name, substituted (`substitute_args()`).
+#[allow(dead_code)]
+pub fn generic_args(
+    generics: &Generics,
+    f: impl FnMut(&Ident) -> Option<GenericArgument>,
+) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
+    let mut args: Vec<GenericArgument> = generics.params.iter().map(own_name_arg).collect();
+    substitute_args(args.iter_mut(), f)?;
+    Ok(args)
+}
+
+/// `ty` written at a site that answers names with `f` and `Self` with `self_ty` (`None`: `Self`
+/// stays): `substitute_args()` on `ty` as an argument.
+#[allow(dead_code)]
+pub fn substitute_type(
+    ty: &Type,
+    mut f: impl FnMut(&Ident) -> Option<GenericArgument>,
+    self_ty: Option<&Type>,
+) -> std::result::Result<Type, EncodeError> {
+    let mut arg = GenericArgument::Type(ty.clone());
+    substitute_args(std::iter::once(&mut arg), |name: &Ident| {
+        if name == "Self" {
+            self_ty.map(|ty| GenericArgument::Type(ty.clone()))
+        } else {
+            f(name)
+        }
+    })?;
+    match arg {
+        GenericArgument::Type(ty) => Ok(ty),
+        other => Err(EncodeError::UnexpectedArgument(Box::new(other))),
+    }
+}
+
+/// The first argument of the Repeater, `ARGS` of `<S as Repeater<ARGS, KEY>>::Type`.
+#[allow(dead_code)]
+pub fn projection_args(projection: &Type) -> Type {
+    match projection {
+        Type::Path(TypePath {
+            qself: Some(_),
+            path,
+        }) => match &path.segments[0].arguments {
+            PathArguments::AngleBracketed(args) => match &args.args[0] {
+                GenericArgument::Type(ty) => ty.clone(),
+                other => panic!("not a type: {}", quote!(#other)),
+            },
+            other => panic!("not the arguments of a trait: {}", quote!(#other)),
+        },
+        other => panic!("not a projection: {}", quote!(#other)),
+    }
+}
+
+/// The first argument of the Repeater for an entry with `context`, as written at a site that
+/// answers names with `f`: the one of `repeater_projection()` (the generics of the context by
+/// their own names, encoded), with the site substituted (`substitute_args()`). `self_ty` is what
+/// `Self: 'a` names (`None`: `Self`).
 #[allow(dead_code)]
 pub fn repeater_args(
     context: &Context,
-    site: &UseSite,
+    f: impl FnMut(&Ident) -> Option<GenericArgument>,
     self_ty: Option<&Type>,
     const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
-    let args = site.generic_args(&context.generics)?;
     let default: Type = parse_quote!(Self);
-    encode_generics_args_with_params(
-        &args,
-        &context.generics.params,
-        Some((self_ty.unwrap_or(&default), &context.self_outlives)),
+    let repeater: Path = parse_quote!(Repeater);
+    let projection = repeater_projection(
+        &repeater,
+        self_ty.unwrap_or(&default),
+        context,
+        0,
+        parse_str::<EntryId>("0").unwrap(),
         const_fn,
+    )?;
+    substitute_type(&projection_args(&projection), f, None)
+}
+
+/// The trait `tr` as the Referrer's crate visits it to write a copy at `context`, where `type_fn`
+/// writes the entries: only its generics are visited, so the defaults of its parameters are the
+/// entries written (step 1 of the recipe of `Referrer::visitor()`).
+#[allow(dead_code)]
+pub fn visited_trait(
+    referrer: &Referrer,
+    context: ContextId,
+    tr: &ItemTrait,
+    type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
+) -> ItemTrait {
+    use syn::visit_mut::VisitMut;
+    let mut shell = tr.clone();
+    shell.items.clear();
+    shell.supertraits.clear();
+    let mut file = File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: vec![Item::Trait(shell)],
+    };
+    referrer.visitor(context, type_fn).visit_file_mut(&mut file);
+    match file.items.remove(0) {
+        Item::Trait(shell) => shell,
+        _ => unreachable!(),
+    }
+}
+
+/// The arguments of an impl of `tr`: `given` completed by `complete_params()` on the parameters of
+/// the visited trait (steps 1 and 2 of the recipe).
+#[allow(dead_code)]
+pub fn completed_args<'a>(
+    referrer: &Referrer,
+    context: ContextId,
+    tr: &ItemTrait,
+    given: impl IntoIterator<Item = &'a GenericArgument>,
+    type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
+) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
+    complete_params(
+        &visited_trait(referrer, context, tr, type_fn)
+            .generics
+            .params,
+        given,
     )
+}
+
+/// Writes what a site answers into the syntax of a copy (step 3 of the recipe of
+/// `Referrer::visitor()`): one `substitute_args()` pass for each type, generic argument,
+/// expression and lifetime that it visits (what a visited type holds is substituted with it, not
+/// again). The first error is kept in `error`.
+#[allow(dead_code)]
+pub struct Written<F> {
+    f: F,
+    pub error: Option<EncodeError>,
+}
+
+#[allow(dead_code)]
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Written<F> {
+    pub fn new(f: F) -> Self {
+        Written { f, error: None }
+    }
+
+    fn write(&mut self, arg: &mut GenericArgument) {
+        if let Err(error) = substitute_args(std::iter::once(arg), &mut self.f) {
+            self.error.get_or_insert(error);
+        }
+    }
+
+    fn misfit(&mut self, arg: GenericArgument) {
+        self.error
+            .get_or_insert(EncodeError::UnexpectedArgument(Box::new(arg)));
+    }
+
+    /// Writes into the fields of `item` (its generics are the declaration of the copy), and returns
+    /// it. Panics if a value does not fit.
+    pub fn item(mut self, mut item: ItemStruct) -> ItemStruct {
+        use syn::visit_mut::VisitMut;
+        self.visit_fields_mut(&mut item.fields);
+        if let Some(error) = self.error {
+            panic!("{}", error);
+        }
+        item
+    }
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> syn::visit_mut::VisitMut for Written<F> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let mut arg = GenericArgument::Type(ty.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Type(written) => *ty = written,
+            other => self.misfit(other),
+        }
+    }
+
+    // A bare const parameter is parsed as a type argument (`N` in `Foo<N>`), and becomes a const.
+    fn visit_generic_argument_mut(&mut self, arg: &mut GenericArgument) {
+        self.write(arg)
+    }
+
+    fn visit_lifetime_mut(&mut self, lifetime: &mut Lifetime) {
+        let mut arg = GenericArgument::Lifetime(lifetime.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Lifetime(written) => *lifetime = written,
+            other => self.misfit(other),
+        }
+    }
 }
 
 /// The context id with the number `n`.
