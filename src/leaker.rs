@@ -39,7 +39,7 @@ use template_quote::{quote, ToTokens};
 /// ```
 /// # use {syn::*, type_leak::*};
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S(Rel);), true);
+/// leaker.intern_struct(&parse_quote!(struct S(Rel);));
 /// let referrer = leaker.result().finish().unwrap();
 /// // `Rel` depends on where it is written, so it needs a Repeater impl.
 /// let (_, ty, _) = referrer.iter().next().unwrap();
@@ -76,7 +76,13 @@ use template_quote::{quote, ToTokens};
 ///   rustc could not prove the predicate for the Repeater's impl (E0277). The copy writes it as it
 ///   is, so its crate must resolve there.
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
-/// - Values and bodies are not analyzed unless [`Options::check_values()`] is on.
+/// - Values and bodies are not analyzed unless [`Leaker::check_values`] is on.
+/// - A type that names the `Self` of a nested struct, enum or union and uses a generic whose bound
+///   names it (`Rel2<Self, T>` with `T: AsRef<Self>`) is an entry for any type, with the error
+///   [`Reason::NestedSelfInBounds`]: when you accept it with [`LeakerResult::allow()`], the
+///   declaration of the type must have no trait bound on the parameter that receives `Self`
+///   (E0277), and rustc before 1.70 fails with E0275 if the copy's field is the last field of a
+///   struct.
 ///
 /// ## Outlives bounds
 ///
@@ -128,6 +134,29 @@ use template_quote::{quote, ToTokens};
 /// E0747). Write an absolute path (`MyType<{ ::my_crate::MY_CONST }>`) or an [allowed](Allow)
 /// name.
 pub struct Leaker<A = ()> {
+    /// Makes the Leaker read the values of an item too, if it is `true` (it is `false` by default):
+    /// the values of consts and statics, the defaults and values of associated consts, and the
+    /// bodies of functions and methods. Set it before the calls that it should affect.
+    ///
+    /// Enum discriminants, the defaults of const parameters and array lengths are read either way
+    /// (the first two as a value is, but their errors are no [`ErrorItem::in_value`]).
+    ///
+    /// Without it a relative path in a value breaks the copy and the Leaker does not tell. The
+    /// types in a type position of a value (a cast, a `let`, a closure parameter or output, the
+    /// generic arguments of a path or method call, the self type of a qualified path) are leaked
+    /// like any type of the item. Another relative path (a function, a constant, a struct literal,
+    /// a variant, the trait of a qualified path) is rejected unless it is absolute or starts with
+    /// `$crate`, is [allowed](Allow) (the types too, by [`Rules::values()`](crate::Rules::values)),
+    /// or starts with a generic or `Self` in scope or a name that the value declares. A macro whose
+    /// arguments are not expressions (`cfg!`, `stringify!` and `matches!` excepted), a
+    /// `macro_rules!`, a glob import and syntax that `syn` does not parse are rejected.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// let mut leaker = Leaker::from_config(Rules::new().prelude());
+    /// leaker.check_values = true;
+    /// ```
+    pub check_values: bool,
     /// What the Leaker leaves as written instead of leaking it, and the errors it does not
     /// record.
     allow: A,
@@ -138,75 +167,16 @@ pub struct Leaker<A = ()> {
     /// keeps without an entry too.
     top_levels: BTreeSet<ContextId>,
     assumed_primitives: Vec<Ident>,
-    options: Options,
     /// The parts copied as written.
     parts: Vec<PartItem>,
     /// The errors of the outermost calls, in the order found.
     errors: Vec<ErrorItem>,
 }
 
-/// What a [`Leaker`] reads and accepts beyond its [`Allow`] rules. Pass it to
-/// [`Leaker::from_config()`]; everything is off by default.
-///
-/// ```
-/// # use type_leak::*;
-/// let _leaker = Leaker::from_config(Rules::new().prelude(), Options::new().check_values());
-/// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Options {
-    check_values: bool,
-    nested_self_entries: bool,
-}
-
-impl Options {
-    /// Creates the options with everything off, as [`Leaker::new()`] has them.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Makes the Leaker read the values of an item too: the values of consts and statics, the
-    /// defaults and values of associated consts, and the bodies of functions and methods (enum
-    /// discriminants, the defaults of const parameters and array lengths are read either way, the
-    /// first two as a value is, but their errors are no [`ErrorItem::in_value`]).
-    ///
-    /// Without it a relative path in a value breaks the copy and the Leaker does not tell. The
-    /// types in a type position of a value (a cast, a `let`, a closure parameter or output, the
-    /// generic arguments of a path or method call, the self type of a qualified path) are leaked
-    /// like any type of the item. Another relative path (a function, a constant, a struct literal,
-    /// a variant, the trait of a qualified path) is rejected unless it is absolute or starts with
-    /// `$crate`, is [allowed](Allow) (the types too, by [`Rules::values()`](crate::Rules::values)),
-    /// or starts with a generic or `Self` in scope or a name that the value declares. A macro whose arguments are not expressions
-    /// (`cfg!`, `stringify!` and `matches!` excepted), a `macro_rules!`, a glob import and syntax
-    /// that `syn` does not parse are rejected.
-    pub fn check_values(mut self) -> Self {
-        self.check_values = true;
-        self
-    }
-
-    /// Accepts a type that names the `Self` of a struct, an enum or a union nested in the analyzed
-    /// syntax ([`View::visit_item()`], the items of [`intern_mod()`](Leaker::intern_mod)) when a
-    /// bound of the generics it uses names that `Self` too: `Rel2<Self, T>` in `struct S<T:
-    /// AsRef<Self>>`.
-    ///
-    /// Without it such an entry is an error ([`Reason::NestedSelfInBounds`]). With it the entry is
-    /// for any type that the bound holds for ([`SelfRequirement::Any`]), and the copy passes its
-    /// own type as the implementor. A default of a parameter is not changed (E0735), and a bound
-    /// that names a leaked type that names `Self` is still an error. You promise two things: the
-    /// declaration of the leaked type has no trait bound on the parameter that receives `Self`
-    /// (`struct Rel2<A: Clone, B>`), else the impl fails in the Leaker's crate (E0277), so write
-    /// the type with an absolute path or give the item its own `intern_*` call; and rustc before
-    /// 1.70 fails with E0275 if the copy's field is the last field of a struct, so put it first or
-    /// add `where Self: Sized` to the item.
-    pub fn nested_self_entries(mut self) -> Self {
-        self.nested_self_entries = true;
-        self
-    }
-}
-
 impl Leaker {
     /// Creates a [`Leaker`] that allows nothing, so every relative path is leaked.
     pub fn new() -> Self {
-        Self::from_config((), Options::new())
+        Self::from_config(())
     }
 }
 
@@ -217,17 +187,15 @@ impl Default for Leaker {
 }
 
 impl<A: Allow> Leaker<A> {
-    /// Creates a [`Leaker`] with the rule `allow` and the `options` of the analysis.
-    ///
-    /// See [`Options::check_values()`] and [`Options::nested_self_entries()`].
-    pub fn from_config(allow: A, options: Options) -> Self {
+    /// Creates a [`Leaker`] with the rule `allow`. See [`Leaker::check_values`].
+    pub fn from_config(allow: A) -> Self {
         Self {
+            check_values: false,
             allow,
             types: TypeGraph::default(),
             contexts: Contexts::default(),
             top_levels: BTreeSet::new(),
             assumed_primitives: Vec::new(),
-            options,
             parts: Vec::new(),
             errors: Vec::new(),
         }
@@ -257,57 +225,49 @@ impl<A: Allow> Leaker<A> {
     /// Analyzes a struct and returns its top-level context. `Self` is the struct
     /// ([`SelfRequirement::Type`]).
     ///
-    /// `allow_self = true` leaks a type that names `Self` as one entry for the struct (`Self::A`
-    /// cannot be leaked whole, E0220: write `<Self as ::path::Trait>::A`). `false` splits it into
-    /// parts, which is an error for `Rel<Self>`: use it if the Repeater impls are for a marker type
-    /// and [`Visitor::with_self()`](crate::Visitor::with_self) replaces `Self` in the copies.
-    pub fn intern_struct(&mut self, item: &ItemStruct, allow_self: bool) -> ContextId {
-        self.enter_type(&item.ident, &item.generics, allow_self, |view| {
+    /// A type that names `Self` is leaked as one entry for the struct (`Self::A` cannot be leaked
+    /// whole, E0220: write `<Self as ::path::Trait>::A`).
+    pub fn intern_struct(&mut self, item: &ItemStruct) -> ContextId {
+        self.enter_type(&item.ident, &item.generics, |view| {
             syn::visit::visit_item_struct(view, item)
         })
         .0
     }
 
     /// Analyzes an enum like [`intern_struct()`](Leaker::intern_struct).
-    pub fn intern_enum(&mut self, item: &ItemEnum, allow_self: bool) -> ContextId {
-        self.enter_type(&item.ident, &item.generics, allow_self, |view| {
+    pub fn intern_enum(&mut self, item: &ItemEnum) -> ContextId {
+        self.enter_type(&item.ident, &item.generics, |view| {
             syn::visit::visit_item_enum(view, item)
         })
         .0
     }
 
     /// Analyzes a union like [`intern_struct()`](Leaker::intern_struct).
-    pub fn intern_union(&mut self, item: &ItemUnion, allow_self: bool) -> ContextId {
-        self.enter_type(&item.ident, &item.generics, allow_self, |view| {
+    pub fn intern_union(&mut self, item: &ItemUnion) -> ContextId {
+        self.enter_type(&item.ident, &item.generics, |view| {
             syn::visit::visit_item_union(view, item)
         })
         .0
     }
 
     /// Analyzes an impl and returns its top-level context. `Self` is the self type
-    /// ([`SelfRequirement::Type`]), and `allow_self` is as for
-    /// [`intern_struct()`](Leaker::intern_struct).
+    /// ([`SelfRequirement::Type`]).
     ///
     /// An entry in the self type that depends on `Self` through a bound of the impl (`impl<T> S<T>
     /// where T: AsRef<Option<Self>>`) is an error, also in an impl that [`View::visit_item()`] or
     /// [`intern_mod()`](Leaker::intern_mod) visits: use an absolute self type or a bound without
     /// `Self`. The trait path must not depend on the context.
-    pub fn intern_impl(&mut self, item: &ItemImpl, allow_self: bool) -> ContextId {
+    pub fn intern_impl(&mut self, item: &ItemImpl) -> ContextId {
         // The scope checks the path of the trait, and the walk analyzes its arguments.
         let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
-        self.enter_impl(
-            &item.generics,
-            &item.self_ty,
-            trait_path,
-            allow_self,
-            |view| view.walk_item_impl(item),
-        )
+        self.enter_impl(&item.generics, &item.self_ty, trait_path, |view| {
+            view.walk_item_impl(item)
+        })
         .0
     }
 
     /// Analyzes a trait and returns its top-level context. `Self` is the implementor
-    /// ([`SelfRequirement::Bound`]), and `allow_self` is as for
-    /// [`intern_struct()`](Leaker::intern_struct).
+    /// ([`SelfRequirement::Bound`]).
     ///
     /// Unlike [`enter_trait()`](Leaker::enter_trait), it knows the generic associated types (GATs)
     /// of the trait: `Self::G<'x>` records the outlives bounds of the GAT, which the copy must
@@ -317,16 +277,16 @@ impl<A: Allow> Leaker<A> {
     /// ```
     /// # use {syn::*, type_leak::*};
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self>; }), true);
+    /// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Wrap<Self>; }));
     /// let referrer = leaker.result().finish().unwrap();
     /// let (_, _, context) = referrer.iter().next().unwrap();
     /// assert_eq!(context.self_ty, Some(SelfRequirement::Bound(parse_quote!(Tr))));
     /// ```
-    pub fn intern_trait(&mut self, item: &ItemTrait, allow_self: bool) -> ContextId {
+    pub fn intern_trait(&mut self, item: &ItemTrait) -> ContextId {
         // The scope knows the generic associated types of the trait: what they require is part of
         // the context of an entry that names them.
         let gats = Gat::of_items(&item.items);
-        self.enter_trait_of(&item.ident, &item.generics, gats, allow_self, |view| {
+        self.enter_trait_of(&item.ident, &item.generics, gats, |view| {
             syn::visit::visit_item_trait(view, item)
         })
         .0
@@ -382,16 +342,14 @@ impl<A: Allow> Leaker<A> {
 
     /// Analyzes parts of a struct, an enum or a union: runs `f` on a [`View`] inside the type
     /// `ident` with `generics`. Like [`enter_generics()`](Leaker::enter_generics), but `Self` is
-    /// the type ([`SelfRequirement::Type`]) and `generics` may name it; `allow_self` is as for
-    /// [`intern_struct()`](Leaker::intern_struct).
+    /// the type ([`SelfRequirement::Type`]) and `generics` may name it.
     pub fn enter_type<R>(
         &mut self,
         ident: &Ident,
         generics: &Generics,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_type(self, ident, generics, allow_self, f)
+        Scopes::enter_type(self, ident, generics, f)
     }
 
     /// Analyzes parts of an impl: runs `f` on a [`View`] inside an impl with `generics` for
@@ -408,10 +366,9 @@ impl<A: Allow> Leaker<A> {
         generics: &Generics,
         self_ty: &Type,
         trait_: Option<&Path>,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_impl(self, generics, self_ty, trait_, allow_self, f)
+        Scopes::enter_impl(self, generics, self_ty, trait_, f)
     }
 
     /// Analyzes parts of a trait: runs `f` on a [`View`] inside the trait `ident` with `generics`.
@@ -422,10 +379,9 @@ impl<A: Allow> Leaker<A> {
         &mut self,
         ident: &Ident,
         generics: &Generics,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_trait(self, ident, generics, allow_self, f)
+        Scopes::enter_trait(self, ident, generics, f)
     }
 
     /// Ends the analysis and returns the [`LeakerResult`]: the [`Referrer`] and the errors found.
@@ -525,7 +481,7 @@ impl<A: Allow> Leaker<A> {
 /// ```
 /// # use {syn::*, type_leak::*};
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S(::p::W<'_, dyn RelTr>);), true);
+/// leaker.intern_struct(&parse_quote!(struct S(::p::W<'_, dyn RelTr>);));
 /// let result = leaker.result();
 /// assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
 /// // Allowing the error copies the part as written, and `finish()` is `Ok`.
@@ -617,7 +573,7 @@ impl LeakerResult {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);), true);
+    /// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);));
     /// let result = leaker.result();
     ///
     /// let repeater: Path = parse_quote!(crate::Repeater);
@@ -637,7 +593,7 @@ impl LeakerResult {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S(Wrap<Self>);), true);
+    /// leaker.intern_struct(&parse_quote!(struct S(Wrap<Self>);));
     /// let result = leaker.result();
     ///
     /// let repeater: Path = parse_quote!(Repeater);
@@ -719,9 +675,8 @@ impl<A: Allow> Scopes for Leaker<A> {
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
-        let mut visitor = AnalyzeVisitor::new(&mut self.allow, &root)
-            .reading_values(self.options.check_values)
-            .with_nested_self_entries(self.options.nested_self_entries);
+        let mut visitor =
+            AnalyzeVisitor::new(&mut self.allow, &root).reading_values(self.check_values);
         let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, or a

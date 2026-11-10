@@ -37,8 +37,9 @@ fn body_messages(body: &str) -> Vec<String> {
 
 fn messages_of<A: Allow>(config: A, source: &str) -> Vec<String> {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
-    let mut leaker = Leaker::from_config(config, Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     leaker
         .result()
         .errors()
@@ -182,8 +183,9 @@ fn body_entries(body: &str) -> Vec<String> {
         body
     );
     let item: ItemTrait = parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", source, e));
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let referrer = leaker
         .result()
         .finish()
@@ -257,8 +259,9 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     );
     fn entries<A: Allow>(config: A, source: &str) -> Vec<String> {
         let item: ItemTrait = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(config, Options::new().check_values());
-        leaker.intern_trait(&item, true);
+        let mut leaker = Leaker::from_config(config);
+        leaker.check_values = true;
+        leaker.intern_trait(&item);
         let mut entries: Vec<String> = leaker
             .result()
             .finish()
@@ -345,8 +348,9 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
         assert_eq!(body_messages(body), rejected(path), "{}", body);
         let item: ItemTrait =
             parse_str(&format!("trait Tr {{ fn f(&self, p: u8) {{ {} }} }}", body)).unwrap();
-        let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-        leaker.intern_trait(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.check_values = true;
+        leaker.intern_trait(&item);
         let result = leaker.result();
         assert_eq!(
             result.errors()[0].help_text(),
@@ -354,8 +358,9 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
         );
         // An allowed path is accepted.
         let config = config().or_if(starts_with(parse_str(first).unwrap()));
-        let mut leaker = Leaker::from_config(config, Options::new().check_values());
-        leaker.intern_trait(&item, true);
+        let mut leaker = Leaker::from_config(config);
+        leaker.check_values = true;
+        leaker.intern_trait(&item);
         assert!(leaker.result().finish().is_ok(), "{}", body);
     }
 }
@@ -367,8 +372,9 @@ fn a_primitive_name_in_a_value_is_assumed() {
             const N: u8 = 1 as u8;
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     assert!(
         leaker.assertions().to_string().contains("u8"),
         "{}",
@@ -412,8 +418,9 @@ fn a_relative_macro_path_says_what_to_write() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     let items = &err;
@@ -431,8 +438,9 @@ fn a_relative_macro_path_says_what_to_write() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(
@@ -519,8 +527,9 @@ fn what_the_leaker_cannot_read_is_rejected() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(
@@ -578,10 +587,11 @@ fn an_associated_const_default_is_read() {
 fn the_note_says_which_value() {
     let notes = |source: &str| -> Vec<String> {
         let item: Item = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+        let mut leaker = Leaker::from_config(config());
+        leaker.check_values = true;
         match &item {
-            Item::Trait(i) => leaker.intern_trait(i, true),
-            Item::Impl(i) => leaker.intern_impl(i, true),
+            Item::Trait(i) => leaker.intern_trait(i),
+            Item::Impl(i) => leaker.intern_impl(i),
             Item::Mod(i) => leaker.intern_mod(i),
             _ => unreachable!(),
         };
@@ -640,7 +650,8 @@ fn a_module_is_read_with_its_declared_names() {
             pub mod inner { pub const D: usize = 2; pub fn g() -> usize { D } }
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
     leaker.intern_mod(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 
@@ -652,7 +663,8 @@ fn a_module_is_read_with_its_declared_names() {
             pub fn g() -> usize { Other::N }
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
     leaker.intern_mod(&item);
     let result = leaker.result();
     let messages: Vec<String> = result
@@ -672,8 +684,9 @@ fn an_impl_is_read() {
             fn g(&self) -> usize { Self::N }
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_impl(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_impl(&item);
     assert!(leaker.result().errors().is_empty());
 
     let item: ItemImpl = parse_quote! {
@@ -682,8 +695,9 @@ fn an_impl_is_read() {
             fn f(&self) -> u8 { Rel::f() }
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_impl(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let messages: Vec<String> = result
         .errors()
@@ -698,7 +712,8 @@ fn an_impl_is_read() {
 
 #[test]
 fn a_nested_item_is_read_through_the_view() {
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
     leaker.enter_generics(&parse_quote!(<T: ::core::default::Default>), |view| {
         view.visit_item(&parse_quote!(
             const N: usize = 1;
@@ -710,7 +725,8 @@ fn a_nested_item_is_read_through_the_view() {
         ));
     });
     assert!(leaker.result().errors().is_empty());
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
     leaker.enter_generics(&parse_quote!(<T>), |view| {
         view.visit_item(&parse_quote!(
             fn f<V>() -> usize {
@@ -731,7 +747,8 @@ fn a_nested_item_is_read_through_the_view() {
 /// the call has it once.
 #[test]
 fn a_bad_value_is_an_error_of_its_scope_and_the_one_around_it() {
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Wrap<u8>));
         view.enter_generics(&Generics::default(), |view| {
@@ -761,7 +778,8 @@ fn self_without_meaning_in_a_value() {
             pub const X: usize = Self::N;
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
     leaker.intern_mod(&item);
     let result = leaker.result();
     let err = result.errors();
@@ -775,7 +793,7 @@ fn self_without_meaning_in_a_value() {
     );
     // The value is not read without the option.
     let plain = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(plain, Options::new());
+    let mut leaker = Leaker::from_config(plain);
     leaker.intern_mod(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
@@ -793,15 +811,9 @@ fn the_types_are_leaked_as_ever() {
         }
     };
     fn entries<A: Allow>(config: A, check_values: bool, source: &ItemTrait) -> Vec<String> {
-        let mut leaker = Leaker::from_config(
-            config,
-            if check_values {
-                Options::new().check_values()
-            } else {
-                Options::new()
-            },
-        );
-        leaker.intern_trait(source, true);
+        let mut leaker = Leaker::from_config(config);
+        leaker.check_values = check_values;
+        leaker.intern_trait(source);
         leaker
             .result()
             .finish()
@@ -874,8 +886,9 @@ fn ordinary_bodies_are_accepted() {
             .iter()
             .any(|name| starts_with(name.clone())(cause, place))
     });
-    let mut leaker = Leaker::from_config(config, Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     // The types of the signatures are in the prelude: nothing is leaked.
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 }
@@ -892,24 +905,25 @@ fn the_option_is_off_by_default() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Rules::new(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(Rules::new());
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::from_config(Rules::<()>::default(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(Rules::<()>::default());
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
     // Nothing is leaked where the types are allowed: like method bodies, the defaults of associated
     // consts are not analyzed.
-    let mut leaker = Leaker::from_config(Rules::new().primitive().prelude(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(Rules::new().primitive().prelude());
+    leaker.intern_trait(&item);
     assert!(leaker.result().finish().unwrap().is_empty());
-    let mut leaker = Leaker::from_config(Rules::new(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(Rules::new());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_err());
 }

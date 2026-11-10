@@ -40,7 +40,7 @@ fn configured<A: Allow>(config: A) -> impl Allow {
 
 /// The Leaker of the triggers: `Leaker::from_config(config, ..)` with the rules of `with_rules()`.
 fn leaker_from<A: Allow>(config: A) -> Leaker<impl Allow> {
-    Leaker::from_config(configured(config), Options::new())
+    Leaker::from_config(configured(config))
 }
 
 /// Runs `f` with `rules` added to the config of the triggers.
@@ -148,14 +148,12 @@ fn help_of(item: &ErrorItem) -> Option<(String, String)> {
 fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     let item: ItemTrait = parse_str(source).unwrap();
     if check_values {
-        let leaker = Leaker::from_config(
-            configured(reading_values_config()),
-            Options::new().check_values(),
-        );
-        run(leaker, |leaker| leaker.intern_trait(&item, true))
+        let mut leaker = Leaker::from_config(configured(reading_values_config()));
+        leaker.check_values = true;
+        run(leaker, |leaker| leaker.intern_trait(&item))
     } else {
         run(leaker_from(allowing_config()), |leaker| {
-            leaker.intern_trait(&item, true)
+            leaker.intern_trait(&item)
         })
     }
 }
@@ -175,7 +173,7 @@ fn relative_path() -> LeakerResult {
         }
     );
     run(leaker_from(Rules::new()), |leaker| {
-        leaker.intern_trait(&item, true)
+        leaker.intern_trait(&item)
     })
 }
 
@@ -258,15 +256,15 @@ fn reason_unreadable() {
     );
 }
 
-/// A bare identifier that may be a const, in a path that names `Self`, which is denied.
+/// A bare identifier that may be a const, in a path that names `Self::A`.
 fn maybe_const() -> LeakerResult {
     let item: ItemStruct = parse_quote!(
         struct S {
-            a: ::p::W<[Self], LEN>,
+            a: ::p::W<Self::A, LEN>,
         }
     );
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_struct(&item, false)
+        leaker.intern_struct(&item)
     })
 }
 
@@ -318,7 +316,7 @@ fn self_projection() -> LeakerResult {
         }
     );
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_impl(&item, true)
+        leaker.intern_impl(&item)
     })
 }
 
@@ -337,7 +335,7 @@ fn reason_self_projection() {
 /// A bound of an outer trait that names its `Self`, for a type in an item nested in it.
 fn unnameable_self() -> LeakerResult {
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
+        leaker.enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), |view| {
             view.visit_item(&parse_quote!(
                 impl ::p::W for X {
                     fn f(&self, x: Rel<T>) {}
@@ -366,29 +364,6 @@ fn reason_self_in_default() {
     // The cause is the whole default, the note is at the `Self` in it.
     assert_item(&items[0], Reason::SelfInDefault, "type", "Wrap < Self >");
     assert_eq!(items[0].notes[0].0.to_string(), "Self");
-}
-
-/// A generic whose bound mentions a `Self` that is denied.
-fn denied_self_in_bounds() -> LeakerResult {
-    let item: ItemTrait = parse_quote!(
-        trait Tr {
-            fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T>);
-        }
-    );
-    run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_trait(&item, false)
-    })
-}
-
-#[test]
-fn reason_denied_self_in_bounds() {
-    let items = errors(denied_self_in_bounds);
-    assert_eq!(items.len(), 1);
-    assert_item(&items[0], Reason::DeniedSelfInBounds, "type", "Wrap < T >");
-    assert_eq!(
-        note_texts(&items[0]).first(),
-        Some(&"the bounds of its generics mention `Self`, which cannot be leaked")
-    );
 }
 
 /// A type that names the `Self` of a nested struct, with a generic whose bound names it too.
@@ -424,7 +399,7 @@ fn unprovable_bound() -> LeakerResult {
         }
     );
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_trait(&item, true)
+        leaker.intern_trait(&item)
     })
 }
 
@@ -445,7 +420,7 @@ fn self_in_trait_predicate() -> LeakerResult {
         }
     );
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_trait(&item, true)
+        leaker.intern_trait(&item)
     })
 }
 
@@ -467,7 +442,7 @@ fn self_in_impl_self_type() -> LeakerResult {
         impl<T> S<T> where T: AsRef<Option<Self>> {}
     );
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_impl(&item, true)
+        leaker.intern_impl(&item)
     })
 }
 
@@ -522,13 +497,16 @@ fn the_cause_of_a_macro_is_its_path_and_that_of_a_qualified_trait_is_a_trait() {
     assert_eq!(items[0].message, "use absolute path: 'mac!'");
 }
 
-/// A lifetime that no scope declares, in the supertrait of a trait where `Self` is denied.
+/// A lifetime that no scope declares, in a type that cannot be leaked (`_` has no meaning in the
+/// impl of the Repeater).
 fn lifetime() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
-        trait Tr: ::p::Sup<&'a Self> {}
+        trait Tr {
+            fn f(&self, x: ::p::W<'a, _>);
+        }
     );
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.intern_trait(&item, false)
+        leaker.intern_trait(&item)
     })
 }
 
@@ -576,7 +554,7 @@ fn the_trait_of_a_dyn_type_is_a_trait() {
         }
     );
     let mut leaker = allowing();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
@@ -626,19 +604,17 @@ fn a_macro_call_in_an_array_length_is_a_macro() {
     assert!(matches!(&items[0].cause, Cause::Macro(path) if path.is_ident("two")));
     assert_eq!(items[0].help.as_ref().unwrap().0.to_string(), "two");
     // A macro that is a type is a type, as a whole.
-    let item: ItemStruct = parse_quote!(
-        struct S {
-            f: ::p::Wrap<::p::m!(Self)>,
-        }
+    let item: ItemTrait = parse_quote!(
+        trait Tr: ::p::Sup<::p::m!(Self)> {}
     );
     let mut leaker = allowing();
-    leaker.intern_struct(&item, false);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
-        Reason::RelativePath,
+        Reason::SelfInTraitPredicate,
         "type",
         ":: p :: m ! (Self)",
     );
@@ -658,7 +634,7 @@ fn a_type_in_a_turbofish_in_an_array_length_is_a_type() {
         }
     );
     let mut leaker = allowing();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
@@ -675,23 +651,23 @@ fn a_relative_type_in_an_absolute_holder_that_cannot_be_leaked_is_a_type() {
         }
     );
     let mut leaker = allowing();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::MaybeConst, "type", "Rel");
-    // A bare identifier among the arguments of a holder that `Self` stops from being leaked.
+    // A bare identifier among the arguments of a holder that `Self::A` stops from being leaked.
     let mut leaker = allowing();
-    leaker.enter_type(&id("S"), &Generics::default(), false, |view| {
-        view.visit_type(&parse_quote!(::l::W<[Self], ILEN>))
+    leaker.enter_type(&id("S"), &Generics::default(), |view| {
+        view.visit_type(&parse_quote!(::l::W<[Self::A], ILEN>))
     });
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::MaybeConst, "type", "ILEN");
     assert_eq!(
-        note_at(&items[0], "Self"),
-        Some("it cannot be leaked as a whole because of `Self`")
+        note_at(&items[0], "Self :: A"),
+        Some("it cannot be leaked as a whole because of `Self::A`")
     );
 }
 
@@ -711,7 +687,7 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
@@ -723,7 +699,7 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
     // Where `u8` is allowed, `a` is the first. A closure cannot be written in the impl of the
     // Repeater, so it is an error naming the closure, and the array type is no entry.
     let mut leaker = allowing();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
@@ -747,7 +723,7 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
         }
     );
     let mut leaker = allowing();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }
 
@@ -762,7 +738,7 @@ fn a_bound_with_a_binder_is_unreadable() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
@@ -780,7 +756,7 @@ fn a_bound_in_parentheses_is_unreadable() {
         trait Tr: (Clone) {}
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1);
@@ -802,43 +778,49 @@ fn the_path_of_a_qualified_type_is_unreadable() {
     // a type (`syn` has the `qself` and the path apart).
     let leak = |ty: Type| {
         let mut leaker = Leaker::new();
-        leaker.enter_impl(
-            &Generics::default(),
-            &parse_quote!(B),
-            None,
-            false,
-            |view| view.visit_type(&ty),
-        );
+        leaker.enter_impl(&Generics::default(), &parse_quote!(B), None, |view| {
+            view.visit_type(&ty)
+        });
         leaker.result().errors().to_vec()
     };
-    let items = leak(parse_quote!(<Self as super::Tr<u8>>::X));
+    let items = leak(parse_quote!(<Self::A as super::Tr<u8>>::X));
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
-        Reason::RelativePath,
+        Reason::SelfProjection,
         "unreadable",
         "super :: Tr < u8 > :: X",
     );
-    // `Self` cannot be leaked here, so the type cannot be leaked as a whole, and its trait is
+    // `Self::A` cannot be leaked, so the type cannot be leaked as a whole, and its trait is
     // relative. `u8` in the arguments of the trait is leaked alone: the notes do not name it.
-    assert_eq!(items[0].message, "use absolute path: 'super::Tr<u8>::X'");
     assert_eq!(
-        note_texts(&items[0]),
-        ["it cannot be leaked as a whole because of `Self`"]
+        items[0].message,
+        "write `<Self as SomeTrait>::A` instead of `Self::A` in `<Self::A as super::Tr<u8>>::X`: \
+         the copy cannot tell which trait `A` comes from"
+    );
+    assert_eq!(
+        note_at(&items[0], "Self :: A"),
+        Some("it cannot be leaked as a whole because of `Self::A`")
     );
     // The type around it is written as it is, `Rel` with it, and what it holds has an error of its
-    // own (`Tr`, with `Self`).
-    let items = leak(parse_quote!(Rel<<Self as Tr<u8>>::X>));
+    // own (`Tr`, with `Self::A`).
+    let items = leak(parse_quote!(Rel<<Self::A as Tr<u8>>::X>));
     assert_eq!(items.len(), 2);
     assert_eq!(
         items[0].message,
-        "use absolute path: 'Rel<<Self as Tr<u8>>::X>'"
+        "write `<Self as SomeTrait>::A` instead of `Self::A` in `Rel<<Self::A as Tr<u8>>::X>`: \
+         the copy cannot tell which trait `A` comes from"
     );
-    assert_eq!(items[1].message, "use absolute path: 'Tr<u8>::X'");
+    assert_eq!(
+        items[1].message,
+        "write `<Self as SomeTrait>::A` instead of `Self::A` in `<Self::A as Tr<u8>>::X`: the copy \
+         cannot tell which trait `A` comes from"
+    );
     for item in &items {
+        assert_eq!(item.reason, Reason::SelfProjection);
         assert_eq!(
-            note_texts(item),
-            ["it cannot be leaked as a whole because of `Self`"]
+            note_at(item, "Self :: A"),
+            Some("it cannot be leaked as a whole because of `Self::A`")
         );
     }
     let items = type_errors(allowing(), parse_quote!(<T as RelTrait<'_>>::Ty));
@@ -864,7 +846,6 @@ fn every_trigger() -> Vec<(&'static str, Trigger)> {
         ("self_projection", self_projection),
         ("unnameable_self", unnameable_self),
         ("self_in_default", self_in_default),
-        ("denied_self_in_bounds", denied_self_in_bounds),
         ("nested_self_in_bounds", nested_self_in_bounds),
         ("unprovable_bound", unprovable_bound),
         ("self_in_trait_predicate", self_in_trait_predicate),
@@ -925,7 +906,6 @@ fn the_triggers_have_every_reason_and_every_kind_of_cause() {
         Reason::SelfProjection,
         Reason::UnnameableSelf,
         Reason::SelfInDefault,
-        Reason::DeniedSelfInBounds,
         Reason::NestedSelfInBounds,
         Reason::UnprovableBound,
         Reason::SelfInTraitPredicate,
@@ -1496,7 +1476,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
         }
     );
     let mut leaker = allowing();
-    let id = leaker.intern_struct(&item, true);
+    let id = leaker.intern_struct(&item);
     let mut result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
@@ -1618,8 +1598,8 @@ mod limits {
 
     /// Runs a Leaker on `item_trait`, returning the leaked types or the error message.
     fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
-        let mut leaker = Leaker::from_config(leaker_config(), Options::new());
-        leaker.intern_trait(item_trait, true);
+        let mut leaker = Leaker::from_config(leaker_config());
+        leaker.intern_trait(item_trait);
         leaker.reduce_roots();
         let referrer = leaker
             .result()
@@ -1766,7 +1746,7 @@ mod limits {
         assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
 
         let mut leaker = Leaker::new();
-        leaker.intern_trait(&item, true);
+        leaker.intern_trait(&item);
         let expected = quote! {
             #[allow(dead_code, non_snake_case)]
             const _: () = {
@@ -1790,7 +1770,7 @@ mod limits {
             }
         })
         .unwrap();
-        let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
+        let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item));
         assert!(err.iter().all(|item| item.reason == Reason::RelativePath));
         // The cause of each is the whole bound or type that is a conflict (a trait is its own path:
         // it needs no note), and what stops the type from being leaked as a whole is a note.
@@ -1847,7 +1827,7 @@ mod limits {
             }
         })
         .unwrap();
-        let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
+        let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item));
         // The suggestion of the absolute path is the help.
         assert_eq!(
             err[0].help_text(),
@@ -1904,7 +1884,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: Clone {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Clone'",
@@ -1917,7 +1897,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: ::my_crate::Sup<{ usize::MAX }> {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'usize::MAX'",
@@ -1930,7 +1910,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: MyBound {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'MyBound'",
@@ -1944,7 +1924,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: crate::m::Bound + super::Other {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[
             (
@@ -1963,7 +1943,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: my_mod::Clone {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'my_mod::Clone'",
@@ -1978,7 +1958,7 @@ const ROWS: &[Row] = &[
                     fn f<T: Iterator<Item = u8>>(&self, t: T);
                 }
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Iterator<Item = u8>'",
@@ -1991,7 +1971,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: TryFrom<u8> {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'TryFrom<u8>'",
@@ -2007,7 +1987,7 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: impl Clone);
                 }
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Clone'",
@@ -2021,7 +2001,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: for<'a> Fn(&'a u8) {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'for<'a> Fn (&'a u8)'",
@@ -2034,7 +2014,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: (Clone) {}
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: '(Clone)'",
@@ -2049,7 +2029,7 @@ const ROWS: &[Row] = &[
                     a: MyType<'_>,
                 }
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_struct(&item))
         },
         items: &[(
             "use absolute path: 'MyType<'_>'",
@@ -2062,7 +2042,7 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 struct S<const N: Idx>(u8);
             );
-            errors_in(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
+            errors_in(Leaker::new(), |leaker| leaker.intern_struct(&item))
         },
         items: &[(
             "use absolute path: 'Idx'",
@@ -2077,7 +2057,7 @@ const ROWS: &[Row] = &[
                     fn f(&self) -> &dyn RelTr;
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'RelTr'",
@@ -2085,41 +2065,10 @@ const ROWS: &[Row] = &[
              `&'a dyn Trait` or `dyn Trait + 'a`)",
         )],
     },
-    Row {
-        kind: "a type that names `Self`, where `Self` is denied",
-        error: || {
-            let item: ItemTrait = parse_quote!(
-                trait Tr {
-                    fn f(&self) -> Rel<Self>;
-                }
-            );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, false))
-        },
-        items: &[(
-            "use absolute path: 'Rel<Self>'",
-            "write `Rel` with an absolute path (e.g. `::my_crate::Rel`)",
-        )],
-    },
     // ── a bare identifier that may be a const ────────────────────────────────────────────────
     Row {
-        kind: "a bare identifier that may be a const, in a path that names `Self`, which is denied",
-        error: || errors(maybe_const),
-        items: &[(
-            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
-            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const)",
-        )],
-    },
-    Row {
         kind: "a bare identifier that may be a const, in a path that names `Self::A`",
-        error: || {
-            let item: ItemStruct = parse_quote!(
-                struct S {
-                    a: ::p::W<Self::A, LEN>,
-                }
-            );
-            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
-        },
+        error: || errors(maybe_const),
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
@@ -2134,28 +2083,12 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<T = ::p::W<Self, LEN>> {}
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
              const), or name the type instead of `Self` in `::p::W<Self, LEN>`",
-        )],
-    },
-    Row {
-        kind: "a bare identifier that may be a const, in a path whose bound names `Self`",
-        error: || {
-            let item: ItemStruct = parse_quote!(
-                struct S<T: ::core::convert::AsRef<Self>> {
-                    a: ::p::W<T, LEN>,
-                }
-            );
-            errors_in(allowing(), |leaker| leaker.intern_struct(&item, false))
-        },
-        items: &[(
-            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
-            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or write the bound of the generics of `::p::W<T, LEN>` without `Self`",
         )],
     },
     Row {
@@ -2167,7 +2100,7 @@ const ROWS: &[Row] = &[
                     fn f<'b>(&self, y: &'b dyn ::core::convert::AsRef<LEN>) -> &'b u8;
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
@@ -2185,7 +2118,7 @@ const ROWS: &[Row] = &[
                     a: ::p::W<{ ::p::m!() }, LEN>,
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
@@ -2226,7 +2159,7 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: Wrap<Self::A>) {}
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_impl(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_impl(&item))
         },
         items: &[
             (
@@ -2247,7 +2180,7 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 struct S<T>(T, Wrap<Self::A>);
             );
-            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item))
         },
         items: &[(
             "write `<Self as SomeTrait>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -2264,7 +2197,7 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: Wrap<Self::A>) {}
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_impl(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_impl(&item))
         },
         items: &[(
             "write `<Self as SomeTrait>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -2279,7 +2212,7 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 struct S<T: ::p::Tr<Self::A>>(Wrap<T>);
             );
-            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item))
         },
         items: &[
             (
@@ -2318,7 +2251,7 @@ const ROWS: &[Row] = &[
         kind: "a bound of an outer type that names an associated item of its `Self`",
         error: || {
             errors_in(allowing(), |leaker| {
-                leaker.enter_type(&id("S"), &parse_quote!(<T: AsRef<Self::X>>), true, |view| {
+                leaker.enter_type(&id("S"), &parse_quote!(<T: AsRef<Self::X>>), |view| {
                     view.visit_item(&parse_quote!(
                         impl ::p::W for X {
                             fn f(&self, x: Rel<T>) {}
@@ -2331,14 +2264,6 @@ const ROWS: &[Row] = &[
             "the bound of `T` mentions `Self::X`, which has no name here",
             "write the bound of `T` without `Self::X`, or write `Rel<T>` with an absolute path, \
              so that it is not leaked",
-        )],
-    },
-    Row {
-        kind: "a generic whose bound mentions a `Self` that is denied",
-        error: || errors(denied_self_in_bounds),
-        items: &[(
-            "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked",
-            "write the bound of the generics of `Wrap<T>` without `Self`",
         )],
     },
     Row {
@@ -2381,7 +2306,7 @@ const ROWS: &[Row] = &[
                         Rel<X>: Default;
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "`Rel<X>` is in a bound or where predicate, and a bound of its generics names \
@@ -2409,7 +2334,7 @@ const ROWS: &[Row] = &[
                     fn g<'c>(&self, x: &'c dyn RelTrait) -> &'c u8;
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[
             (
@@ -2435,7 +2360,7 @@ const ROWS: &[Row] = &[
                     fn f<F: for<'x> Fn(Rel<'x>) -> &'x u8>(&self, f: F);
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Rel<'x>'",
@@ -2451,7 +2376,7 @@ const ROWS: &[Row] = &[
                     fn g(x: &Rel<T>) -> &u8;
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Rel<T>'",
@@ -2465,7 +2390,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<'a, T: 'a, F: Fn(&Rel<T>) -> &u8> {}
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Rel<T>'",
@@ -2479,7 +2404,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<'a, T: 'a, F: Fn(::p::WRef<u8>, Rel<T>) -> &u8> {}
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Rel<T>'",
@@ -2495,25 +2420,12 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);
                 }
             );
-            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item))
         },
         items: &[(
             "use absolute path: 'Rel<T>'",
             "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
              absolute path",
-        )],
-    },
-    Row {
-        kind: "an elided output lifetime, where `Self` has lifetimes and is denied",
-        error: || {
-            let item: ItemStruct = parse_quote!(
-                pub struct S<'a>(fn(::core::slice::Iter<u8>, Self) -> &u8, &'a u8);
-            );
-            errors_in(allowing(), |leaker| leaker.intern_struct(&item, false))
-        },
-        items: &[(
-            "use absolute path: 'Self'",
-            "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output",
         )],
     },
 ];

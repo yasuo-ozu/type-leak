@@ -2,7 +2,7 @@
 //! Leaker's) and rewrite copies of them in another generated crate (the Referrer's), where every
 //! rewritten type is checked to be exactly the original one.
 //!
-//! In the Leaker's crate, `#[prop_leak(id = 17, allow_self = true, ..)]` is put on a struct, an
+//! In the Leaker's crate, `#[prop_leak(id = 17, ..)]` is put on a struct, an
 //! enum, a union, a trait, an impl or a module (analyzed by the matching `intern_*`). It emits
 //!
 //! - the item itself,
@@ -77,7 +77,6 @@ use type_leak::*;
 pub(crate) struct Args {
     /// The `ID` of the Repeater's `KEY`, the index of the item in the Leaker's crate.
     id: u64,
-    allow_self: bool,
     /// Allow the names of the standard prelude (`Vec`, `Option`, `Clone`, ...).
     prelude: bool,
     /// Allowed crates (`::std`).
@@ -103,8 +102,9 @@ pub(crate) struct Args {
     /// ([`ValueTypes`]), and the host of a trait has the default bodies and values of the copy, not
     /// `unimplemented!()` and a value of the type of the constant.
     bodies: bool,
-    /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
-    /// that does ([`Options::nested_self_entries()`]).
+    /// The macro takes the risk of an entry that names the own `Self` of a nested item together with
+    /// a bound that does: it accepts the `NestedSelfInBounds` errors (`LeakerResult::allow()`). Else
+    /// they stay, and the item is rejected.
     nested_self_entries: bool,
     /// `marker = "::path::Marker"`: the impls of the entries that name no `Self`, nor do their
     /// generics, are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner,
@@ -140,7 +140,6 @@ impl Parse for Args {
     fn parse(input: ParseStream) -> Result<Self> {
         let mut args = Args {
             id: 0,
-            allow_self: true,
             prelude: false,
             allow: Vec::new(),
             scope: String::new(),
@@ -168,7 +167,6 @@ impl Parse for Args {
             };
             match (key.as_str(), lit) {
                 ("id", Lit::Int(i)) => args.id = i.base10_parse()?,
-                ("allow_self", Lit::Bool(b)) => args.allow_self = b.value,
                 ("prelude", Lit::Bool(b)) => args.prelude = b.value,
                 ("scope", Lit::Str(s)) => args.scope = s.value(),
                 ("primitive", Lit::Bool(b)) => args.primitive = b.value,
@@ -196,7 +194,7 @@ impl Parse for Args {
 
 impl Args {
     fn tokens(&self) -> TokenStream {
-        let (id, allow_self, prelude) = (self.id, self.allow_self, self.prelude);
+        let (id, prelude) = (self.id, self.prelude);
         let primitive = self.primitive;
         let (redeclare, values) = (self.redeclare, self.values);
         let bodies = self.bodies;
@@ -215,7 +213,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
+        quote!(id = #id, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
     }
 
     /// The item is nested in `enter_mod` and has a `Self` of its own: the copy is wrapped in a
@@ -430,15 +428,8 @@ fn analyze_config<A: Allow>(
     args: &Args,
     config: A,
 ) -> (LeakerResult, ContextId, TokenStream) {
-    let mut options = Options::new();
-    if args.values {
-        options = options.check_values();
-    }
-    if args.nested_self_entries {
-        options = options.nested_self_entries();
-    }
-    let mut leaker = Leaker::from_config(config, options);
-    let allow_self = args.allow_self;
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = args.values;
     let scope = args.scope.as_str();
     CHECKED.with(|checked| checked.borrow_mut().clear());
     let context = match (args.via.as_str(), scope, item) {
@@ -446,7 +437,7 @@ fn analyze_config<A: Allow>(
         ("type", "", Item::Struct(_) | Item::Enum(_) | Item::Union(_)) => {
             let (ident, generics) = adt_head(item);
             leaker
-                .enter_type(ident, generics, allow_self, |view| walk_adt(view, item))
+                .enter_type(ident, generics, |view| walk_adt(view, item))
                 .0
         }
         // The same, with the generics, the where clause and the types given to the view one by
@@ -454,7 +445,7 @@ fn analyze_config<A: Allow>(
         ("parts", "", Item::Struct(_) | Item::Enum(_) | Item::Union(_)) => {
             let (ident, generics) = adt_head(item);
             leaker
-                .enter_type(ident, generics, allow_self, |view| adt_parts(view, item))
+                .enter_type(ident, generics, |view| adt_parts(view, item))
                 .0
         }
         ("parts", "generics", Item::Struct(_) | Item::Enum(_) | Item::Union(_)) => {
@@ -465,7 +456,7 @@ fn analyze_config<A: Allow>(
         }
         ("parts", "trait", Item::Trait(i)) => {
             leaker
-                .enter_trait(&i.ident, &i.generics, allow_self, |view| {
+                .enter_trait(&i.ident, &i.generics, |view| {
                     visit_generics_parts(view, &i.generics);
                     for bound in &i.supertraits {
                         view.visit_type_param_bound(bound);
@@ -481,7 +472,7 @@ fn analyze_config<A: Allow>(
         (via @ ("check" | "unchecked"), "", Item::Struct(_) | Item::Enum(_) | Item::Union(_)) => {
             let (ident, generics) = adt_head(item);
             leaker
-                .enter_type(ident, generics, allow_self, |view| {
+                .enter_type(ident, generics, |view| {
                     check_positions(view, item, args, via == "check");
                     walk_adt(view, item)
                 })
@@ -502,7 +493,7 @@ fn analyze_config<A: Allow>(
         }
         (via @ ("check" | "unchecked"), "trait", Item::Trait(i)) => {
             leaker
-                .enter_trait(&i.ident, &i.generics, allow_self, |view| {
+                .enter_trait(&i.ident, &i.generics, |view| {
                     check_positions(view, item, args, via == "check");
                     syn::visit::visit_item_trait(view, i)
                 })
@@ -514,7 +505,7 @@ fn analyze_config<A: Allow>(
             let (ident, generics) = adt_head(item);
             leaker
                 .enter_mod(format!("prop{}", args.id), [ident.clone()], |view| {
-                    view.enter_type(ident, generics, allow_self, |view| walk_adt(view, item))
+                    view.enter_type(ident, generics, |view| walk_adt(view, item))
                         .0
                 })
                 .1
@@ -523,7 +514,7 @@ fn analyze_config<A: Allow>(
         ("some", "impl", Item::Impl(i)) if i.trait_.is_some() => {
             let path = i.trait_.as_ref().map(|(_, path, _)| path);
             leaker
-                .enter_impl(&i.generics, &i.self_ty, path, allow_self, |view| {
+                .enter_impl(&i.generics, &i.self_ty, path, |view| {
                     view.visit_type(&i.self_ty);
                     if let Some((_, path, _)) = &i.trait_ {
                         for seg in &path.segments {
@@ -537,7 +528,7 @@ fn analyze_config<A: Allow>(
         ("visit", "", Item::Impl(i)) => {
             let path = i.trait_.as_ref().map(|(_, path, _)| path);
             leaker
-                .enter_impl(&i.generics, &i.self_ty, path, allow_self, |view| {
+                .enter_impl(&i.generics, &i.self_ty, path, |view| {
                     syn::visit::visit_item_impl(view, i)
                 })
                 .0
@@ -546,13 +537,23 @@ fn analyze_config<A: Allow>(
         (via, scope, _) => panic!("test macro: `via = {:?}` with the scope {:?}", via, scope),
     };
     let assertions = leaker.assertions();
-    (leaker.result(), context, assertions)
+    let mut result = leaker.result();
+    if args.nested_self_entries {
+        // The risk of an entry for any type that names `Self`: the error stays otherwise.
+        let risks: Vec<Cause> = result
+            .errors()
+            .iter()
+            .filter(|error| error.reason == Reason::NestedSelfInBounds)
+            .map(|error| error.cause.clone())
+            .collect();
+        result = result.allow(move |cause: &Cause, _: Place| risks.contains(cause));
+    }
+    (result, context, assertions)
 }
 
 /// The analysis of `item` through its scope by the calls that name them: `intern_*`, `enter_mod`,
 /// `enter_generics`, `enter_trait` and `enter_impl`.
 fn analyze_scope<A: Allow>(leaker: &mut Leaker<A>, item: &Item, args: &Args) -> ContextId {
-    let allow_self = args.allow_self;
     match (args.scope.as_str(), item) {
         ("mod", Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_)) => {
             let name = match item {
@@ -585,14 +586,14 @@ fn analyze_scope<A: Allow>(leaker: &mut Leaker<A>, item: &Item, args: &Args) -> 
         }
         ("trait", Item::Trait(i)) => {
             leaker
-                .enter_trait(&i.ident, &i.generics, allow_self, |view| {
+                .enter_trait(&i.ident, &i.generics, |view| {
                     syn::visit::visit_item_trait(view, i)
                 })
                 .0
         }
         ("impl", Item::Impl(i)) => {
             leaker
-                .enter_impl(&i.generics, &i.self_ty, None, allow_self, |view| {
+                .enter_impl(&i.generics, &i.self_ty, None, |view| {
                     view.visit_type(&i.self_ty);
                     if let Some((_, path, _)) = &i.trait_ {
                         for seg in &path.segments {
@@ -602,11 +603,11 @@ fn analyze_scope<A: Allow>(leaker: &mut Leaker<A>, item: &Item, args: &Args) -> 
                 })
                 .0
         }
-        ("", Item::Struct(i)) => leaker.intern_struct(i, allow_self),
-        ("", Item::Enum(i)) => leaker.intern_enum(i, allow_self),
-        ("", Item::Union(i)) => leaker.intern_union(i, allow_self),
-        ("", Item::Trait(i)) => leaker.intern_trait(i, allow_self),
-        ("", Item::Impl(i)) => leaker.intern_impl(i, allow_self),
+        ("", Item::Struct(i)) => leaker.intern_struct(i),
+        ("", Item::Enum(i)) => leaker.intern_enum(i),
+        ("", Item::Union(i)) => leaker.intern_union(i),
+        ("", Item::Trait(i)) => leaker.intern_trait(i),
+        ("", Item::Impl(i)) => leaker.intern_impl(i),
         ("", Item::Mod(i)) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     }

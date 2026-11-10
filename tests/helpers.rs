@@ -45,13 +45,13 @@ fn analyze(item: &Item) -> (Referrer, ContextId) {
 
 /// The same, with the result that writes the impls.
 fn analyze_result(item: &Item) -> (LeakerResult, ContextId) {
-    let mut leaker = Leaker::from_config(config(), Options::new());
+    let mut leaker = Leaker::from_config(config());
     let context = match item {
-        Item::Struct(i) => leaker.intern_struct(i, true),
-        Item::Enum(i) => leaker.intern_enum(i, true),
-        Item::Union(i) => leaker.intern_union(i, true),
-        Item::Trait(i) => leaker.intern_trait(i, true),
-        Item::Impl(i) => leaker.intern_impl(i, true),
+        Item::Struct(i) => leaker.intern_struct(i),
+        Item::Enum(i) => leaker.intern_enum(i),
+        Item::Union(i) => leaker.intern_union(i),
+        Item::Trait(i) => leaker.intern_trait(i),
+        Item::Impl(i) => leaker.intern_impl(i),
         Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     };
@@ -136,8 +136,8 @@ fn the_entries_that_depend_on_the_context_come_first() {
             d: ::bar::Y,
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     let all: Vec<String> = common::types(&referrer).map(s).collect();
@@ -171,14 +171,14 @@ fn a_referrer_with_no_entry_is_empty() {
     );
     // A Leaker that allows the crates finds no entry.
     let rules = config().external_crates();
-    let mut leaker = Leaker::from_config(rules, Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(rules);
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(referrer.iter().count(), 0);
     // The default one finds the type of the other crate.
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert!(!referrer.is_empty());
     assert_eq!(referrer.iter().count(), 1);
@@ -197,10 +197,10 @@ fn assert_declares_nothing(r: &RepeaterImpl) {
     assert!(r.module.is_none());
 }
 
-/// The sumtype shape: `Leaker::new()` (no allowed path) and `intern_trait(.., false)` on a trait
+/// The sumtype shape: `Leaker::new()` (no allowed path) and `intern_trait(..)` on a trait
 /// whose only entries are the absolute types of external crates. `iter()` counts them, and an impl
 /// of the Repeater for a marker declares nothing (no generics, no `Self`, no module), with the
-/// entry as the type. A relative type or `Self` makes the call fail and the macro throws the
+/// entry as the type. A type that names `Self` makes the call fail and the macro throws the
 /// Leaker away.
 #[test]
 fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marker() {
@@ -213,7 +213,7 @@ fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marke
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     assert!(!referrer.is_empty());
@@ -248,22 +248,35 @@ fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marke
     // it cannot leak is an error, and the macro throws the Leaker away then.
     let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel; } };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel<'_>; } };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_err());
-    // `Self` is not leaked with `allow_self == false`: an absolute type that names it is left as
-    // written, and is no entry for the macro to skip.
+    // An absolute type that names `Self` is an entry too. It needs the `Self` of the copy, which a
+    // marker cannot give: the call fails, and the macro throws the Leaker away.
     let item: ItemTrait = parse_quote! {
         pub trait Tr { fn f(&self) -> ::std::vec::Vec<Self>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
-    assert!(leaker.result().finish().unwrap().is_empty());
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    assert_eq!(result.clone().finish().unwrap().iter().count(), 1);
+    let error = result
+        .repeater_impls(
+            &repeater(),
+            7,
+            ImplSelf::Marker(&marker),
+            slot_const(&repeater()),
+        )
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&error, EncodeError::NeedsSelf(ty) if s(&**ty) == ":: std :: vec :: Vec < Self >")
+    );
 }
 
 // ── repeater_impls ───────────────────────────────────────────────────────────────────────────
@@ -930,12 +943,9 @@ fn display_uses_the_headline_of_the_cause() {
     // A default that names `Self`: it was "use absolute path: 'Self'". The cause is the whole type
     // of the default, and the note is at the `Self` in it.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T, U = Rel<Self>> {}
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<T, U = Rel<Self>> {}
+    ));
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(err[0].cause.to_token_stream().to_string(), "Rel < Self >");
@@ -949,9 +959,8 @@ fn display_uses_the_headline_of_the_cause() {
     leaker.enter_trait(
         &parse_quote!(Tr),
         &parse_quote!(<T: ::p::Tr<Self>>),
-        true,
         |view| {
-            view.enter_type(&parse_quote!(S), &Generics::default(), true, |view| {
+            view.enter_type(&parse_quote!(S), &Generics::default(), |view| {
                 view.visit_type(&parse_quote!(Rel<T>))
             })
         },
@@ -970,24 +979,18 @@ fn display_uses_the_headline_of_the_cause() {
     check(err, "`Self` has no meaning here");
     // A relative path keeps "use absolute path", with the reason in the notes.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr: Rel {}
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr: Rel {}
+    ));
     let result = leaker.result();
     let err = result.errors();
     check(err, "use absolute path: 'Rel'");
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<'a, T: 'a> {
-                fn g(x: &Rel<T>) -> &u8;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<'a, T: 'a> {
+            fn g(x: &Rel<T>) -> &u8;
+        }
+    ));
     let result = leaker.result();
     let err = result.errors();
     check(err, "use absolute path: 'Rel<T>'");

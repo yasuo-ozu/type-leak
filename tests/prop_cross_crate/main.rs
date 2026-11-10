@@ -1834,14 +1834,6 @@ fn family(error: &Rejection) -> Option<Family> {
             "a type in the self type of an impl whose context depends on `Self` through a bound",
             &[gen::TAG_IMPL_HEADER_SELF],
         ),
-        "DeniedSelfInBounds" => family_of(
-            "a type that uses a generic whose bound mentions a `Self` that cannot be leaked",
-            &[
-                gen::TAG_BOUND_CYCLE,
-                gen::TAG_SELF_IN_BOUNDS,
-                gen::TAG_SELF_DENIED,
-            ],
-        ),
         // The same fault in a struct, an enum or a union nested in `enter_mod`, analyzed without
         // `nested_self_entries`: the item wrote a type that names `Self` and a generic whose bound
         // does (`gen::TAG_NESTED_SELF_BOUNDS`, put only where the option is off).
@@ -1888,7 +1880,6 @@ fn maybe_const_family(error: &Rejection) -> Option<Family> {
     } else {
         &[
             gen::TAG_SELF_ASSOC,
-            gen::TAG_SELF_DENIED,
             gen::TAG_SELF_IN_BOUNDS,
             gen::TAG_BOUND_CYCLE,
         ]
@@ -1960,16 +1951,6 @@ fn relative_path_family(error: &Rejection) -> Option<Family> {
             vec![gen::TAG_SELF_ASSOC.to_string()],
         ));
     }
-    // A type that names `Self`, where `allow_self` is false.
-    if text.contains("Self") {
-        reasons.push((
-            "a type that names `Self`, which the item does not allow",
-            vec![
-                gen::TAG_SELF_ASSOC.to_string(),
-                gen::TAG_SELF_DENIED.to_string(),
-            ],
-        ));
-    }
     // A type that holds an array whose length is a macro call (`[u8; ::k::two!()]`) cannot be leaked
     // whole, so the relative path that holds it is an error.
     if because_of_macro(&error.note) {
@@ -1996,15 +1977,11 @@ fn relative_path_family(error: &Rejection) -> Option<Family> {
         ));
     }
     // `RLEN`, `crate::base::BLEN`: a constant, a value, which is not leaked: in the default of a
-    // parameter, or in the length of an array of a type that is split into parts because it
-    // names the `Self` that the item does not allow.
+    // parameter.
     if text.ends_with("LEN") {
         reasons.push((
             "a relative constant that is not leaked as a whole",
-            vec![
-                gen::TAG_CONST_DEFAULT.to_string(),
-                gen::TAG_SELF_DENIED.to_string(),
-            ],
+            vec![gen::TAG_CONST_DEFAULT.to_string()],
         ));
     }
     let name = reasons.first()?.0;
@@ -2101,7 +2078,7 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
 /// list).
 #[derive(Debug, PartialEq)]
 struct AcceptFamily {
-    /// The number of the failure in `accept_families()`: `(i)`, `(ii)` or `(iii)`.
+    /// The number of the failure in `accept_families()`: `(i)` or `(ii)`.
     class: &'static str,
     name: &'static str,
     tags: Vec<Vec<String>>,
@@ -2129,11 +2106,6 @@ fn accept_family(class: &'static str, name: &'static str, tags: &[&[&str]]) -> A
 /// - (ii) The same cause with an alias bound (`T: Fn(<T as Iterator>::Item) -> u8` next to a bound
 ///   that fixes the `Item`): E0277 too, but rustc cannot implement the trait with a generic impl at
 ///   all, so nothing makes it compile. The item has the alias bound (`alias_bound`).
-/// - (iii) `Self` with `allow_self = false` (`RelativePath`, the cause is `Self`) in a function
-///   pointer whose elided output takes the lifetime of an input that a path hides:
-///   `Visitor::with_self()` replaces `Self` by a type with lifetimes inside the accepted part, and
-///   the elision fails (E0106). The item denies `Self` (`self_denied`) and has the function pointer
-///   (`hidden_self`).
 ///
 /// This is the list of the failures: anything else is a defect, or a new limitation to add here,
 /// with its shape.
@@ -2165,13 +2137,6 @@ fn accept_families(code: &str, allowed: &[Rejection]) -> Vec<AcceptFamily> {
                     &[gen::TAG_SELF_IN_PREDICATE],
                     &[gen::TAG_BOUND_CYCLE, gen::TAG_RELATIVE_STD],
                 ],
-            ));
-        }
-        "E0106" if cause("RelativePath", &|t| t == "Self") => {
-            families.push(accept_family(
-                "(iii)",
-                "`Self` accepted in a function pointer whose elided output takes the lifetime of a hidden one, and `with_self()` replaces it",
-                &[&[gen::TAG_SELF_DENIED], &[gen::TAG_HIDDEN_SELF]],
             ));
         }
         _ => (),
@@ -2625,7 +2590,7 @@ struct Stats {
     allowed_positions: usize,
     allowed_checked: usize,
     /// The items accepted by `allow()` whose copy does not compile for a failure that
-    /// `accept_families()` lists, by its class (`(i)`, `(ii)`, `(iii)`).
+    /// `accept_families()` lists, by its class (`(i)`, `(ii)`).
     documented: BTreeMap<&'static str, usize>,
     /// The errors that were allowed, by `Reason` and the kind of the cause.
     allowed_errors: BTreeMap<(String, String), usize>,
@@ -2703,16 +2668,14 @@ struct Forced {
 
 /// An error that a rejection must have: its `Reason`, and, where they tell the shape from the item's
 /// other errors, the kind of its cause, a text that its tokens (without whitespace) or its note
-/// hold, whether the item is analyzed with `allow_self`, and a tag of the item. Where the Leaker has
-/// another reason that takes the place of the shape's own, it is another `Expect` with its
-/// condition.
+/// hold, and a tag of the item. Where the Leaker has another reason that takes the place of the
+/// shape's own, it is another `Expect` with its condition.
 #[derive(Clone, Copy)]
 struct Expect {
     reason: &'static str,
     cause: Option<&'static str>,
     tokens: Option<&'static str>,
     note: Option<&'static str>,
-    allow_self: Option<bool>,
     tag: Option<&'static str>,
 }
 
@@ -2723,7 +2686,6 @@ impl Expect {
             cause: None,
             tokens: None,
             note: None,
-            allow_self: None,
             tag: None,
         }
     }
@@ -2749,13 +2711,6 @@ impl Expect {
         }
     }
 
-    const fn allow_self(self, allow_self: bool) -> Expect {
-        Expect {
-            allow_self: Some(allow_self),
-            ..self
-        }
-    }
-
     const fn tag(self, tag: &'static str) -> Expect {
         Expect {
             tag: Some(tag),
@@ -2774,7 +2729,6 @@ impl Expect {
                     .contains(tokens)
             })
             && self.note.map_or(true, |note| error.note.contains(note))
-            && self.allow_self.map_or(true, |a| a == item.allow_self)
             && self.tag.map_or(true, |tag| item.tags.contains(tag))
     }
 
@@ -2788,9 +2742,6 @@ impl Expect {
         }
         if let Some(note) = self.note {
             write!(text, " whose note holds `{}`", note).unwrap();
-        }
-        if let Some(allow_self) = self.allow_self {
-            write!(text, " (item with allow_self {})", allow_self).unwrap();
         }
         if let Some(tag) = self.tag {
             write!(text, " (item with the tag {})", tag).unwrap();
@@ -2851,14 +2802,10 @@ const FORCED: &[Forced] = &[
         in_body: false,
         values: false,
     },
-    // Without `allow_self` the `Self` of the bound cannot be leaked at all.
     Forced {
         tag: gen::FORCED_IMPL_HEADER_SELF,
         shape: gen::TAG_IMPL_HEADER_SELF,
-        expect: &[
-            Expect::reason("SelfInImplSelfType").allow_self(true),
-            Expect::reason("DeniedSelfInBounds").allow_self(false),
-        ],
+        expect: &[Expect::reason("SelfInImplSelfType")],
         in_body: false,
         values: false,
     },
@@ -2964,10 +2911,7 @@ impl Forced {
         let wanted: Vec<String> = self
             .expect
             .iter()
-            .filter(|expect| {
-                expect.allow_self.map_or(true, |a| a == item.allow_self)
-                    && expect.tag.map_or(true, |tag| item.tags.contains(tag))
-            })
+            .filter(|expect| expect.tag.map_or(true, |tag| item.tags.contains(tag)))
             .map(Expect::describe)
             .collect();
         format!("an error with {}", wanted.join(", or with "))
@@ -4639,11 +4583,10 @@ fn random_items_leak_across_crates() {
             if let Some(item) = case.items.iter().find(|i| Some(i.id) == failure.item) {
                 writeln!(
                     message,
-                    "item {} ({}, in {:?}, allow_self {}):\n{}",
+                    "item {} ({}, in {:?}):\n{}",
                     item.id,
                     item.kind,
                     item.module,
-                    item.allow_self,
                     excerpt(&item.source, 60)
                 )
                 .unwrap();
@@ -5083,15 +5026,7 @@ mod checks {
             by_reason("UnprovableBound", "any words", "Wrap < T >"),
             Some(vec![gen::TAG_BOUND_AT.to_string()])
         );
-        let same = |a: &str, b: &str| {
-            let (a, b) = (
-                family(&rejection_of(a, "", "X")),
-                family(&rejection_of(b, "", "X")),
-            );
-            a.is_some() && a == b
-        };
-        // `NestedSelfInBounds` is explained by its own shape, `DeniedSelfInBounds` is not.
-        assert!(!same("DeniedSelfInBounds", "NestedSelfInBounds"));
+        // `NestedSelfInBounds` is explained by its own shape.
         assert_eq!(
             family(&rejection_of("NestedSelfInBounds", "", "Wrap<Self, T>")).map(|f| f.tags),
             Some(vec![
@@ -5102,7 +5037,6 @@ mod checks {
         for reason in [
             "SelfInTraitPredicate",
             "SelfInImplSelfType",
-            "DeniedSelfInBounds",
             "UnconstrainedLifetime",
             "MaybeConst",
         ] {
@@ -5826,17 +5760,11 @@ mod checks {
     }
 
     /// A generated item with the tags and settings given, for the checks of the forced shapes.
-    fn item_with(
-        kind: &'static str,
-        scope: &'static str,
-        allow_self: bool,
-        names: &[&str],
-    ) -> gen::Item {
+    fn item_with(kind: &'static str, scope: &'static str, names: &[&str]) -> gen::Item {
         gen::Item {
             id: 0,
             kind,
             module: Vec::new(),
-            allow_self,
             scope,
             contents: vec![kind],
             tags: tags(names),
@@ -5972,7 +5900,7 @@ mod checks {
         let forced = gen::forced_in;
         let item = |settings: &str, body: &str| {
             format!(
-                "#[@ATTR@(id = 1, allow_self = true, {}, krate = \"k\")]\npub trait Tr1_1 {{\nfn m(&self) {{ {} loop {{}} }}\n}}\n",
+                "#[@ATTR@(id = 1, {}, krate = \"k\")]\npub trait Tr1_1 {{\nfn m(&self) {{ {} loop {{}} }}\n}}\n",
                 settings, body
             )
         };
@@ -6098,7 +6026,7 @@ mod checks {
             ("impl-inherent", ""),
             ("mod", ""),
         ] {
-            let item = item_with(kind, scope, true, &[gen::FORCED_VALUE_PATH]);
+            let item = item_with(kind, scope, &[gen::FORCED_VALUE_PATH]);
             let problems = forced_problems(&item, &report_with(true, Vec::new()));
             assert_eq!(problems.len(), 1, "{} {}", kind, scope);
             assert_eq!(problems[0].0, FORCED_ACCEPTED);
@@ -6140,12 +6068,12 @@ mod checks {
             );
             assert!(forced_problems(&item, &report).is_empty());
         }
-        let through_impl = item_with("impl-trait", "impl", true, &[gen::FORCED_VALUE_PATH]);
+        let through_impl = item_with("impl-trait", "impl", &[gen::FORCED_VALUE_PATH]);
         assert!(forced_of(&through_impl).is_empty());
         assert!(forced_problems(&through_impl, &report_with(true, Vec::new())).is_empty());
         // An item whose plain tag `value_path` is the discriminant's, or the stale tag of an impl, has
         // no forced shape: the Leaker may accept it.
-        let plain = item_with("impl-trait", "", true, &[gen::TAG_VALUE_PATH]);
+        let plain = item_with("impl-trait", "", &[gen::TAG_VALUE_PATH]);
         assert!(forced_problems(&plain, &report_with(true, Vec::new())).is_empty());
     }
 
@@ -6297,7 +6225,7 @@ mod checks {
     /// rejects with no error that the shape needs; one rejected for the reason of the shape passes.
     #[test]
     fn an_accepted_forced_item_fails_and_a_rejected_one_passes() {
-        let nested = item_with("struct", "mod", true, &[gen::TAG_NESTED_SELF_BOUNDS]);
+        let nested = item_with("struct", "mod", &[gen::TAG_NESTED_SELF_BOUNDS]);
         let accepted = report_with(true, Vec::new());
         let problems = forced_problems(&nested, &accepted);
         assert_eq!(problems.len(), 1);
@@ -6320,17 +6248,17 @@ mod checks {
         assert_eq!(problems[0].0, FORCED_OTHER);
         assert!(problems[0].1.contains("RelativePath"), "{}", problems[0].1);
         // An item with no forced shape is not asked.
-        let plain = item_with("struct", "mod", true, &[gen::TAG_NESTED_SELF_OPTION]);
+        let plain = item_with("struct", "mod", &[gen::TAG_NESTED_SELF_OPTION]);
         assert!(forced_problems(&plain, &accepted).is_empty());
         assert!(forced_problems(&plain, &wrong).is_empty());
     }
 
-    /// What decides whether an error is the one that a shape needs: the cause, the tokens, the
-    /// `allow_self` of the item, its tags; and the scopes where nothing is forced.
+    /// What decides whether an error is the one that a shape needs: the cause, the tokens, the tags
+    /// of the item; and the scopes where nothing is forced.
     #[test]
     fn the_error_that_a_forced_shape_needs_is_told_by_its_cause_tokens_and_the_item() {
         // `Rl<'_>`: a relative path of the kind `Type` that holds the elided lifetime.
-        let elided = item_with("trait", "", true, &[gen::FORCED_ELIDED_ARG]);
+        let elided = item_with("trait", "", &[gen::FORCED_ELIDED_ARG]);
         let ok = report_with(false, vec![error_of("RelativePath", "Type", "Rl < '_ >")]);
         assert!(forced_problems(&elided, &ok).is_empty());
         for other in [
@@ -6342,26 +6270,23 @@ mod checks {
             assert_eq!(forced_problems(&elided, &report).len(), 1);
         }
         // A bare macro: the cause is a macro; a constant: an expression.
-        let two = item_with("struct", "", true, &[gen::FORCED_MACRO_PATH]);
+        let two = item_with("struct", "", &[gen::FORCED_MACRO_PATH]);
         let report = report_with(false, vec![error_of("RelativePath", "Macro", "two !")]);
         assert!(forced_problems(&two, &report).is_empty());
         let report = report_with(false, vec![error_of("RelativePath", "Expr", "RLEN")]);
         assert_eq!(forced_problems(&two, &report).len(), 1);
-        // Without `allow_self` the `Self` of a bound cannot be leaked: another reason says it.
-        let denied = report_with(
-            false,
-            vec![error_of("DeniedSelfInBounds", "Type", "S1_1 < T >")],
-        );
+        // A bound that names `Self` in the header of an impl: the reason is `SelfInImplSelfType`.
         let header = report_with(
             false,
             vec![error_of("SelfInImplSelfType", "Type", "S1_1 < T >")],
         );
-        let allowing = item_with("impl-inherent", "", true, &[gen::FORCED_IMPL_HEADER_SELF]);
-        let denying = item_with("impl-inherent", "", false, &[gen::FORCED_IMPL_HEADER_SELF]);
-        assert!(forced_problems(&allowing, &header).is_empty());
-        assert_eq!(forced_problems(&allowing, &denied).len(), 1);
-        assert!(forced_problems(&denying, &denied).is_empty());
-        assert_eq!(forced_problems(&denying, &header).len(), 1);
+        let other = report_with(
+            false,
+            vec![error_of("UnprovableBound", "Type", "S1_1 < T >")],
+        );
+        let impl_header = item_with("impl-inherent", "", &[gen::FORCED_IMPL_HEADER_SELF]);
+        assert!(forced_problems(&impl_header, &header).is_empty());
+        assert_eq!(forced_problems(&impl_header, &other).len(), 1);
         // A predicate on a type that names `Self` is a cycle first if a bound of the generics names a
         // leaked type; the error is still the one about that type.
         let predicate = report_with(
@@ -6372,11 +6297,10 @@ mod checks {
                 "super :: base :: B1 < Self >",
             )],
         );
-        let plain = item_with("trait", "", true, &[gen::FORCED_SELF_IN_TRAIT_PRED]);
+        let plain = item_with("trait", "", &[gen::FORCED_SELF_IN_TRAIT_PRED]);
         let cyclic = item_with(
             "trait",
             "",
-            true,
             &[gen::FORCED_SELF_IN_TRAIT_PRED, gen::TAG_BOUND_CYCLE],
         );
         assert_eq!(forced_problems(&plain, &predicate).len(), 1);
@@ -6388,10 +6312,10 @@ mod checks {
         assert_eq!(forced_problems(&cyclic, &elsewhere).len(), 1);
         // `enter_impl` visits the self type and the trait's arguments only: nothing is forced, even if
         // the item is accepted; `enter_trait` and a module do not read bodies.
-        let through_impl = item_with("impl-trait", "impl", true, &[gen::FORCED_MACRO_PATH]);
+        let through_impl = item_with("impl-trait", "impl", &[gen::FORCED_MACRO_PATH]);
         assert!(forced_of(&through_impl).is_empty());
         assert!(forced_problems(&through_impl, &report_with(true, Vec::new())).is_empty());
-        let body = |kind, scope| item_with(kind, scope, true, &[gen::TAG_UNREADABLE]);
+        let body = |kind, scope| item_with(kind, scope, &[gen::TAG_UNREADABLE]);
         assert_eq!(forced_of(&body("struct", "")).len(), 1);
         assert_eq!(forced_of(&body("trait", "")).len(), 1);
         assert!(forced_of(&body("trait", "trait")).is_empty());
@@ -6593,8 +6517,8 @@ mod checks {
         let rejected = Report {
             kind: "struct".into(),
             rejections: vec![rejection_of(
-                "DeniedSelfInBounds",
-                "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked",
+                "UnprovableBound",
+                "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked type",
                 "Wrap < T >",
             )],
             ..Default::default()
@@ -6857,7 +6781,7 @@ mod checks {
     fn a_failure_of_an_accepted_copy_needs_a_documented_class_and_a_shape() {
         let unprovable_assoc = allowed_report(vec![allowed("UnprovableBound", "Self :: A0")]);
         let unprovable_self = allowed_report(vec![allowed("UnprovableBound", "Self")]);
-        let denied_self = allowed_report(vec![allowed("RelativePath", "Self")]);
+        let relative_self = allowed_report(vec![allowed("RelativePath", "Self")]);
         let classify = |tags_of: &[&str], codes: &[&str], report: &Report| {
             unexplained_accept(&tags(tags_of), codes, report)
         };
@@ -6893,29 +6817,20 @@ mod checks {
             Ok("(ii)")
         );
         assert!(classify(&["alias_bound"], &["E0277"], &unprovable_self).is_err());
-        // (iii): `Self` denied, in a function pointer that hides a lifetime.
-        assert_eq!(
-            classify(&["self_denied", "hidden_self"], &["E0106"], &denied_self),
-            Ok("(iii)")
-        );
-        assert!(
-            classify(&["self_denied"], &["E0106"], &denied_self).unwrap_err()[0]
-                .starts_with("NO SHAPE THAT GIVES IT")
-        );
         // Anything else is not a known failure: the lifetime that E0195 was about, another code, an
         // error that was not allowed, every diagnostic of the item counts.
         let all = &[
             "bound_cycle",
             "self_in_predicate",
             "alias_bound",
-            "self_denied",
             "hidden_self",
         ];
         let unconstrained = allowed_report(vec![allowed("UnconstrainedLifetime", "Wrap < 'b >")]);
         for (codes, report) in [
             (&["E0195"][..], &unconstrained),
             (&["E0308"][..], &unprovable_assoc),
-            (&["E0277"][..], &denied_self),
+            (&["E0277"][..], &relative_self),
+            (&["E0106"][..], &relative_self),
             (&["E0277"][..], &allowed_report(Vec::new())),
             (&["E0277", "E0425"][..], &unprovable_assoc),
         ] {

@@ -780,8 +780,8 @@ pub mod x {
 }
 
 /// Fragments of impls, analyzed with the scope API: `scope_leak!` is the shape of `coinduction`
-/// (`Leaker::enter_impl(.., false, ..)` with `visit_path_arguments()`, `ImplSelf::Marker`) and, with
-/// `allow_self = true`, of `newer-type` (`ImplSelf::Param`).
+/// (`Leaker::enter_impl(..)` with `visit_path_arguments()`, `ImplSelf::Marker`) and, with `Self` in
+/// an argument, of `newer-type` (`ImplSelf::Param`).
 pub mod scoped {
     use core::marker::PhantomData;
     use type_leak_test_macro::{scope_errors, scope_leak};
@@ -800,7 +800,7 @@ pub mod scoped {
     impl Tr<Rel2, Rel3> for Holder<Rel2, Rel3> {}
 
     // `coinduction`: the trait and the self type are resolved by name, so only their arguments are
-    // leaked. `Self` is denied. Three required entries: `Rel3` (no generics, so the marker's impl is
+    // leaked. Three required entries: `Rel3` (no generics, so the marker's impl is
     // plain), `Rel<T>` and `&'a Rel2`.
     scope_leak! {
         id = 7001, marker = M7001,
@@ -812,7 +812,7 @@ pub mod scoped {
     // is for the self type, `ImplSelf::Param`), next to `Rel<T>`. A marker is refused then, so the
     // impl of `Rel<T>` is for a parameter, and the copy writes the marker as its owner.
     scope_leak! {
-        id = 7002, marker = M7002, allow_self = true,
+        id = 7002, marker = M7002,
         impl<T: ::core::clone::Clone> crate::scoped::Tr<Wrap<Self>, Rel<T>>
             for crate::scoped::Holder<T, u8> {}
     }
@@ -863,11 +863,6 @@ pub mod scoped {
     scope_errors! {
         name = SCOPE_ERRORS_MULTI,
         impl<T> crate::scoped::Tr<One<'_>, Two<'_, T>> for crate::scoped::Holder<Three<'_>, u8> {}
-    }
-    // `Self` is denied by `allow_self = false`.
-    scope_errors! {
-        name = SCOPE_ERRORS_SELF_DENIED, allow_self = false,
-        impl crate::scoped::Tr<Wrap<Self>, u8> for crate::scoped::Holder<u8, u8> {}
     }
     // `Self` has no meaning in generics: two mentions, two items.
     scope_errors! {
@@ -934,7 +929,7 @@ pub mod kinds {
     // Structs.
 
     /// `Self` (the type) is an entry of it, as are `Rel`, `Wrap<T>`, `Pair<Rel, T>` and `&'a Rel`.
-    #[prop_leak(id = 9001, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9001, prelude = true)]
     pub struct Node<'a, T: 'a> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
@@ -943,23 +938,17 @@ pub mod kinds {
         pub next: Option<Box<Wrap<Self>>>,
     }
 
-    /// `Self` is denied, and the struct does not name it.
-    #[prop_leak(id = 9002, allow_self = false)]
+    /// A struct that does not name `Self`.
+    #[prop_leak(id = 9002)]
     pub struct Plain<T> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
         pub pair: Pair<T, Rel>,
     }
 
-    /// `Self` is denied, and the struct names it: the Leaker rejects it.
-    #[prop_leak(id = 9003, allow_self = false)]
-    pub struct SelfDenied {
-        pub me: Wrap<Self>,
-    }
-
     /// An optional entry (a type of another crate), which a strict Referrer replaces. The crate
     /// is not a dependency of the Referrer's crate.
-    #[prop_leak(id = 9004, allow_self = true)]
+    #[prop_leak(id = 9004)]
     pub struct Holds {
         pub wrapped: ::type_leak_test_ext::Ext<(Rel,)>,
         pub plain: ::type_leak_test_ext::Ext<u8>,
@@ -976,7 +965,7 @@ pub mod kinds {
     /// `Cl<T>` carries, and the predicate does not hold without itself (`T` is not `Clone`). It is no
     /// entry: the copy writes it as it is, and the Repeater's impl of `Cl<T>` holds. Replaced, the copy
     /// was E0277 (`required for `u32` to implement `Repeater<(T,), ..>``).
-    #[prop_leak(id = 9005, allow_self = false)]
+    #[prop_leak(id = 9005)]
     pub struct Needs<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -986,7 +975,7 @@ pub mod kinds {
 
     // Enums.
 
-    #[prop_leak(id = 9011, allow_self = true)]
+    #[prop_leak(id = 9011)]
     pub enum Choice<T> {
         Rel(Rel),
         Wrapped(Wrap<T>),
@@ -995,7 +984,7 @@ pub mod kinds {
         Nothing,
     }
 
-    #[prop_leak(id = 9012, allow_self = false)]
+    #[prop_leak(id = 9012)]
     pub enum Borrow<'a, T: 'a> {
         Lt(Lt<'a, T>),
         Rel(Rel),
@@ -1003,14 +992,14 @@ pub mod kinds {
 
     // Unions.
 
-    #[prop_leak(id = 9021, allow_self = false)]
+    #[prop_leak(id = 9021)]
     pub union Bits<T: ::core::marker::Copy> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
         pub pair: Pair<Rel, Rel>,
     }
 
-    #[prop_leak(id = 9022, allow_self = true)]
+    #[prop_leak(id = 9022)]
     pub union BitsSelf {
         pub rel: Rel,
         pub me: Wrap<Self>,
@@ -1021,7 +1010,7 @@ pub mod kinds {
     pub struct Holder<T>(pub T);
 
     /// An inherent impl: `Self` is `Holder<T>`.
-    #[prop_leak(id = 9031, allow_self = true)]
+    #[prop_leak(id = 9031)]
     impl<T> Holder<T> {
         pub fn rel(&self) -> Rel {
             Rel(1)
@@ -1039,7 +1028,7 @@ pub mod kinds {
 
     /// An impl of a trait: the trait is `::type_leak_test_leaker::kinds::Mark`, an absolute path (its arguments must
     /// be too, as a bound is copied as written), and the associated type and the method are leaked.
-    #[prop_leak(id = 9032, allow_self = true)]
+    #[prop_leak(id = 9032)]
     impl<T> ::type_leak_test_leaker::kinds::Mark<u8> for Holder<T> {
         type Out = Pair<Rel, Wrap<T>>;
         fn mark(&self, a: u8) -> Pair<Rel, Wrap<T>> {
@@ -1048,7 +1037,7 @@ pub mod kinds {
     }
 
     /// A relative argument of the trait is leaked too (the trait itself is resolved by name).
-    #[prop_leak(id = 9034, allow_self = true)]
+    #[prop_leak(id = 9034)]
     impl<T> ::type_leak_test_leaker::kinds::Mark<Rel> for Holder<Wrap<T>> {
         type Out = Rel;
         fn mark(&self, a: Rel) -> Rel {
@@ -1056,8 +1045,8 @@ pub mod kinds {
         }
     }
 
-    /// `Self` is denied for the impl, which does not name it.
-    #[prop_leak(id = 9033, allow_self = false)]
+    /// An inherent impl that does not name `Self`.
+    #[prop_leak(id = 9033)]
     impl<T> Holder<Wrap<T>> {
         pub fn inner(&self) -> Rel {
             Rel(3)
@@ -1120,22 +1109,16 @@ pub mod kinds {
 
     // Traits.
 
-    /// `Self` is denied for the trait (`sumtype`'s way), and it does not name `Self`.
-    #[prop_leak(id = 9051, allow_self = false)]
+    /// A trait that does not name `Self` (`sumtype`'s way).
+    #[prop_leak(id = 9051)]
     pub trait NoSelf {
         fn wrapped(&self) -> Wrap<Rel>;
         fn pair<T>(&self, x: Pair<T, Rel>) -> Rel;
     }
 
-    /// `Self` is denied, and the trait names it: the Leaker rejects it.
-    #[prop_leak(id = 9052, allow_self = false)]
-    pub trait SelfDeniedTrait {
-        fn me(&self) -> Wrap<Self>;
-    }
-
     /// A trait which is implemented for an unsized type in the Referrer's crate (`dyn_host`): the
     /// Repeater's impls of the entries that name `Self` must declare `__S: ?Sized`.
-    #[prop_leak(id = 9053, allow_self = true)]
+    #[prop_leak(id = 9053)]
     pub trait Unsized {
         fn me(&self) -> Wrap<Self>;
         fn borrowed<'a>(&'a self, x: &'a Self) -> Wrap<&'a Self>;
@@ -1147,22 +1130,14 @@ pub mod kinds {
 
     /// `Self` is allowed: the path that holds the const is an entry as a whole (`CW<[Self], LEN>`),
     /// so the const is never read as a type, whatever the path holds beside it.
-    #[prop_leak(id = 9081, allow_self = true)]
+    #[prop_leak(id = 9081)]
     pub struct ConstSelf {
         pub me: ::type_leak_test_leaker::kinds::CW<[Self], LEN>,
         pub rel: ::type_leak_test_leaker::kinds::CW<Rel, LEN>,
     }
 
-    /// `Self` is denied, and the path that holds the const names it: it cannot be leaked as a
-    /// whole, and the const must not be leaked alone as a type (it would not compile): the Leaker
-    /// rejects it.
-    #[prop_leak(id = 9082, allow_self = false)]
-    pub struct ConstSelfDenied {
-        pub me: ::type_leak_test_leaker::kinds::CW<[Self], LEN>,
-    }
-
     /// A trait: `Self` is the implementor, and `CW<Self, LEN>` is an entry for its implementors.
-    #[prop_leak(id = 9083, allow_self = true)]
+    #[prop_leak(id = 9083)]
     pub trait ConstTrait {
         fn me(&self) -> ::type_leak_test_leaker::kinds::CW<Self, LEN>;
         fn rel(&self, x: ::type_leak_test_leaker::kinds::CW<Rel, LEN>) -> Rel;
@@ -1171,7 +1146,7 @@ pub mod kinds {
     /// A bare identifier that is a type, where the path that holds it cannot be leaked (an elided
     /// lifetime, `impl Trait`, a trait object under an elided reference, a trait bound): it is
     /// leaked alone as a type, which works for a type.
-    #[prop_leak(id = 9084, allow_self = false)]
+    #[prop_leak(id = 9084)]
     pub trait SoftIdent {
         fn by_dyn(&self, x: &dyn ::type_leak_test_leaker::kinds::Sink<Rel>);
         fn by_impl(&self, x: impl ::type_leak_test_leaker::kinds::Sink<Rel>);
@@ -1186,7 +1161,7 @@ pub mod kinds {
     // the item to write it with.
 
     /// A struct that names its own `Self` in relative types, next to ones that do not.
-    #[prop_leak(id = 9061, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9061, scope = "mod")]
     pub struct Links<T> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
@@ -1196,7 +1171,7 @@ pub mod kinds {
     }
 
     /// An enum, with `Self` in the generics of a variant that a bound names too.
-    #[prop_leak(id = 9062, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9062, scope = "mod")]
     pub enum Step<T> {
         Rel(Rel),
         Wrapped(Wrap<T>),
@@ -1206,7 +1181,7 @@ pub mod kinds {
     }
 
     /// A trait: `Self` is the implementor, and the Referrer's crate implements the trait for a host.
-    #[prop_leak(id = 9063, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9063, scope = "mod")]
     pub trait Walk<T> {
         fn me(&self) -> Wrap<Self>;
         fn rel(&self, x: Pair<Rel, T>) -> Wrap<T>;
@@ -1220,7 +1195,7 @@ pub mod kinds {
     // the copy pass its own type (`SelfRequirement::Any`).
 
     /// The bound is on the parameter.
-    #[prop_leak(id = 9111, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9111, scope = "mod", prelude = true)]
     pub struct Owned<T: AsRef<Self>> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
@@ -1228,14 +1203,14 @@ pub mod kinds {
     }
 
     /// The bound is a where predicate, and names `Self` among other types.
-    #[prop_leak(id = 9112, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9112, scope = "mod")]
     pub struct Tagged<T>(pub Wrap<T>, pub u8)
     where
         T: ::core::convert::AsRef<(Self, u8)>;
 
     /// The report of the property test: an enum with a lifetime, a const parameter with a default,
     /// and a bound that names `Self` twice and a relative type (`Lt<'a, Rel>`).
-    #[prop_leak(id = 9113, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9113, scope = "mod")]
     pub enum Reported<'a, T: ::core::marker::Send + 'a, const V: usize = 3>
     where
         T: ::core::convert::AsRef<::std::collections::BTreeMap<(Self, Self), self::Lt<'a, Rel>>>,
@@ -1245,7 +1220,7 @@ pub mod kinds {
     }
 
     /// A union.
-    #[prop_leak(id = 9114, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9114, scope = "mod")]
     pub union Overlaid<T: ::core::marker::Copy + ::core::convert::AsRef<Self>> {
         pub wrapped: Wrap<T>,
         pub rel: Rel,
@@ -1254,7 +1229,7 @@ pub mod kinds {
     /// A type that names `Self` and has a generic with a bound that names it: it is for the
     /// Leaker's type, which the bound does not hold for in the copy. The Leaker rejects it (the
     /// macro expands to nothing); `Wrap<T>`, which does not name `Self`, is the supported case.
-    #[prop_leak(id = 9115, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9115, scope = "mod", prelude = true)]
     pub struct Both<T: AsRef<Self>> {
         pub me: Wrap<Self>,
         pub wrapped: Wrap<T>,
@@ -1262,27 +1237,27 @@ pub mod kinds {
 
     /// The entry is in a bound of another generic (`U: Into<Wrap<T>>`), where the copy's `Self` is
     /// the type being declared.
-    #[prop_leak(id = 9116, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9116, scope = "mod", prelude = true)]
     pub struct Chain<T: AsRef<Self>, U: Into<Wrap<T>>>(pub T, pub U);
 
     /// The entry is in a where predicate.
-    #[prop_leak(id = 9117, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9117, scope = "mod", prelude = true)]
     pub struct InPredicate<T: AsRef<Self>>(pub T)
     where
         Wrap<T>: Sized;
 
     /// The entry has a lifetime, which the bound `T: 'a` keeps.
-    #[prop_leak(id = 9118, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9118, scope = "mod", prelude = true)]
     pub struct Outlives<'a, T: AsRef<Self> + 'a>(pub &'a Wrap<T>, pub T);
 
     /// `Self: 'a` is written, so the arguments of the Repeater encode `&'a Self`: the copy's own.
-    #[prop_leak(id = 9119, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9119, scope = "mod", prelude = true)]
     pub struct SelfOutlived<'a, T: AsRef<Self>>(pub &'a Wrap<T>, pub T)
     where
         Self: 'a;
 
     /// A predicate on `Self` alone is in the context of the entry too.
-    #[prop_leak(id = 9120, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9120, scope = "mod", prelude = true)]
     pub struct SelfSized<T: AsRef<Self>>(pub Wrap<T>, pub T)
     where
         Self: Sized;
@@ -1293,28 +1268,28 @@ pub mod kinds {
     // the type to be `Sized`), which shows on those toolchains only.
 
     /// The bound is `AsRef<Self>`: the impl is `?Sized`, the entry is the last field.
-    #[prop_leak(id = 9125, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9125, scope = "mod")]
     pub struct Last<T: ::core::convert::AsRef<Self>> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
     }
 
     /// An enum: its variants are checked as fields (on rustc 1.56 too).
-    #[prop_leak(id = 9126, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9126, scope = "mod")]
     pub enum Alternative<T: ::core::convert::AsRef<Self>> {
         Plain(u8),
         Wrapped(Wrap<T>),
     }
 
     /// `Self` is behind a `Box`, and the argument of `Borrow`: still `?Sized`.
-    #[prop_leak(id = 9127, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9127, scope = "mod")]
     pub struct Pointed<
         T: ::core::convert::AsRef<::std::boxed::Box<Self>> + ::core::borrow::Borrow<Self>,
     >(pub u8, pub Wrap<T>);
 
     /// `Self` in a tuple: the impl keeps `Sized` (the tuple needs it), the entry is not the last
     /// field.
-    #[prop_leak(id = 9128, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9128, scope = "mod")]
     pub struct Tupled<T: ::core::convert::AsRef<(Self, u8)>> {
         pub wrapped: Wrap<T>,
         pub tag: u8,
@@ -1327,7 +1302,7 @@ pub mod kinds {
 
     /// A bound that names `Self`, an absolute type that names it too, and a relative type that uses
     /// the generic (`Wrap<T>`, for any type that the bound holds for).
-    #[prop_leak(id = 9121, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9121, scope = "mod", prelude = true)]
     pub struct Pathed<T: AsRef<Self>> {
         pub path: ::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, T>,
         pub wrapped: Wrap<T>,
@@ -1335,14 +1310,14 @@ pub mod kinds {
     }
 
     /// A recursive type: `Self` in a box.
-    #[prop_leak(id = 9122, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9122, scope = "mod", prelude = true)]
     pub struct List {
         pub next: Option<::std::boxed::Box<Self>>,
         pub rel: Rel,
     }
 
     /// An enum with `Self` in a box in a vector, and in a pair next to a relative type.
-    #[prop_leak(id = 9124, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9124, scope = "mod", prelude = true)]
     pub enum Tree<T> {
         Leaf(Rel),
         Branch(Vec<::std::boxed::Box<Self>>),
@@ -1366,7 +1341,7 @@ pub mod kinds {
     /// The impls of the entries that do not name `Self` (`Rel`, `Defd2<Rel, u8>`, `Defd<V>`) are
     /// for a primitive type that the id and the index choose (`ImplSelf::Bucket`), and those that
     /// do (`Wrap<Self>`) are for the implementor. The default `Defd<T>` is one of the first.
-    #[prop_leak(id = 9209, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
+    #[prop_leak(id = 9209, scope = "mod", prelude = true, redeclare = true)]
     pub trait BucketMix<T, U = Defd<T>> {
         fn plain(&self) -> Rel;
         fn plain_pair(&self) -> Defd2<Rel, u8>;
@@ -1388,7 +1363,6 @@ pub mod kinds {
     /// (`impl MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
     #[prop_leak(
         id = 9210,
-        allow_self = true,
         prelude = true,
         redeclare = true,
         marker = "::type_leak_test_leaker::kinds::Marker9210"
@@ -1399,7 +1373,7 @@ pub mod kinds {
     }
 
     /// One default, written for the host: `T: AsRef<Host>` holds for the types that it is used with.
-    #[prop_leak(id = 9131, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
+    #[prop_leak(id = 9131, scope = "mod", prelude = true, redeclare = true)]
     pub trait SelfDefault<T: AsRef<Self>, U = Defd<T>> {
         fn get(&self, t: T, u: U);
     }
@@ -1409,7 +1383,6 @@ pub mod kinds {
     /// has `T: AsRef<Self>`, and the path through the host needs `T: AsRef<Host>`.)
     #[prop_leak(
         id = 9132,
-        allow_self = true,
         scope = "mod",
         prelude = true,
         redeclare = true
@@ -1427,11 +1400,11 @@ pub mod kinds {
     // the default is the type of the original there.
 
     /// The bound names `Self` next to one that does not (`Clone`, which stays in the impl).
-    #[prop_leak(id = 9151, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9151, scope = "mod", prelude = true)]
     pub struct SelfBoundDefault<T: Clone + AsRef<Self>, U = Defd<T>>(pub T, pub U);
 
     /// An enum, the bound in a where predicate.
-    #[prop_leak(id = 9152, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9152, scope = "mod", prelude = true)]
     pub enum SelfBoundDefaultEnum<T, U = Defd<T>>
     where
         T: Clone + AsRef<Self>,
@@ -1442,11 +1415,11 @@ pub mod kinds {
 
     /// The default and a field have the same type: the default is an entry without `Self`, and the
     /// field one for any type (the copy passes its own).
-    #[prop_leak(id = 9153, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9153, scope = "mod", prelude = true)]
     pub struct DefaultAndField<T: AsRef<Self>, U = Defd<T>>(pub T, pub U, pub Defd<T>);
 
     /// Two defaults, the second names the first.
-    #[prop_leak(id = 9154, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9154, scope = "mod", prelude = true)]
     pub struct TwoDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, U>>(pub T, pub U, pub V);
 
     // Items nested in a module whose generics have a bound that names their own `Self`, and a type
@@ -1459,14 +1432,14 @@ pub mod kinds {
 
     /// The bound is on the parameter. The entry is not the last field: rustc before 1.70 cannot
     /// prove that the copy is `Sized` otherwise (E0275).
-    #[prop_leak(id = 9161, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(id = 9161, scope = "mod", prelude = true, nested_self_entries = true)]
     pub struct Linked<T: AsRef<Self>> {
         pub link: Link<Self, T>,
         pub rel: Rel,
     }
 
     /// An enum, with `where Self: Sized` for rustc 1.56, and an entry that does not use the generic.
-    #[prop_leak(id = 9162, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(id = 9162, scope = "mod", prelude = true, nested_self_entries = true)]
     pub enum Variant<T: AsRef<Self>>
     where
         Self: Sized,
@@ -1477,13 +1450,13 @@ pub mod kinds {
     }
 
     /// The bound is a where predicate that names `Self` among other types.
-    #[prop_leak(id = 9163, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(id = 9163, scope = "mod", prelude = true, nested_self_entries = true)]
     pub struct Tuple<T>(pub Vec<Link<Self, u8>>, pub T, pub Rel)
     where
         T: AsRef<(Self, u8)>;
 
     /// No bound names `Self`: the entry is for the Leaker's type, as without the option.
-    #[prop_leak(id = 9164, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(id = 9164, scope = "mod", prelude = true, nested_self_entries = true)]
     pub struct Unbound<T: Clone> {
         pub link: Link<Self, T>,
         pub rel: Rel,
@@ -1496,7 +1469,7 @@ pub mod kinds {
 
     /// The `Item` is fixed by a bound, and a bound of the generic names it through an alias that
     /// the Leaker cannot tell from a struct.
-    #[prop_leak(id = 9171, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9171, prelude = true)]
     pub trait AliasItem<T: Iterator<Item = u8>>
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
@@ -1507,7 +1480,7 @@ pub mod kinds {
     }
 
     /// The same for a strict Referrer, which replaces the alias too: its entry has no cycle.
-    #[prop_leak(id = 9172, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9172, prelude = true)]
     pub trait AliasItemStrict<T: Iterator<Item = u8>>
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
@@ -1518,7 +1491,7 @@ pub mod kinds {
     }
 
     /// The projection written (the Leaker rejected it before).
-    #[prop_leak(id = 9173, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9173, prelude = true)]
     pub trait WrittenItem<T: Iterator<Item = u8>>
     where
         T: Fn(<T as Iterator>::Item),
@@ -1529,7 +1502,7 @@ pub mod kinds {
     }
 
     /// A struct instead of the alias: it compiled before, and the Leaker cannot tell.
-    #[prop_leak(id = 9174, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9174, prelude = true)]
     pub trait StructItem<T: Iterator<Item = u8>>
     where
         T: Fn(::type_leak_test_leaker::kinds::WFoo<T>),
@@ -1541,7 +1514,7 @@ pub mod kinds {
 
     /// The `Item` is fixed by a supertrait of a bound (F25), in the where clause of the trait and
     /// in the generics of a method.
-    #[prop_leak(id = 9175, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9175, prelude = true)]
     pub trait SuperItem<T: ::type_leak_test_leaker::kinds::WIter>
     where
         T: Fn(T::Item),
@@ -1555,7 +1528,7 @@ pub mod kinds {
     }
 
     /// A trait with an associated type of its own, which the Leaker cannot tell from `WIter`.
-    #[prop_leak(id = 9176, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9176, prelude = true)]
     pub trait OwnAssoc<T: ::type_leak_test_leaker::kinds::Cont>
     where
         T: Fn(T::Out),
@@ -1566,7 +1539,7 @@ pub mod kinds {
     }
 
     /// A struct with the predicates, and a field.
-    #[prop_leak(id = 9177, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9177, prelude = true)]
     pub struct AliasStruct<T: Iterator<Item = u8>>(pub PhantomData<Wrap<T>>)
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
@@ -1574,14 +1547,13 @@ pub mod kinds {
 
     /// The bound that names the leaked type is the one that is left out (F2): the entry would be
     /// in a cycle with itself otherwise.
-    #[prop_leak(id = 9178, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9178, prelude = true)]
     pub struct IntoEntry<T: Iterator<Item = u8> + Into<Wrap<T>>>(pub T);
 
     /// The impl of F19: `Self` in a bound is the self type, which has the entry `Wrap<I>` (and
     /// `Pair` is allowed, so the self type is no entry as a whole).
     #[prop_leak(
         id = 9179,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::Pair"
     )]
@@ -1599,7 +1571,7 @@ pub mod kinds {
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>);
 
-    #[prop_leak(id = 9182, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9182, prelude = true)]
     impl<T: Iterator<Item = u8>> Bounded<T>
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
@@ -1607,13 +1579,13 @@ pub mod kinds {
         pub fn m(&self, _x: Wrap<T>) {}
     }
 
-    #[prop_leak(id = 9183, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9183, prelude = true)]
     pub struct SelfBounded<T: Iterator<Item = u8>>(pub T, pub Wrap<Self>, pub Wrap<T>)
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>);
 
     /// Control: nothing fixes the `Item`, so the bound stays in the impl of the entry.
-    #[prop_leak(id = 9180, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9180, prelude = true)]
     pub trait RigidItem<T: Iterator>
     where
         T: Fn(T::Item),
@@ -1625,7 +1597,7 @@ pub mod kinds {
 
     /// Control: a bound of another generic that names a fixed `Item` is not left out (the rule is
     /// about the generic that the bound names itself), and the Leaker rejects it.
-    #[prop_leak(id = 9181, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9181, prelude = true)]
     pub trait OtherGeneric<T: Iterator<Item = u8>, U: Fn(T::Item)> {
         fn m(&self)
         where
@@ -1636,7 +1608,7 @@ pub mod kinds {
     // of the method's generic that F26 leaves out stays out, as the entry does not need it.
 
     /// `Y: 'x` pulls `Self: 'x` into the context of `Wrap<Y>`.
-    #[prop_leak(id = 9200, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9200, prelude = true)]
     pub trait SelfOutlives {
         fn m<'x, Y: 'x + Iterator<Item = u8>>(&self)
         where
@@ -1656,7 +1628,7 @@ pub mod kinds {
 
     pub struct SelfOutlivesHost;
 
-    #[prop_leak(id = 9201, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9201, prelude = true)]
     impl<'a> ::type_leak_test_leaker::kinds::SelfOutlivesTr<'a>
         for ::type_leak_test_leaker::kinds::SelfOutlivesHost
     {
@@ -1693,7 +1665,7 @@ pub mod kinds {
     /// entry, the one in the return type of the other method is); a path ends with the name of a
     /// generic of a method (`inner::U` next to `<U>`); and two methods declare `N` as a type and as
     /// a const.
-    #[prop_leak(id = 9071, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9071, prelude = true)]
     pub trait SameNames {
         fn with_bound<X: Clone>(&self, x: Cloned<X>) -> Cloned<X>;
         fn without_bound<X>(&self, x: Wrap<X>) -> Wrap<X>;
@@ -1705,31 +1677,31 @@ pub mod kinds {
     }
 
     /// A bound that names a parameter the entry `Wrap<T>` does not use (`V`).
-    #[prop_leak(id = 9072, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9072, prelude = true)]
     pub struct ForeignBound<T: Into<V>, V>(pub Wrap<T>, pub V);
 
     /// The same in a trait: the bound of a method generic names the trait's `T`.
-    #[prop_leak(id = 9073, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9073, prelude = true)]
     pub trait ForeignBoundTrait<T> {
         fn convert<U: Into<T>>(&self, x: Wrap<U>) -> Wrap<U>;
     }
 
     /// `T: 'a`, a bound that names a lifetime the entry does not use.
-    #[prop_leak(id = 9074, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9074, prelude = true)]
     pub struct OutlivesBound<'a, T: 'a>(pub Wrap<T>, pub &'a u8);
 
     /// A where clause on the parameter that the entry `Cloned<T>` needs.
-    #[prop_leak(id = 9075, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9075, prelude = true)]
     pub struct WhereBound<T>(pub Cloned<T>)
     where
         T: Clone;
 
     /// A cyclic bound: the Leaker rejects it.
-    #[prop_leak(id = 9076, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9076, prelude = true)]
     pub struct CyclicBound<T: From<Wrap<T>>>(pub T);
 
     /// A `for<'b>` binder whose lifetime only the entry `Lt<'b, u8>` names: the impl declares it.
-    #[prop_leak(id = 9077, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9077, prelude = true)]
     pub struct Binder<F>(pub F)
     where
         F: for<'b> Fn(Lt<'b, u8>);
@@ -1743,7 +1715,7 @@ pub mod kinds {
 
     /// The paths `self::U` and `crate::U` end with the name of the generic `U`: they are relative
     /// types, which the Referrer's crate cannot name, not the generic.
-    #[prop_leak(id = 9091, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9091, prelude = true)]
     pub struct PathsLikeGeneric<U> {
         pub generic: U,
         pub here: self::U,
@@ -1753,7 +1725,7 @@ pub mod kinds {
     }
 
     /// The same in the methods of a trait: the generic is the method's or the trait's.
-    #[prop_leak(id = 9092, allow_self = false, prelude = true)]
+    #[prop_leak(id = 9092, prelude = true)]
     pub trait PathsLikeGenericTrait<T> {
         fn here<U>(&self, x: U, y: self::U) -> crate::U;
         fn wrapped<U>(&self, x: Wrap<U>) -> Wrap<self::U>;
@@ -1807,7 +1779,6 @@ pub mod kinds {
     /// method. The Referrer's crate declares the copy (`ValueTypesCopy`).
     #[prop_leak(
         id = 9141,
-        allow_self = true,
         scope = "mod",
         prelude = true,
         redeclare = true,
@@ -1869,7 +1840,7 @@ pub mod kinds {
     /// that constrains it (E0195 in the impl of the host), so the Leaker rejects it
     /// (`UnconstrainedLifetime`, the cause is the type). Accepted, `Held<'b>` is copied as
     /// written.
-    #[prop_leak_accept(id = 9184, allow_self = true, prelude = true)]
+    #[prop_leak_accept(id = 9184, prelude = true)]
     pub trait HeldInput {
         fn f<'b>(&self, x: Held<'b>) -> &'b u8;
     }
@@ -1890,7 +1861,6 @@ pub mod kinds {
     /// lifetime.)
     #[prop_leak_accept(
         id = 9185,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
@@ -1901,7 +1871,7 @@ pub mod kinds {
 
     /// A struct analyzed in `enter_generics`, where `Self` has no meaning: a type that names it is
     /// copied as written. `rel` is leaked as usual.
-    #[prop_leak_accept(id = 9186, allow_self = true, prelude = true, scope = "generics")]
+    #[prop_leak_accept(id = 9186, prelude = true, scope = "generics")]
     pub struct NoSelfMeaning {
         pub rel: Rel,
         pub me: Wrap<Self>,
@@ -1917,7 +1887,6 @@ pub mod kinds {
     pub trait SharedTr {}
     #[prop_leak_accept(
         id = 9187,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
@@ -1933,7 +1902,6 @@ pub mod kinds {
     pub struct ElidedPair<'e, T: ?Sized + 'e, U>(pub PhantomData<(&'e T, U)>);
     #[prop_leak_accept(
         id = 9189,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
@@ -1950,7 +1918,7 @@ pub mod kinds {
     /// the `Rel` of the where predicate are replaced. The tokens and the context of the `Wrap<Y>`
     /// in `ai` are those of `a1`'s, so the Visitor tells them by where they are, or it would write
     /// the path in the bound of `ai` (E0277).
-    #[prop_leak_accept(id = 9188, allow_self = true, prelude = true)]
+    #[prop_leak_accept(id = 9188, prelude = true)]
     pub trait EntryAndBound {
         fn m<Y: Clone>(&self, a1: Wrap<Y>, ai: impl Into<Wrap<Y>>)
         where
@@ -2042,7 +2010,7 @@ pub mod kinds {
     /// `Clone` as the bound of the trait's generic, as a supertrait and in the bound of a method:
     /// three errors with one cause, dropped by `allow(trait Clone)`. The copy keeps the three as
     /// written.
-    #[prop_leak_result(id = 9190, allow_self = true)]
+    #[prop_leak_result(id = 9190)]
     pub trait PreludeBounds<T: Clone>: Clone {
         fn rel(&self, t: T) -> Rel;
         fn dup<U: Clone>(&self, u: U) -> Pair<Wrap<T>, Wrap<U>>;
@@ -2050,7 +2018,7 @@ pub mod kinds {
 
     /// A path headed by `core` or `std` with no leading `::`, in a bound of the trait's generic and in
     /// a where predicate: two errors, dropped by `allow(std_crates)`.
-    #[prop_leak_result(id = 9191, allow_self = true)]
+    #[prop_leak_result(id = 9191)]
     pub trait StdBounds<T: core::fmt::Debug> {
         fn rel(&self, t: T) -> Rel;
         fn show<U>(&self, u: Wrap<U>) -> Rel
@@ -2061,7 +2029,7 @@ pub mod kinds {
     /// A trait of the module in a bound, twice, and a type of the module with an elided lifetime:
     /// two errors (`PlainTr`, `Held<'_>`), allowed by writing their paths, `allow(trait PlainTr, type
     /// Held)`.
-    #[prop_leak_result(id = 9192, allow_self = true)]
+    #[prop_leak_result(id = 9192)]
     pub trait ExplicitCauses<T: PlainTr> {
         fn held(&self, x: Held<'_>) -> Rel;
         fn plain<U: PlainTr>(&self, u: U) -> Wrap<T>;
@@ -2069,7 +2037,7 @@ pub mod kinds {
 
     /// Three errors, of which the Referrer's macro allows one (`allow(trait Clone)`) and reports
     /// two: `core::fmt::Debug` and `Held<'_>`. The copy is made either way.
-    #[prop_leak_result(id = 9193, allow_self = true)]
+    #[prop_leak_result(id = 9193)]
     pub trait Denied<T: Clone> {
         fn held(&self, x: Held<'_>) -> Rel;
         fn show<U: core::fmt::Debug>(&self, u: Wrap<U>) -> Wrap<T>;
@@ -2093,31 +2061,13 @@ pub mod kinds {
     /// trait has it late-bound (E0195 in the impl of the host). The Leaker copies it as written for
     /// every Referrer (F18), and the Referrer's crate resolves the path. `g` has it in a box, and in
     /// the output; `Rel` is an entry beside it.
-    #[prop_leak(id = 9194, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9194, prelude = true)]
     pub trait OptionalHoldsLifetime {
         fn f<'b>(&self, x: ::type_leak_test_leaker::kinds::Held<'b>, r: Rel) -> &'b u8;
         fn g<'c>(
             &self,
             x: Box<::type_leak_test_leaker::kinds::Held<'c>>,
         ) -> ::type_leak_test_leaker::kinds::Held<'c>;
-    }
-
-    /// `Self` is denied (`allow_self = false`), and `T: PartialEq<Self>` names it, so the type that
-    /// uses `T` is a conflict (`DeniedSelfInBounds`), copied as written, `dyn SharedTr + 'a`
-    /// included. No entry names `Self`: the top-level context of the trait has to record it for
-    /// the Visitor to find the part (F44). `g` has the entry `dyn SharedTr`, `+ 'static`.
-    #[prop_leak_accept(
-        id = 9195,
-        allow_self = false,
-        prelude = true,
-        allow = "::type_leak_test_leaker::kinds::Bare"
-    )]
-    pub trait DeniedSelfObject<'a> {
-        fn f<T: PartialEq<Self>>(
-            &self,
-            x: ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>,
-        );
-        fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
     }
 
     /// Flat recovery: a type whose own path conflicts is written as it is, and the types in it are
@@ -2127,18 +2077,10 @@ pub mod kinds {
     pub struct Two<A: ?Sized, B: ?Sized>(pub PhantomData<(*const A, *const B)>);
     pub struct Leaf;
 
-    /// `Self` is denied and `T: PartialEq<Self>` names it (`DeniedSelfInBounds`): `Two<T, Leaf>` is
-    /// written as it is, `Two` with it, and `Leaf` in it is an entry, as in `g`.
-    #[prop_leak_accept(id = 9219, allow_self = false, prelude = true)]
-    pub trait DeniedSelfFlat {
-        fn f<T: PartialEq<Self>>(&self, x: Two<T, Leaf>);
-        fn g(&self, y: Leaf);
-    }
-
     /// The self type of the impl has a bound that names `Self` (`SelfInImplSelfType`, and the `Self`
     /// of the bound, `UnprovableBound`): `Two<T, Leaf>` is written as it is, and `Leaf` in it is an
     /// entry, as in the method.
-    #[prop_leak_accept(id = 9220, allow_self = true, prelude = true)]
+    #[prop_leak_accept(id = 9220, prelude = true)]
     impl<T: ::core::convert::AsRef<Option<Self>>> Two<T, Leaf> {
         pub fn g(&self, _y: Leaf) {}
     }
@@ -2148,7 +2090,7 @@ pub mod kinds {
     /// where the trait has it late-bound (E0195 in the impl of the host). Both are written as
     /// they are, so `'b` stays in the copy, and `Leaf` is an entry. In `g` every one of three
     /// types is in the way of the lifetime, in `h` two ways, each through a `Held<'d>`.
-    #[prop_leak_accept(id = 9221, allow_self = true, prelude = true)]
+    #[prop_leak_accept(id = 9221, prelude = true)]
     pub trait NestedMethodLifetime {
         fn f<'b>(&self, x: Two<Leaf, *mut Held<'b>>) -> &'b u8;
         fn g<'c>(&self, x: Two<Two<Leaf, Held<'c>>, Leaf>) -> &'c u8;
@@ -2158,7 +2100,7 @@ pub mod kinds {
     /// The same where an optional entry is on the way to the lifetime: `Wrap<Held<'b>>` of this
     /// crate by its own name is replaced by a strict Referrer unless it is the only one that keeps
     /// `'b` constrained, and then it is written as it is, with `Held<'b>` in it.
-    #[prop_leak_accept(id = 9222, allow_self = true, prelude = true)]
+    #[prop_leak_accept(id = 9222, prelude = true)]
     pub trait NestedOptionalLifetime {
         fn f<'b>(
             &self,
@@ -2171,7 +2113,6 @@ pub mod kinds {
     /// original types (F44).
     #[prop_leak_accept(
         id = 9196,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
@@ -2187,7 +2128,6 @@ pub mod kinds {
     /// the `Self` of the bound, `UnprovableBound`): both are copied as written (F44).
     #[prop_leak_accept(
         id = 9197,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
@@ -2198,15 +2138,12 @@ pub mod kinds {
     }
 
     /// A struct nested in a module (`scope = "mod"`) with a generic whose bound names its `Self`,
-    /// and a field that names it too: `NestedSelfInBounds`, copied as written. The macro writes no
-    /// entry that names the `Self` of the struct, so the visitor has no `with_nested_self()` (F45):
-    /// it must leave the part all the same. `bare` is an entry beside it.
+    /// and a field that names it too: `NestedSelfInBounds`, an entry for any type, which the copy
+    /// writes with its own type. `bare` is an entry beside it.
     #[prop_leak_accept(
         id = 9198,
-        allow_self = true,
         prelude = true,
         scope = "mod",
-        no_nested_self = true,
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
     pub struct NestedSelfObject<'a, T: ::core::convert::AsRef<Self>> {
@@ -2241,7 +2178,6 @@ pub mod kinds {
     /// error).
     #[prop_leak_accept(
         id = 9205,
-        allow_self = true,
         scope = "mod",
         prelude = true,
         redeclare = true,
@@ -2262,7 +2198,6 @@ pub mod kinds {
     /// `nested_self_entries` has to as well.
     #[prop_leak(
         id = 9206,
-        allow_self = true,
         scope = "mod",
         prelude = true,
         nested_self_entries = true
@@ -2281,7 +2216,7 @@ pub mod kinds {
     /// `Self::A0` is resolved by the impl of the host, whose predicate must be the one of the
     /// trait. So the optional entries in the predicate stay as written, as they do beside
     /// `Y: Into<Self::A0>` (E0277 "expected an `Fn(&Wrap<..>)` closure, found `T`" otherwise).
-    #[prop_leak_accept(id = 9207, allow_self = true, prelude = true)]
+    #[prop_leak_accept(id = 9207, prelude = true)]
     pub trait OptionalNextToError<T>
     where
         T: ::core::ops::Fn(
@@ -2303,7 +2238,6 @@ pub mod kinds {
     /// writes them as they are; the entries are the relative types.
     #[prop_leak(
         id = 9208,
-        allow_self = true,
         scope = "mod",
         prelude = true,
         redeclare = true,
@@ -2340,7 +2274,7 @@ pub mod kinds {
     /// relative paths. The Leaker rejected them (`use absolute path: 'x'`), so the Referrer's crate
     /// lacked `DiscriminantBindings`. The copy writes them as they are, in a crate that has none of
     /// the Leaker's names.
-    #[prop_leak(id = 9215, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9215, scope = "mod")]
     pub enum DiscriminantBindings {
         Let = { let x = 3; x },
         Arm = match 5 { y => y + 1 },
@@ -2350,7 +2284,7 @@ pub mod kinds {
     }
 
     /// F56: the default of the const parameter binds a name (`n`). It was rejected as well.
-    #[prop_leak(id = 9216, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9216, scope = "mod")]
     pub struct DefaultBinding<const N: usize = { let n = 2; n * 2 }>(pub [u8; N]);
 
     /// A macro of this crate, which the Referrer's crate does not have.
@@ -2363,7 +2297,7 @@ pub mod kinds {
     /// F56: a discriminant that calls a macro of this crate (`rel_two!`) by a relative path. The
     /// Leaker did not report it, and the copy in the Referrer's crate could not resolve the macro.
     /// It is rejected now: the Referrer's macro expands to nothing.
-    #[prop_leak(id = 9217, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9217, scope = "mod")]
     pub enum RelativeMacroDiscriminant {
         Two = rel_two!(),
     }
@@ -2375,7 +2309,7 @@ pub mod kinds {
 
     /// F56: the default of a const parameter that writes a struct of this crate as a literal
     /// (`RelPoint { a: 1 }`). Not reported before, and the copy could not resolve `RelPoint`.
-    #[prop_leak(id = 9218, allow_self = true, scope = "mod")]
+    #[prop_leak(id = 9218, scope = "mod")]
     pub struct LiteralDefault<const N: usize = { RelPoint { a: 1 }.a }>(pub [u8; N]);
 
     // F64 (`tests/findings.rs`): a bound that stays in the context of an entry and names its
@@ -2391,7 +2325,6 @@ pub mod kinds {
     /// paths.
     #[prop_leak(
         id = 9223,
-        allow_self = true,
         prelude = true,
         allow = "::type_leak_test_leaker::kinds::WIt"
     )]
@@ -2417,7 +2350,7 @@ pub mod kinds {
     /// `Self`. The completion of the arguments found no entry for it and left it as written, a type that
     /// the Referrer's crate does not import (E0412). The trait is not declared again there: the
     /// use site completes the arguments.
-    #[prop_leak(id = 9224, allow_self = true, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9224, scope = "mod", prelude = true)]
     pub trait NestedSelfBoundDefault<T: AsRef<Self>, U = Defd<T>> {
         fn get(&self, t: T, u: U);
     }
@@ -2425,11 +2358,11 @@ pub mod kinds {
     /// F66: a braced const parameter as the length of an array, in a type that is no entry. The use
     /// site writes the argument of `N` instead of it: `[u8; { { N } }]` is rejected by rustc.
     /// `N` is named by a bound, so the use site passes it by its own name.
-    #[prop_leak(id = 9225, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9225, prelude = true)]
     pub struct BracedLength<const N: usize, T: Into<[u8; N]>>(pub T, pub [u8; { N }], pub Rel);
 
     /// F66: the same in the arguments of a path (`IntoIter<u8, { N }>`).
-    #[prop_leak(id = 9226, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9226, prelude = true)]
     pub struct BracedArgument<const N: usize, T: Into<[u8; N]>>(
         pub T,
         pub ::core::array::IntoIter<u8, { N }>,
@@ -2438,7 +2371,7 @@ pub mod kinds {
 
     /// F66: the default of a type parameter that names a braced const parameter, which
     /// `complete_params()` substitutes.
-    #[prop_leak(id = 9227, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9227, prelude = true)]
     pub struct BracedDefault<const N: usize, T: Into<[u8; N]>, U = [u8; { N }]>(
         pub T,
         pub U,
@@ -2453,7 +2386,7 @@ pub mod kinds {
     /// the box, so the copy had `'x` in a projection only, early-bound where the trait has it
     /// late-bound (E0195 in the impl of the host). Both are written as they are now, and the only
     /// entry is `Rel`.
-    #[prop_leak(id = 9228, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9228, prelude = true)]
     pub trait ObjectInVec {
         fn f<'x>(
             &self,
@@ -2462,7 +2395,7 @@ pub mod kinds {
     }
 
     /// F67: the same under an `Option`, under two boxes, and in a tuple.
-    #[prop_leak(id = 9229, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9229, prelude = true)]
     pub trait ObjectUnderTypes {
         fn f<'a>(
             &self,
@@ -2491,7 +2424,7 @@ pub mod kinds {
     /// `Self` is the optional type `OptSelf<0>`, which the bound `X: AsRef<(&'static OptBound,
     /// bool)>` hid from the check. The strict copy was E0277 ("expected an `Fn(&OptSelf<0>)`
     /// closure, found `X`"). `OptSelf<0>` is no entry now, and the copy writes it as it is.
-    #[prop_leak(id = 9230, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9230, prelude = true)]
     impl ::type_leak_test_leaker::kinds::OptSelf<0> {
         pub fn m<X>(&self, _a0: X)
         where
@@ -2511,7 +2444,7 @@ pub mod kinds {
     /// F69: a function pointer over a type of `::core` (no entry), so the use site writes the
     /// argument of `T` into it, and one with a binder whose input names the lifetime. `Rel` is the
     /// only entry.
-    #[prop_leak(id = 9231, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9231, prelude = true)]
     pub struct ElidedPointer<T>(
         pub fn(&::core::cell::Cell<[T; 1]>) -> &u8,
         pub for<'e> fn(&'e T) -> &u8,
@@ -2521,14 +2454,14 @@ pub mod kinds {
 
     /// F69: the same in a trait object and a function pointer, in the arguments of a method (the host
     /// implements the trait for the instantiation).
-    #[prop_leak(id = 9232, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9232, prelude = true)]
     pub trait ElidedMethods<T> {
         fn call(&self, f: &dyn ::core::ops::Fn(&T) -> &u8, g: fn(&T) -> &u8) -> Rel;
     }
 
     /// F69: the default of a parameter that is such a function pointer, which
     /// `complete_params()` completes when the use site leaves it out.
-    #[prop_leak(id = 9233, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9233, prelude = true)]
     pub struct ElidedDefault<T, U = fn(&T) -> &u8>(pub T, pub U, pub Rel);
 
     // F70 (`tests/findings.rs`): the same where an entry is in the inputs, and the Referrer replaces
@@ -2537,12 +2470,12 @@ pub mod kinds {
 
     /// F70: `Vec<T>` of `::std` is an optional entry that a strict Referrer replaces, in a function
     /// pointer. The Leaker leaks it alone.
-    #[prop_leak(id = 9234, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9234, prelude = true)]
     pub struct ElidedEntry<T>(pub fn(&::std::vec::Vec<T>) -> &u8, pub Rel);
 
     /// F70: the same in the sugar of `Fn(..)` of a trait object, which no reference or box holds
     /// (it would be the entry).
-    #[prop_leak(id = 9235, allow_self = true, prelude = true)]
+    #[prop_leak(id = 9235, prelude = true)]
     pub struct ElidedEntryObject<T>(
         pub ::core::marker::PhantomData<dyn ::core::ops::Fn(&::std::vec::Vec<T>) -> &u8>,
         pub Rel,
@@ -2566,7 +2499,7 @@ pub mod kinds {
 
     /// F71: the type of `::std` is in the bound of the predicate, and the bounded type is no
     /// generic (`u8`).
-    #[prop_leak(id = 9237, allow_self = false)]
+    #[prop_leak(id = 9237)]
     pub struct InBound<T>
     where
         u8: ::core::convert::Into<::std::vec::Vec<T>>,
@@ -2575,7 +2508,7 @@ pub mod kinds {
     }
 
     /// F71: nested types of `::std` (`Vec<Box<T>>`): none is an entry.
-    #[prop_leak(id = 9238, allow_self = false)]
+    #[prop_leak(id = 9238)]
     pub struct NestedBounded<T>
     where
         ::std::vec::Vec<::std::boxed::Box<T>>: ::core::clone::Clone,
@@ -2585,7 +2518,7 @@ pub mod kinds {
 
     /// F71: the type of `::std` is in a field too, and an entry in another field has the predicate in
     /// its context.
-    #[prop_leak(id = 9239, allow_self = false)]
+    #[prop_leak(id = 9239)]
     pub struct BoundedAndHeld<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -2596,7 +2529,7 @@ pub mod kinds {
 
     /// F71: no entry but the type in the predicate (`Vec<T>`), whose own context carries it: there
     /// is none now.
-    #[prop_leak(id = 9240, allow_self = false)]
+    #[prop_leak(id = 9240)]
     pub struct OnlyBounded<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -2605,7 +2538,7 @@ pub mod kinds {
     }
 
     /// F71: the predicate is a predicate of a method, on a generic of the method.
-    #[prop_leak(id = 9241, allow_self = false)]
+    #[prop_leak(id = 9241)]
     pub trait BoundedMethod {
         fn m<U>(&self, a: Cl<U>) -> Cl<U>
         where
@@ -2613,7 +2546,7 @@ pub mod kinds {
     }
 
     /// F71: the predicate is a predicate of the trait.
-    #[prop_leak(id = 9242, allow_self = false)]
+    #[prop_leak(id = 9242)]
     pub trait BoundedTrait<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -2622,7 +2555,7 @@ pub mod kinds {
     }
 
     /// F71: the predicate is a predicate of the impl.
-    #[prop_leak(id = 9243, allow_self = false)]
+    #[prop_leak(id = 9243)]
     impl<T> Holder<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -2642,7 +2575,7 @@ pub mod kinds {
     /// and carries no predicate, and it is an entry that the copy replaces, as `Wrap<Rel>` is. The
     /// predicate is in the context of `ClConcrete<U>`: the copy's environment has it normalized,
     /// as `Vec<u8>` has no bounds to prove.
-    #[prop_leak(id = 9244, allow_self = false)]
+    #[prop_leak(id = 9244)]
     pub struct ConcreteBounded<U>
     where
         ::std::vec::Vec<u8>: ::core::convert::Into<U>,
@@ -2663,7 +2596,6 @@ pub mod kinds {
     /// both.
     #[prop_leak(
         id = 9236,
-        allow_self = false,
         prelude = true,
         marker = "::type_leak_test_leaker::kinds::Marker9236"
     )]

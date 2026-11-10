@@ -27,9 +27,7 @@ use common::{check_in, starts_with};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
-use type_leak::{
-    to_syn_error, Allow, Cause, ContextId, ErrorItem, Leaker, Options, Place, Referrer, Rules,
-};
+use type_leak::{to_syn_error, Allow, Cause, ContextId, ErrorItem, Leaker, Place, Referrer, Rules};
 
 /// A Leaker which allows `::p`, standing for an external crate which the Referrer's crate is known
 /// to have as the Leaker's: its types may be an anchor. The types of the other external crates may
@@ -46,7 +44,7 @@ fn leaker_with(allowed: &[Path]) -> Leaker<impl Allow> {
         .or_if(move |cause: &Cause, place: Place| {
             allowed.iter().any(|a| starts_with(a.clone())(cause, place))
         });
-    Leaker::from_config(config, Options::new())
+    Leaker::from_config(config)
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {
@@ -78,7 +76,7 @@ fn analyze_in<A: Allow>(
     mut leaker: Leaker<A>,
     item: &ItemTrait,
 ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
-    let context = leaker.intern_trait(item, true);
+    let context = leaker.intern_trait(item);
     Ok((leaker.result().finish()?, context))
 }
 
@@ -276,7 +274,7 @@ fn the_type_holding_the_binder_is_leaked_as_a_whole() {
     // The fields of a struct.
     let item: ItemStruct = parse_quote! { struct S { f: for<'x> fn(Rel<'x>) -> &'x u8 } };
     let mut leaker = leaker();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         common::types(&referrer).map(s).collect::<Vec<_>>(),
@@ -1649,7 +1647,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
         }
     };
     let mut leaker = leaker_allowing_nothing();
-    let context = leaker.intern_trait(&item, true);
+    let context = leaker.intern_trait(&item);
     let result = leaker.result();
     let referrer = result.finish().unwrap();
     // The macro which replaces them: the type is replaced (with its entry), and `&'x u8`
@@ -1682,7 +1680,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     ] {
         let item: ItemTrait = item;
         let mut leaker = leaker_allowing_nothing();
-        let context = leaker.intern_trait(&item, true);
+        let context = leaker.intern_trait(&item);
         let referrer = leaker.result().finish().unwrap();
         let mut copy = item.clone();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
@@ -1735,16 +1733,16 @@ mod elided {
 
     use super::{e, messages, s};
     use syn::*;
-    use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options, Referrer, Rules};
+    use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Referrer, Rules};
 
     fn leaker() -> Leaker<impl Allow> {
         let config = Rules::new().primitive().prelude();
-        Leaker::from_config(config, Options::new())
+        Leaker::from_config(config)
     }
 
     fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
         let mut leaker = leaker();
-        leaker.intern_trait(item, true);
+        leaker.intern_trait(item);
         leaker.result().finish()
     }
 
@@ -1909,7 +1907,7 @@ mod elided {
             struct S<'a, T: 'a> { f: fn(&Rel<T>) -> &u8, g: Box<dyn Fn(&Rel<T>) -> &u8>, h: &'a Rel<T> }
         };
         let mut leaker = leaker();
-        leaker.intern_struct(&item, true);
+        leaker.intern_struct(&item);
         let referrer = leaker.result().finish().unwrap();
         let mut found: Vec<String> = crate::common::types(&referrer).map(s).collect();
         found.sort();
@@ -2162,7 +2160,7 @@ mod elided {
             impl<'a, T: 'a> ::p::Tr<'a, T> for u8 { fn g(x: &Rel<T>) -> &u8 { loop {} } }
         };
         let mut impl_leaker = leaker();
-        impl_leaker.intern_impl(&item, true);
+        impl_leaker.intern_impl(&item);
         assert_eq!(
             impl_leaker.result().errors()[0]
                 .notes
@@ -2282,7 +2280,7 @@ mod elided {
             }
         };
         let mut leaker = leaker();
-        let context = leaker.intern_trait(&item, true);
+        let context = leaker.intern_trait(&item);
         let referrer = leaker.result().finish().unwrap();
         // The entries are ordered by context and then by their tokens.
         assert_eq!(

@@ -33,7 +33,7 @@ pub enum Cause {
     /// qualified path in a value (`<u8 as Rel>::f()`).
     Trait(Path),
     /// An expression: a path in a const expression (an array length, a discriminant) or, with
-    /// [`check_values()`](crate::Options::check_values), in a value; also an expression that
+    /// [`Leaker::check_values`](crate::Leaker::check_values), in a value; also an expression that
     /// cannot be leaked (a closure in an array length). A path is an [`Expr::Path`], as written.
     Expr(Expr),
     /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`). A macro that is a
@@ -321,13 +321,21 @@ pub enum Reason {
     /// default, and the note is at the `Self`. In a nested struct, enum or union it is an error
     /// only if a bound of the generics names `Self` too (E0735).
     SelfInDefault,
-    /// A type that uses a generic whose bound mentions a `Self` that cannot be leaked, because
-    /// `allow_self` is `false`: a macro can analyze the item with `allow_self = true`.
-    DeniedSelfInBounds,
-    /// A type that names the `Self` of a nested struct, enum or union and uses a generic whose
-    /// bound names it too (`Wrap<Self, T>` with `T: AsRef<Self>`). Write it with an absolute path,
-    /// or accept it with [`nested_self_entries()`](crate::Options::nested_self_entries), or give
-    /// the item its own `intern_*` call.
+    /// A risk, not a part copied as written: the type is an entry all the same. It names the `Self`
+    /// of a nested struct, enum or union and uses a generic whose bound names it too
+    /// (`Wrap<Self, T>` in `struct S<T: AsRef<Self>>(Wrap<Self, T>);`). The entry is for any type
+    /// that the bound holds for ([`SelfRequirement::Any`](crate::SelfRequirement::Any)), and the
+    /// copy passes its own type.
+    ///
+    /// The error has no [`paths`](ErrorItem::paths):
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops it if the rule allows its cause,
+    /// and then you promise two things. The declaration of the leaked type has no trait bound on
+    /// the parameter that receives `Self` (`struct Wrap<A: Clone, B>`), else the impl fails in the
+    /// Leaker's crate (E0277): write the type with an absolute path or give the item its own
+    /// `intern_*` call. And rustc before 1.70 fails with E0275 if the copy's field is the last
+    /// field of a struct: put it first, or add `where Self: Sized` to the item. A default of a
+    /// parameter is not changed (E0735), and a bound that names a leaked type that names `Self` is
+    /// still an error.
     NestedSelfInBounds,
     /// A type in a bound or where predicate that the copy cannot write through the Repeater
     /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)).
@@ -341,7 +349,7 @@ pub enum Reason {
 
 impl Reason {
     /// Every reason.
-    const ALL: [Reason; 13] = [
+    const ALL: [Reason; 12] = [
         Reason::RelativePath,
         Reason::SelfWithoutMeaning,
         Reason::Unreadable,
@@ -350,7 +358,6 @@ impl Reason {
         Reason::SelfProjection,
         Reason::UnnameableSelf,
         Reason::SelfInDefault,
-        Reason::DeniedSelfInBounds,
         Reason::NestedSelfInBounds,
         Reason::UnprovableBound,
         Reason::SelfInTraitPredicate,
@@ -368,7 +375,6 @@ impl Reason {
             Reason::SelfProjection => "SelfProjection",
             Reason::UnnameableSelf => "UnnameableSelf",
             Reason::SelfInDefault => "SelfInDefault",
-            Reason::DeniedSelfInBounds => "DeniedSelfInBounds",
             Reason::NestedSelfInBounds => "NestedSelfInBounds",
             Reason::UnprovableBound => "UnprovableBound",
             Reason::SelfInTraitPredicate => "SelfInTraitPredicate",
@@ -397,7 +403,7 @@ impl Reason {
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self, a: MyType<'_>); }), true);
+/// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self, a: MyType<'_>); }));
 /// let result = leaker.result();
 /// let item = &result.errors()[0];
 /// assert_eq!(item.message, "use absolute path: 'MyType<'_>'");
@@ -433,7 +439,7 @@ pub struct ErrorItem {
     /// What to write instead, with the tokens it is about. The analysis gives every error one; it
     /// is `None` only in an item that [`Parse`] read without.
     pub help: Option<(TokenStream, String)>,
-    /// Found while reading a value ([`check_values()`](crate::Options::check_values)); see
+    /// Found while reading a value ([`Leaker::check_values`](crate::Leaker::check_values)); see
     /// [`place()`](ErrorItem::place).
     pub in_value: bool,
     /// Found in a default: of a trait's method or const, or of a parameter; see
@@ -541,7 +547,7 @@ impl ErrorItem {
 /// // A relative trait in a bound, and a relative type with an elided lifetime.
 /// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item, true);
+/// leaker.intern_trait(&item);
 /// let errors = leaker.result().finish().unwrap_err();
 /// let messages: Vec<String> = to_syn_error(&errors).into_iter().map(|e| e.to_string()).collect();
 /// // One error for each. The notes and the help follow the message.

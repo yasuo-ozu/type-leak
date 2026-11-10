@@ -6,7 +6,7 @@ use common::{check_in, starts_with};
 use syn::*;
 use template_quote::ToTokens;
 use type_leak::{
-    to_syn_error, Cause, CheckResult, ContextId, Leaker, Options, Reason, Referrer, Rules, View,
+    to_syn_error, Cause, CheckResult, ContextId, Leaker, Reason, Referrer, Rules, View,
 };
 
 /// Classifies a `CheckResult` (as the variants of the former `CheckResult` enum).
@@ -30,9 +30,7 @@ fn test_check() {
     // `Self` is the struct, and may be leaked.
     let mut check = |ty: Type| {
         let ident = &test_struct.ident;
-        leaker
-            .enter_type(ident, generics, true, |view| view.check(&ty))
-            .1
+        leaker.enter_type(ident, generics, |view| view.check(&ty)).1
     };
     assert_eq!(kind(&check(parse_quote!(T1))), "Neutral");
     assert_eq!(kind(&check(parse_quote!((T1, T2)))), "Neutral");
@@ -102,7 +100,7 @@ fn test_check() {
 #[test]
 fn test_check_allows_crate_paths_only_if_allowed() {
     let config = Rules::new().crate_paths();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
 
     let item: ItemTrait = parse_quote!(
         pub trait Parse<Atom>: ::core::marker::Sized {
@@ -112,14 +110,14 @@ fn test_check_allows_crate_paths_only_if_allowed() {
             ) -> ::core::result::Result<Self, Self::Error>;
         }
     );
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
 
     // Without it the same paths are leaked (here in bounds, which cannot be leaked): the allowed
     // `crate` is what lets them through.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     let message = to_syn_error(err).to_string();
@@ -134,7 +132,7 @@ fn test_check_allows_crate_paths_only_if_allowed() {
 fn test_check_allowed_paths() {
     let generics: Generics = parse_quote!(<'l1, const N1: usize, T1>);
     let config = || Rules::new().or_if(starts_with(parse_quote!(some::path)));
-    let mut leaker = Leaker::from_config(config(), Options::new());
+    let mut leaker = Leaker::from_config(config());
 
     assert_eq!(
         kind(&check_in(&mut leaker, &parse_quote!(some::path), &generics)),
@@ -158,7 +156,7 @@ fn test_check_allowed_paths() {
     );
 
     let config = config().or_if(starts_with(parse_quote!(::abs::path)));
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     assert_eq!(
         kind(&check_in(
             &mut leaker,
@@ -181,7 +179,7 @@ fn test_check_allowed_paths() {
 fn test_check_allowed_paths_with_generic_args() {
     let generics: Generics = parse_quote!(<T1>);
     let config = Rules::new().prelude().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
 
     // An allowed path with generic arguments is still allowed.
     assert_eq!(
@@ -218,14 +216,14 @@ fn test_check_allowed_paths_with_generic_args() {
     // Trait bounds with generic arguments on allowed paths are accepted, and relative types in
     // them are leaked.
     let config = Rules::new().prelude().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
         trait MyTrait: Into<u8> {
             fn f<I: Iterator<Item = u8>>(&self, i: I);
             fn g<I: Iterator<Item = RelType>>(&self, i: I);
         }
     };
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     let leaked: std::collections::BTreeSet<String> = leaker
         .result()
@@ -449,38 +447,23 @@ fn check_self_in_a_struct_scope() {
         struct S<T>(T);
     );
     let mut leaker = Leaker::new();
-    let mut check_all = |allow_self: bool| {
-        leaker
-            .enter_type(&item.ident, &item.generics, allow_self, |view| {
-                [
-                    check_ty(view, parse_quote!(Self)),
-                    check_ty(view, parse_quote!(Rel<Self>)),
-                    check_ty(view, parse_quote!(::p::W<(Rel, Self)>)),
-                    check_ty(view, parse_quote!(T)),
-                ]
-            })
-            .1
-    };
+    let [own, in_rel, in_path, plain] = leaker
+        .enter_type(&item.ident, &item.generics, |view| {
+            [
+                check_ty(view, parse_quote!(Self)),
+                check_ty(view, parse_quote!(Rel<Self>)),
+                check_ty(view, parse_quote!(::p::W<(Rel, Self)>)),
+                check_ty(view, parse_quote!(T)),
+            ]
+        })
+        .1;
     // `Self` can be leaked: it is not a cause, and `Rel` is the cause of `Rel<Self>`.
-    let [own, in_rel, in_path, plain] = check_all(true);
     assert_eq!(kind(&own), "Neutral");
     assert!(own.note.is_none());
     assert_eq!(kind(&in_rel), "MustIntern");
     assert_eq!(strings(&in_rel.must), ["Rel < Self >"]);
     assert!(in_rel.impossible.is_empty());
     assert_eq!(kind(&in_path), "MustInternOrInherit");
-    assert_eq!(kind(&plain), "Neutral");
-    // With `allow_self` unset it cannot, so it is an impossible cause, and the type that holds it
-    // is a conflict if it is a cause itself.
-    let [own, in_rel, in_path, plain] = check_all(false);
-    assert_eq!(kind(&own), "MustNotIntern");
-    assert_eq!(strings(&own.impossible), ["Self"]);
-    assert_eq!(kind(&in_rel), "Conflict");
-    assert_eq!(strings(&in_rel.must), ["Rel < Self >"]);
-    assert_eq!(strings(&in_rel.impossible), ["Self"]);
-    assert!(in_rel.is_own);
-    assert_eq!(kind(&in_path), "Conflict");
-    assert!(!in_path.is_own);
     assert_eq!(kind(&plain), "Neutral");
     // A check records nothing: the scopes found no error.
     assert!(leaker.result().errors().is_empty());
@@ -529,12 +512,12 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
     let item: ItemStruct = parse_quote!(
         struct S<T>(T);
     );
-    let (_, results) = leaker.enter_type(&item.ident, &item.generics, true, |view| {
+    let (_, results) = leaker.enter_type(&item.ident, &item.generics, |view| {
         view.enter_generics(&parse_quote!(<'a>), checks).1
     });
     assert_eq!(kind(&results[0]), "Neutral");
     assert_eq!(kind(&results[4]), "Neutral");
-    let (_, results) = leaker.enter_type(&item.ident, &item.generics, true, |view| {
+    let (_, results) = leaker.enter_type(&item.ident, &item.generics, |view| {
         view.enter_mod("m", [], checks).1
     });
     assert_eq!(kind(&results[0]), "MustNotIntern");
@@ -593,7 +576,7 @@ fn check_tells_an_optional_entry_of_an_external_crate() {
     }
     // Not if the Leaker allows the crate.
     let config = Rules::new().or_if(starts_with(parse_quote!(::foo)));
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let result = check_in(&mut leaker, &parse_quote!(::foo::X), &generics);
     assert_eq!(kind(&result), "Neutral");
     assert!(!result.optional);
@@ -655,62 +638,64 @@ fn check_sees_the_generics_of_the_scopes_around() {
 
 #[test]
 fn check_reports_the_conflict_a_scope_reports() {
-    // The bounds of the generics mention `Self`, which `allow_self` forbids to leak: the type
-    // using `T` cannot be leaked, which only the scope knows.
+    let ty: Type = parse_quote!(Rel<T>);
+    // A bound of the generics names `Self`, which can be leaked: `Rel<T>` is an entry.
     let item: ItemStruct = parse_quote!(
         struct S<T: ::p::Bound<Self>>(T);
     );
-    let ty: Type = parse_quote!(Rel<T>);
     let mut leaker = Leaker::new();
-    let mut check = |allow_self| {
-        leaker
-            .enter_type(&item.ident, &item.generics, allow_self, |view| {
-                view.check(&ty)
-            })
-            .1
-    };
-    let allowed = check(true);
+    let allowed = leaker
+        .enter_type(&item.ident, &item.generics, |view| view.check(&ty))
+        .1;
     assert_eq!(kind(&allowed), "MustIntern");
     assert!(allowed.note.is_none());
-    let forbidden = check(false);
-    assert_eq!(kind(&forbidden), "Conflict");
-    assert_eq!(strings(&forbidden.must), ["Rel < T >"]);
-    assert!(forbidden.is_own);
-    let note = forbidden.note.clone().expect("a note");
-    assert!(note.contains("mention `Self`"), "{}", note);
-    let help = forbidden.help.clone().expect("a help");
-    assert_eq!(
-        help,
-        "write the bound of the generics of `Rel<T>` without `Self`"
+    // A bound names `Self::A`, which the Repeater's impl cannot write: the type using `T` cannot be
+    // leaked, which only the scope knows.
+    let item: ItemStruct = parse_quote!(
+        struct S<T: ::p::Bound<Self::A>>(T);
+    );
+    let conflict = leaker
+        .enter_type(&item.ident, &item.generics, |view| view.check(&ty))
+        .1;
+    assert_eq!(kind(&conflict), "Conflict");
+    assert_eq!(strings(&conflict.must), ["Rel < T >"]);
+    assert_eq!(strings(&conflict.impossible), ["Self :: A"]);
+    assert!(conflict.is_own);
+    let note = conflict.note.clone().expect("a note");
+    assert!(note.starts_with("`Self::A` is shorthand"), "{}", note);
+    let help = conflict.help.clone().expect("a help");
+    assert!(
+        help.starts_with("replace `Self::A` with `<Self as SomeTrait>::A`"),
+        "{}",
+        help
     );
     // It is what the scope reports for the same type.
-    leaker.enter_type(&item.ident, &item.generics, false, |view| {
-        view.visit_type(&ty)
-    });
+    let mut leaker = Leaker::new();
+    leaker.enter_type(&item.ident, &item.generics, |view| view.visit_type(&ty));
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(err.len(), 1);
     let item = &err[0];
-    assert_eq!(item.reason, Reason::DeniedSelfInBounds);
+    assert_eq!(item.reason, Reason::SelfProjection);
     // The error is reported at the first of `must`, with the causes of `impossible` as notes, after
     // the note of the conflict, and the help of the conflict.
     assert_eq!(
         item.cause.to_token_stream().to_string(),
-        forbidden.must[0].to_token_stream().to_string()
+        conflict.must[0].to_token_stream().to_string()
     );
     assert_eq!(
         item.notes[0].0.to_string(),
-        forbidden.must[0].to_token_stream().to_string()
+        conflict.must[0].to_token_stream().to_string()
     );
-    assert_eq!(Some(&item.notes[0].1), forbidden.note.as_ref());
+    assert_eq!(Some(&item.notes[0].1), conflict.note.as_ref());
     assert_eq!(
         item.notes[1..]
             .iter()
             .map(|(at, _)| at.to_string())
             .collect::<Vec<_>>(),
-        strings(&forbidden.impossible)
+        strings(&conflict.impossible)
     );
-    assert_eq!(item.help_text(), forbidden.help.as_deref());
+    assert_eq!(item.help_text(), conflict.help.as_deref());
 }
 
 /// Types that a visit would record in some way: entries, optional entries, conflicts, errors for
@@ -772,7 +757,7 @@ fn analyze(checked: bool) -> (Vec<ContextId>, Referrer) {
             checks(view);
         });
         ids.push(id);
-        let (id, ()) = view.enter_type(&item.ident, &item.generics, true, |view| {
+        let (id, ()) = view.enter_type(&item.ident, &item.generics, |view| {
             checks(view);
             view.visit_type(&parse_quote!(Rel4<Self>));
         });

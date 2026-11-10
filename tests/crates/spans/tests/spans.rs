@@ -45,7 +45,7 @@ fn the_span_of_a_relative_path_is_the_path() {
     let source = "trait Tr {\n    fn f(&self, a: MyType<'_>, b: Vec<&'_ u8>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 2, "{}", messages(items));
@@ -88,7 +88,7 @@ fn the_span_of_a_relative_trait_is_the_bound() {
     let source = "trait Tr: Clone {\n    fn f<T: ToString>(&self, t: T);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 2, "{}", messages(items));
@@ -141,7 +141,7 @@ fn the_syn_error_has_the_span_of_each_item() {
     let source = "trait Tr {\n    fn f(&self, a: MyType<'_>, b: Vec<&'_ u8>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     let errors: Vec<syn::Error> = to_syn_error(items).into_iter().collect();
@@ -160,8 +160,8 @@ fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let source = "trait Tr<T: Fn(Rel)> {\n    fn f(&self, a: Wrap<T>)\n    where\n        Wrap<T>: Sized;\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(
@@ -209,7 +209,7 @@ fn a_serialized_error_keeps_its_spans() {
         "trait Tr: Clone {\n    fn f(&self, a: MyType<'_>, b: Box<dyn RelA + RelB<'_>>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     // `Box` and the trait object in it, which has an error of its own.
@@ -263,7 +263,7 @@ fn a_serialized_leaker_result_keeps_its_spans() {
         "trait Tr: Clone {\n    fn f(&self, a: MyType<'_>, b: Box<dyn RelA + RelB<'_>>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 4, "{}", messages(result.errors()));
     let read: LeakerResult = parse2(result.to_token_stream()).unwrap();
@@ -301,7 +301,7 @@ fn an_accepted_cause_is_the_same_whatever_its_spans() {
     let source = "impl ::p::S {\n    fn f(_: ::p::W<'_, dyn RelTr>) {}\n}";
     let item: ItemImpl = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let errors = result.errors();
     assert_eq!(errors.len(), 1, "{}", messages(errors));
@@ -371,8 +371,8 @@ fn assert_in_source(tokens: proc_macro2::TokenStream, source: &str) {
 fn macro_error(source: &str) -> ErrorItem {
     let item: ItemStruct = parse_str(source).unwrap();
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_struct(&item);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1, "{}", messages(result.errors()));
     result.errors()[0].clone()
@@ -451,8 +451,9 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     let source = "trait Tr {\n    fn f(&self) -> u8 {\n        two!() + 1\n    }\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
     assert_eq!(items.len(), 1, "{}", messages(items));

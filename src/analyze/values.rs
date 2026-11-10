@@ -1,5 +1,6 @@
-//! The check of the values of an item, for [`check_values()`](crate::Options::check_values): the
-//! default of an associated const, the value of a const or a static, and the body of a function.
+//! The check of the values of an item, for
+//! [`Leaker::check_values`](crate::Leaker::check_values): the default of an associated const, the
+//! value of a const or a static, and the body of a function.
 //! An enum discriminant and the default of a const parameter are read the same way, whether
 //! values are read or not.
 //!
@@ -68,9 +69,7 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
     /// is, as the notes do. `in_value` is not set for what it finds: that is for the values that
     /// `check_values` reads.
     pub(super) fn read_expr(&mut self, what: String, expr: &Expr) {
-        let mut walk = ValueWalk::new(self, what);
-        walk.deny_self = true;
-        walk.visit_expr(expr);
+        ValueWalk::new(self, what).visit_expr(expr);
     }
 
     /// Checks the body `block` of the function `sig`, if values are read. `default`: it is the
@@ -136,10 +135,6 @@ struct ValueWalk<'a, 'r, A> {
     reads: usize,
     /// While such a type is read: the name it has that the value declares.
     declared_name: Option<String>,
-    /// A path that starts with `Self` is rejected if the analysis denies `Self` (`allow_self` is
-    /// `false`), as in the default of a const parameter. A value that `check_values` reads has no
-    /// such rule.
-    deny_self: bool,
 }
 
 impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
@@ -151,7 +146,6 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
             barrier: 0,
             reads: 0,
             declared_name: None,
-            deny_self: false,
         }
     }
 
@@ -221,7 +215,7 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
         }
         if self_segment(path).is_some() {
             self.visitor.check_self_has_meaning(Cause::expr_path(path));
-            return !self.deny_self || self.visitor.allow_self;
+            return true;
         }
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
             return true;

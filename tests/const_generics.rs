@@ -7,12 +7,12 @@ use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, Options, Referrer, Rules};
+use type_leak::{ContextId, Leaker, Referrer, Rules};
 
 /// Leaks the types of `item`, and returns the top-level context of the trait.
 fn leak(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(item, true);
+    let context = leaker.intern_trait(item);
     (leaker.result().finish().unwrap(), context)
 }
 
@@ -53,7 +53,7 @@ fn test_const_generic_param_in_expr() {
         struct S<const N: usize> { a: [RelType; N], b: [::core::primitive::u8; N] }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     leaker.reduce_roots();
     // The element is interned (the innermost minimum cut), and the array is rebuilt around it.
     let expected: Type = parse_quote!(RelType);
@@ -68,7 +68,7 @@ fn test_const_generic_param_ty_not_interned() {
     // The type of a const parameter cannot be a projection, so it must not be interned.
     let item: ItemStruct = parse_quote! { struct S<const N: usize, const B: bool>; };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
 
@@ -76,7 +76,7 @@ fn test_const_generic_param_ty_not_interned() {
         trait MyTrait { fn f<const M: ::core::primitive::u8>(&self); }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
 }
@@ -94,7 +94,7 @@ fn test_method_local_generics_not_interned() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     assert_eq!(
         finish_as_strings(leaker),
@@ -122,7 +122,7 @@ fn test_local_generics_leaked() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     let referrer = leaker.result().finish().unwrap();
     let actual: BTreeSet<(String, String)> = referrer
@@ -165,7 +165,7 @@ fn test_local_generics_keep_self() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     let referrer = leaker.result().finish().unwrap();
     let (ty, generics) = referrer
@@ -321,8 +321,8 @@ fn test_binder_in_type() {
         })
     );
     // Where the Leaker allows the crates, `Rel<L>` is the entry, with `L` only.
-    let mut leaker = Leaker::from_config(Rules::new().external_crates(), Options::new());
-    let context = leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(Rules::new().external_crates());
+    let context = leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),

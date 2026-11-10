@@ -11,8 +11,8 @@ use syn::Path;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Place {
-    /// While a value is read ([`check_values()`](crate::Options::check_values)): the value of a
-    /// const or static, the body of a function, a trait's default value or body.
+    /// While a value is read ([`Leaker::check_values`](crate::Leaker::check_values)): the value
+    /// of a const or static, the body of a function, a trait's default value or body.
     pub in_value: bool,
     /// In a default: a default body or an associated const default of a trait, and the default of
     /// a generic parameter (`U = Rel<'_>`, `T = Wrap<Self>`).
@@ -50,8 +50,8 @@ pub struct Place {
 /// # use syn::*;
 /// // You promise that `::serde` is the same crate on both sides.
 /// let allow = Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(::serde)));
-/// let mut leaker = Leaker::from_config(allow, Options::new());
-/// leaker.intern_struct(&parse_quote!(struct S { a: ::serde::Value, b: MyType }), true);
+/// let mut leaker = Leaker::from_config(allow);
+/// leaker.intern_struct(&parse_quote!(struct S { a: ::serde::Value, b: MyType }));
 /// // Only `MyType` is leaked.
 /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 /// ```
@@ -175,7 +175,7 @@ impl<A> Rules<A> {
 
     /// Allows everything found in a value (see [`Place::in_value`]): the Leaker writes every
     /// relative path in a value as it is, also the type of a `let`, instead of leaking it. It has
-    /// an effect only with [`Options::check_values()`](crate::Options::check_values).
+    /// an effect only with [`Leaker::check_values`](crate::Leaker::check_values).
     pub fn values(mut self) -> Self {
         self.values = true;
         self

@@ -66,9 +66,9 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_trait = parse_macro_input!(item as ItemTrait);
 
     // 1. Analyze the trait. The `ContextId` names the scope of its generics and `Self`: crate B
-    //    needs it to rewrite a copy. `true` lets a type that names `Self` be leaked whole.
+    //    needs it to rewrite a copy. A type that names `Self` is leaked whole.
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&item_trait, true);
+    let top_level = leaker.intern_trait(&item_trait);
     let result = leaker.result();
     if !result.errors().is_empty() {
         return report(result.errors()).into();

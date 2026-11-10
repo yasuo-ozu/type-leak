@@ -7,7 +7,7 @@ use template_quote::quote;
 use type_leak::{
     array_const, complete_params, repeater_projection, slot_const, substitute_args, Allow, Cause,
     CheckResult, Context, ContextId, EncodeError, EntryId, ErrorItem, ImplSelf, Leaker,
-    LeakerResult, ModuleScope, Options, Place, Referrer, Rules, View,
+    LeakerResult, ModuleScope, Place, Referrer, Rules, View,
 };
 
 /// Converts the types of a `Referrer` to a `BTreeSet<String>` for order-independent comparison.
@@ -479,18 +479,16 @@ pub fn entry_module_parent(result: &LeakerResult, ix: usize) -> Option<ContextId
 }
 
 /// Interns the items `items` of a trait `Tr` with the generics `generics` (e.g. `fn f(&self) ->
-/// Rel<Self>;`), where `Self` may be interned if `allow_self`. The errors are those of
-/// `Leaker::result()`.
+/// Rel<Self>;`). The errors are those of `Leaker::result()`.
 #[allow(dead_code)]
 pub fn intern_fns<A: Allow>(
     leaker: &mut Leaker<A>,
     generics: &Generics,
     items: TokenStream,
-    allow_self: bool,
 ) -> ContextId {
     let where_clause = &generics.where_clause;
     let item: ItemTrait = parse_quote!(trait Tr #generics #where_clause { #items });
-    leaker.intern_trait(&item, allow_self)
+    leaker.intern_trait(&item)
 }
 
 /// Analyzes the types of the function `sig`, which is itself the analyzed item, in a scope that
@@ -543,15 +541,9 @@ pub fn starts_with(prefix: Path) -> impl Fn(&Cause, Place) -> bool + Clone {
 /// Analyzes the trait `item` (`Self` allowed) with `config`; `check_values` reads the values too.
 #[allow(dead_code)]
 pub fn analyze_trait<A: Allow>(item: &ItemTrait, config: A, check_values: bool) -> LeakerResult {
-    let mut leaker = Leaker::from_config(
-        config,
-        if check_values {
-            Options::new().check_values()
-        } else {
-            Options::new()
-        },
-    );
-    leaker.intern_trait(item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = check_values;
+    leaker.intern_trait(item);
     leaker.result()
 }
 

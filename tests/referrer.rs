@@ -203,7 +203,7 @@ fn test_grouped_types_are_found() {
         struct S { a: #grouped, b: RelA }
     };
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_struct(&item, true);
+    let context = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
@@ -223,7 +223,7 @@ fn parse_error(tokens: proc_macro2::TokenStream) -> String {
 fn format_version_round_trip() {
     let item: ItemStruct = parse_quote! { struct S<T> { a: RelA, b: Wrap<T> } };
     let mut leaker = type_leak::Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     let tokens = quote!(#referrer);
     // The tag is the first token, a string literal.
@@ -314,8 +314,8 @@ fn test_contexts() {
     let mut leaker = type_leak::Leaker::new();
     let item0: ItemStruct = parse_quote! { struct S<T> { a: RelA, b: Wrap<T> } };
     let item1: ItemStruct = parse_quote! { struct S<U> { a: RelA, b: Wrap<U> } };
-    let context0 = leaker.intern_struct(&item0, true);
-    let context1 = leaker.intern_struct(&item1, true);
+    let context0 = leaker.intern_struct(&item0);
+    let context1 = leaker.intern_struct(&item1);
     let referrer = leaker.result().finish().unwrap();
     // `RelA` uses no generics, so it is shared by the calls, but `Wrap<T>` and `Wrap<U>` are not.
     assert_eq!(
@@ -367,8 +367,8 @@ fn test_contexts() {
     // A generic that no scope declares is not assumed to be the Leaker's: both are found only in a
     // scope which declares both (here, a third scope of the same Leaker).
     let mut both = type_leak::Leaker::new();
-    both.intern_struct(&item0, true);
-    both.intern_struct(&item1, true);
+    both.intern_struct(&item0);
+    both.intern_struct(&item1);
     let (context, ()) = both.enter_generics(&parse_quote!(<T, U>), |_| ());
     assert_eq!(
         rewrite_with(both.result().finish().unwrap(), context, item.clone()),
@@ -385,8 +385,8 @@ fn test_contexts() {
     // The contexts are those of the types, not of the calls: a call without types adds none.
     let mut leaker = type_leak::Leaker::new();
     let empty: ItemStruct = parse_quote! { struct S; };
-    leaker.intern_struct(&empty, true);
-    leaker.intern_struct(&item0, true);
+    leaker.intern_struct(&empty);
+    leaker.intern_struct(&item0);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(common::entry_id(&referrer, 0).index(), 0);
     assert_eq!(common::context_ids(&referrer).len(), 2);
@@ -450,22 +450,22 @@ fn test_referrer_followed_by_tokens() {
         (
             "one context",
             leak(|leaker| {
-                leaker.intern_struct(&item_a, true);
+                leaker.intern_struct(&item_a);
             }),
         ),
         (
             "two contexts",
             leak(|leaker| {
-                leaker.intern_struct(&item_a, true);
-                leaker.intern_struct(&item_b, true);
+                leaker.intern_struct(&item_a);
+                leaker.intern_struct(&item_b);
             }),
         ),
         (
             "contexts with Self",
             leak(|leaker| {
-                leaker.intern_trait(&tr, true);
-                leaker.intern_struct(&with_self, true);
-                leaker.intern_struct(&plain, true);
+                leaker.intern_trait(&tr);
+                leaker.intern_struct(&with_self);
+                leaker.intern_struct(&plain);
             }),
         ),
         (
@@ -477,7 +477,7 @@ fn test_referrer_followed_by_tokens() {
         (
             "gaps in the ids",
             leak(|leaker| {
-                leaker.intern_struct(&gaps, true);
+                leaker.intern_struct(&gaps);
             }),
         ),
         (
@@ -526,7 +526,7 @@ fn test_outermost_generics_as_leakers() {
         }
     };
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let rewrite = |item: &Item, outermost_as_leakers: bool| {
         let mut item = item.clone();
@@ -591,7 +591,7 @@ fn referrer_of(tr: ItemTrait) -> (Referrer, ContextId) {
 /// The result of the analysis of the trait (it has no error), and its top-level context.
 fn result_of(tr: ItemTrait) -> (LeakerResult, ContextId) {
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let result = leaker.result();
     result.clone().finish().unwrap();
     (result, context)
@@ -626,24 +626,18 @@ fn test_has_self() {
             assert_eq!(parsed.has_self(), expected, "{}", item);
         }
     }
-    // `Self` cannot be interned if `allow_self` is unset.
     let leak = |item: &str| {
         let mut leaker = type_leak::Leaker::new();
-        common::intern_fns(
-            &mut leaker,
-            &Generics::default(),
-            item.parse().unwrap(),
-            false,
-        );
+        common::intern_fns(&mut leaker, &Generics::default(), item.parse().unwrap());
         leaker.result().finish()
     };
-    assert!(leak("fn f(&self, x: Rel<Self>) -> Rel2;").is_err());
     let referrer = leak("fn f(&self, x: Rel) -> Rel2;").unwrap();
     assert!(!referrer.is_empty());
     assert!(!referrer.has_self());
-    // The bounds of the generics which a type uses cannot mention `Self` either (see
-    // `tests/requirements.rs`), but those of a generic which is not used can.
-    assert!(leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Rel;").is_ok());
+    // The bounds of a generic which no type uses do not make an entry name `Self`.
+    let referrer = leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Rel;").unwrap();
+    assert!(!referrer.is_empty());
+    assert!(!referrer.has_self());
 }
 
 #[test]
@@ -1035,7 +1029,7 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
         }
     );
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let text = quote!(#referrer).to_string();
     // Only the outlives are kept (`U: Clone` is for the method to write), and a type with none
@@ -1071,7 +1065,7 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
     // only.
     use syn::visit::Visit;
     let mut leaker = type_leak::Leaker::new();
-    leaker.enter_trait(&parse_quote!(Tr), &tr.generics, true, |view| {
+    leaker.enter_trait(&parse_quote!(Tr), &tr.generics, |view| {
         let TraitItem::Fn(method) = &tr.items[2] else {
             panic!()
         };
@@ -1258,7 +1252,7 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let (mut with_args, mut plain) = (tr.clone(), tr.clone());
     let repeater: Path = parse_quote!(crate::Repeater);
@@ -1575,9 +1569,9 @@ fn self_is_taken_from_the_context() {
         struct St<T>(Rel<Self>, T);
     );
     let mut leaker = Leaker::new();
-    let c1 = leaker.intern_trait(&tr1, true);
-    let c2 = leaker.intern_trait(&tr2, true);
-    let c3 = leaker.intern_struct(&st, true);
+    let c1 = leaker.intern_trait(&tr1);
+    let c2 = leaker.intern_trait(&tr2);
+    let c3 = leaker.intern_struct(&st);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 3);
     // The scopes differ by what `Self` is, as an entry of each names it.
@@ -1622,7 +1616,7 @@ fn self_is_taken_from_the_context() {
     }
     // A scope that declares no `Self` finds no entry that names it.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr1, true);
+    leaker.intern_trait(&tr1);
     let (plain, ()) =
         leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&parse_quote!(T)));
     let referrer = leaker.result().finish().unwrap();
@@ -1649,25 +1643,24 @@ fn a_nested_function_or_type_alias_keeps_the_self_around() {
     // E0401 there, so the one around is its only meaning. Only a struct, an enum, a union, a trait
     // and an impl have a `Self` of their own, and the Referrer must agree.
     let mut leaker = Leaker::new();
-    let (context, ()) =
-        leaker.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
-            for item in [
-                parse_quote!(
-                    fn f(x: Rel<Self>) {}
-                ),
-                parse_quote!(
-                    type A = Rel2<Self>;
-                ),
-                parse_quote!(
-                    struct V {
-                        a: Rel3<Self>,
-                    }
-                ),
-            ] {
-                let item: Item = item;
-                v.visit_item(&item);
-            }
-        });
+    let (context, ()) = leaker.enter_impl(&Generics::default(), &parse_quote!(W), None, |v| {
+        for item in [
+            parse_quote!(
+                fn f(x: Rel<Self>) {}
+            ),
+            parse_quote!(
+                type A = Rel2<Self>;
+            ),
+            parse_quote!(
+                struct V {
+                    a: Rel3<Self>,
+                }
+            ),
+        ] {
+            let item: Item = item;
+            v.visit_item(&item);
+        }
+    });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 3);
     assert_eq!(self_of_entry(&referrer, "Rel < Self >"), "Self = W");
@@ -1752,7 +1745,7 @@ fn a_nested_function_or_type_alias_keeps_the_self_around() {
 fn a_nested_type_alias_in_a_trait_keeps_the_self_of_the_trait() {
     // The implementors of the trait are `Self` in a nested function or type alias too.
     let mut leaker = Leaker::new();
-    let (context, ()) = leaker.enter_trait(&parse_quote!(Tr), &Generics::default(), true, |v| {
+    let (context, ()) = leaker.enter_trait(&parse_quote!(Tr), &Generics::default(), |v| {
         for item in [
             parse_quote!(
                 type A = Rel<Self>;
@@ -1829,8 +1822,8 @@ fn the_generics_are_taken_from_the_context() {
         }
     );
     let mut leaker = Leaker::new();
-    let c1 = leaker.intern_trait(&tr1, true);
-    let c2 = leaker.intern_trait(&tr2, true);
+    let c1 = leaker.intern_trait(&tr1);
+    let c2 = leaker.intern_trait(&tr2);
     assert_ne!(c1, c2);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
@@ -1888,7 +1881,7 @@ fn a_bound_on_self_alone_need_not_be_written_by_the_copy() {
     );
     let copy = |tr: &ItemTrait, item: ItemFn| {
         let mut leaker = Leaker::new();
-        let context = leaker.intern_trait(tr, true);
+        let context = leaker.intern_trait(tr);
         let referrer = leaker.result().finish().unwrap();
         let predicate = |ix: usize| common::entry(&referrer, ix).generics.where_clause.is_some();
         let mut item = item;
@@ -1958,7 +1951,7 @@ fn an_entry_context_is_a_scope_too() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     for ix in 0..referrer.iter().count() {
         let ty = common::types(&referrer).nth(ix).unwrap().clone();
@@ -1991,7 +1984,7 @@ fn trait_with_bounds() -> ItemTrait {
 fn a_trait_is_rewritten_whole_and_part_by_part() {
     let tr = trait_with_bounds();
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // The entries, by context and tokens: those without generics, then those with `<T>`.
     assert_eq!(
@@ -2049,7 +2042,7 @@ fn a_signature_visited_by_itself_is_a_nested_item() {
         }
     };
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     for (text, expected, as_leakers) in [
         // A `T` of the method with a bound is not the trait's `T`.

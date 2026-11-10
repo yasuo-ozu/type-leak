@@ -348,8 +348,8 @@ pub struct Features {
     /// `crate::base` (E0433); fixed (a generic of the entry hides the declared item), on by default.
     pub declared_named_like_generic: bool,
     /// A bare identifier that may be a const as an argument of a path of another crate, next to an
-    /// argument that is leaked (`::l::BC<Rel<T>, ILEN>`, `::l::W<[Self], ILEN>` with `allow_self =
-    /// false`, `::l::BC<super::RC<..>, ILEN>` in a module that declares `RC`): the Leaker used to
+    /// argument that is leaked (`::l::BC<Rel<T>, ILEN>`, `::l::W<[Self], ILEN>`,
+    /// `::l::BC<super::RC<..>, ILEN>` in a module that declares `RC`): the Leaker used to
     /// leak the identifier alone as a type (`type Type = ILEN`, E0573); fixed (it is rejected), on
     /// by default. Off, the generator braces the constant (`{ ILEN }`) in such a path.
     pub bare_const_in_absolute_path: bool,
@@ -615,7 +615,6 @@ impl Config {
 /// - `method_lifetime`: a leaked path or trait object names a lifetime of a method, in its
 ///   arguments too (`Rel<&'x str>`): `Gen::note_method_lifetime()`.
 /// - `self_in_bounds`: a predicate names `Self` (`Self: 'x`, `Self: Sized`).
-/// - `self_denied`: the item is analyzed with `allow_self = false` and names `Self`.
 /// - `bare:<Name>`: the prelude trait `Name` is spelled bare, and the Leaker does not allow the names
 ///   of the prelude. A bare `?Sized` has none: `?` applies to the real `Sized` only, so the Leaker
 ///   accepts it whatever the prelude.
@@ -655,7 +654,6 @@ pub const TAG_BINDER_NO_ANCHOR: &str = "binder_no_anchor";
 pub const TAG_CONST_DEFAULT: &str = "const_default";
 pub const TAG_METHOD_LIFETIME: &str = "method_lifetime";
 pub const TAG_SELF_IN_BOUNDS: &str = "self_in_bounds";
-pub const TAG_SELF_DENIED: &str = "self_denied";
 /// Not put by the generator: the harness gives it to a module analyzed whole and an item analyzed
 /// in `enter_mod` (`main.rs`), where a path of another crate can hold a name that the module
 /// declares beside a bare name (`::l::B2<I0, R0>`), which the Leaker rejects.
@@ -785,7 +783,6 @@ pub struct Item {
     pub kind: &'static str,
     /// The module that contains it, from the root.
     pub module: Vec<String>,
-    pub allow_self: bool,
     /// How the macro analyzes it: `""` by the `intern_*` method of its kind, or through a scope
     /// (`mod`: `enter_mod`, `generics`: `enter_generics`, `trait`: `enter_trait`, `impl`:
     /// `enter_impl`, see `SCOPES`).
@@ -4311,13 +4308,12 @@ impl Gen {
         id
     }
 
-    fn attr(&self, id: usize, allow_self: bool, scope: &str) -> String {
+    fn attr(&self, id: usize, scope: &str) -> String {
         format!(
-            "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
+            "#[{}(id = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
              {}{}{}{}primitive = {})]\n",
             ATTR,
             id,
-            allow_self,
             self.cfg.prelude,
             scope,
             self.cfg.allow_arg(self.flags),
@@ -4348,7 +4344,7 @@ impl Gen {
     /// The attribute of an item that is analyzed through `scope` (`""` for none).
     fn attr_with(&mut self, ann: Option<(usize, bool)>, scope: &'static str) -> String {
         self.last_scope = scope;
-        ann.map_or(String::new(), |(id, a)| self.attr(id, a, scope))
+        ann.map_or(String::new(), |(id, _)| self.attr(id, scope))
     }
 
     /// The analysis of an item through other calls of the same API (`via` in the attribute,
@@ -5079,9 +5075,8 @@ impl Gen {
     /// as without the feature, and a trait that does not have the shape is made as before.
     ///
     /// Only the items that the macro is applied to have it (a module analyzed as a whole names no
-    /// `Self`), and a parameter bound that names `Self` needs an item that may: a nested trait has
-    /// a `Self` of its own whatever `allow_self` says, the others are rejected with `allow_self =
-    /// false`, so those are the control.
+    /// `Self`), and a parameter bound that names `Self` needs an item that names it freely: a nested
+    /// trait, or one whose flag (the old `allow_self` draw) is true; the others are the control.
     fn self_default_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfDefault> {
         let (_, allow_self) = ann?;
         if !self.features.trait_self_defaults || self.module_mode {
@@ -6223,12 +6218,14 @@ impl Gen {
 
     /// One item of the module `path`. `whole`: the module is analyzed as a whole.
     fn gen_one(&mut self, path: &[String], whole: bool) -> String {
-        let (ann, allow_self) = if whole {
-            (None, true)
+        // The flag of the item is the draw that gave `allow_self` of the attribute, which the macro
+        // does not know any more: it is kept (the items stay the same), and `false` makes `Self`
+        // rarer in the item.
+        let ann = if whole {
+            None
         } else {
             let id = self.new_id();
-            let allow_self = self.chance(70);
-            (Some((id, allow_self)), allow_self)
+            Some((id, self.chance(70)))
         };
         let ann_id = ann.map(|(id, _)| id);
         self.last_scope = "";
@@ -6286,9 +6283,6 @@ impl Gen {
         if text.contains("Self::") || text.contains("<Self as ") {
             self.tags.insert(TAG_SELF_ASSOC.to_string());
         }
-        if !allow_self && has_word(&text, "Self") {
-            self.tags.insert(TAG_SELF_DENIED.to_string());
-        }
         if names_self_in_where(&text) {
             self.tags.insert(TAG_SELF_IN_PREDICATE.to_string());
         }
@@ -6306,7 +6300,6 @@ impl Gen {
                 id,
                 kind,
                 module: path.to_vec(),
-                allow_self,
                 scope: self.last_scope,
                 contents: vec![kind],
                 tags: self.tags.clone(),
@@ -6459,7 +6452,7 @@ pub fn generate_with(
         g.no_self = false;
         g.module_mode = false;
         g.cyclic_module = false;
-        let attr = g.attr(id, true, "");
+        let attr = g.attr(id, "");
         let module = format!("{}pub mod {} {{\n{}\n}}\n", attr, name, body);
         lib += &module;
         let contents = std::mem::take(&mut g.contents);
@@ -6468,7 +6461,6 @@ pub fn generate_with(
             id,
             kind: "mod",
             module: Vec::new(),
-            allow_self: true,
             scope: "",
             contents,
             tags,
@@ -7580,7 +7572,8 @@ fn has_word(text: &str, name: &str) -> bool {
 /// writes the bound) that names the generic in the arguments of a path (`hides_generic()`), if a
 /// bound of the generic fixes an associated type (`fixes_assoc()`, in any scope of the text: a
 /// where predicate of a method equates the generic of its trait too), and the text has an entry
-/// that keeps the bound: a bound or where predicate that names `Self` or the self type of the impl.
+/// that keeps the bound: a bound or where predicate that names `Self` or the self type of the impl,
+/// or `Self: 'x`.
 pub fn hidden_bounds_in(text: &str) -> BTreeSet<(String, String)> {
     let generics = declared_generics(text);
     let clauses = bound_clauses(text);
@@ -7598,6 +7591,11 @@ pub fn hidden_bounds_in(text: &str) -> BTreeSet<(String, String)> {
     let self_type = impl_self_type(text).map(|ty| norm(&ty));
     let keeps = clauses.iter().any(|(bounded, bounds)| {
         (bounded.trim() != "Self" && (has_word(bounded, "Self") || has_word(bounds, "Self")))
+            // `Self: 'x` puts `Self` into the context of an entry whose generic has `'x` (F47).
+            || (bounded.trim() == "Self"
+                && split_top(bounds, '+')
+                    .into_iter()
+                    .any(|bound| bound.trim().starts_with('\'')))
             || self_type.as_ref().map_or(false, |ty| {
                 names_type(&norm(bounded), ty) || names_type(&norm(bounds), ty)
             })

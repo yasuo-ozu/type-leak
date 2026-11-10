@@ -5,13 +5,13 @@
 //!
 //! ```ignore
 //! scope_leak! {
-//!     id = 7001, marker = M7001, allow_self = false,
+//!     id = 7001, marker = M7001,
 //!     impl<'a, T: ::core::clone::Clone> crate::m::Tr<Rel<T>, &'a Rel2> for crate::m::Holder<T, Rel3> {}
 //! }
 //! ```
 //!
 //! whose trait and self type are resolved by name, so only their arguments are leaked:
-//! `Leaker::enter_impl(&generics, &self_ty, None, allow_self, |view| { view.visit_path_arguments(..) .. })`.
+//! `Leaker::enter_impl(&generics, &self_ty, None, |view| { view.visit_path_arguments(..) .. })`.
 //! It emits the marker type, the Repeater's implementation of each entry (`ImplSelf::Marker(&marker)`
 //! if no entry names `Self`, nor do the generics of its context, and else `ImplSelf::Param(&ident)`
 //! for all of them), a witness for each type argument,
@@ -45,7 +45,7 @@ use type_leak::*;
 /// Which scope the analysis enters.
 #[derive(Clone, Copy, PartialEq)]
 enum Scope {
-    /// `enter_impl(&generics, &self_ty, None, allow_self, ..)`
+    /// `enter_impl(&generics, &self_ty, None, ..)`
     Impl,
     /// `enter_generics(&generics, ..)`, where `Self` has no meaning.
     Generics,
@@ -55,7 +55,6 @@ enum Scope {
 struct ScopeInput {
     id: u64,
     marker: Ident,
-    allow_self: bool,
     primitive: bool,
     prelude: bool,
     /// The Leaker allows the absolute paths (`Rules::external_crates()`): a type of another crate is
@@ -72,7 +71,6 @@ impl Parse for ScopeInput {
         let mut parsed = ScopeInput {
             id: 0,
             marker: Ident::new("Marker", Span::call_site()),
-            allow_self: false,
             primitive: true,
             prelude: false,
             external: false,
@@ -87,7 +85,6 @@ impl Parse for ScopeInput {
                 "id" => parsed.id = input.parse::<LitInt>()?.base10_parse()?,
                 "marker" => parsed.marker = input.parse()?,
                 "name" => parsed.name = Some(input.parse()?),
-                "allow_self" => parsed.allow_self = input.parse::<LitBool>()?.value,
                 "primitive" => parsed.primitive = input.parse::<LitBool>()?.value,
                 "prelude" => parsed.prelude = input.parse::<LitBool>()?.value,
                 "external" => parsed.external = input.parse::<LitBool>()?.value,
@@ -169,20 +166,16 @@ impl ScopeInput {
         &self,
         config: A,
     ) -> std::result::Result<(LeakerResult, ContextId), Vec<ErrorItem>> {
-        let mut leaker = Leaker::from_config(config, Options::new());
+        let mut leaker = Leaker::from_config(config);
         let visit = |view: &mut View<'_, '_, A>| {
             for arguments in self.fragments() {
                 view.visit_path_arguments(arguments);
             }
         };
         let (context, ()) = match self.scope {
-            Scope::Impl => leaker.enter_impl(
-                &self.item.generics,
-                &self.item.self_ty,
-                None,
-                self.allow_self,
-                visit,
-            ),
+            Scope::Impl => {
+                leaker.enter_impl(&self.item.generics, &self.item.self_ty, None, visit)
+            }
             Scope::Generics => leaker.enter_generics(&self.item.generics, visit),
         };
         let result = leaker.result();
@@ -195,9 +188,9 @@ impl ScopeInput {
 
     fn pairs(&self) -> TokenStream {
         let (id, marker) = (self.id, &self.marker);
-        let (allow_self, primitive, prelude) = (self.allow_self, self.primitive, self.prelude);
+        let (primitive, prelude) = (self.primitive, self.prelude);
         let external = self.external;
-        quote!(id = #id, marker = #marker, allow_self = #allow_self, primitive = #primitive, prelude = #prelude, external = #external,)
+        quote!(id = #id, marker = #marker, primitive = #primitive, prelude = #prelude, external = #external,)
     }
 }
 

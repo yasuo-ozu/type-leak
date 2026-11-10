@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    to_syn_error, Allow, Cause, Context, ContextId, EntryId, ErrorItem, Leaker, Options, Place,
-    Referrer, Rules, SelfRequirement, View,
+    to_syn_error, Allow, Cause, Context, ContextId, EntryId, ErrorItem, Leaker, Place, Referrer,
+    Rules, SelfRequirement, View,
 };
 
 fn s(x: &impl ToTokens) -> String {
@@ -54,9 +54,9 @@ fn id(n: usize) -> ContextId {
 fn is_accepted(item: Item) -> bool {
     let mut leaker = Leaker::new();
     match &item {
-        Item::Struct(item) => leaker.intern_struct(item, true),
-        Item::Trait(item) => leaker.intern_trait(item, true),
-        Item::Union(item) => leaker.intern_union(item, true),
+        Item::Struct(item) => leaker.intern_struct(item),
+        Item::Trait(item) => leaker.intern_trait(item),
+        Item::Union(item) => leaker.intern_union(item),
         other => panic!("{}", s(other)),
     };
     leaker.result().finish().is_ok()
@@ -105,7 +105,7 @@ fn intern_struct() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true);
+    let top_level = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     // `MyType6` uses all the generics: it is the entry of the top-level context.
     assert_eq!(
@@ -121,22 +121,18 @@ fn intern_struct() {
     assert_eq!(top_level.index(), 1);
     assert_eq!(common::context_ids(&referrer).len(), 2);
     assert!(!referrer.has_self());
-    // A type that does not mention `Self` is not affected by `allow_self`, and `Self` alone is
-    // never leaked.
+    // `Self` alone is never leaked.
     let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct MyStruct<T1> {
-                a: Rel<T1>,
-                b: Self,
-            }
-        ),
-        false,
-    );
+    leaker.intern_struct(&parse_quote!(
+        pub struct MyStruct<T1> {
+            a: Rel<T1>,
+            b: Self,
+        }
+    ));
     assert!(leaker.result().finish().is_ok());
     // `reduce_roots()` changes nothing here.
     let mut leaker = Leaker::new();
-    let context = leaker.intern_struct(&item, true);
+    let context = leaker.intern_struct(&item);
     leaker.reduce_roots();
     let reduced = leaker.result().finish().unwrap();
     assert_eq!(entries(&reduced), entries(&referrer));
@@ -175,7 +171,7 @@ fn intern_enum() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_enum(&item, true);
+    let top_level = leaker.intern_enum(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
@@ -192,11 +188,6 @@ fn intern_enum() {
     assert_eq!(top_level.index(), 2);
     assert_eq!(top_level, common::entry_id(&referrer, 3));
     assert!(referrer.has_self());
-    // Without `Self` it is an error to leak `Rel2<Self>`, and the others are not.
-    let mut leaker = Leaker::new();
-    leaker.intern_enum(&item, false);
-    let result = leaker.result();
-    assert!(result.finish().is_err());
 }
 
 #[test]
@@ -209,7 +200,7 @@ fn intern_union() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_union(&item, true);
+    let top_level = leaker.intern_union(&item);
     let referrer = leaker.result().finish().unwrap();
     // `Wrap<T>` uses the generics of the union: it is the entry of the top-level context.
     assert_eq!(
@@ -230,7 +221,7 @@ fn intern_union() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_union(&item, true);
+    leaker.intern_union(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         common::types(&referrer)
@@ -258,7 +249,7 @@ fn intern_trait() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&item, true);
+    let top_level = leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
@@ -286,7 +277,7 @@ fn intern_impl() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_impl(&item, true);
+    let top_level = leaker.intern_impl(&item);
     let referrer = leaker.result().finish().unwrap();
     // The self type, the trait with its arguments and the signatures are analyzed, and the bodies
     // are not.
@@ -313,7 +304,7 @@ fn intern_impl() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
@@ -328,7 +319,7 @@ fn intern_impl() {
         impl Relative for ::path::W {}
     );
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(err.len(), 1);
@@ -390,7 +381,7 @@ fn from_config_and_the_items_accumulate() {
     // A Leaker with a configuration analyzes the items like one without it, and the contexts of
     // the items are numbered in the order they appear.
     let config = Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let first: ItemStruct = parse_quote!(
         struct A<T> {
             x: Vec<(Rel, u8)>,
@@ -408,18 +399,15 @@ fn from_config_and_the_items_accumulate() {
             B(Rel2),
         }
     );
-    let a = leaker.intern_struct(&first, true);
-    let b = leaker.intern_trait(&second, true);
-    let c = leaker.intern_enum(&third, true);
+    let a = leaker.intern_struct(&first);
+    let b = leaker.intern_trait(&second);
+    let c = leaker.intern_enum(&third);
     // The next generics take the next id.
-    let d = leaker.intern_struct(
-        &parse_quote!(
-            struct D<V> {
-                x: Wrap<V>,
-            }
-        ),
-        true,
-    );
+    let d = leaker.intern_struct(&parse_quote!(
+        struct D<V> {
+            x: Wrap<V>,
+        }
+    ));
     assert_eq!(d, id(2));
     let referrer = leaker.result().finish().unwrap();
     // `Rel` is leaked once, in the context of no generics, which is that of `E`.
@@ -443,8 +431,8 @@ fn from_config_and_the_items_accumulate() {
     assert!(common::entry(&referrer, 0).generics.params.is_empty());
     // `from_config()` is what `new()` is with the allowed paths.
     let config = Rules::new().or_if(starts_with(parse_quote!(Vec)));
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_struct(&first, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_struct(&first);
     // `Vec` is allowed, and `u8` is not (it is a relative path, as it is not a configured one).
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
@@ -463,8 +451,8 @@ fn test_config_allows_drop_in_an_array_length_and_the_lists_add_up() {
         struct S([::core::primitive::u8; drop]);
     );
     fn entry_count<A: Allow>(config: A, item: &ItemStruct) -> usize {
-        let mut leaker = Leaker::from_config(config, Options::new());
-        leaker.intern_struct(item, true);
+        let mut leaker = Leaker::from_config(config);
+        leaker.intern_struct(item);
         leaker.result().finish().unwrap().iter().count()
     }
     assert_eq!(entry_count(Rules::new(), &item), 1);
@@ -475,11 +463,11 @@ fn test_config_allows_drop_in_an_array_length_and_the_lists_add_up() {
         struct S(crate::A, u8, Vec<crate::B>);
     );
     let all = Rules::new().primitive().prelude().crate_paths();
-    let mut leaker = Leaker::from_config(all, Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(all);
+    leaker.intern_struct(&item);
     assert!(leaker.result().finish().unwrap().is_empty());
-    let mut leaker = Leaker::from_config(only_prelude(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(only_prelude());
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         common::types(&referrer)
@@ -501,9 +489,9 @@ fn test_intern() {
     };
     let item: ItemTrait = parse_quote!(#tokens);
     let config = Rules::new().crate_paths();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
 
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
 }
@@ -521,8 +509,8 @@ fn messages(errors: &[ErrorItem]) -> String {
 
 fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
     let config = type_leak::Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_struct(item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_struct(item);
     let referrer = leaker
         .result()
         .finish()
@@ -534,8 +522,8 @@ fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
 
 fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
     let config = type_leak::Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_trait(item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(item);
     let referrer = leaker
         .result()
         .finish()
@@ -587,7 +575,7 @@ fn test_finish_reduces_and_accumulates() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 
     // Several `intern_struct()` and `reduce_roots()` calls accumulate.
@@ -602,9 +590,9 @@ fn test_finish_reduces_and_accumulates() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&s, true);
+    leaker.intern_struct(&s);
     leaker.reduce_roots();
-    leaker.intern_struct(&u, true);
+    leaker.intern_struct(&u);
     leaker.reduce_roots();
     let leaked: BTreeSet<String> = leaker
         .result()
@@ -652,11 +640,11 @@ fn a_scope_that_adds_no_entry_after_reduce_roots_changes_nothing() {
     let plain: ItemStruct = parse_quote! { struct S2 { a: u8 } };
     let again: ItemStruct = parse_quote! { struct S3 { a: (R1, R2) } };
     let run = |later: &[&ItemStruct], reduce_after: bool| -> Referrer {
-        let mut leaker = Leaker::from_config(Rules::new().primitive(), Options::new());
-        leaker.intern_struct(&first, true);
+        let mut leaker = Leaker::from_config(Rules::new().primitive());
+        leaker.intern_struct(&first);
         leaker.reduce_roots();
         for item in later {
-            leaker.intern_struct(item, true);
+            leaker.intern_struct(item);
         }
         if reduce_after {
             leaker.reduce_roots();
@@ -784,9 +772,9 @@ fn a_kept_optional_entry_becomes_required_when_it_holds_a_required_type() {
     let in_field: ItemStruct = parse_quote! { struct S2 { a: ::ext::X<(Rel,)> } };
     let other: ItemStruct = parse_quote! { struct S3 { b: Rel2 } };
     let run = |items: &[&ItemStruct], reduce: bool| -> Vec<String> {
-        let mut leaker = Leaker::from_config(rule, Options::new());
+        let mut leaker = Leaker::from_config(rule);
         for (ix, item) in items.iter().enumerate() {
-            leaker.intern_struct(item, true);
+            leaker.intern_struct(item);
             if reduce && ix == 0 {
                 leaker.reduce_roots();
             }
@@ -826,7 +814,7 @@ fn test_finish_order_is_deterministic() {
     let finish = || -> Vec<String> {
         {
             let mut leaker = Leaker::new();
-            leaker.intern_struct(&item, true);
+            leaker.intern_struct(&item);
             leaker.result().finish().unwrap()
         }
         .iter()
@@ -862,7 +850,7 @@ fn test_finish_order_is_deterministic() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     let listed: Vec<(String, usize)> = (0..referrer.iter().count())
         .map(|ix| {
@@ -954,8 +942,8 @@ fn test_assertions_for_assumed_primitives() {
         }
     };
     let config = type_leak::Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item);
     let assertions = leaker.assertions().to_string();
     assert!(leaker.result().errors().is_empty());
     assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
@@ -970,7 +958,7 @@ fn test_assertions_for_assumed_primitives() {
 
     // Without `Rules::primitive()`, `u16` in a type is leaked, so it is not assumed.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let assertions = leaker.assertions().to_string();
     assert!(leaker.result().errors().is_empty());
     assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
@@ -983,7 +971,7 @@ fn test_assertions_for_assumed_primitives() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     assert!(leaker.assertions().is_empty());
     assert!(leaker.result().errors().is_empty());
 }
@@ -992,81 +980,58 @@ fn test_assertions_for_assumed_primitives() {
 fn test_receivers() {
     // The type of a receiver (`&self` is `self: &Self`) is analyzed as any other type, where
     // `Self` alone is never leaked.
-    let leak = |sig: proc_macro2::TokenStream,
-                allow_self: bool|
-     -> std::result::Result<BTreeSet<String>, String> {
+    let leak = |sig: proc_macro2::TokenStream| -> std::result::Result<BTreeSet<String>, String> {
         let mut leaker = Leaker::new();
-        common::intern_fns(&mut leaker, &parse_quote!(<'a>), sig, allow_self);
+        common::intern_fns(&mut leaker, &parse_quote!(<'a>), sig);
         let referrer = leaker.result().finish().map_err(|e| messages(&e))?;
         Ok(common::types(&referrer)
             .map(|t| quote!(#t).to_string())
             .collect::<BTreeSet<_>>())
     };
-    for allow_self in [true, false] {
-        for sig in [
-            quote!(
-                fn f(&self);
-            ),
-            quote!(
-                fn f(&'a mut self);
-            ),
-            quote!(
-                fn f(mut self);
-            ),
-            quote!(
-                fn f(self: ::std::boxed::Box<Self>);
-            ),
-            quote!(
-                fn f(self: &'a Self);
-            ),
-            quote!(
-                fn f(&self) -> &Self;
-            ),
-        ] {
-            assert_eq!(leak(sig, allow_self), Ok(BTreeSet::new()), "{}", allow_self);
-        }
+    for sig in [
+        quote!(
+            fn f(&self);
+        ),
+        quote!(
+            fn f(&'a mut self);
+        ),
+        quote!(
+            fn f(mut self);
+        ),
+        quote!(
+            fn f(self: ::std::boxed::Box<Self>);
+        ),
+        quote!(
+            fn f(self: &'a Self);
+        ),
+        quote!(
+            fn f(&self) -> &Self;
+        ),
+    ] {
+        assert_eq!(leak(sig.clone()), Ok(BTreeSet::new()), "{}", sig);
     }
 
-    // A relative type applied to `Self` is leaked as a whole only if `Self` can be interned.
+    // A relative type applied to `Self` is leaked as a whole.
     assert_eq!(
-        leak(
-            quote!(
-                fn f(self: Rel<Self>);
-            ),
-            true
-        ),
+        leak(quote!(
+            fn f(self: Rel<Self>);
+        )),
         Ok(strings(&["Rel<Self>"]))
     );
-    assert_eq!(
-        leak(
-            quote!(
-                fn f(self: Rel<Self>);
-            ),
-            false
-        ),
-        Err("use absolute path: 'Rel<Self>'".to_string())
-    );
-    // `Rel` may be a const, and the path cannot be leaked as a whole because of `Self`: it is not
+    // `Rel` may be a const, so the path is leaked as a whole, with `Self` in it, and `Rel` is not
     // leaked as a type (see `tests/bare_const.rs`).
     assert_eq!(
-        leak(
-            quote!(
-                fn f(self: ::k::W<Rel, Self>);
-            ),
-            false
-        ),
-        Err(
-            "`Rel` may be a const, and the type that holds it cannot be leaked as a whole"
-                .to_string()
-        )
+        leak(quote!(
+            fn f(self: ::k::W<Rel, Self>);
+        )),
+        Ok(strings(&["::k::W<Rel, Self>"]))
     );
+    // A receiver has no optional entry: the path of another crate is written as it is, and `Rel`
+    // is leaked.
     assert_eq!(
-        leak(
-            quote!(
-                fn f(self: ::k::W<(Rel,), Self>);
-            ),
-            false
-        ),
+        leak(quote!(
+            fn f(self: ::k::W<(Rel,), Self>);
+        )),
         Ok(strings(&["Rel"]))
     );
 }
@@ -1082,7 +1047,7 @@ fn test_grouped_const_param_type_is_asserted() {
     for ty in [parse_quote!(u8), grouped] {
         let item: ItemTrait = parse_quote!(trait Tr<const N: #ty> {});
         let mut leaker = Leaker::new();
-        leaker.intern_trait(&item, true);
+        leaker.intern_trait(&item);
         let assertions = leaker.assertions().to_string();
         assert!(leaker.result().errors().is_empty());
         assert!(
@@ -1096,7 +1061,7 @@ fn test_grouped_const_param_type_is_asserted() {
         trait Tr<const N: ::core::primitive::u8> {}
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert!(leaker.assertions().is_empty());
     assert!(leaker.result().errors().is_empty());
 }
@@ -1140,107 +1105,63 @@ fn test_impl_trait_binders() {
 }
 
 #[test]
-fn test_self_ty_cannot_be_interned() {
-    let leak = |sig: proc_macro2::TokenStream,
-                allow_self: bool|
-     -> std::result::Result<BTreeSet<String>, syn::Error> {
-        let mut leaker = Leaker::new();
-        common::intern_fns(&mut leaker, &Generics::default(), sig, allow_self);
-        let referrer = leaker.result().finish().map_err(|e| to_syn_error(&e))?;
-        Ok(common::types(&referrer)
-            .map(|t| quote!(#t).to_string())
-            .collect::<BTreeSet<_>>())
-    };
+fn test_a_type_with_self_is_leaked_as_a_whole() {
+    let leak =
+        |sig: proc_macro2::TokenStream| -> std::result::Result<BTreeSet<String>, syn::Error> {
+            let mut leaker = Leaker::new();
+            common::intern_fns(&mut leaker, &Generics::default(), sig);
+            let referrer = leaker.result().finish().map_err(|e| to_syn_error(&e))?;
+            Ok(common::types(&referrer)
+                .map(|t| quote!(#t).to_string())
+                .collect::<BTreeSet<_>>())
+        };
     let set = |types: &[&str]| types.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
 
-    // A relative type applied to `Self` cannot be leaked as a whole, so the path is an error.
-    let err = leak(
-        quote!(
-            fn f(&self) -> Rel<Self>;
-        ),
-        false,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(err.starts_with("use absolute path: 'Rel<Self>'"), "{}", err);
-    assert!(
-        err.contains("it cannot be leaked as a whole because of `Self`"),
-        "{}",
-        err
-    );
+    // A relative type applied to `Self` is leaked as a whole.
     assert_eq!(
-        leak(
-            quote!(
-                fn f(&self) -> Rel<Self>;
-            ),
-            true
-        )
+        leak(quote!(
+            fn f(&self) -> Rel<Self>;
+        ))
         .unwrap(),
         set(&["Rel < Self >"])
     );
 
-    // The components are leaked instead if the type can be decomposed.
+    // `Self` does not depend on the context by itself, so `Rel` is enough.
     let sig = quote!(
         fn f(&self) -> (Rel, Self);
     );
-    assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
-    // `Self` does not depend on the context by itself, so `Rel` is enough.
-    assert_eq!(leak(sig, true).unwrap(), set(&["Rel"]));
-    // The type of an external crate, if `Self` can be leaked, is one required entry with `Rel` in
-    // it (it was the entry `Rel` and an optional one).
+    assert_eq!(leak(sig).unwrap(), set(&["Rel"]));
+    // The type of an external crate with `Self` in it is one required entry with `Rel` in it (it
+    // was the entry `Rel` and an optional one).
     let sig = quote!(
         fn f(&self) -> ::k::W<(Rel,), Self>;
     );
-    assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
-    assert_eq!(
-        leak(sig, true).unwrap(),
-        set(&[":: k :: W < (Rel ,) , Self >"])
-    );
+    assert_eq!(leak(sig).unwrap(), set(&[":: k :: W < (Rel ,) , Self >"]));
 
-    // `Rel` as an argument may be a const, so the path is interned as a whole if it can be (with
-    // `Self` allowed), and otherwise it is an error: `Rel` is not leaked as a type (see
-    // `tests/bare_const.rs`).
+    // `Rel` as an argument may be a const, so the path is interned as a whole: `Rel` is not leaked
+    // as a type (see `tests/bare_const.rs`).
     let sig = quote!(
         fn f(&self) -> ::k::W<Rel, Self>;
     );
-    let err = leak(sig.clone(), false).unwrap_err().to_string();
-    assert!(
-        err.starts_with(
-            "`Rel` may be a const, and the type that holds it cannot be leaked as a whole"
-        ),
-        "{}",
-        err
-    );
-    assert_eq!(leak(sig, true).unwrap(), set(&[":: k :: W < Rel , Self >"]));
+    assert_eq!(leak(sig).unwrap(), set(&[":: k :: W < Rel , Self >"]));
 
-    // The type of an external crate with `Self` in it is an entry (which the Referrer replaces)
-    // only if `Self` can be leaked (old: not an entry, as the crate was trusted).
-    let in_crate = |allow_self: bool| {
-        leak(
-            quote!(
-                fn f(&self) -> ::k::W<(), Self>;
-            ),
-            allow_self,
-        )
-        .unwrap()
-    };
-    assert_eq!(in_crate(true), set(&[":: k :: W < () , Self >"]));
-    assert!(in_crate(false).is_empty());
+    // The type of an external crate with `Self` in it is an entry, which the Referrer replaces.
+    for (ty, entry) in [
+        (quote!(::k::W<(), Self>), ":: k :: W < () , Self >"),
+        (quote!(::k::W<Self>), ":: k :: W < Self >"),
+    ] {
+        let sig = quote!(
+            fn f(&self) -> #ty;
+        );
+        assert_eq!(leak(sig).unwrap(), set(&[entry]), "{}", ty);
+    }
 
     // `Self` alone is never leaked.
-    for ty in [
-        quote!(Self),
-        quote!(Self::Item),
-        quote!(&Self),
-        quote!(::k::W<Self>),
-    ] {
+    for ty in [quote!(Self), quote!(Self::Item), quote!(&Self)] {
         assert_eq!(
-            leak(
-                quote!(
-                    fn f(&self) -> #ty;
-                ),
-                false
-            )
+            leak(quote!(
+                fn f(&self) -> #ty;
+            ))
             .unwrap(),
             BTreeSet::new(),
             "{}",
@@ -1264,7 +1185,7 @@ fn test_bodies_are_not_analyzed() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let referrer = leaker.result().finish().unwrap();
     // `::k::W`, the type of an external crate, is an entry, after the others.
     assert_eq!(

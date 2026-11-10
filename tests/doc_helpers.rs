@@ -60,7 +60,7 @@ fn substitute_args_gives_the_arguments_of_a_use_site() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
 
     // `impl<'a, T: 'a> Tr<'a, T> for ..` declares the generics: each is passed by its own name.
@@ -84,7 +84,7 @@ fn the_self_type_of_the_encoder_names_the_type_in_self_outlives() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // The entry `&'a Wrap<Self>` needs `Self: 'a`, which the arguments encode as `&'a Self`.
     let context = common::entry(&referrer, 0);
@@ -105,7 +105,7 @@ fn substitute_args_passes_method_generics_by_name() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // `impl Tr<u8> for ..`: `T` is `u8`. `U` is a generic of the method, passed by its name.
     let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
@@ -129,7 +129,7 @@ fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // `Wrap<Self>` names `Self`; the context of `Rel<T>` has it in the bound of `T`.
     let wrap = referrer
@@ -147,14 +147,11 @@ fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
     assert!(referrer.bucket_self(wrap, 7).is_none() && referrer.bucket_self(rel, 7).is_none());
 
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T> {
-                fn f(&self) -> Wrap<T>;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<T> {
+            fn f(&self) -> Wrap<T>;
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer
         .bucket_self(common::entry_id_at(&referrer, 0), 7)
@@ -168,7 +165,7 @@ fn bucket_self_is_a_primitive_unless_the_entry_needs_self() {
         trait Tr<T> { fn f(&self) -> Wrap<T>; fn g(&self) -> Wrap2<Self>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     let wrap = referrer
@@ -289,7 +286,7 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
         trait Tr<const B: bool, const C: char = 'z'> { fn f(&self) -> Wrap<B, C>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     let repeater: Path = parse_quote!(crate::Repeater);
@@ -338,7 +335,7 @@ fn context_holds_the_generics_an_entry_uses() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     // `Rel` uses no generic. `Wrap<T>` uses `T`. `Wrap<U>` uses `U` and, through the bound
     // `U: Into<T>`, `T`.
@@ -357,7 +354,7 @@ fn impl_self_marker_fails_the_call_if_an_entry_names_self() {
         trait Tr<T> { fn f(&self) -> Wrap<T>; fn g(&self) -> Wrap2<Self>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     let wrap2 = referrer
@@ -370,7 +367,7 @@ fn impl_self_marker_fails_the_call_if_an_entry_names_self() {
         trait Tr<T> { fn f(&self) -> Wrap<T>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&only_wrap, true);
+    leaker.intern_trait(&only_wrap);
     let marker: Type = parse_quote!(crate::Marker);
     let r = leaker
         .result()
@@ -417,22 +414,16 @@ fn impl_self_marker_fails_the_call_if_an_entry_names_self() {
 #[test]
 fn self_requirement_is_the_type_in_a_struct_and_the_bound_in_a_trait() {
     let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote!(
-            struct S<T> {
-                a: Rel<Self>,
-            }
-        ),
-        true,
-    );
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T> {
-                fn f(&self) -> Rel<Self>;
-            }
-        ),
-        true,
-    );
+    leaker.intern_struct(&parse_quote!(
+        struct S<T> {
+            a: Rel<Self>,
+        }
+    ));
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<T> {
+            fn f(&self) -> Rel<Self>;
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     // Each has an entry `Rel<Self>`, with its own context.
     assert_eq!(referrer.iter().count(), 2);
@@ -468,7 +459,7 @@ fn context_id_is_the_top_level_context_and_an_integer_literal() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true);
+    let top_level = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     // `Wrap<T>` uses the generics of the struct, as the top-level context has them.
     // `Rel` uses no generic, so its context is another one.
@@ -501,7 +492,7 @@ fn repeater_impl_for_each_entry_of_a_trait() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
 

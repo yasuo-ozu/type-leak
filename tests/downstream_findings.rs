@@ -64,16 +64,16 @@ fn config() -> Rules<impl Allow + Clone> {
 
 /// The result of the analysis of `item`, which has no error, and its Referrer.
 fn trait_of(item: ItemTrait) -> (LeakerResult, Referrer) {
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     (result, referrer)
 }
 
 fn struct_of(item: ItemStruct) -> (LeakerResult, Referrer) {
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     (result, referrer)
@@ -534,8 +534,8 @@ fn six_a_cyclic_bound_is_rejected_with_a_clear_error() {
     let item: ItemStruct = parse_quote! {
         struct CY<T: From<inner::LocalG<T>>>(pub T);
     };
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let err = result.errors();
     assert!(!err.is_empty());
@@ -566,8 +566,8 @@ fn six_a_cyclic_bound_is_rejected_with_a_clear_error() {
     let item: ItemStruct = parse_quote! {
         struct CY<T: From<u8>>(pub inner::LocalG<T>);
     };
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
 }
@@ -596,8 +596,8 @@ fn seven_a_binder_lifetime_is_declared_by_the_impl() {
     let item: ItemStruct = parse_quote! {
         struct W<F>(pub F) where F: for<'b> Fn(inner::LocalL<'b>) -> &'b u8;
     };
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(messages(err), "use absolute path: 'inner::LocalL<'b>'");
@@ -620,10 +620,10 @@ fn found_by_visitor(source: &str) -> (usize, std::collections::BTreeSet<usize>) 
     use std::cell::RefCell;
     use syn::visit_mut::VisitMut;
     let mut item: Item = parse_str(source).unwrap();
-    let mut leaker = Leaker::from_config(config(), Options::new());
+    let mut leaker = Leaker::from_config(config());
     let context = match &item {
-        Item::Struct(i) => leaker.intern_struct(i, true),
-        Item::Trait(i) => leaker.intern_trait(i, true),
+        Item::Struct(i) => leaker.intern_struct(i),
+        Item::Trait(i) => leaker.intern_trait(i),
         _ => unreachable!(),
     };
     let referrer = leaker
@@ -702,10 +702,10 @@ fn default_entries(source: &str) -> std::result::Result<usize, Vec<String>> {
     let item: Item = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
     match &item {
-        Item::Struct(i) => leaker.intern_struct(i, true),
-        Item::Enum(i) => leaker.intern_enum(i, true),
-        Item::Trait(i) => leaker.intern_trait(i, true),
-        Item::Impl(i) => leaker.intern_impl(i, true),
+        Item::Struct(i) => leaker.intern_struct(i),
+        Item::Enum(i) => leaker.intern_enum(i),
+        Item::Trait(i) => leaker.intern_trait(i),
+        Item::Impl(i) => leaker.intern_impl(i),
         Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     };
@@ -757,7 +757,7 @@ fn twelve_a_relaxed_bound_is_copied_as_written() {
     let item: ItemTrait = parse_quote! {
         trait A<T: ?Sized> where T: ::core::fmt::Debug { fn f(&self, t: &Wrap<T>); }
     };
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let key = key_of_first(&result);
     let referrer = result.clone().finish().unwrap();
@@ -833,7 +833,7 @@ fn twelve_the_headline_names_the_path_not_the_modifier() {
     ] {
         let item: ItemTrait = parse_str(source).unwrap();
         let mut leaker = Leaker::new();
-        leaker.intern_trait(&item, true);
+        leaker.intern_trait(&item);
         let result = leaker.result();
         let err = result.errors();
         let items = err;
@@ -846,8 +846,8 @@ fn twelve_the_headline_names_the_path_not_the_modifier() {
             source
         );
         // Allowed by the prelude option, or written in full.
-        let mut leaker = Leaker::from_config(config(), Options::new());
-        leaker.intern_trait(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_trait(&item);
         assert!(leaker.result().finish().is_ok(), "{}", source);
         let absolute = source.replace("Sized", "::core::marker::Sized");
         assert_eq!(default_entries(&absolute), Ok(0), "{}", absolute);
@@ -869,8 +869,8 @@ fn twelve_a_relaxed_bound_is_bare_only_if_it_has_nothing_else() {
     let item: ItemTrait = parse_quote!(
         trait A<T: ?m::Sized> {}
     );
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_err());
 }
@@ -888,8 +888,8 @@ fn fourteen_values_are_not_read_by_default() {
             fn f(&self) -> usize { inner::helper() }
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_trait(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
     // The same with a const and a function of a module.
     let item: ItemMod = parse_quote! {
@@ -898,7 +898,7 @@ fn fourteen_values_are_not_read_by_default() {
             pub fn f() -> usize { inner::helper() }
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new());
+    let mut leaker = Leaker::from_config(config());
     leaker.intern_mod(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 }
@@ -907,8 +907,9 @@ fn fourteen_values_are_not_read_by_default() {
 /// each.
 fn value_errors(source: &str) -> Vec<(String, String, String)> {
     let item: ItemTrait = parse_str(source).unwrap();
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     err.iter()
@@ -945,8 +946,9 @@ fn fourteen_a_type_in_an_associated_const_default_is_carried() {
             const N: usize = ::core::mem::size_of::<inner::Local>();
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    let context = leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    let context = leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         common::types(&referrer).map(text).collect::<Vec<_>>(),
@@ -1015,14 +1017,10 @@ fn fourteen_a_relative_path_in_a_default_method_body_is_rejected() {
 #[test]
 fn fourteen_a_discriminant_and_an_array_length_are_always_read() {
     for check_values in [false, true] {
-        let options = if check_values {
-            Options::new().check_values()
-        } else {
-            Options::new()
-        };
         let item: ItemEnum = parse_quote! { enum E { A = inner::X, B = 2 } };
-        let mut leaker = Leaker::from_config(config(), options);
-        leaker.intern_enum(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.check_values = check_values;
+        leaker.intern_enum(&item);
         let result = leaker.result();
         let items = result.errors();
         assert_eq!(items.len(), 1);
@@ -1032,8 +1030,9 @@ fn fourteen_a_discriminant_and_an_array_length_are_always_read() {
         let item: ItemEnum = parse_quote! {
             enum E { A = ::core::mem::size_of::<inner::Local>() as isize }
         };
-        let mut leaker = Leaker::from_config(config(), options);
-        leaker.intern_enum(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.check_values = check_values;
+        leaker.intern_enum(&item);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
             common::types(&referrer).map(text).collect::<Vec<_>>(),
@@ -1043,8 +1042,9 @@ fn fourteen_a_discriminant_and_an_array_length_are_always_read() {
         let item: ItemTrait = parse_quote! {
             trait Tr { fn f(&self) -> [u8; ::core::mem::size_of::<inner::Local>()]; }
         };
-        let mut leaker = Leaker::from_config(config(), options);
-        leaker.intern_trait(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.check_values = check_values;
+        leaker.intern_trait(&item);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
             common::types(&referrer).map(text).collect::<Vec<_>>(),
@@ -1066,8 +1066,8 @@ fn issue_one_a_macro_cause_is_written_with_its_bang() {
     let item: ItemStruct = parse_quote!(
         struct S([u8; two!()]);
     );
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let errors = result.errors();
     assert_eq!(errors.len(), 1, "{}", messages(errors));
@@ -1095,8 +1095,8 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
         ("::p::ty!(Self)", "::p::ty!(Self)"),
     ] {
         let item: ItemStruct = parse_str(&format!("struct S<T = {}>(T);", default)).unwrap();
-        let mut leaker = Leaker::from_config(config(), Options::new());
-        leaker.intern_struct(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_struct(&item);
         let result = leaker.result();
         let errors = result.errors();
         assert_eq!(errors.len(), 1, "{}: {}", default, messages(errors));
@@ -1122,8 +1122,9 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(
         result.errors()[0].message,
@@ -1141,8 +1142,9 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let message = &result.errors()[0].message;
     assert!(message.contains("macro_rules ! m"), "{}", message);
@@ -1167,8 +1169,8 @@ fn issue_two_a_help_has_no_colon_in_its_words() {
     let mut checked = 0;
     for source in examples {
         let item: ItemStruct = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(config(), Options::new());
-        leaker.intern_struct(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_struct(&item);
         let result = leaker.result();
         for error in result.errors() {
             let help = error.help_text().unwrap();
@@ -1206,14 +1208,16 @@ fn issue_three_allow_prelude_accepts_the_names_of_every_edition() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(config(), Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(messages(result.errors()), "");
     // Without `Rules::prelude()`, they are relative paths.
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let shown = messages(result.errors());
     for name in [
@@ -1251,8 +1255,8 @@ fn issue_three_the_names_of_a_later_prelude_are_refused_with_their_absolute_path
         ("align_of_val", "::core::mem::align_of_val"),
     ] {
         let item: ItemTrait = parse_str(&format!("trait Tr: {} {{}}", name)).unwrap();
-        let mut leaker = Leaker::from_config(config(), Options::new());
-        leaker.intern_trait(&item, true);
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_trait(&item);
         let result = leaker.result();
         let errors = result.errors();
         assert_eq!(errors.len(), 1, "{}", name);
@@ -1274,7 +1278,7 @@ fn issue_three_the_help_knows_the_traits_of_the_prelude_it_allows() {
     ] {
         let item: ItemTrait = parse_str(&format!("trait Tr: {} {{}}", name)).unwrap();
         let mut leaker = Leaker::new();
-        leaker.intern_trait(&item, true);
+        leaker.intern_trait(&item);
         let result = leaker.result();
         assert_eq!(
             result.errors()[0].help_text(),
@@ -1297,8 +1301,8 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
         struct S<T: Base<Local>>(T);
     );
     let crate_only = || Rules::new().crate_paths();
-    let mut leaker = Leaker::from_config(crate_only(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(crate_only());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let errors = result.errors();
     assert_eq!(errors.len(), 1, "{}", messages(errors));
@@ -1310,8 +1314,8 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
     let item: ItemStruct = parse_quote!(
         struct S<T: ::p::Base<Local>>(T);
     );
-    let mut leaker = Leaker::from_config(crate_only(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(crate_only());
+    leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         common::types(&referrer).map(text).collect::<Vec<_>>(),
@@ -1326,7 +1330,7 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let errors = result.errors();
     assert_eq!(errors.len(), 2, "{}", messages(errors));
@@ -1350,8 +1354,8 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
     let item: ItemStruct = parse_quote!(
         struct S<T = Rel<Self>>(T);
     );
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let notes: Vec<&str> = result.errors()[0]
         .notes

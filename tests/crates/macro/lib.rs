@@ -270,7 +270,7 @@ pub fn leak_strict(
     let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item_trait, true);
+    leaker.intern_trait(&item_trait);
     match leaker.result().finish() {
         Ok(_) => quote!(#item_trait).into(),
         Err(e) => report_errors(&e, serialized),
@@ -287,7 +287,7 @@ pub fn leak_discard(
 ) -> proc_macro::TokenStream {
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item_trait, true);
+    leaker.intern_trait(&item_trait);
     match leaker.result().finish() {
         Ok(_) => panic!("the trait has errors"),
         Err(errors) => {
@@ -351,7 +351,7 @@ pub fn leak_tagged(
     };
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&item_trait, true);
+    let context = leaker.intern_trait(&item_trait);
     let referrer = match leaker.result().finish() {
         Ok(referrer) => referrer,
         Err(e) => return report(&e).into(),
@@ -631,11 +631,10 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Rules::new()
             .primitive()
             .or_if(starts_with(allowed)),
-        Options::new(),
     );
     match &item {
-        Item::Trait(item) => leaker.intern_trait(item, true),
-        Item::Struct(item) => leaker.intern_struct(item, true),
+        Item::Trait(item) => leaker.intern_trait(item),
+        Item::Struct(item) => leaker.intern_struct(item),
         Item::Mod(item) => leaker.intern_mod(item),
         _ => return quote!(compile_error!("unsupported item");).into(),
     };
@@ -681,9 +680,8 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
             .primitive()
             .prelude()
             .or_if(starts_with(args.allow.clone().into_iter().collect())),
-        Options::new(),
     );
-    let context = leaker.intern_trait(&item_trait, true);
+    let context = leaker.intern_trait(&item_trait);
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
     let assertions = leaker.assertions();
     leaker.reduce_roots();
@@ -1227,7 +1225,7 @@ pub fn __shared_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream
 }
 
 /// The Leaker's side of `tests/prop_cross_crate.rs`: analyzes the struct, enum, union, trait, impl
-/// or module it is put on (`#[prop_leak(id = 3, allow_self = true, prelude = false, allow = "::std")]`),
+/// or module it is put on (`#[prop_leak(id = 3, prelude = false, allow = "::std")]`),
 /// and emits the Repeater's implementations, the witnesses of its type positions, and the exported
 /// macros `__tl_prop_<id>!` (for the Referrer's crate) and `__tl_report_<id>!`. See `prop.rs`.
 #[proc_macro_attribute]

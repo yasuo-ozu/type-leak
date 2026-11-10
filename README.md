@@ -58,7 +58,7 @@ let item: ItemTrait = parse_quote! {
 
 // Crate A: analyze the trait, and write one Repeater impl per entry (`42` is the ID).
 let mut leaker = Leaker::new();
-let top_level = leaker.intern_trait(&item, true);
+let top_level = leaker.intern_trait(&item);
 let result = leaker.result();
 let repeater: Path = parse_quote!(path::Repeater);
 let impls: Vec<ItemImpl> = result

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Context, ContextId, EntryId, Leaker, LeakerResult, ModuleScope, Options, Visitor};
+use type_leak::{Context, ContextId, EntryId, Leaker, LeakerResult, ModuleScope, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -122,7 +122,7 @@ fn intern_mod_errors_and_bodies() {
 /// standard prelude, and returns the module context too.
 fn referrer_with_prelude(m: &ItemMod) -> (type_leak::Referrer, ContextId) {
     let config = type_leak::Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let context = leaker.intern_mod(m);
     (leaker.result().finish().unwrap(), context)
 }
@@ -525,7 +525,7 @@ fn serialization_with_modules() {
     );
     let tokens = {
         let mut leaker = Leaker::new();
-        leaker.intern_struct(&simple, true);
+        leaker.intern_struct(&simple);
         leaker.result().finish().unwrap()
     }
     .to_token_stream();
@@ -1014,14 +1014,11 @@ fn a_module_nested_in_an_unseen_module_is_not_found_by_its_name() {
 fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
     let mut leaker = Leaker::new();
     // `Rel` with no module is the first entry, and the one of the module `m` is the second.
-    let top = leaker.intern_struct(
-        &parse_quote!(
-            struct A {
-                x: Rel,
-            }
-        ),
-        true,
-    );
+    let top = leaker.intern_struct(&parse_quote!(
+        struct A {
+            x: Rel,
+        }
+    ));
     let module = leaker.intern_mod(&parse_quote!(
         mod m {
             pub struct B(Rel);
@@ -1068,14 +1065,11 @@ fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
             pub struct B(Rel);
         }
     ));
-    let top = leaker.intern_struct(
-        &parse_quote!(
-            struct A {
-                x: Rel,
-            }
-        ),
-        true,
-    );
+    let top = leaker.intern_struct(&parse_quote!(
+        struct A {
+            x: Rel,
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         rewrite_in(
@@ -1203,14 +1197,11 @@ fn a_block_item_hides_the_entry_of_a_module() {
 #[test]
 fn self_has_no_meaning_in_a_mod_item_of_a_scope_which_declares_it() {
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(
-        &parse_quote!(
-            trait Tr {
-                fn f(&self) -> Rel<Self>;
-            }
-        ),
-        true,
-    );
+    let context = leaker.intern_trait(&parse_quote!(
+        trait Tr {
+            fn f(&self) -> Rel<Self>;
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     // The trait itself declares `Self`, and the entry is found.
     let expected: Item = parse_quote!(

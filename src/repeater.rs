@@ -118,7 +118,7 @@ pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: Ent
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Wrap<T>; }), true);
+/// leaker.intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Wrap<T>; }));
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // The entry `Wrap<T>`, written with its own generics.
@@ -246,7 +246,7 @@ pub enum ImplSelf<'a> {
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S(Rel);), true);
+/// leaker.intern_struct(&parse_quote!(struct S(Rel);));
 /// let result = leaker.result();
 ///
 /// let repeater: Path = parse_quote!(crate::Repeater);
@@ -359,7 +359,7 @@ impl RepeaterImpl {
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S(Rel);), true);
+/// leaker.intern_struct(&parse_quote!(struct S(Rel);));
 /// let result = leaker.result();
 /// let repeater: Path = parse_quote!(crate::Repeater);
 /// let marker: Type = parse_quote!(Marker);

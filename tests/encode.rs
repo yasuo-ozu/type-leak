@@ -138,7 +138,7 @@ fn slot_const_refuses_an_alias_and_encodes_the_consts_of_an_entry() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let ix = common::entry_id_at(&referrer, 0);
     let args = common::repeater_args(
@@ -255,7 +255,7 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     });
     let item: ItemTrait = parse_quote!(trait Tr #generics { fn f(&self) -> Wrap<#(#used),*>; });
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     common::repeater_args(
         common::entry(&referrer, 0),
@@ -275,7 +275,7 @@ fn unbounded_self_error(self_ty: &str) -> EncodeError {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     let self_ty: Type = parse_str(self_ty).unwrap();
     let entry = referrer.iter().next().unwrap();
@@ -309,7 +309,7 @@ fn params_error(generics: &str) -> EncodeError {
 fn needs_self_error(source: &str) -> EncodeError {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let marker: Type = parse_quote!(crate::Marker);
     // The call fails for the first entry that names `Self`, which is `Wrap<T, Self>` here.
@@ -421,7 +421,7 @@ fn both_errors_are_std_errors() {
         trait Tr: Clone {}
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     let err = err[0].clone();
@@ -631,7 +631,7 @@ fn repeater_projection_writes_the_generics_of_the_entry_by_their_names() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let (ix, _, context) = referrer.iter().next().unwrap();
     let repeater = repeater();

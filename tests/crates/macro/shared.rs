@@ -72,14 +72,14 @@ impl Parse for Shared {
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let Shared { id, items } = parse2(input)?;
     let config = Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let mut contexts = Vec::new();
     for item in &items {
         contexts.push(match item {
-            Item::Trait(i) => leaker.intern_trait(i, true),
-            Item::Struct(i) => leaker.intern_struct(i, true),
-            Item::Enum(i) => leaker.intern_enum(i, true),
-            Item::Union(i) => leaker.intern_union(i, true),
+            Item::Trait(i) => leaker.intern_trait(i),
+            Item::Struct(i) => leaker.intern_struct(i),
+            Item::Enum(i) => leaker.intern_enum(i),
+            Item::Union(i) => leaker.intern_union(i),
             other => return Err(Error::new_spanned(other, "unsupported item")),
         });
     }

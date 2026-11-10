@@ -52,7 +52,7 @@ use template_quote::{quote, ToTokens};
 /// use quote::ToTokens;
 ///
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);), true);
+/// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);));
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // Crate A writes the Referrer into the input of the macro of crate B, which reads it back.
@@ -605,7 +605,7 @@ impl Referrer {
         }
         // A bound that has no name here (see `Context::of()`) is in no entry. An entry for any type
         // has the `Self` of a nested struct, enum or union as the implementor, also where its type
-        // names it (`nested_self_entries`).
+        // names it (`Reason::NestedSelfInBounds`).
         let any = nested_type && matches!(entry.self_ty(), Some(SelfRequirement::Any));
         let context = if any {
             Context::of_any(ty, scopes, self_ty, nested_type, enclosing)
@@ -639,7 +639,7 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);), true);
+    /// leaker.intern_struct(&parse_quote!(struct S<T>(Wrap<T>);));
     /// let referrer = leaker.result().finish().unwrap();
     ///
     /// let (ix, ty, context) = referrer.iter().next().unwrap();
@@ -909,7 +909,7 @@ impl Referrer {
     /// # use syn::*;
     /// # use syn::visit_mut::VisitMut;
     /// let mut leaker = Leaker::new();
-    /// let top_level = leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Rel; }), true);
+    /// let top_level = leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self) -> Rel; }));
     /// let referrer = leaker.result().finish().unwrap();
     ///
     /// // Step 1: the copy of `f` in `impl Tr for ..`, with the entry written.
@@ -968,7 +968,7 @@ impl Referrer {
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
     /// let item: ItemStruct = parse_quote!(struct S<T>(::core::option::Option<Wrap<T>>););
-    /// let context = leaker.intern_struct(&item, true);
+    /// let context = leaker.intern_struct(&item);
     /// let referrer = leaker.result().finish().unwrap();
     ///
     /// let ty = parse_quote!(::core::option::Option<Wrap<T>>);
@@ -1035,7 +1035,7 @@ fn bucket_type(id: u64, ix: usize) -> Type {
 ///
 /// `declared` are the generics of the impl without `param`, in which `param` replaced `Self`, and
 /// `ty` is the type of the impl. A type that names `Self` (`Rel2<Self, T>`, with
-/// [`nested_self_entries()`](crate::Options::nested_self_entries)) needs it as
+/// [`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds)) needs it as
 /// the bounds do: `Rel2<__S, T>` is well-formed for `__S: Sized` only, unless the declaration of
 /// `Rel2` relaxes it, which the Leaker cannot see. They need no `Sized` if every use of `param` is
 ///
@@ -1477,7 +1477,7 @@ fn declared_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
 /// as written ([recovery](crate::Leaker#errors-and-recovery)) are left as they are. Items and
 /// imports declared in a block hide the leaked types that name them there, and those declared in a
 /// module or a `File` hide the entries of no module that name them. Values are visited too: a type
-/// there is an entry only with [`Options::check_values()`](crate::Options::check_values).
+/// there is an entry only with [`Leaker::check_values`](crate::Leaker::check_values).
 ///
 /// `G` is the closure of [`Visitor::with_nested_self()`]; none by default.
 ///
@@ -1487,7 +1487,7 @@ fn declared_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
 /// use syn::visit_mut::VisitMut;
 /// let mut item: ItemTrait = parse_quote!(trait Tr { fn f(&self) -> Rel; });
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker.intern_trait(&item, true);
+/// let top_level = leaker.intern_trait(&item);
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // Rewrite the whole trait, with the `ContextId` that the Leaker returned for it.
@@ -1575,12 +1575,11 @@ where
 
     /// Replaces `Self` by `self_ty` in the copy.
     ///
-    /// Use it for a Repeater implemented for a marker type, with `allow_self = false`
-    /// ([`Leaker::intern_struct()`](crate::Leaker::intern_struct)). Leaked types are still found by
-    /// their original tokens, and `type_fn` gets them with `Self` replaced. `Self` is replaced in
-    /// the other types too, parts copied as written included, but not in what `type_fn` returns, in
-    /// receivers (`&self`) or in expressions, nor in a nested struct, enum, union, trait or impl
-    /// (which has a `Self` of its own: see [`Visitor::with_nested_self()`]).
+    /// Leaked types are still found by their original tokens, and `type_fn` gets them with `Self`
+    /// replaced. `Self` is replaced in the other types too, parts copied as written included, but
+    /// not in what `type_fn` returns, in receivers (`&self`) or in expressions, nor in a nested
+    /// struct, enum, union, trait or impl (which has a `Self` of its own: see
+    /// [`Visitor::with_nested_self()`]).
     ///
     /// The default of a parameter of the outermost item (`trait Tr<T: AsRef<Self>, U = Rel<T>>`) is
     /// looked up without `Self`, so a leaked type in it goes to `type_fn`; if a bound of an earlier
@@ -1591,8 +1590,7 @@ where
     /// A `self_ty` with lifetimes (`::p::S<'a>`) would give `fn(&Self) -> &u8` more input lifetimes
     /// (E0106), so the visitor names the elided one with a fresh binder
     /// (`for<'__tl_e0> fn(&'__tl_e0 ::p::S<'a>) -> &'__tl_e0 u8`). Where it cannot, the type is
-    /// leaked whole, an error with `allow_self = false`
-    /// ([Elided lifetimes](crate::Leaker#elided-lifetimes)).
+    /// leaked whole ([Elided lifetimes](crate::Leaker#elided-lifetimes)).
     pub fn with_self(mut self, self_ty: Type) -> Self {
         self.self_ty = Some(self_ty);
         self
@@ -1740,8 +1738,8 @@ where
         visitor.item_depth += 1;
         // Only an item nested in the visited syntax that declares `Self` has one of its own: the
         // Leaker keeps the `Self` around for a function, a type alias or a trait alias. The layer
-        // of the item is the Leaker's: its `Self` is allowed whatever `allow_self` the scope
-        // around has (`AnalyzeVisitor::with_item_of()`), so entries that name it exist.
+        // of the item is the Leaker's: entries that name its `Self` exist
+        // (`AnalyzeVisitor::with_item_of()`).
         let mut own_trait = false;
         if self.item_depth > 0 {
             if let Some(declared) = declares {
@@ -2189,7 +2187,7 @@ impl Referrer {
     //    nested in the analyzed syntax has no bound of the generics that names the item's `Self`
     //    (`U = Wrap<T>` with `T: Clone + AsRef<Self>` is `T: Clone`, any type), which the Referrer
     //    computes for a copy, so the entries of 13 are not found the same way; and an entry that
-    //    is for any type may name `Self` in its type (`nested_self_entries`), which the Referrer
+    //    is for any type may name `Self` in its type (`NestedSelfInBounds`), which the Referrer
     //    finds too.
     // 15: the context of an entry leaves out a bound of a generic that names the generic in the
     //    arguments of its path (`T: Fn(Alias<T>)`), if another bound of it fixes an associated

@@ -13,7 +13,7 @@ mod common;
 use common::starts_with;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Allow, Cause, ErrorItem, Leaker, Options, Place, Referrer, Rules};
+use type_leak::{Allow, Cause, ErrorItem, Leaker, Place, Referrer, Rules};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -44,16 +44,16 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
         .or_if(move |cause: &Cause, place: Place| {
             allowed.iter().any(|a| starts_with(a.clone())(cause, place))
         });
-    Leaker::from_config(config, Options::new())
+    Leaker::from_config(config)
 }
 
 /// Analyzes `item` with the matching `intern_*`.
 fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     let mut leaker = leaker();
     match &item {
-        Item::Struct(item) => leaker.intern_struct(item, true),
-        Item::Trait(item) => leaker.intern_trait(item, true),
-        Item::Impl(item) => leaker.intern_impl(item, true),
+        Item::Struct(item) => leaker.intern_struct(item),
+        Item::Trait(item) => leaker.intern_trait(item),
+        Item::Impl(item) => leaker.intern_impl(item),
         _ => panic!("unsupported item"),
     };
     leaker.result().finish()
@@ -611,9 +611,9 @@ fn self_in_a_predicate_of_an_impl_is_rejected_if_its_self_type_is_leaked_with_a_
 }
 
 #[test]
-fn the_cycle_of_self_is_an_error_where_self_cannot_be_leaked() {
-    // The tuple `(T, Self)` is copied as written where `Self` cannot be leaked, which drops what
-    // the types in it found: the cycle is kept apart.
+fn the_cycle_of_self_in_a_tuple_of_a_predicate_is_an_error() {
+    // `Self` in the tuple `(V, Self)` of a predicate is the self type of the impl, whose generics
+    // have the bound `V: Fn(Rel)` that names a leaked type.
     let item: ItemImpl = parse_quote!(
         impl<V: Fn(Rel)> W<V> {
             fn f(&self)
@@ -624,10 +624,12 @@ fn the_cycle_of_self_is_an_error_where_self_cannot_be_leaked() {
         }
     );
     let mut leaker = leaker();
-    leaker.intern_impl(&item, false);
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let err = result.errors();
+    assert_eq!(err.len(), 1, "{}", messages(err));
     assert!(messages(err).contains(HEADLINE), "{}", messages(err));
+    assert_eq!(err[0].cause, Cause::Type(parse_quote!(Self)));
 }
 
 #[test]
@@ -989,7 +991,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         // The relative names are allowed paths, as the prelude's are in `leaker()`.
         let mut leaker = leaker_allowing(&[name]);
         match &item {
-            Item::Trait(item) => leaker.intern_trait(item, true),
+            Item::Trait(item) => leaker.intern_trait(item),
             _ => unreachable!(),
         };
         let referrer = leaker
@@ -1018,7 +1020,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         .unwrap();
         let mut leaker = leaker_allowing(&["MyTrait", "p::Tr", "::p"]);
         match &item {
-            Item::Trait(item) => leaker.intern_trait(item, true),
+            Item::Trait(item) => leaker.intern_trait(item),
             _ => unreachable!(),
         };
         let referrer = leaker
@@ -1044,7 +1046,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         .unwrap();
         let mut leaker = leaker_allowing(&["MyTrait", "p::Tr", "::p"]);
         match &item {
-            Item::Trait(item) => leaker.intern_trait(item, true),
+            Item::Trait(item) => leaker.intern_trait(item),
             _ => unreachable!(),
         };
         let result = leaker.result();

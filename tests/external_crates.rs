@@ -18,7 +18,7 @@ fn tag() -> String {
 
 fn leaker() -> Leaker<impl Allow> {
     let config = Rules::new().primitive();
-    Leaker::from_config(config, Options::new())
+    Leaker::from_config(config)
 }
 
 /// A Leaker which allows the external crates `allowed` (`::name`).
@@ -35,7 +35,7 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
         .or_if(move |cause: &Cause, place: Place| {
             allowed.iter().any(|a| starts_with(a.clone())(cause, place))
         });
-    Leaker::from_config(config, Options::new())
+    Leaker::from_config(config)
 }
 
 /// Prints tokens without whitespace, to compare them with the source.
@@ -52,7 +52,7 @@ fn entries(referrer: &Referrer) -> Vec<String> {
 
 fn entries_of(item: ItemTrait) -> Vec<String> {
     let mut leaker = leaker();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     entries(&leaker.result().finish().unwrap())
 }
 
@@ -164,7 +164,7 @@ fn std_and_alloc_are_nodes() {
         }
     );
     let mut leaker = leaker_allowing(&["std", "alloc"]);
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
         vec![entry("Rel")]
@@ -181,33 +181,33 @@ fn allowed_absolute_path_is_never_a_node() {
             fn f(&self, a: ::foo::X, b: ::foo::inner::W<(Rel,)>, c: ::foobar::Y, d: foo::Z);
         }
     };
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
         vec![entry("Rel"), entry("foo::Z"), entry("::foobar::Y"),]
     );
     // An allowed relative path allows the relative paths only: an absolute one is a node.
     let config = Rules::new().or_if(starts_with(parse_quote!(my)));
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
         trait T {
             fn f(&self, a: my::X, b: ::my::Y);
         }
     };
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
         vec![entry("::my::Y")]
     );
     // The more specific path may be allowed alone.
     let config = Rules::new().or_if(starts_with(parse_quote!(::foo::inner)));
-    let mut leaker = Leaker::from_config(config, Options::new());
+    let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
         trait T {
             fn f(&self, a: ::foo::inner::X, b: ::foo::Y);
         }
     };
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
         vec![entry("::foo::Y")]
@@ -215,11 +215,7 @@ fn allowed_absolute_path_is_never_a_node() {
     // `check()` of the same.
     let ty: Type = parse_quote!(::foo::W<(Rel,)>);
     let config = Rules::new().or_if(starts_with(parse_quote!(::foo)));
-    let result = check_in(
-        &mut Leaker::from_config(config, Options::new()),
-        &ty,
-        &Generics::default(),
-    );
+    let result = check_in(&mut Leaker::from_config(config), &ty, &Generics::default());
     assert_eq!(
         result.must.iter().map(squash).collect::<Vec<_>>(),
         vec!["Rel"]
@@ -335,7 +331,7 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
         }
     );
     let mut leaker = leaker();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(err.len(), 1);
@@ -357,10 +353,10 @@ fn the_default_leaker_merges_the_entries_of_the_one_that_allows_the_crates(
             .any(|name| entry.contains(&format!("::{}", name)))
     };
     let mut leaker = leaker();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let default = leaker.result().finish().unwrap();
     let mut leaker = leaker_allowing(allowed);
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let reference = leaker.result().finish().unwrap();
     let text = |referrer: &Referrer, ix: usize| {
         squash(quote!(#{common::types(referrer).nth(ix).unwrap()}))
@@ -458,7 +454,7 @@ fn result_with_foo() -> (LeakerResult, ContextId) {
         }
     };
     let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true);
+    let context = leaker.intern_trait(&item);
     (leaker.result(), context)
 }
 
@@ -517,7 +513,7 @@ fn a_type_of_a_crate_with_a_relative_type_in_it_is_replaced_as_a_whole() {
         }
     );
     let mut analyzer = leaker();
-    let context = analyzer.intern_trait(&item, true);
+    let context = analyzer.intern_trait(&item);
     let referrer = analyzer.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
@@ -537,14 +533,14 @@ fn a_type_of_a_crate_with_a_relative_type_in_it_is_replaced_as_a_whole() {
         }
     );
     let mut analyzer = leaker();
-    let context = analyzer.intern_trait(&item, true);
+    let context = analyzer.intern_trait(&item);
     let referrer = analyzer.result().finish().unwrap();
     assert_eq!(
         expand(&referrer, context, parse_quote!(::foo::W<::bar::X>)),
         "P < 0usize >"
     );
     let mut analyzer = leaker_allowing(&["foo", "bar"]);
-    let context = analyzer.intern_trait(&item, true);
+    let context = analyzer.intern_trait(&item);
     let referrer = analyzer.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(
@@ -572,7 +568,7 @@ fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
         }
     );
     let mut analyzer = leaker();
-    let context = analyzer.intern_trait(&item, true);
+    let context = analyzer.intern_trait(&item);
     let referrer = analyzer.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     assert!(referrer
@@ -677,14 +673,11 @@ fn a_referrer_and_the_result_read_back_from_its_tokens_are_equal() {
     }
     // Anything that the serialization keeps is still compared.
     let mut leaker = leaker();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait T {
-                fn f(&self, a: ::foo::Y) -> Rel;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait T {
+            fn f(&self, a: ::foo::Y) -> Rel;
+        }
+    ));
     assert_ne!(result.finish().unwrap(), leaker.result().finish().unwrap());
 }
 
@@ -696,7 +689,7 @@ fn referrer_serialization_round_trip() {
         }
     };
     let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true);
+    let context = leaker.intern_trait(&item);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     let before = entries(&referrer);
@@ -739,7 +732,7 @@ fn std_crates_allows_the_absolute_paths_of_std_and_alloc() {
     );
     // As a result: `::std`, `::alloc` and `::foo` all make entries.
     let mut analyzer = leaker();
-    analyzer.intern_trait(&item, true);
+    analyzer.intern_trait(&item);
     let result = analyzer.result();
     let plain = result.clone().finish().unwrap();
     assert_eq!(
@@ -755,8 +748,8 @@ fn std_crates_allows_the_absolute_paths_of_std_and_alloc() {
     let allowed = result.allow(Rules::new().std_crates()).finish().unwrap();
     assert_eq!(allowed, plain);
     // In the Leaker: they are no entries, and the others are.
-    let mut analyzer = Leaker::from_config(Rules::new().primitive().std_crates(), Options::new());
-    analyzer.intern_trait(&item, true);
+    let mut analyzer = Leaker::from_config(Rules::new().primitive().std_crates());
+    analyzer.intern_trait(&item);
     assert_eq!(
         entries(&analyzer.result().finish().unwrap()),
         [entry("Rel"), entry("::foo::X")]
@@ -772,9 +765,8 @@ fn external_crates_makes_no_entry_of_a_crate_in_the_leaker() {
             fn f<U: ::bar::B>(&self, a: ::foo::X, b: ::foo::W<(Rel, U)>, c: [u8; ::n::N]) -> Rel;
         }
     );
-    let mut analyzer =
-        Leaker::from_config(Rules::new().primitive().external_crates(), Options::new());
-    analyzer.intern_trait(&item, true);
+    let mut analyzer = Leaker::from_config(Rules::new().primitive().external_crates());
+    analyzer.intern_trait(&item);
     let referrer = analyzer.result().finish().unwrap();
     // The types in the paths are entries, and no absolute path is.
     assert!(common::types(&referrer).all(|ty| !squash(quote!(#ty)).starts_with("::")));
@@ -785,9 +777,8 @@ fn external_crates_makes_no_entry_of_a_crate_in_the_leaker() {
             fn f(&self) -> Rel;
         }
     );
-    let mut analyzer =
-        Leaker::from_config(Rules::new().primitive().external_crates(), Options::new());
-    analyzer.intern_trait(&item, true);
+    let mut analyzer = Leaker::from_config(Rules::new().primitive().external_crates());
+    analyzer.intern_trait(&item);
     assert_eq!(analyzer.result().finish().unwrap().iter().count(), 1);
 }
 
@@ -805,7 +796,7 @@ fn referrer_round_trip_keeps_the_indices() {
         }
     };
     let mut leaker = leaker();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     let before = entries(&referrer);
     assert!(common::context_ids(&referrer).len() > 2);
@@ -850,7 +841,7 @@ fn raw_identifier_crates_are_serialized_back_and_allowed_by_name() {
         }
     };
     let mut leaker = leaker();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
@@ -866,7 +857,7 @@ fn raw_identifier_crates_are_serialized_back_and_allowed_by_name() {
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
     // Allowed by the Leaker, the crate is not a node, by its name (without `r#`).
     let mut leaker = leaker_allowing(&["r#async"]);
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
         [entry("::plain::Z"), entry("::r#fn::Y")]

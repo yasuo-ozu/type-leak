@@ -9,7 +9,7 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Options, Reason, Referrer, Rules,
+    Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Reason, Referrer, Rules,
     SelfRequirement, View,
 };
 
@@ -141,7 +141,7 @@ fn a_struct_an_enum_and_a_union_declare_self_as_the_item() {
         let mut leaker = Leaker::new();
         let ty: Type = parse_quote!(Rel<Self, T>);
         let ident = ident(name);
-        let (context, ()) = leaker.enter_type(&ident, &generics, true, |v| v.visit_type(&ty));
+        let (context, ()) = leaker.enter_type(&ident, &generics, |v| v.visit_type(&ty));
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
             entries(&referrer),
@@ -168,7 +168,7 @@ fn an_impl_declares_self_as_the_self_type() {
     let generics: Generics = parse_quote!(<T>);
     let mut leaker = Leaker::new();
     let self_ty: Type = parse_quote!(::p::Wrap<T>);
-    let (context, ()) = leaker.enter_impl(&generics, &self_ty, None, true, |view| {
+    let (context, ()) = leaker.enter_impl(&generics, &self_ty, None, |view| {
         view.visit_type(&parse_quote!(Rel<Self>));
         view.visit_type(&parse_quote!(Rel2<T>));
     });
@@ -187,7 +187,7 @@ fn an_impl_declares_self_as_the_self_type() {
 fn a_trait_declares_self_as_the_implementor() {
     let generics: Generics = parse_quote!(<T, const N: usize>);
     let mut leaker = Leaker::new();
-    let (_, ()) = leaker.enter_trait(&ident("Tr"), &generics, true, |view| {
+    let (_, ()) = leaker.enter_trait(&ident("Tr"), &generics, |view| {
         view.visit_type(&parse_quote!(Rel<Self::Item, T>));
     });
     let referrer = leaker.result().finish().unwrap();
@@ -203,7 +203,7 @@ fn a_trait_declares_self_as_the_implementor() {
         }
     );
     let mut other = Leaker::new();
-    other.intern_trait(&item, true);
+    other.intern_trait(&item);
     let other = other.result().finish().unwrap();
     assert_eq!(entries(&other), entries(&referrer));
     assert_eq!(self_of(&other, 0), self_of(&referrer, 0));
@@ -263,12 +263,12 @@ fn the_whole_item_methods_are_scopes_of_the_item() {
         }
     );
     let mut whole = Leaker::new();
-    let top = whole.intern_struct(&item, true);
+    let top = whole.intern_struct(&item);
     let whole = whole.result().finish().unwrap();
 
     let mut scope = Leaker::new();
     let fields = item.fields.clone();
-    let (top_scope, ()) = scope.enter_type(&item.ident, &item.generics, true, |view| {
+    let (top_scope, ()) = scope.enter_type(&item.ident, &item.generics, |view| {
         for field in &fields {
             view.visit_type(&field.ty);
         }
@@ -344,7 +344,7 @@ fn an_item_in_a_scope_has_local_generics() {
     assert_eq!(entries(&referrer), [e("Rel < T >", "< T >")]);
     // The top-level context has no generics here, whereas that of `intern_struct()` has them.
     let mut leaker = Leaker::new();
-    let top = leaker.intern_struct(&item, true);
+    let top = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(common::entry_id(&referrer, 0), top);
     assert_eq!(s(&common::entry(&referrer, 0).generics), "< T >");
@@ -439,17 +439,11 @@ fn self_is_kept_by_the_generics_in_a_scope_which_declares_it() {
     let impl_generics: Generics = parse_quote!(<T>);
     let method_generics: Generics = parse_quote!(<'a, U>);
     let mut leaker = Leaker::new();
-    leaker.enter_impl(
-        &impl_generics,
-        &parse_quote!(::p::W<T>),
-        None,
-        true,
-        |view| {
-            view.enter_generics(&method_generics, |view| {
-                view.visit_type(&parse_quote!(Rel<'a, Self, U>))
-            });
-        },
-    );
+    leaker.enter_impl(&impl_generics, &parse_quote!(::p::W<T>), None, |view| {
+        view.enter_generics(&method_generics, |view| {
+            view.visit_type(&parse_quote!(Rel<'a, Self, U>))
+        });
+    });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
@@ -459,54 +453,32 @@ fn self_is_kept_by_the_generics_in_a_scope_which_declares_it() {
 
     // A module in a scope is not in that `Self`.
     let mut leaker = Leaker::new();
-    leaker.enter_impl(
-        &impl_generics,
-        &parse_quote!(::p::W<T>),
-        None,
-        true,
-        |view| {
-            view.enter_mod("m", [], |view| view.visit_type(&parse_quote!(Rel<Self>)));
-        },
-    );
+    leaker.enter_impl(&impl_generics, &parse_quote!(::p::W<T>), None, |view| {
+        view.enter_mod("m", [], |view| view.visit_type(&parse_quote!(Rel<Self>)));
+    });
     // The error of the scope in the module is recorded once, for the scope around it too.
     let result = leaker.result();
     assert_eq!(messages(result.errors()), "`Self` has no meaning here");
 }
 
 #[test]
-fn allow_self_decides_whether_self_may_be_interned() {
+fn self_may_be_interned_in_a_scope() {
     let generics: Generics = parse_quote!(<T>);
     let ty: Type = parse_quote!(Rel<Self>);
-    for allow_self in [true, false] {
-        let result = recorded(|leaker| {
-            leaker.enter_type(&ident("S"), &generics, allow_self, |view| {
-                view.visit_type(&ty)
-            });
+    // (`enter_type()` is the same for a struct, an enum and a union.)
+    let result = recorded(|leaker| {
+        leaker.enter_type(&ident("S"), &generics, |view| view.visit_type(&ty));
+    });
+    assert!(result.errors().is_empty());
+    let result = recorded(|leaker| {
+        leaker.enter_impl(&generics, &parse_quote!(::p::W<T>), None, |view| {
+            view.visit_type(&ty)
         });
-        assert_eq!(result.errors().is_empty(), allow_self);
-        if !allow_self {
-            let err = result.errors();
-            assert!(messages(err).starts_with("use absolute path: 'Rel<Self>'"));
-            assert_eq!(
-                err[0].notes.first().map(|(_, n)| n.as_str()),
-                Some("it cannot be leaked as a whole because of `Self`")
-            );
-        }
-        // (`enter_type()` is the same for a struct, an enum and a union.)
-        let result = recorded(|leaker| {
-            leaker.enter_impl(
-                &generics,
-                &parse_quote!(::p::W<T>),
-                None,
-                allow_self,
-                |view| view.visit_type(&ty),
-            );
-        });
-        assert_eq!(result.errors().is_empty(), allow_self);
-    }
+    });
+    assert!(result.errors().is_empty());
     // A type which can be decomposed is, and the others are not affected.
     let mut leaker = Leaker::new();
-    leaker.enter_type(&ident("S"), &generics, false, |view| {
+    leaker.enter_type(&ident("S"), &generics, |view| {
         view.visit_type(&parse_quote!((Rel, Self)));
         view.visit_type(&parse_quote!(Rel2<T>));
     });
@@ -514,48 +486,37 @@ fn allow_self_decides_whether_self_may_be_interned() {
         entries(&leaker.result().finish().unwrap()),
         [e("Rel", ""), e("Rel2 < T >", "< T >")]
     );
-    // The bounds of the generics a type uses cannot mention `Self` either.
+    // The bounds of the generics a type uses may mention `Self` too.
     let bounded: Generics = parse_quote!(<T: ::core::cmp::PartialEq<Self>>);
     let result = recorded(|leaker| {
-        leaker.enter_type(&ident("S"), &bounded, false, |view| {
+        leaker.enter_type(&ident("S"), &bounded, |view| {
             view.visit_type(&parse_quote!(Wrap<T>))
         });
     });
-    assert_eq!(
-        result.errors()[0].notes.first().map(|(_, n)| n.as_str()),
-        Some("the bounds of its generics mention `Self`, which cannot be leaked")
-    );
-}
-
-/// The headlines of the errors of a call.
-fn headlines(result: &LeakerResult) -> Vec<String> {
-    assert!(!result.errors().is_empty(), "an error");
-    result
-        .errors()
-        .iter()
-        .map(|item| item.message.clone())
-        .collect()
+    assert!(result.errors().is_empty(), "{:?}", result.errors());
 }
 
 #[test]
-fn allow_self_applies_to_the_whole_items() {
-    // With `allow_self == false`, `Self` is not leaked: the type that names it is an error, with
-    // the path to write instead (`use absolute path`), and not another error.
-    let denied = ["use absolute path: 'Rel<Self>'"];
+fn self_is_accepted_in_the_whole_items() {
+    // `Self` is no error in a whole item: the type that names it is an entry.
+    let leaked = |f: &dyn Fn(&mut Leaker)| {
+        let mut leaker = Leaker::new();
+        f(&mut leaker);
+        let result = leaker.result();
+        assert!(result.errors().is_empty(), "{:?}", result.errors());
+        entries(&result.finish().unwrap())
+    };
     let item: ItemImpl = parse_quote! {
         impl<T> ::p::Tr for ::p::W<T> {
             fn f(&self) -> Rel<Self> { loop {} }
         }
     };
-    let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
     assert_eq!(
-        headlines(&recorded(|l| {
-            l.intern_impl(&item, false);
-        })),
-        denied
+        leaked(&|l| {
+            l.intern_impl(&item);
+        }),
+        [e("Rel < Self >", "< T >"), e(":: p :: W < T >", "< T >")],
+        "impl"
     );
     let item: ItemStruct = parse_quote!(
         struct S<T> {
@@ -563,15 +524,12 @@ fn allow_self_applies_to_the_whole_items() {
             b: T,
         }
     );
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
     assert_eq!(
-        headlines(&recorded(|l| {
-            l.intern_struct(&item, false);
-        })),
-        denied
+        leaked(&|l| {
+            l.intern_struct(&item);
+        }),
+        [e("Rel < Self >", "< T >")],
+        "struct"
     );
     let item: ItemEnum = parse_quote!(
         enum E<T> {
@@ -579,41 +537,31 @@ fn allow_self_applies_to_the_whole_items() {
             B(T),
         }
     );
-    let mut leaker = Leaker::new();
-    leaker.intern_enum(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
     assert_eq!(
-        headlines(&recorded(|l| {
-            l.intern_enum(&item, false);
-        })),
-        denied
+        leaked(&|l| {
+            l.intern_enum(&item);
+        }),
+        [e("Rel < Self >", "< T >")],
+        "enum"
     );
     let item: ItemUnion = parse_quote!(union U { a: Rel<Self> });
-    let mut leaker = Leaker::new();
-    leaker.intern_union(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
     assert_eq!(
-        headlines(&recorded(|l| {
-            l.intern_union(&item, false);
-        })),
-        denied
+        leaked(&|l| {
+            l.intern_union(&item);
+        }),
+        [e("Rel < Self >", "")],
+        "union"
     );
-    // `Self` in the default of a const parameter (an expression) is `Self` too. Audit mutant
-    // `s_allowself_expr` (an expression is never a denied `Self`).
+    // `Self` in the default of a const parameter (an expression) is no error either.
     let item: ItemStruct = parse_quote!(
         pub struct S<const N: usize = { Self::K }>(u8);
     );
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
     assert_eq!(
-        headlines(&recorded(|l| {
-            l.intern_struct(&item, false);
-        })),
-        ["use absolute path: 'Self::K'"]
+        leaked(&|l| {
+            l.intern_struct(&item);
+        }),
+        [e("u8", "")],
+        "const default"
     );
 }
 
@@ -627,7 +575,7 @@ fn a_module_in_a_module_in_a_scope() {
     let self_ty: Type = parse_quote!(::p::W<T>);
     let mut leaker = Leaker::new();
     let (outer, inner) = leaker.enter_mod("outer", [], |view| {
-        view.enter_impl(&generics, &self_ty, None, true, |view| {
+        view.enter_impl(&generics, &self_ty, None, |view| {
             view.visit_type(&parse_quote!(Rel<T>));
             view.visit_type(&parse_quote!(Rel2<Self>));
             view.visit_type(&parse_quote!(::q::Abs));
@@ -965,7 +913,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
 /// A Leaker that allows the primitive types and the names of the standard prelude.
 fn leaker_with_std() -> Leaker<impl Allow> {
     let config = Rules::new().primitive().prelude();
-    Leaker::from_config(config, Options::new())
+    Leaker::from_config(config)
 }
 
 /// `Leaker::enter_generics()` docs: a scope keeps what it recorded when it has errors. The
@@ -1017,7 +965,6 @@ fn the_cycle_of_a_failed_inner_scope_is_an_error_of_the_outer_one() {
             &parse_quote!(<V: Fn(Rel)>),
             &parse_quote!(W<V>),
             None,
-            true,
             |view| {
                 view.visit_where_clause(&parse_quote!(where Self: Sized));
             },
@@ -1073,15 +1020,12 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
         view.enter_mod("inner", [], |view| view.visit_type(&parse_quote!(RelKept)));
         view.visit_type(&parse_quote!(Bad<'_>));
     });
-    let item = leaker.intern_struct(
-        &parse_quote!(
-            struct S<T> {
-                a: RelKept2,
-                b: Bad<'_>,
-            }
-        ),
-        true,
-    );
+    let item = leaker.intern_struct(&parse_quote!(
+        struct S<T> {
+            a: RelKept2,
+            b: Bad<'_>,
+        }
+    ));
     let result = leaker.result();
     // Each of the two calls reports its error, in the order of the calls.
     let cause = Cause::Type(parse_quote!(Bad<'_>));
@@ -1155,14 +1099,11 @@ fn modules_run() -> (Vec<ContextId>, String) {
         ids.push(module);
         ids.push(inner);
     }
-    ids.push(leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T> {
-                fn f(&self) -> Wrap<T>;
-            }
-        ),
-        true,
-    ));
+    ids.push(leaker.intern_trait(&parse_quote!(
+        trait Tr<T> {
+            fn f(&self) -> Wrap<T>;
+        }
+    )));
     (
         ids,
         leaker
@@ -1488,7 +1429,7 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
             view.visit_type(&parse_quote!(Rel<T>));
             if panic {
                 caught(|| {
-                    let _ = view.enter_type(&ident("S"), &parse_quote!(<U>), true, |view| {
+                    let _ = view.enter_type(&ident("S"), &parse_quote!(<U>), |view| {
                         view.visit_type(&parse_quote!(RelU<U>));
                         view.visit_type(&parse_quote!(Rel2<Self>));
                         view.visit_type(&parse_quote!(Bad<'_>));
@@ -1529,20 +1470,13 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
 
 #[test]
 fn a_panic_caught_in_a_nested_scope_restores_what_the_scope_declares() {
-    // `Self` is the one of the outer scope again, and so is whether it may be interned (the outer
-    // scope that does not allow it is in the layers of the item scopes, below).
+    // `Self` is the one of the outer scope again.
     let mut leaker = Leaker::new();
-    leaker.enter_type(&ident("O"), &Generics::default(), true, |view| {
+    leaker.enter_type(&ident("O"), &Generics::default(), |view| {
         caught(|| {
-            let _ = view.enter_impl(
-                &Generics::default(),
-                &parse_quote!(::p::W),
-                None,
-                true,
-                |_| {
-                    panic!("a closure panics");
-                },
-            );
+            let _ = view.enter_impl(&Generics::default(), &parse_quote!(::p::W), None, |_| {
+                panic!("a closure panics");
+            });
         });
         view.visit_type(&parse_quote!(Rel2<Self>));
     });
@@ -1553,7 +1487,7 @@ fn a_panic_caught_in_a_nested_scope_restores_what_the_scope_declares() {
     let mut leaker = Leaker::new();
     leaker.enter_generics(&Generics::default(), |view| {
         caught(|| {
-            let _ = view.enter_type(&ident("S"), &Generics::default(), true, |_| {
+            let _ = view.enter_type(&ident("S"), &Generics::default(), |_| {
                 panic!("a closure panics");
             });
         });
@@ -1633,20 +1567,14 @@ fn caught_with(message: &str, f: impl FnOnce()) {
 /// A Leaker with contexts from earlier calls: a trait, and a struct with other generics.
 fn leaker_with_contexts() -> (Leaker, Vec<ContextId>) {
     let mut leaker = Leaker::new();
-    let first = leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T> {
-                type A: ::p::X<Rel<T>>;
-            }
-        ),
-        true,
-    );
-    let second = leaker.intern_struct(
-        &parse_quote!(
-            struct S<U>(Rel2<U>);
-        ),
-        true,
-    );
+    let first = leaker.intern_trait(&parse_quote!(
+        trait Tr<T> {
+            type A: ::p::X<Rel<T>>;
+        }
+    ));
+    let second = leaker.intern_struct(&parse_quote!(
+        struct S<U>(Rel2<U>);
+    ));
     (leaker, vec![first, second])
 }
 
@@ -1674,30 +1602,24 @@ fn after_a_panic(panic: bool) -> (Vec<ContextId>, LeakerResult) {
             });
         });
         caught_with("an outermost closure panics", || {
-            let _ = leaker.enter_type(&ident("S3"), &parse_quote!(<V>), true, |view| {
+            let _ = leaker.enter_type(&ident("S3"), &parse_quote!(<V>), |view| {
                 record_and_panic(view, "an outermost closure panics")
             });
         });
     }
     // New contexts get the numbers they would get without the panic.
-    ids.push(leaker.intern_struct(
-        &parse_quote!(
-            struct S3<W>(Rel3<W>);
-        ),
-        true,
-    ));
+    ids.push(leaker.intern_struct(&parse_quote!(
+        struct S3<W>(Rel3<W>);
+    )));
     ids.push(
         leaker
             .enter_mod("kept", [], |view| view.visit_type(&parse_quote!(Rel4)))
             .0,
     );
     // The context of the earlier trait is still there: the same generics share it.
-    ids.push(leaker.intern_struct(
-        &parse_quote!(
-            struct Again<T>(Rel5<T>);
-        ),
-        true,
-    ));
+    ids.push(leaker.intern_struct(&parse_quote!(
+        struct Again<T>(Rel5<T>);
+    )));
     let result = leaker.result();
     result.clone().finish().unwrap();
     (ids, result)
@@ -1760,14 +1682,13 @@ fn after_a_nested_panic(panic: bool) -> (Vec<ContextId>, Referrer) {
             let _ = leaker.enter_generics(&parse_quote!(<V>), |view| {
                 view.visit_type(&parse_quote!(RelOuter<V>));
                 view.enter_mod("lost", [], |_| ());
-                let _ = view.enter_type(&ident("N"), &parse_quote!(<N>), true, |view| {
+                let _ = view.enter_type(&ident("N"), &parse_quote!(<N>), |view| {
                     view.visit_type(&parse_quote!(RelNested<N>));
                     // Two levels down: the scopes around are left in turn.
                     let _ = view.enter_impl(
                         &parse_quote!(<I>),
                         &parse_quote!(::p::W<I>),
                         None,
-                        true,
                         |view| record_and_panic(view, "a nested closure panics"),
                     );
                     unreachable!("the panic goes through the scopes around");
@@ -1776,12 +1697,9 @@ fn after_a_nested_panic(panic: bool) -> (Vec<ContextId>, Referrer) {
             });
         });
     }
-    ids.push(leaker.intern_struct(
-        &parse_quote!(
-            struct S3<W>(Rel3<W>);
-        ),
-        true,
-    ));
+    ids.push(leaker.intern_struct(&parse_quote!(
+        struct S3<W>(Rel3<W>);
+    )));
     ids.push(
         leaker
             .enter_generics(&parse_quote!(<V>), |view| {
@@ -1901,20 +1819,20 @@ fn self_in_the_generics_of_a_scope_which_has_none_is_an_error() {
         );
         // The scopes which declare `Self` have a meaning for it, so they are fine.
         let result = recorded(|leaker| {
-            leaker.enter_type(&ident("S"), generics, true, |_| ());
+            leaker.enter_type(&ident("S"), generics, |_| ());
         });
         assert_eq!(result.errors().is_empty(), *declared_ok, "{}", text);
         let result = recorded(|leaker| {
-            leaker.enter_trait(&ident("Tr"), generics, true, |_| ());
+            leaker.enter_trait(&ident("Tr"), generics, |_| ());
         });
         assert_eq!(result.errors().is_empty(), *declared_ok, "{}", text);
         let result = recorded(|leaker| {
-            leaker.enter_impl(generics, &parse_quote!(::p::W), None, true, |_| ());
+            leaker.enter_impl(generics, &parse_quote!(::p::W), None, |_| ());
         });
         assert_eq!(result.errors().is_empty(), *declared_ok, "{}", text);
         // The generics nested in one of them keep it.
         let result = recorded(|leaker| {
-            leaker.enter_type(&ident("S"), &Generics::default(), false, |view| {
+            leaker.enter_type(&ident("S"), &Generics::default(), |view| {
                 view.enter_generics(generics, |_| ());
             });
         });
@@ -1949,7 +1867,7 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
     // no meaning.
     let generics: Generics = parse_quote!(<T = Rel<Self>>);
     let result = recorded(|leaker| {
-        leaker.enter_type(&ident("S"), &generics, true, |_| ());
+        leaker.enter_type(&ident("S"), &generics, |_| ());
     });
     let err = result.errors();
     assert_eq!(
@@ -1965,7 +1883,7 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
     assert_eq!(messages(err), "`Self` has no meaning here");
     // Also in a scope nested in one which declares it, and in the default of its own.
     let result = recorded(|leaker| {
-        leaker.enter_type(&ident("S"), &Generics::default(), true, |view| {
+        leaker.enter_type(&ident("S"), &Generics::default(), |view| {
             view.enter_generics(&generics, |_| ());
         });
     });
@@ -1978,10 +1896,10 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
     assert_self_without_meaning(result.errors());
 }
 
-// ── `allow_self` of a nested item ────────────────────────────────────────────────────────────
+// ── `Self` of a nested item ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
+fn a_nested_item_has_a_self_of_its_own() {
     let items: Vec<Item> = vec![
         parse_quote!(
             trait Tr {
@@ -2011,10 +1929,10 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
     ];
     for item in &items {
         let text = s(item);
-        // In a scope which denies `Self`: nested in generics, in a module, directly, and inside
-        // several of them.
+        // In a scope of a type: nested in generics, in a module, directly, and inside several of
+        // them.
         let mut leaker = Leaker::new();
-        leaker.enter_type(&ident("S"), &Generics::default(), false, |view| {
+        leaker.enter_type(&ident("S"), &Generics::default(), |view| {
             view.enter_generics(&Generics::default(), |view| view.visit_item(item));
             view.enter_mod("m", [], |view| view.visit_item(item));
             view.visit_item(item);
@@ -2036,25 +1954,27 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
             "{}",
             text
         );
-        // In the others which deny it.
-        for scope in 0..4 {
+        // The `Self` of the entries is the item's, not that of the scope around (`S`).
+        assert!(
+            (0..referrer.iter().count()).all(|ix| self_of(&referrer, ix) != "Self = S"),
+            "{}",
+            text
+        );
+        // In the other scopes.
+        for scope in 0..3 {
             let result = recorded(|leaker| match scope {
-                0 | 1 => {
-                    leaker.enter_type(&ident("S"), &Generics::default(), false, |view| {
+                0 => {
+                    leaker.enter_type(&ident("S"), &Generics::default(), |view| {
                         view.visit_item(item)
                     });
                 }
-                2 => {
-                    leaker.enter_impl(
-                        &Generics::default(),
-                        &parse_quote!(::p::W),
-                        None,
-                        false,
-                        |view| view.visit_item(item),
-                    );
+                1 => {
+                    leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), None, |view| {
+                        view.visit_item(item)
+                    });
                 }
                 _ => {
-                    leaker.enter_trait(&ident("S"), &Generics::default(), false, |view| {
+                    leaker.enter_trait(&ident("S"), &Generics::default(), |view| {
                         view.visit_item(item)
                     });
                 }
@@ -2062,33 +1982,30 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
             assert!(result.errors().is_empty(), "{}: {:?}", text, result);
         }
     }
-    // The `Self` of the scope itself is still denied, also after the nested items.
-    let result = recorded(|leaker| {
-        leaker.enter_type(&ident("S"), &Generics::default(), false, |view| {
-            view.visit_item(&items[0]);
-            view.visit_type(&parse_quote!(Rel2<Self>));
-        });
+    // The `Self` of the scope itself is the scope's again after the nested items.
+    let mut leaker = Leaker::new();
+    leaker.enter_type(&ident("S"), &Generics::default(), |view| {
+        view.visit_item(&items[0]);
+        view.visit_type(&parse_quote!(Rel2<Self>));
     });
-    assert!(!result.errors().is_empty());
-    // A function does not declare `Self`, so it is the one of the scope around which it denies.
-    let result = recorded(|leaker| {
-        leaker.enter_impl(
-            &Generics::default(),
-            &parse_quote!(::p::W),
-            None,
-            false,
-            |view| {
-                view.visit_item(&parse_quote!(
-                    fn f() -> Rel<Self> {
-                        loop {}
-                    }
-                ));
-            },
-        );
+    let referrer = leaker.result().finish().unwrap();
+    let rel2 = common::types(&referrer)
+        .position(|ty| s(ty) == "Rel2 < Self >")
+        .unwrap();
+    assert_eq!(self_of(&referrer, rel2), "Self = S");
+    // A function does not declare `Self`, so it is the one of the scope around.
+    let mut leaker = Leaker::new();
+    leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), None, |view| {
+        view.visit_item(&parse_quote!(
+            fn f() -> Rel<Self> {
+                loop {}
+            }
+        ));
     });
-    assert!(!result.errors().is_empty());
-    // The items of a module analyzed as a whole have their own, as they have always had (the
-    // module has no `allow_self`).
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(entries(&referrer), [e("Rel < Self >", "")]);
+    assert_eq!(self_of(&referrer, 0), "Self = :: p :: W");
+    // The items of a module analyzed as a whole have their own.
     let m: ItemMod = parse_quote!(
         mod m {
             pub struct S {
@@ -2106,10 +2023,10 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 2);
 }
 
-// ── `allow_self` of a trait ──────────────────────────────────────────────────────────────────
+// ── `Self` of a trait ────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn allow_self_applies_to_traits() {
+fn self_in_a_trait_is_the_implementor() {
     let item: ItemTrait = parse_quote!(
         trait Tr<T> {
             fn f(&self) -> Rel<Self>;
@@ -2117,23 +2034,13 @@ fn allow_self_applies_to_traits() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [e("Rel < Self >", "< T >"), e("Rel2", "")]
     );
     assert_eq!(self_of(&referrer, 0), "Self: Tr < T >");
-    // `Rel<Self>` cannot be leaked without `Self`, as for a struct.
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
-    let result = leaker.result();
-    let err = result.errors();
-    assert!(messages(err).starts_with("use absolute path: 'Rel<Self>'"));
-    assert_eq!(
-        err[0].notes.first().map(|(_, n)| n.as_str()),
-        Some("it cannot be leaked as a whole because of `Self`")
-    );
     // What can be decomposed is, and the receivers are not affected.
     let item: ItemTrait = parse_quote!(
         trait Tr<T> {
@@ -2142,47 +2049,33 @@ fn allow_self_applies_to_traits() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Rel", ""), e("Rel2 < T >", "< T >")]);
     assert!(!referrer.has_self());
-    // A bound of the generics which mentions `Self` cannot be leaked either.
+    // A bound of the generics which mentions `Self` is no error either.
     let item: ItemTrait = parse_quote!(
         trait Tr<T: ::core::cmp::PartialEq<Self>> {
             fn f(&self) -> Wrap<T>;
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false);
-    let result = leaker.result();
-    let err = result.errors();
-    assert_eq!(
-        err[0].notes.first().map(|(_, n)| n.as_str()),
-        Some("the bounds of its generics mention `Self`, which cannot be leaked")
-    );
     // The same for the scope of the Leaker and of the View.
     let ty: Type = parse_quote!(Rel<Self, T>);
     let generics: Generics = parse_quote!(<T>);
-    for allow_self in [true, false] {
-        let result = recorded(|leaker| {
-            leaker.enter_trait(&ident("Tr"), &generics, allow_self, |view| {
-                view.visit_type(&ty)
-            });
+    let result = recorded(|leaker| {
+        leaker.enter_trait(&ident("Tr"), &generics, |view| view.visit_type(&ty));
+    });
+    assert!(result.errors().is_empty());
+    let result = recorded(|leaker| {
+        leaker.enter_generics(&Generics::default(), |view| {
+            view.enter_trait(&ident("Tr"), &generics, |view| view.visit_type(&ty));
         });
-        assert_eq!(result.errors().is_empty(), allow_self);
-        let result = recorded(|leaker| {
-            leaker.enter_generics(&Generics::default(), |view| {
-                view.enter_trait(&ident("Tr"), &generics, allow_self, |view| {
-                    view.visit_type(&ty)
-                });
-            });
-        });
-        assert_eq!(result.errors().is_empty(), allow_self);
-    }
+    });
+    assert!(result.errors().is_empty());
 }
 
 // ── a function as the analyzed item, and `Visit::visit_signature()` ──────────────────────────
@@ -2222,7 +2115,6 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
                     &Generics::default(),
                     &parse_quote!(::p::W),
                     Some(&parse_quote!(::p::Tr)),
-                    true,
                     |view| {
                         let method: ImplItemFn = parse_quote!(
                             fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
@@ -2234,7 +2126,7 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
                 );
             }
             2 => {
-                leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+                leaker.enter_trait(&ident("Tr"), &Generics::default(), |view| {
                     let method: TraitItemFn = parse_quote!(
                         fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ();
                     );
@@ -2243,7 +2135,7 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
             }
             // The signature alone is the one of a method.
             3 => {
-                leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+                leaker.enter_trait(&ident("Tr"), &Generics::default(), |view| {
                     view.visit_signature(&sig)
                 });
             }
@@ -2299,20 +2191,14 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 2);
     // The same method in `enter_impl()` given no trait (an inherent impl) has none to differ from.
     let result = recorded(|leaker| {
-        leaker.enter_impl(
-            &Generics::default(),
-            &parse_quote!(::p::W),
-            None,
-            true,
-            |view| {
-                let method: ImplItemFn = parse_quote!(
-                    fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
-                        loop {}
-                    }
-                );
-                view.visit_impl_item_fn(&method)
-            },
-        );
+        leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), None, |view| {
+            let method: ImplItemFn = parse_quote!(
+                fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
+                    loop {}
+                }
+            );
+            view.visit_impl_item_fn(&method)
+        });
     });
     assert!(result.errors().is_empty());
     // Generics around do not declare those of the signature, whichever they are.
@@ -2364,7 +2250,7 @@ fn visit_signature_is_visit_item_of_a_nested_function() {
     let err = result.errors();
     assert_self_without_meaning(err);
     let mut leaker = Leaker::new();
-    leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+    leaker.enter_trait(&ident("Tr"), &Generics::default(), |view| {
         view.visit_signature(&method)
     });
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
@@ -2476,7 +2362,7 @@ fn visit_path_at_the_root_analyzes_the_arguments_and_does_not_check_the_path() {
         [e("Rel", ""), e("Rel2", "")]
     );
     let mut leaker = Leaker::new();
-    leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+    leaker.enter_trait(&ident("Tr"), &Generics::default(), |view| {
         view.visit_path(&parse_quote!(Self::X))
     });
     assert!(leaker.result().finish().unwrap().is_empty());
@@ -2532,7 +2418,7 @@ fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
     let err = result.errors();
     assert_self_without_meaning(err);
     let mut leaker = Leaker::new();
-    leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+    leaker.enter_trait(&ident("Tr"), &Generics::default(), |view| {
         view.visit_type_param_bound(&parse_quote!(Self::X))
     });
     let result = leaker.result();
@@ -2545,13 +2431,13 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     // The path of the trait of an impl is checked in the same way.
     let item: ItemImpl = parse_quote!(impl Tr for W {});
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(messages(err), "use absolute path: 'Tr'");
     let item: ItemImpl = parse_quote!(impl ::p::Tr for W {});
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
     // The check comes first, before what is visited of the impl, and the arguments of the trait
@@ -2562,7 +2448,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(
@@ -2572,25 +2458,21 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     );
     let item: ItemImpl = parse_quote!(impl ::p::Tr<Rel> for () {});
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true);
+    leaker.intern_impl(&item);
     assert_eq!(entries(&leaker.result().finish().unwrap()), [e("Rel", "")]);
     // `enter_impl()` checks the trait it is given: the caller visits the arguments of the path.
     let item: ItemImpl = parse_quote!(impl Tr<Rel> for W {});
     let (_, trait_path, _) = item.trait_.as_ref().unwrap();
     let mut leaker = Leaker::new();
-    leaker.enter_impl(
-        &item.generics,
-        &item.self_ty,
-        Some(trait_path),
-        true,
-        |view| view.visit_path(trait_path),
-    );
+    leaker.enter_impl(&item.generics, &item.self_ty, Some(trait_path), |view| {
+        view.visit_path(trait_path)
+    });
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(messages(err), "use absolute path: 'Tr<Rel>'");
     // Without a trait (an inherent impl), the caller visits the bound to check the path.
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&item.generics, &item.self_ty, None, true, |view| {
+    leaker.enter_impl(&item.generics, &item.self_ty, None, |view| {
         view.visit_type_param_bound(&parse_quote!(#trait_path))
     });
     let result = leaker.result();
@@ -2598,7 +2480,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     assert_eq!(messages(err), "use absolute path: 'Tr<Rel>'");
     // The same path visited as `Visit::visit_path()` is not checked.
     let mut leaker = Leaker::new();
-    leaker.enter_impl(&item.generics, &item.self_ty, None, true, |view| {
+    leaker.enter_impl(&item.generics, &item.self_ty, None, |view| {
         view.visit_path(trait_path)
     });
     assert_eq!(entries(&leaker.result().finish().unwrap()), [e("Rel", "")]);
@@ -2608,12 +2490,11 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
 //
 // `enter_type()`, `enter_impl()`, `enter_trait()` and `enter_mod()` are the scope of the item (or
 // of the module) around `enter_generics()` of its generics: what they return, record and roll back
-// is what `enter_generics()` does, plus what the item declares (`Self`, and whether it may be
-// interned, or the module). The expected values below were taken from the scopes before they were
-// composed that way, so they pin what has not changed: the ids (the same contexts, and no other
-// one), the entries, the panics and what `Self` and `allow_self` mean. A scope that finds errors
-// keeps its corrected result, and its errors are recorded once, in place, in the list of the
-// outermost call (`Leaker::result()`).
+// is what `enter_generics()` does, plus what the item declares (`Self`, or the module). The
+// expected values below were taken from the scopes before they were composed that way, so they pin
+// what has not changed: the ids (the same contexts, and no other one), the entries, the panics and
+// what `Self` means. A scope that finds errors keeps its corrected result, and its errors are
+// recorded once, in place, in the list of the outermost call (`Leaker::result()`).
 
 /// The kinds of the scopes with a layer around their generics, and the module.
 const KINDS: [&str; 6] = ["struct", "enum", "union", "impl", "trait", "mod"];
@@ -2644,21 +2525,15 @@ fn self_type(generics: &Generics) -> Type {
 /// a `Leaker` or a `View`: the item is `S`, and the self type of the impl is that of
 /// [`self_type()`], which is of the trait `::p::Tr` (its methods are compared with a trait's). A module has no generics: it is entered as `m`.
 macro_rules! enter {
-    ($on:expr, $kind:expr, $generics:expr, $allow_self:expr, $f:expr) => {{
+    ($on:expr, $kind:expr, $generics:expr, $f:expr) => {{
         let generics: &Generics = $generics;
         match $kind {
-            "struct" | "enum" | "union" => $on.enter_type(&ident("S"), generics, $allow_self, $f),
+            "struct" | "enum" | "union" => $on.enter_type(&ident("S"), generics, $f),
             "impl" => {
                 let trait_: Path = parse_quote!(::p::Tr);
-                $on.enter_impl(
-                    generics,
-                    &self_type(generics),
-                    Some(&trait_),
-                    $allow_self,
-                    $f,
-                )
+                $on.enter_impl(generics, &self_type(generics), Some(&trait_), $f)
             }
-            "trait" => $on.enter_trait(&ident("S"), generics, $allow_self, $f),
+            "trait" => $on.enter_trait(&ident("S"), generics, $f),
             "mod" => $on.enter_mod("m", [], $f),
             kind => panic!("{}", kind),
         }
@@ -2763,7 +2638,7 @@ fn root_item(kind: &str) -> String {
         view.visit_where_clause(&parse_quote!(where T: ::p::Tr2<Rel5>));
         7
     };
-    let (id, value) = enter!(leaker, kind, &generics, true, body);
+    let (id, value) = enter!(leaker, kind, &generics, body);
     assert_eq!(value, 7);
     let result = leaker.result();
     result.clone().finish().unwrap();
@@ -2825,35 +2700,35 @@ fn nested_ids() -> String {
     let mut ids = Vec::new();
     let (top, ()) = leaker.enter_generics(&parse_quote!(<X>), |view| {
         let generics: Generics = parse_quote!(<U>);
-        let (a, ()) = view.enter_type(&s_ident, &generics, true, |view| {
+        let (a, ()) = view.enter_type(&s_ident, &generics, |view| {
             view.visit_type(&parse_quote!(Rel<Self, U>))
         });
         // The same generics, but another `Self`, which an entry names: another context. (`d`
         // below has no entry that names `Self`, so its context is that of the generics.)
-        let (b, ()) = view.enter_type(&ident("E"), &generics, true, |view| {
+        let (b, ()) = view.enter_type(&ident("E"), &generics, |view| {
             view.visit_type(&parse_quote!(Rel<Self, U>))
         });
-        let (c, ()) = view.enter_type(&ident("Un"), &parse_quote!(<'a>), false, |view| {
+        let (c, ()) = view.enter_type(&ident("Un"), &parse_quote!(<'a>), |view| {
             view.visit_type(&parse_quote!(Rel2<&'a ()>))
         });
         let (m, inner) = view.enter_mod("m", [ident("S")], |view| {
             view.visit_type(&parse_quote!(S<Rel3>));
-            view.enter_type(&ident("S2"), &parse_quote!(<V>), true, |view| {
+            view.enter_type(&ident("S2"), &parse_quote!(<V>), |view| {
                 view.visit_type(&parse_quote!(Rel4<Self, V>))
             })
             .0
         });
         let (m2, ()) = view.enter_mod("m2", [], |view| view.visit_type(&parse_quote!(Rel3)));
         // After the modules, the same generics are still the same context.
-        let (d, ()) = view.enter_type(&s_ident, &generics, true, |_| ());
-        let (e, ()) = view.enter_impl(&generics, &parse_quote!(::p::Wrap<U>), None, true, |view| {
+        let (d, ()) = view.enter_type(&s_ident, &generics, |_| ());
+        let (e, ()) = view.enter_impl(&generics, &parse_quote!(::p::Wrap<U>), None, |view| {
             view.visit_type(&parse_quote!(Rel6<Self, U>))
         });
-        let (f, ()) = view.enter_trait(&ident("Tr"), &generics, false, |view| {
+        let (f, ()) = view.enter_trait(&ident("Tr"), &generics, |view| {
             view.visit_type(&parse_quote!(Rel7<U>));
             // A trait inside a module inside a trait.
             view.enter_mod("m4", [], |view| {
-                view.enter_trait(&ident("Tr2"), &parse_quote!(<W>), true, |view| {
+                view.enter_trait(&ident("Tr2"), &parse_quote!(<W>), |view| {
                     view.visit_type(&parse_quote!(Rel8<Self, W>))
                 });
             });
@@ -2940,7 +2815,7 @@ fn failing(kind: &str, fail: bool) -> (LeakerResult, [(&'static str, ContextId);
     let mut leaker = Leaker::new();
     let (outer, (first, last)) = leaker.enter_mod("outer", [], |view| {
         view.visit_type(&parse_quote!(Rel));
-        let (first, ()) = view.enter_type(&ident("F"), &parse_quote!(<A>), true, |view| {
+        let (first, ()) = view.enter_type(&ident("F"), &parse_quote!(<A>), |view| {
             view.visit_type(&parse_quote!(RelA<Self, A>));
         });
         if fail {
@@ -2950,12 +2825,12 @@ fn failing(kind: &str, fail: bool) -> (LeakerResult, [(&'static str, ContextId);
             let body = |view: &mut View| {
                 view.visit_type(&parse_quote!(RelU<Self, A>));
                 view.enter_mod("lost", [], |view| view.visit_type(&parse_quote!(RelM)));
-                view.enter_type(&ident("Lost"), &parse_quote!(<W>), true, |_| ());
+                view.enter_type(&ident("Lost"), &parse_quote!(<W>), |_| ());
                 view.visit_type(&parse_quote!(Bad1<'_>));
             };
-            enter!(view, kind, &bad_generics(), true, body);
+            enter!(view, kind, &bad_generics(), body);
         }
-        let (last, ()) = view.enter_type(&ident("L"), &parse_quote!(<C>), true, |view| {
+        let (last, ()) = view.enter_type(&ident("L"), &parse_quote!(<C>), |view| {
             view.visit_type(&parse_quote!(RelC<Self, C>));
             view.enter_mod("kept", [], |view| view.visit_type(&parse_quote!(RelK)));
         });
@@ -3060,7 +2935,7 @@ fn a_failing_outermost_scope_of_each_kind_keeps_its_corrected_result() {
             view.enter_mod("inner", [], |view| view.visit_type(&parse_quote!(RelM)));
             view.visit_type(&parse_quote!(Bad1<'_>));
         };
-        ids.push(enter!(leaker, kind, &bad_generics(), true, body).0.index());
+        ids.push(enter!(leaker, kind, &bad_generics(), body).0.index());
     }
     // The module which is entered after them is the one after theirs.
     let (module, ()) = leaker.enter_mod("later", [], |_| ());
@@ -3118,10 +2993,10 @@ fn a_panic_in_an_outermost_scope_leaves_no_trace() {
             let body = |view: &mut View| {
                 view.visit_type(&parse_quote!(RelLost<Self, T>));
                 view.enter_mod("lost", [], |_| ());
-                view.enter_type(&ident("Lost"), &parse_quote!(<W>), true, |_| ());
+                view.enter_type(&ident("Lost"), &parse_quote!(<W>), |_| ());
                 panic!("a closure panics");
             };
-            let _ = enter!(leaker, kind, &parse_quote!(<T>), true, body);
+            let _ = enter!(leaker, kind, &parse_quote!(<T>), body);
         });
     }
     let (module, ()) = leaker.enter_mod("kept", [], |_| ());
@@ -3151,11 +3026,11 @@ fn panicking(outer: &str, kind: &str, panic: bool, mention_self: bool) -> String
                     view.visit_type(&parse_quote!(Bad<'_>));
                     panic!("a closure panics");
                 };
-                let _ = enter!(view, kind, &parse_quote!(<U>), true, body);
+                let _ = enter!(view, kind, &parse_quote!(<U>), body);
             });
         }
         // `U` is not a generic any more, `Lost` is not declared, `Self` is the one of the outer
-        // scope again, and so is `allow_self` (which a module, or an item with `true`, sets).
+        // scope again.
         view.visit_type(&parse_quote!(Wrap<U, Lost>));
         if mention_self {
             view.visit_type(&parse_quote!(Wrap2<Self>));
@@ -3163,7 +3038,7 @@ fn panicking(outer: &str, kind: &str, panic: bool, mention_self: bool) -> String
         view.enter_mod("kept", [], |view| view.visit_type(&parse_quote!(RelK)))
             .0
     };
-    let (top, module) = enter!(leaker, outer, &parse_quote!(<T>), false, body);
+    let (top, module) = enter!(leaker, outer, &parse_quote!(<T>), body);
     let result = leaker.result();
     let errors = result.errors().to_vec();
     let dumped = dump(&result, &[("top", top), ("module", module)]);
@@ -3183,8 +3058,8 @@ fn panicking(outer: &str, kind: &str, panic: bool, mention_self: bool) -> String
 #[test]
 fn a_panic_caught_in_a_scope_restores_the_scope_around() {
     for mention_self in [false, true] {
-        // Whatever the scope around declares (`Self`, and `allow_self`), it is as if the scope
-        // which panicked had not been entered.
+        // Whatever the scope around declares (`Self`), it is as if the scope which panicked had
+        // not been entered.
         let mut first = None;
         for outer in ITEMS {
             let expected = panicking(outer, "struct", false, mention_self);
@@ -3198,22 +3073,30 @@ fn a_panic_caught_in_a_scope_restores_the_scope_around() {
                     mention_self
                 );
             }
-            assert_eq!(
-                *first.get_or_insert(expected.clone()),
-                expected,
-                "{}",
-                outer
-            );
-        }
-        pin(
-            &format!("panicking {}", mention_self),
-            &first.unwrap(),
             if mention_self {
-                PANICKING_SELF
+                // The context of `Wrap2<Self>` says what `Self` is in the scope around.
+                let this = match outer {
+                    "impl" => "Self = :: p :: W < T >",
+                    "trait" => "Self: S < T >",
+                    _ => "Self = S < T >",
+                };
+                pin(
+                    &format!("panicking {}, mention_self", outer),
+                    &expected,
+                    &PANICKING_SELF.replace("{self}", this),
+                );
             } else {
-                PANICKING
-            },
-        );
+                assert_eq!(
+                    *first.get_or_insert(expected.clone()),
+                    expected,
+                    "{}",
+                    outer
+                );
+            }
+        }
+        if !mention_self {
+            pin("panicking", &first.unwrap(), PANICKING);
+        }
     }
 }
 
@@ -3228,11 +3111,16 @@ entry 1: Wrap < U , Lost > in 2
 entry 2: RelK in 3
 "#;
 const PANICKING_SELF: &str = r#"
-use absolute path: 'Wrap2<Self>'
---
+id top = 3
+id module = 0
+context 1: < T > ; - ; in module -
+context 2:  ; - ; in module -
+context 3: < T > ; {self} ; in module -
+context 4:  ; - ; in module 0 Some("kept") None
 entry 0: Rel < T > in 1
 entry 1: Wrap < U , Lost > in 2
-entry 2: RelK in 3
+entry 2: Wrap2 < Self > in 3
+entry 3: RelK in 4
 "#;
 
 // ── the generics are declared once ───────────────────────────────────────────────────────────
@@ -3268,29 +3156,29 @@ fn a_scope_of_an_item_or_a_module_adds_no_scope_of_its_own() {
     };
     for kind in ["struct", "impl", "trait"] {
         check(format!("{} of the generics", kind), &|l| {
-            enter!(l, kind, &b, true, |v| as_item(v, &sig));
+            enter!(l, kind, &b, |v| as_item(v, &sig));
         });
         check(format!("{} of others", kind), &|l| {
-            enter!(l, kind, &none, true, |v| nested(v, &sig));
+            enter!(l, kind, &none, |v| nested(v, &sig));
         });
         check(format!("{}, mod", kind), &|l| {
-            enter!(l, kind, &b, true, |v| {
+            enter!(l, kind, &b, |v| {
                 v.enter_mod("m", [], |v| as_item(v, &sig));
             });
         });
         check(format!("generics, {} of the generics", kind), &|l| {
             l.enter_generics(&b, |v| {
-                enter!(v, kind, &b, true, |v| nested(v, &sig));
+                enter!(v, kind, &b, |v| nested(v, &sig));
             });
         });
         check(format!("mod, {} of the generics", kind), &|l| {
             l.enter_mod("m", [], |v| {
-                enter!(v, kind, &b, true, |v| nested(v, &sig));
+                enter!(v, kind, &b, |v| nested(v, &sig));
             });
         });
         check(format!("{}, {}, mod", kind, kind), &|l| {
-            enter!(l, kind, &b, true, |v| {
-                enter!(v, kind, &b, true, |v| {
+            enter!(l, kind, &b, |v| {
+                enter!(v, kind, &b, |v| {
                     v.enter_mod("m", [], |v| nested(v, &sig));
                 });
             });
@@ -3381,60 +3269,51 @@ fn self_in_the_generics_of_a_scope() {
     for kind in ["struct", "impl", "trait"] {
         // `Self` is declared by the item: it may be in its generics.
         check(format!("{} bound", kind), &|l| {
-            enter!(l, kind, &bound, true, |_| ());
-        });
-        check(format!("{} bound, not allowed", kind), &|l| {
-            enter!(l, kind, &bound, false, |_| ());
+            enter!(l, kind, &bound, |_| ());
         });
         check(format!("{} default", kind), &|l| {
-            enter!(l, kind, &default, true, |_| ());
+            enter!(l, kind, &default, |_| ());
         });
         check(format!("mod, {}", kind), &|l| {
             l.enter_mod("m", [], |v| {
-                enter!(v, kind, &bound, true, |v| {
+                enter!(v, kind, &bound, |v| {
                     v.visit_type(&parse_quote!(Rel<Self>))
                 });
             });
         });
         // In a scope nested in one which declares it, it is what it is there.
         check(format!("{}, generics", kind), &|l| {
-            enter!(l, kind, &none, true, |v| {
+            enter!(l, kind, &none, |v| {
                 v.enter_generics(&bound, |v| v.visit_type(&parse_quote!(Rel<Self>)));
             });
         });
         check(format!("{}, mod, generics", kind), &|l| {
-            enter!(l, kind, &none, true, |v| {
+            enter!(l, kind, &none, |v| {
                 v.enter_mod("m", [], |v| {
                     v.enter_generics(&bound, |_| ());
                 });
             });
         });
-        // What the scope around says of `allow_self` is restored, and a module or an item sets its
-        // own.
-        check(format!("{} not allowed", kind), &|l| {
-            enter!(l, kind, &none, false, |v| {
-                v.visit_type(&parse_quote!(Rel<Self>))
-            });
-        });
-        check(format!("{} not allowed, {} allowed", kind, kind), &|l| {
-            enter!(l, kind, &none, false, |v| {
-                enter!(v, kind, &none, true, |v| {
+        // The `Self` of the scope around is restored, and a module or an item sets its own.
+        check(format!("{} in {}", kind, kind), &|l| {
+            enter!(l, kind, &none, |v| {
+                enter!(v, kind, &none, |v| {
                     v.visit_type(&parse_quote!(Rel<Self>))
                 });
-                enter!(v, kind, &none, false, |v| {
+                enter!(v, kind, &none, |v| {
                     v.visit_type(&parse_quote!(Rel2<Self>))
                 });
             });
         });
-        check(format!("{} not allowed, then", kind), &|l| {
-            enter!(l, kind, &none, false, |v| {
-                enter!(v, kind, &none, true, |_| ());
+        check(format!("{}, then", kind), &|l| {
+            enter!(l, kind, &none, |v| {
+                enter!(v, kind, &none, |_| ());
                 v.enter_mod("m", [], |_| ());
                 v.visit_type(&parse_quote!(Rel<Self>))
             });
         });
-        check(format!("{} not allowed, mod, item", kind), &|l| {
-            enter!(l, kind, &none, false, |v| {
+        check(format!("{}, mod, item", kind), &|l| {
+            enter!(l, kind, &none, |v| {
                 v.enter_mod("m", [], |v| {
                     v.visit_item(&parse_quote!(
                         struct S {
@@ -3444,8 +3323,8 @@ fn self_in_the_generics_of_a_scope() {
                 });
             });
         });
-        check(format!("{} not allowed, item", kind), &|l| {
-            enter!(l, kind, &none, false, |v| {
+        check(format!("{}, item", kind), &|l| {
+            enter!(l, kind, &none, |v| {
                 v.visit_item(&parse_quote!(
                     struct S {
                         a: Rel<Self>,
@@ -3463,36 +3342,30 @@ generics default: Self without meaning: Self (0)
 mod: Self without meaning: Self (0)
 mod, generics: Self without meaning: Self, Self (0)
 struct bound: ok (0)
-struct bound, not allowed: ok (0)
 struct default: `Rel<Self>` is in the default of a parameter, and names `Self` (0)
 mod, struct: ok (1)
 struct, generics: ok (1)
 struct, mod, generics: Self without meaning: Self, Self (0)
-struct not allowed: use absolute path: 'Rel<Self>' (0)
-struct not allowed, struct allowed: use absolute path: 'Rel2<Self>' (1)
-struct not allowed, then: use absolute path: 'Rel<Self>' (0)
-struct not allowed, mod, item: ok (1)
-struct not allowed, item: ok (1)
+struct in struct: ok (2)
+struct, then: ok (1)
+struct, mod, item: ok (1)
+struct, item: ok (1)
 impl bound: ok (0)
-impl bound, not allowed: ok (0)
 impl default: `Rel<Self>` is in the default of a parameter, and names `Self` (0)
 mod, impl: ok (1)
 impl, generics: ok (1)
 impl, mod, generics: Self without meaning: Self, Self (0)
-impl not allowed: use absolute path: 'Rel<Self>' (0)
-impl not allowed, impl allowed: use absolute path: 'Rel2<Self>' (1)
-impl not allowed, then: use absolute path: 'Rel<Self>' (0)
-impl not allowed, mod, item: ok (1)
-impl not allowed, item: ok (1)
+impl in impl: ok (2)
+impl, then: ok (1)
+impl, mod, item: ok (1)
+impl, item: ok (1)
 trait bound: ok (0)
-trait bound, not allowed: ok (0)
 trait default: `Rel<Self>` is in the default of a parameter, and names `Self` (0)
 mod, trait: ok (1)
 trait, generics: ok (1)
 trait, mod, generics: Self without meaning: Self, Self (0)
-trait not allowed: use absolute path: 'Rel<Self>' (0)
-trait not allowed, trait allowed: use absolute path: 'Rel2<Self>' (1)
-trait not allowed, then: use absolute path: 'Rel<Self>' (0)
-trait not allowed, mod, item: ok (1)
-trait not allowed, item: ok (1)
+trait in trait: ok (2)
+trait, then: ok (1)
+trait, mod, item: ok (1)
+trait, item: ok (1)
 "#;

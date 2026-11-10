@@ -29,9 +29,8 @@ impl<A: Allow> View<'_, '_, A> {
     ///
     /// Its generics are local and the generics around stay in scope; to make the generics of an
     /// item the root, use an `intern_*` method. A struct, enum, union, trait or impl declares its
-    /// own `Self`, whatever `allow_self` the scope around has
-    /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) finds its entries); the
-    /// other items keep the one around. The copy must nest the same scopes as the Leaker did.
+    /// own `Self` ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) finds its
+    /// entries); the other items keep the one around. The copy must nest the same scopes as the Leaker did.
     ///
     /// In a nested struct, enum or union, `Self` is the copy's own type. A type that names it is
     /// copied as written if its path is absolute (`::path::Wrap<Self>`), and leaked if it is

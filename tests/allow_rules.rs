@@ -45,8 +45,8 @@ fn paths(error: &ErrorItem) -> Vec<String> {
 
 /// The result of the analysis of the struct `item` with `config`.
 fn analyze<A: Allow>(item: &ItemStruct, config: A) -> LeakerResult {
-    let mut leaker = Leaker::from_config(config, Options::new());
-    leaker.intern_struct(item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_struct(item);
     leaker.result()
 }
 
@@ -222,7 +222,7 @@ fn a_rule_that_accepts_everything_drops_the_bound_and_the_error_inside_it() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 2);
     assert!(result.allow(|_: &Cause, _: Place| true).errors().is_empty());
@@ -412,19 +412,13 @@ fn all_paths(errors: &[ErrorItem], found: &mut Vec<String>) {
 
 #[test]
 fn the_rule_is_not_asked_about_self_or_a_generic() {
-    for (allow_self, check_values) in [(true, false), (false, false), (true, true), (false, true)] {
+    for check_values in [false, true] {
         let seen = Rc::new(Seen::default());
-        let mut leaker = Leaker::from_config(
-            Rules::new().or_if(seen.rule()),
-            if check_values {
-                Options::new().check_values()
-            } else {
-                Options::new()
-            },
-        );
-        leaker.intern_trait(&own_names(), allow_self);
+        let mut leaker = Leaker::from_config(Rules::new().or_if(seen.rule()));
+        leaker.check_values = check_values;
+        leaker.intern_trait(&own_names());
         let result = leaker.result();
-        let what = format!("allow_self {}, check_values {}", allow_self, check_values);
+        let what = format!("check_values {}", check_values);
         assert!(seen.contains("Rel"), "{}: {:?}", what, seen.paths());
         for head in ["Self", "T", "Vec", "Iterator"] {
             // `Iterator` is the bound of `T`, a relative path that the rule may see. The causes of
@@ -460,16 +454,17 @@ fn the_rule_is_not_asked_about_self_or_a_generic() {
 
 #[test]
 fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
-    // With `allow_self = false` a type that names `Self` cannot be an entry.
+    // `Self::A` of a struct cannot be written in the Repeater's impl, so a type that names it cannot
+    // be an entry.
     fn by<A: Allow>(source: &str, allow: A) -> LeakerResult {
         let item: ItemStruct = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(allow, Options::new());
-        leaker.intern_struct(&item, false);
+        let mut leaker = Leaker::from_config(allow);
+        leaker.intern_struct(&item);
         leaker.result()
     }
     for (source, relative) in [
-        ("struct S { a: Rel<Self>, b: Self }", "Rel"),
-        ("struct S { a: Box<Self>, b: Self }", "Box"),
+        ("struct S { a: Rel<Self::A>, b: Self }", "Rel"),
+        ("struct S { a: Box<Self::A>, b: Self }", "Box"),
     ] {
         let plain = by(source, Rules::new());
         assert_eq!(plain.errors().len(), 1, "{}", source);
@@ -488,9 +483,12 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
         assert_eq!(texts(by_rule.errors()), texts(plain.errors()), "{}", source);
         assert!(by_rule.into_referrer().is_empty(), "{}", source);
         assert!(!seen.starts_with("Self"), "{}: {:?}", source, seen.paths());
-        // Accepting `Self` only, on a result.
+        // Accepting the paths of `Self` only, on a result.
         let on_result = plain.clone().allow(|cause: &Cause, _: Place| {
-            cause.path().map_or(false, |path| path.is_ident("Self"))
+            cause
+                .path()
+                .and_then(|path| path.segments.first())
+                .map_or(false, |seg| seg.ident == "Self")
         });
         assert_eq!(
             texts(on_result.errors()),
@@ -613,7 +611,7 @@ fn boom(cause: &Cause, _: Place) -> bool {
 
 #[test]
 fn a_rule_that_panics_is_a_panic_of_the_closure() {
-    let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().or_if(boom));
     let item: ItemStruct = parse_quote!(
         struct S {
             a: Rel,
@@ -621,14 +619,14 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
         }
     );
     // The panic goes on, and the entry of `Rel` is rolled back.
-    let outcome = catch_unwind(AssertUnwindSafe(|| leaker.intern_struct(&item, true)));
+    let outcome = catch_unwind(AssertUnwindSafe(|| leaker.intern_struct(&item)));
     assert!(outcome.is_err());
     let fine: ItemStruct = parse_quote!(
         struct S {
             a: Rel2,
         }
     );
-    leaker.intern_struct(&fine, true);
+    leaker.intern_struct(&fine);
     let result = leaker.result();
     assert!(result.errors().is_empty());
     assert_eq!(entries(&result.into_referrer()), ["Rel2".to_string()]);
@@ -639,15 +637,9 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
 /// What a rule was asked about `item`, as `kind(path)` in the order asked, without the repeats.
 fn asked_as(item: &ItemTrait, values: bool) -> Vec<String> {
     let seen = Rc::new(Seen::default());
-    let mut leaker = Leaker::from_config(
-        Rules::new().or_if(seen.rule()),
-        if values {
-            Options::new().check_values()
-        } else {
-            Options::new()
-        },
-    );
-    leaker.intern_trait(item, true);
+    let mut leaker = Leaker::from_config(Rules::new().or_if(seen.rule()));
+    leaker.check_values = values;
+    leaker.intern_trait(item);
     let _ = leaker.result();
     let mut found: Vec<String> = Vec::new();
     for (cause, _) in seen.asked.borrow().iter() {
@@ -1538,10 +1530,10 @@ mod names {
 
     /// The result of the analysis of the trait or struct `source` with `config`.
     fn leak<A: Allow>(config: A, source: &str) -> LeakerResult {
-        let mut leaker = Leaker::from_config(config, Options::new());
+        let mut leaker = Leaker::from_config(config);
         match parse_str(source).unwrap() {
-            Item::Trait(item) => leaker.intern_trait(&item, true),
-            Item::Struct(item) => leaker.intern_struct(&item, true),
+            Item::Trait(item) => leaker.intern_trait(&item),
+            Item::Struct(item) => leaker.intern_struct(&item),
             other => panic!("{}", quote!(#other)),
         };
         leaker.result()

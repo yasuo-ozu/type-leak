@@ -9,7 +9,7 @@ use type_leak::{ContextId, Leaker, Referrer};
 
 fn referrer_of(tr: &ItemTrait) -> Referrer {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(tr, true);
+    leaker.intern_trait(tr);
     leaker.result().finish().unwrap()
 }
 
@@ -68,7 +68,7 @@ fn test_default_requirements() {
         }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // The contexts are the requirements of the types, numbered in the order of their first
     // appearance: nothing (`RelB`, `RelW` and `RelC`), the generics of the trait, which `All`
@@ -177,7 +177,7 @@ fn test_default_is_shared_with_the_items() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let at = |text: &str| {
@@ -201,7 +201,7 @@ fn test_default_cannot_depend_on_self() {
         trait Tr<T, U = Rel<Self>> {}
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(err.len(), 1);
@@ -240,15 +240,15 @@ fn test_defaults_of_several_calls_are_shared() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_plain = leaker.intern_struct(&plain, true);
-    let top_tr = leaker.intern_trait(&tr, true);
+    let top_plain = leaker.intern_struct(&plain);
+    let top_tr = leaker.intern_trait(&tr);
     // A failed call adds no entry (its error is the only one).
     let bad: ItemTrait = parse_quote!(
         trait Tr<T, U = ::std::vec::Vec<T>> {
             fn f(&self) -> Rel<'_>;
         }
     );
-    leaker.intern_trait(&bad, true);
+    leaker.intern_trait(&bad);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     let referrer = result.into_referrer();
@@ -309,7 +309,7 @@ fn test_default_const_is_kept() {
         trait Tr<T, const N: usize = MY_N> {}
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let result = leaker.result();
     assert!(result.finish().is_err());
     let tr: ItemTrait = parse_quote!(

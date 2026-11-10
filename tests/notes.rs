@@ -32,7 +32,7 @@ fn leaker() -> Leaker<impl Allow> {
         .primitive()
         .prelude()
         .or_if(starts_with(parse_quote!(::p)));
-    Leaker::from_config(config, Options::new())
+    Leaker::from_config(config)
 }
 
 /// What an error says.
@@ -89,7 +89,7 @@ fn errors_of<A: Allow, R>(
 }
 
 fn error(item: &ItemImpl) -> Vec<ErrorItem> {
-    let errors = errors_of(leaker(), |leaker| leaker.intern_impl(item, true));
+    let errors = errors_of(leaker(), |leaker| leaker.intern_impl(item));
     assert!(!errors.is_empty(), "accepted: {}", quote!(#item));
     errors
 }
@@ -249,7 +249,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
         struct S<T>(T, Rel<Self::A>);
     );
     assert_eq!(
-        shown(&errors_of(leaker(), |leaker| leaker.intern_struct(&item, true))),
+        shown(&errors_of(leaker(), |leaker| leaker.intern_struct(&item))),
         expected
     );
     let item: ItemEnum = parse_quote!(
@@ -258,7 +258,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
         }
     );
     assert_eq!(
-        shown(&errors_of(leaker(), |leaker| leaker.intern_enum(&item, true))),
+        shown(&errors_of(leaker(), |leaker| leaker.intern_enum(&item))),
         expected
     );
     let item: ItemUnion = parse_quote!(
@@ -268,7 +268,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
         }
     );
     assert_eq!(
-        shown(&errors_of(leaker(), |leaker| leaker.intern_union(&item, true))),
+        shown(&errors_of(leaker(), |leaker| leaker.intern_union(&item))),
         expected
     );
     // An inherent impl.
@@ -280,7 +280,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
     assert_eq!(shown(&error(&item)), expected);
     // An impl whose parts are visited by a scope: it does not know the trait.
     let outer = errors_of(leaker(), |leaker| {
-        leaker.enter_impl(&Generics::default(), &parse_quote!(S), None, true, |view| {
+        leaker.enter_impl(&Generics::default(), &parse_quote!(S), None, |view| {
             view.enter_generics(&Generics::default(), |view| {
                 view.visit_type(&parse_quote!(Rel<Self::A>))
             })
@@ -321,7 +321,7 @@ fn an_associated_item_of_self_in_a_bound_names_the_generics() {
         struct S<T: ::p::Tr<Self::A>>(Rel<T>);
     );
     let mut leaker = leaker();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let result = leaker.result();
     let err = result.errors();
     let items = shown(err);
@@ -493,7 +493,7 @@ fn the_note_of_a_hidden_lifetime_says_where_the_holder_is_not_leaked() {
         }
     );
     let mut leaker = leaker();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
     assert_eq!(

@@ -39,8 +39,8 @@ fn with_errors() -> LeakerResult {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
-    leaker.intern_struct(&st, true);
+    leaker.intern_trait(&tr);
+    leaker.intern_struct(&st);
     leaker.result()
 }
 
@@ -53,7 +53,7 @@ fn without_errors() -> LeakerResult {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.result()
 }
 
@@ -221,8 +221,9 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
         }
     );
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config, Options::new().check_values());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config);
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.errors().iter().any(|e| e.in_value && e.in_default));
     assert!(result.errors().iter().any(|e| e.paths.len() > 1));

@@ -86,7 +86,9 @@ fn show(cause: &Cause) -> String {
 }
 
 fn values() -> Leaker<Rules> {
-    Leaker::from_config(Rules::new(), Options::new().check_values())
+    let mut leaker = Leaker::from_config(Rules::new());
+    leaker.check_values = true;
+    leaker
 }
 
 /// The shape of the errors: `cause [reason]`, in order.
@@ -538,7 +540,7 @@ fn the_trait_of_a_bound_and_a_trait_object_is_a_trait_and_its_arguments_are_type
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let result = leaker.result();
     // The bound is a predicate, so it is copied whole, `Arg` in it too: it is a path of its error. The
     // trait object is written as it is, and its argument is an entry.
@@ -561,7 +563,7 @@ fn the_qualified_path_in_the_arguments_of_what_conflicts_is_leaked() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let result = leaker.result();
     assert_eq!(paths_of(&result), [vec!["type(Wrap)"]]);
     let entries: Vec<String> = result
@@ -580,7 +582,7 @@ fn the_macro_of_a_type_is_no_path_of_the_error() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    leaker.intern_struct(&item);
     let result = leaker.result();
     // The type macro is a type of its own, leaked whole: no `macro` path (that of a value is one,
     // see `tests/error_items.rs`).

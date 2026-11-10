@@ -11,15 +11,12 @@ use type_leak::*;
 #[test]
 fn iter_has_the_types_of_other_crates_and_each_entry_gets_a_repeater_impl() {
     let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote!(
-            struct S {
-                a: Rel,
-                b: ::foo::X,
-            }
-        ),
-        true,
-    );
+    leaker.intern_struct(&parse_quote!(
+        struct S {
+            a: Rel,
+            b: ::foo::X,
+        }
+    ));
     let result = leaker.result();
     result.clone().finish().unwrap();
     // One impl for each entry, the one of another crate too.
@@ -40,15 +37,12 @@ fn iter_has_the_types_of_other_crates_and_each_entry_gets_a_repeater_impl() {
 #[test]
 fn context_self_is_bound_for_self_in_a_trait_and_none_otherwise() {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr {
-                fn f(&self) -> Wrap<Self>;
-                fn g(&self) -> Rel;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr {
+            fn f(&self) -> Wrap<Self>;
+            fn g(&self) -> Rel;
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     // `Wrap<Self>` is written for the implementors of the trait. `Rel` is for any type.
     for (_, ty, context) in referrer.iter() {
@@ -64,25 +58,19 @@ fn context_self_is_bound_for_self_in_a_trait_and_none_otherwise() {
 #[test]
 fn has_self_tells_whether_an_entry_names_self() {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr {
-                fn f(&self) -> Wrap<Self::A>;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr {
+            fn f(&self) -> Wrap<Self::A>;
+        }
+    ));
     assert!(leaker.result().finish().unwrap().has_self());
 
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr {
-                fn f(&self) -> Wrap;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr {
+            fn f(&self) -> Wrap;
+        }
+    ));
     assert!(!leaker.result().finish().unwrap().has_self());
 }
 
@@ -91,17 +79,14 @@ fn has_self_tells_whether_an_entry_names_self() {
 #[test]
 fn has_self_is_true_if_some_entry_needs_self() {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<'a>
-            where
-                Self: 'a,
-            {
-                fn f(&'a self) -> &'a Rel;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<'a>
+        where
+            Self: 'a,
+        {
+            fn f(&'a self) -> &'a Rel;
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer
         .bucket_self(common::entry_id_at(&referrer, 0), 7)
@@ -112,14 +97,11 @@ fn has_self_is_true_if_some_entry_needs_self() {
 
     // No entry needs `Self`.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T> {
-                fn f(&self, t: Rel<T>) -> Rel2;
-            }
-        ),
-        true,
-    );
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<T> {
+            fn f(&self, t: Rel<T>) -> Rel2;
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer
         .iter()
@@ -136,7 +118,7 @@ fn complete_params_fills_the_defaulted_parameter() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // For `impl Tr<u8> for ..`, omitting `U`.
     let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
@@ -164,7 +146,7 @@ fn outermost_generics_as_leakers_replaces_despite_other_bounds() {
         }
     );
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(Leaked<#ix>) };
 
@@ -206,7 +188,7 @@ fn with_self_replaces_self_with_the_marker_host() {
         }
     );
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&tr, true);
+    let context = leaker.intern_trait(&tr);
     let mut sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>) -> Self::Out);
     let repeater: Path = parse_quote!(Repeater);
     let referrer = leaker.result().finish().unwrap();
@@ -393,7 +375,7 @@ fn a_leaker_that_allows_the_crates_makes_no_entry_of_their_types() {
             leaked: Rel<Self>,             // an entry: the macro writes the type
         }
     };
-    let mut leaker = Leaker::from_config(Rules::new().external_crates(), Options::new());
+    let mut leaker = Leaker::from_config(Rules::new().external_crates());
     let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
@@ -442,7 +424,7 @@ fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site(
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
 
     // 1. The copy of `f` in `impl Tr<u8> for ..`, with the entry written.
@@ -491,14 +473,11 @@ fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site(
 fn referrer_and_context_id_are_read_back_from_tokens() {
     use syn::parse::Parser;
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(
-        &parse_quote!(
-            struct S<T> {
-                a: Wrap<T>,
-            }
-        ),
-        true,
-    );
+    let top_level = leaker.intern_struct(&parse_quote!(
+        struct S<T> {
+            a: Wrap<T>,
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
 
     // Crate A writes both into the input of the macro of crate B...
@@ -519,15 +498,12 @@ fn referrer_and_context_id_are_read_back_from_tokens() {
 #[test]
 fn entry_id_is_written_with_the_usize_suffix_and_read_with_or_without_it() {
     let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote!(
-            struct S {
-                a: Rel,
-                b: Rel2,
-            }
-        ),
-        true,
-    );
+    leaker.intern_struct(&parse_quote!(
+        struct S {
+            a: Rel,
+            b: Rel2,
+        }
+    ));
     let referrer = leaker.result().finish().unwrap();
 
     let ids: Vec<EntryId> = referrer.iter().map(|(ix, _, _)| ix).collect();

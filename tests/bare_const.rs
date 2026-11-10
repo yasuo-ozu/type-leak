@@ -14,9 +14,9 @@
 //!   and the parameters of `W` are not known: an error, unless the module declares `ILEN` too
 //!   (`a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type`, and the
 //!   tests after it).
-//! - For any other cause (`Self` where it is denied, `Self::A`, the default of a parameter, a bound
-//!   that names `Self`, a method lifetime that the copy would leave unconstrained, an expression):
-//!   an error, with the identifier as its cause: `hard_causes_are_errors` pins the text.
+//! - For any other cause (`Self::A` of a type, the default of a parameter that names `Self`, a
+//!   method lifetime that the copy would leave unconstrained, an expression): an error, with the
+//!   identifier as its cause: `hard_causes_are_errors` pins the text.
 //! - The cases that are not affected: `unchanged_cases`.
 //! - Every place with every cause, checked for the property that the identifier is an entry on its
 //!   own only for a soft cause: `the_identifier_is_leaked_alone_only_for_a_soft_cause`.
@@ -44,29 +44,24 @@ macro_rules! item {
 fn analyze_with<A: Allow>(
     mut leaker: Leaker<A>,
     item: &Item,
-    allow_self: bool,
 ) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     match item {
-        Item::Struct(item) => leaker.intern_struct(item, allow_self),
-        Item::Enum(item) => leaker.intern_enum(item, allow_self),
-        Item::Union(item) => leaker.intern_union(item, allow_self),
-        Item::Impl(item) => leaker.intern_impl(item, allow_self),
-        Item::Trait(item) => leaker.intern_trait(item, allow_self),
+        Item::Struct(item) => leaker.intern_struct(item),
+        Item::Enum(item) => leaker.intern_enum(item),
+        Item::Union(item) => leaker.intern_union(item),
+        Item::Impl(item) => leaker.intern_impl(item),
+        Item::Trait(item) => leaker.intern_trait(item),
         Item::Mod(item) => leaker.intern_mod(item),
         _ => panic!("not an item to analyze"),
     };
     leaker.result().finish()
 }
 
-fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+fn analyze(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     // The absolute paths are allowed, so the types of `::l` are no entries: the entries are those
     // that depend on the context.
     let config = Rules::new().primitive().external_crates();
-    analyze_with(
-        Leaker::from_config(config, Options::new()),
-        item,
-        allow_self,
-    )
+    analyze_with(Leaker::from_config(config), item)
 }
 
 /// The entries, as text.
@@ -159,43 +154,41 @@ fn error(name: &str, notes: &[&str], help: &str) -> Shown {
     }
 }
 
-/// The error where `Self` is denied and the holder names it as `cause`.
-fn self_denied(name: &str, cause: &str) -> Shown {
-    error(name, &[&because_of(cause)], &absolute(name))
+/// The note of an error whose cause is `Self::A` of a type.
+const SELF_A_NOTE: &str = "`Self::A` is shorthand that rustc resolves through a trait that this \
+                           type implements. In the copy it is written in an impl of the Repeater, \
+                           which has no such trait (E0220, or E0223 ambiguous associated type), so \
+                           the trait must be written out. `Self` itself is fine";
+
+/// The error for the holder of `name` that names `Self::A` of a type.
+fn self_a(name: &str) -> Shown {
+    error(
+        name,
+        &[SELF_A_NOTE, &because_of("Self::A")],
+        &format!(
+            "{}, or replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that \
+             defines `A` with its absolute path",
+            absolute(name)
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
-// The report: `Self` is denied, and the holder of `ILEN` names it.
+// The report: the holder of `ILEN` names `Self`.
 // ---------------------------------------------------------------------------------------------
 
 /// The shape of the report: a struct whose field names `Self` in a path that holds a bare
-/// identifier. With `allow_self = false` the path cannot be leaked as a whole, and `ILEN` was
-/// leaked alone as a type (`type Type = ILEN;`), which does not compile if it is a const.
+/// identifier. `Self` can be leaked, so the path is the entry: it holds `ILEN` for a type and for a
+/// const. (`ILEN` was leaked alone as a type once, `type Type = ILEN;`, which does not compile if
+/// it is a const.)
 #[test]
-fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
+fn a_bare_identifier_beside_self_is_leaked_as_a_whole() {
     let item = item!(
         struct S {
             a: ::l::W<[Self], ILEN>,
         }
     );
-    let err = analyze(&item, false).err().unwrap();
-    assert_eq!(
-        shown(&err),
-        [self_denied("ILEN", "Self")],
-        "{}",
-        messages(&err)
-    );
-    // The exact text, as the macro shows it.
-    assert_eq!(
-        to_syn_error(&err).to_string(),
-        "`ILEN` may be a const, and the type that holds it cannot be leaked as a whole\n\
-         \n\
-         \x20 = note: it cannot be leaked as a whole because of `Self`\n\
-         \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
-         `{ ::my_crate::ILEN }` for a const)\n"
-    );
-    // With `Self` allowed the path is the entry: it holds `ILEN` for a type and for a const.
-    let referrer = analyze(&item, true).unwrap();
+    let referrer = analyze(&item).unwrap();
     assert_eq!(entries(&referrer), [":: l :: W < [Self] , ILEN >"]);
     // Written so that it is no cause: an absolute path (a const needs braces), or an item that is
     // in scope.
@@ -216,128 +209,86 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
             }
         ),
     ] {
-        let referrer = analyze(&item, false).unwrap();
+        let referrer = analyze(&item).unwrap();
         assert!(entries(&referrer).is_empty(), "{}", quote!(#item));
     }
     // Allowed by the config: left as written, so it is no cause either.
     let config = Rules::new()
         .external_crates()
         .or_if(starts_with(parse_quote!(ILEN)));
-    let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, false).unwrap();
+    let referrer = analyze_with(Leaker::from_config(config), &item).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
-/// Every kind of item that `Self` can be denied in, and every way the holder can name `Self`.
+/// Every kind of item, and every way the holder can name `Self`: the path that holds `ILEN` is the
+/// entry.
 #[test]
-fn a_denied_self_in_the_holder_is_an_error_for_every_kind_of_item() {
-    for (item, cause) in [
-        (
-            item!(
-                struct S {
-                    a: ::l::W<Self, ILEN>,
-                }
-            ),
-            "Self",
+fn the_holder_that_names_self_is_the_entry_for_every_kind_of_item() {
+    for item in [
+        item!(
+            struct S {
+                a: ::l::W<Self, ILEN>,
+            }
         ),
-        (
-            item!(
-                struct S {
-                    a: ::l::W<[Self; 2], ILEN>,
-                }
-            ),
-            "Self",
+        item!(
+            struct S {
+                a: ::l::W<[Self; 2], ILEN>,
+            }
         ),
-        (
-            item!(
-                struct S {
-                    a: <Self as ::l::Tr<ILEN>>::Out,
-                }
-            ),
-            "Self",
+        item!(
+            struct S {
+                a: <Self as ::l::Tr<ILEN>>::Out,
+            }
         ),
-        (
-            item!(
-                enum E {
-                    A(::l::W<Self, ILEN>),
-                    B,
-                }
-            ),
-            "Self",
+        item!(
+            enum E {
+                A(::l::W<Self, ILEN>),
+                B,
+            }
         ),
-        (
-            item!(
-                union U {
-                    a: ::core::mem::ManuallyDrop<::l::W<Self, ILEN>>,
-                }
-            ),
-            "Self",
+        item!(
+            union U {
+                a: ::core::mem::ManuallyDrop<::l::W<Self, ILEN>>,
+            }
         ),
-        (
-            item!(
-                impl ::l::Tr for ::l::Host {
-                    fn f(&self) -> ::l::W<Self, ILEN> {
-                        loop {}
-                    }
+        item!(
+            impl ::l::Tr for ::l::Host {
+                fn f(&self) -> ::l::W<Self, ILEN> {
+                    loop {}
                 }
-            ),
-            "Self",
+            }
         ),
-        (
-            item!(
-                impl ::l::Host {
-                    fn f(&self, x: ::l::W<Self, ILEN>) {}
-                }
-            ),
-            "Self",
+        item!(
+            impl ::l::Host {
+                fn f(&self, x: ::l::W<Self, ILEN>) {}
+            }
         ),
-        (
-            item!(
-                trait Tr {
-                    fn f(&self) -> ::l::W<Self, ILEN>;
-                }
-            ),
-            "Self",
+        item!(
+            trait Tr {
+                fn f(&self) -> ::l::W<Self, ILEN>;
+            }
         ),
         // A receiver is a type as well.
-        (
-            item!(
-                trait Tr {
-                    fn f(self: ::l::W<Self, ILEN>);
-                }
-            ),
-            "Self",
+        item!(
+            trait Tr {
+                fn f(self: ::l::W<Self, ILEN>);
+            }
         ),
-        (
-            item!(
-                trait Tr {
-                    type A;
-                    fn f(&self) -> ::l::W<Self::A, ILEN>;
-                }
-            ),
-            "Self :: A",
+        item!(
+            trait Tr {
+                type A;
+                fn f(&self) -> ::l::W<Self::A, ILEN>;
+            }
         ),
-        (
-            item!(
-                trait Tr {
-                    type G<'x>;
-                    fn f<'y>(&self, x: ::l::W<Self::G<'y>, ILEN>);
-                }
-            ),
-            "Self :: G < 'y >",
+        item!(
+            trait Tr {
+                type G<'x>;
+                fn f<'y>(&self, x: ::l::W<Self::G<'y>, ILEN>);
+            }
         ),
     ] {
-        let denied = analyze(&item, false)
-            .err()
-            .unwrap_or_else(|| panic!("accepted: {}", quote!(#item)));
-        assert_eq!(
-            shown(&denied),
-            [self_denied("ILEN", cause)],
-            "{}",
-            quote!(#item)
-        );
-        // Where `Self` can be leaked, the path that holds `ILEN` is the entry.
-        let referrer = analyze(&item, true)
-            .unwrap_or_else(|err| panic!("{}: {}", quote!(#item), messages(&err)));
+        let referrer =
+            analyze(&item).unwrap_or_else(|err| panic!("{}: {}", quote!(#item), messages(&err)));
         let leaked = entries(&referrer);
         assert!(
             leaked.len() == 1 && leaked[0] != "ILEN" && leaked[0].contains("ILEN"),
@@ -348,16 +299,10 @@ fn a_denied_self_in_the_holder_is_an_error_for_every_kind_of_item() {
     }
 }
 
-/// `Self::A` where `Self` is a type cannot be written in the Repeater's impl (E0220), whether or
-/// not `Self` is denied: the path is not leaked, and `ILEN` is no type.
+/// `Self::A` where `Self` is a type cannot be written in the Repeater's impl (E0220): the path is
+/// not leaked, and `ILEN` is no type.
 #[test]
 fn an_associated_type_of_a_self_that_is_a_type_is_an_error() {
-    let note = "`Self::A` is shorthand that rustc resolves through a trait that this type \
-                implements. In the copy it is written in an impl of the Repeater, which has no \
-                such trait (E0220, or E0223 ambiguous associated type), so the trait must be \
-                written out. `Self` itself is fine";
-    let replace = "replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that defines \
-                   `A` with its absolute path";
     for item in [
         item!(
             struct S {
@@ -370,37 +315,16 @@ fn an_associated_type_of_a_self_that_is_a_type_is_an_error() {
             }
         ),
     ] {
-        let err = analyze(&item, true).err().unwrap();
-        assert_eq!(
-            shown(&err),
-            [error(
-                "ILEN",
-                &[note, &because_of("Self::A")],
-                &format!("{}, or {}", absolute("ILEN"), replace)
-            )],
-            "{}",
-            quote!(#item)
-        );
-        // `Self` is denied as well: the advice is the same.
-        let err = analyze(&item, false).err().unwrap();
-        assert_eq!(
-            shown(&err),
-            [error(
-                "ILEN",
-                &[note, &because_of("Self::A")],
-                &format!("{}, or {}", absolute("ILEN"), replace)
-            )],
-            "{}",
-            quote!(#item)
-        );
-        // Written out with the trait, it is a path that is leaked as a whole.
+        let err = analyze(&item).err().unwrap();
+        assert_eq!(shown(&err), [self_a("ILEN")], "{}", quote!(#item));
     }
+    // Written out with the trait, it is a path that is leaked as a whole.
     let item = item!(
         struct S {
             a: ::l::W<<Self as ::l::Tr>::A, ILEN>,
         }
     );
-    let referrer = analyze(&item, true).unwrap();
+    let referrer = analyze(&item).unwrap();
     assert_eq!(
         entries(&referrer),
         [":: l :: W < < Self as :: l :: Tr > :: A , ILEN >"]
@@ -411,49 +335,30 @@ fn an_associated_type_of_a_self_that_is_a_type_is_an_error() {
 #[test]
 fn hard_causes_are_errors() {
     // The default of a parameter cannot depend on `Self`, so the path that holds the identifier is
-    // not leaked, with `Self` allowed or not.
-    for allow_self in [true, false] {
-        let item = item!(
-            trait Tr<T = ::l::W<Self, ILEN>> {}
-        );
-        let err = analyze(&item, allow_self).err().unwrap();
-        assert_eq!(
-            shown(&err),
-            [error(
-                "ILEN",
-                &["a default of a parameter cannot depend on `Self`"],
-                &format!(
-                    "{}, or name the type instead of `Self` in `::l::W<Self, ILEN>`",
-                    absolute("ILEN")
-                )
-            )],
-            "{}",
-            allow_self
-        );
-    }
+    // not leaked.
+    let item = item!(
+        trait Tr<T = ::l::W<Self, ILEN>> {}
+    );
+    let err = analyze(&item).err().unwrap();
+    assert_eq!(
+        shown(&err),
+        [error(
+            "ILEN",
+            &["a default of a parameter cannot depend on `Self`"],
+            &format!(
+                "{}, or name the type instead of `Self` in `::l::W<Self, ILEN>`",
+                absolute("ILEN")
+            )
+        )]
+    );
 
-    // A bound of a generic that the path uses names `Self`, which is denied.
+    // A bound of a generic that the path uses names `Self`: the path is leaked as a whole.
     let item = item!(
         struct S<T: ::core::convert::AsRef<Self>> {
             a: ::l::W<T, ILEN>,
         }
     );
-    let err = analyze(&item, false).err().unwrap();
-    assert_eq!(
-        shown(&err),
-        [error(
-            "ILEN",
-            &[
-                "the bounds of its generics mention `Self`, which cannot be leaked",
-                &because_of("Self")
-            ],
-            &format!(
-                "{}, or write the bound of the generics of `::l::W<T, ILEN>` without `Self`",
-                absolute("ILEN")
-            )
-        )]
-    );
-    let referrer = analyze(&item, true).unwrap();
+    let referrer = analyze(&item).unwrap();
     assert_eq!(entries(&referrer), [":: l :: W < T , ILEN >"]);
 
     // A method lifetime that the copy would leave unconstrained (E0195): no other argument keeps
@@ -463,35 +368,33 @@ fn hard_causes_are_errors() {
             fn f<'b>(&self, y: &'b dyn ::core::convert::AsRef<ILEN>) -> &'b u8;
         }
     );
-    for allow_self in [true, false] {
-        let err = analyze(&item, allow_self).err().unwrap();
-        assert_eq!(
-            shown(&err),
-            [error(
-                "ILEN",
-                &[
-                    "the lifetime of the trait object defaults to `'b`, a lifetime of the method \
-                     which its return type mentions and no other argument keeps as written (e.g. \
-                     `&'b self`), so the copy would have `'b` only in a projection, and rustc \
-                     rejects the implementation of a method whose lifetime is early-bound where \
-                     the trait's is late-bound (E0195)",
-                    &because_of("'b")
-                ],
-                &format!(
-                    "keep `'b` in another argument of the method (for example `&'b self`), {}, or \
-                     write the bound of the trait object (`dyn Trait + 'b`)",
-                    absolute("ILEN")
-                )
-            )]
-        );
-    }
+    let err = analyze(&item).err().unwrap();
+    assert_eq!(
+        shown(&err),
+        [error(
+            "ILEN",
+            &[
+                "the lifetime of the trait object defaults to `'b`, a lifetime of the method \
+                 which its return type mentions and no other argument keeps as written (e.g. \
+                 `&'b self`), so the copy would have `'b` only in a projection, and rustc \
+                 rejects the implementation of a method whose lifetime is early-bound where \
+                 the trait's is late-bound (E0195)",
+                &because_of("'b")
+            ],
+            &format!(
+                "keep `'b` in another argument of the method (for example `&'b self`), {}, or \
+                 write the bound of the trait object (`dyn Trait + 'b`)",
+                absolute("ILEN")
+            )
+        )]
+    );
     // Anchored, the reference is leaked as a whole.
     let anchored = item!(
         trait Tr {
             fn f<'b>(&'b self, y: &'b dyn ::core::convert::AsRef<ILEN>) -> &'b u8;
         }
     );
-    let referrer = analyze(&anchored, false).unwrap();
+    let referrer = analyze(&anchored).unwrap();
     assert_eq!(
         entries(&referrer),
         ["& 'b dyn :: core :: convert :: AsRef < ILEN >"]
@@ -503,7 +406,7 @@ fn hard_causes_are_errors() {
             a: ::l::W<{ ::l::m!() }, ILEN>,
         }
     );
-    let err = analyze(&item, true).err().unwrap();
+    let err = analyze(&item).err().unwrap();
     assert_eq!(
         shown(&err),
         [error(
@@ -517,7 +420,7 @@ fn hard_causes_are_errors() {
             a: ::l::W<<::l::V>::X, ILEN>,
         }
     );
-    let err = analyze(&item, true).err().unwrap();
+    let err = analyze(&item).err().unwrap();
     assert_eq!(
         shown(&err),
         [error("ILEN", &[&because_of("::l::V")], &absolute("ILEN"))]
@@ -530,47 +433,45 @@ fn every_identifier_is_told() {
     // Two identifiers of one path: the second is a note of the first.
     let item = item!(
         struct S {
-            a: ::l::W<ILEN, [Self], ILEN2>,
+            a: ::l::W<ILEN, Self::A, ILEN2>,
         }
     );
-    let err = analyze(&item, false).err().unwrap();
+    let err = analyze(&item).err().unwrap();
     assert_eq!(
         shown(&err),
         [Shown {
             notes: vec![
-                because_of("Self"),
+                SELF_A_NOTE.to_string(),
+                because_of("Self::A"),
                 "`ILEN2` also depends on the type context".to_string()
             ],
-            ..self_denied("ILEN", "Self")
+            ..self_a("ILEN")
         }]
     );
     // A path in a path: the inner one is an error, and so is the outer one, which holds `ILEN2`
-    // and names `Self` in the inner one.
+    // and names `Self::A` in the inner one.
     let item = item!(
-        trait Tr {
-            fn f(&self, x: ::l::W<::l::V<[Self], ILEN>, ILEN2>);
+        struct S {
+            a: ::l::W<::l::V<Self::A, ILEN>, ILEN2>,
         }
     );
-    let err = analyze(&item, false).err().unwrap();
-    assert_eq!(
-        shown(&err),
-        [self_denied("ILEN", "Self"), self_denied("ILEN2", "Self")]
-    );
+    let err = analyze(&item).err().unwrap();
+    assert_eq!(shown(&err), [self_a("ILEN"), self_a("ILEN2")]);
     // The outer path holds no identifier: the inner one is the only error.
     let item = item!(
-        trait Tr {
-            fn f(&self, x: ::l::W<::l::V<[Self], ILEN>, u8>);
+        struct S {
+            a: ::l::W<::l::V<Self::A, ILEN>, u8>,
         }
     );
-    let err = analyze(&item, false).err().unwrap();
-    assert_eq!(shown(&err), [self_denied("ILEN", "Self")]);
+    let err = analyze(&item).err().unwrap();
+    assert_eq!(shown(&err), [self_a("ILEN")]);
     // And where the inner path is leaked as a whole, the outer path is copied as written.
     let item = item!(
         trait Tr {
-            fn f(&self, x: ::l::W<::l::V<ILEN>, [Self]>);
+            fn f(&self, x: ::l::W<::l::V<ILEN>, &()>);
         }
     );
-    let referrer = analyze(&item, false).unwrap();
+    let referrer = analyze(&item).unwrap();
     assert_eq!(entries(&referrer), [":: l :: V < ILEN >"]);
 }
 
@@ -579,8 +480,8 @@ fn every_identifier_is_told() {
 #[test]
 fn check_agrees() {
     let mut leaker = Leaker::new();
-    let ty: Type = parse_quote!(::l::W<[Self], ILEN>);
-    let (_, result) = leaker.enter_type(&parse_quote!(S), &Generics::default(), false, |view| {
+    let ty: Type = parse_quote!(::l::W<Self::A, ILEN>);
+    let (_, result) = leaker.enter_type(&parse_quote!(S), &Generics::default(), |view| {
         view.check(&ty)
     });
     assert!(result.is_own);
@@ -598,22 +499,23 @@ fn check_agrees() {
             .iter()
             .map(|cause| cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
-        ["Self"]
+        ["Self :: A"]
     );
     assert_eq!(result.headline.as_deref(), Some(headline("ILEN").as_str()));
-    // With `Self` allowed it is leaked.
-    let (_, result) = leaker.enter_type(&parse_quote!(S), &Generics::default(), true, |view| {
-        view.check(&ty)
+    // `Self` itself can be leaked.
+    let own: Type = parse_quote!(::l::W<[Self], ILEN>);
+    let (_, result) = leaker.enter_type(&parse_quote!(S), &Generics::default(), |view| {
+        view.check(&own)
     });
     assert!(result.is_own && result.impossible.is_empty());
     // And `visit_type()` of a scope fails with the error.
     let mut leaker = Leaker::new();
-    leaker.enter_type(&parse_quote!(S), &Generics::default(), false, |view| {
+    leaker.enter_type(&parse_quote!(S), &Generics::default(), |view| {
         view.visit_type(&ty)
     });
     let result = leaker.result();
     let err = result.errors();
-    assert_eq!(shown(err), [self_denied("ILEN", "Self")]);
+    assert_eq!(shown(err), [self_a("ILEN")]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,35 +588,36 @@ fn soft_causes_leak_the_identifier() {
         ),
     ];
     for item in items {
-        for allow_self in [true, false] {
-            let referrer = analyze(&item, allow_self)
-                .unwrap_or_else(|err| panic!("{}: {}", quote!(#item), messages(&err)));
-            assert_eq!(
-                entries(&referrer),
-                ["ILEN"],
-                "{} (allow_self = {})",
-                quote!(#item),
-                allow_self
-            );
-        }
+        let referrer =
+            analyze(&item).unwrap_or_else(|err| panic!("{}: {}", quote!(#item), messages(&err)));
+        assert_eq!(entries(&referrer), ["ILEN"], "{}", quote!(#item));
     }
 }
 
-/// An elided lifetime and `Self` together: `Self` is the cause that can be fixed.
+/// An elided lifetime and `Self::A` together: `Self::A` is the cause that can be fixed.
 #[test]
 fn a_hard_cause_wins_over_a_soft_one() {
     let item = item!(
-        trait Tr {
-            fn f(&self, x: &u8) -> ::l::W<'_, Self, ILEN>;
+        impl ::l::Host {
+            fn f(&self, x: &u8) -> ::l::W<'_, Self::A, ILEN> {
+                loop {}
+            }
         }
     );
-    let err = analyze(&item, false).err().unwrap();
+    let err = analyze(&item).err().unwrap();
     let items = shown(&err);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].message, headline("ILEN"));
-    assert!(items[0].notes.contains(&because_of("Self")));
-    // With `Self` allowed, only the elided lifetime is left.
-    let referrer = analyze(&item, true).unwrap();
+    assert!(items[0].notes.contains(&because_of("Self::A")));
+    // Without `Self::A`, only the elided lifetime is left.
+    let item = item!(
+        impl ::l::Host {
+            fn f(&self, x: &u8) -> ::l::W<'_, Self, ILEN> {
+                loop {}
+            }
+        }
+    );
+    let referrer = analyze(&item).unwrap();
     assert_eq!(entries(&referrer), ["ILEN"]);
 }
 
@@ -747,47 +650,44 @@ fn unchanged_cases() {
             }
         ),
     ] {
-        for allow_self in [true, false] {
-            let referrer = analyze(&item, allow_self).unwrap();
-            assert_eq!(
-                entries(&referrer).len(),
-                1,
-                "{}: {:?}",
-                quote!(#item),
-                entries(&referrer)
-            );
-            assert!(entries(&referrer)[0].contains("ILEN"));
-        }
+        let referrer = analyze(&item).unwrap();
+        assert_eq!(
+            entries(&referrer).len(),
+            1,
+            "{}: {:?}",
+            quote!(#item),
+            entries(&referrer)
+        );
+        assert!(entries(&referrer)[0].contains("ILEN"));
     }
-    // With `Self` allowed, `Self` is in the entry: the trait's `Self` is the implementor.
+    // `Self` is in the entry: the trait's `Self` is the implementor.
     let item = item!(
         trait Tr {
             fn f(&self) -> ::l::W<Self, ILEN>;
         }
     );
     assert_eq!(
-        entries(&analyze(&item, true).unwrap()),
+        entries(&analyze(&item).unwrap()),
         [":: l :: W < Self , ILEN >"]
     );
     // Only an identifier written as an argument may be a const: in a tuple, an array, a function
     // pointer, a binding or parentheses it is a type, which is leaked alone also where the path
     // cannot be leaked.
     for ty in [
-        quote!(::l::W<(ILEN,), Self>),
-        quote!(::l::W<[ILEN; 2], Self>),
-        quote!(::l::W<fn(ILEN), Self>),
-        quote!(::l::W<(ILEN), Self>),
-        quote!((ILEN, Self)),
-        quote!(dyn ::l::Tr<Self, Out = ILEN>),
-        quote!(<ILEN as ::l::Tr<Self>>::Out),
+        quote!(::l::W<(ILEN,), <::l::V>::X>),
+        quote!(::l::W<[ILEN; 2], <::l::V>::X>),
+        quote!(::l::W<fn(ILEN), <::l::V>::X>),
+        quote!(::l::W<(ILEN), <::l::V>::X>),
+        quote!((ILEN, <::l::V>::X)),
+        quote!(dyn ::l::Tr<<::l::V>::X, Out = ILEN>),
+        quote!(<ILEN as ::l::Tr<<::l::V>::X>>::Out),
     ] {
         let item = item!(
             struct S {
                 a: #ty,
             }
         );
-        let referrer =
-            analyze(&item, false).unwrap_or_else(|err| panic!("{}: {}", ty, messages(&err)));
+        let referrer = analyze(&item).unwrap_or_else(|err| panic!("{}: {}", ty, messages(&err)));
         assert_eq!(entries(&referrer), ["ILEN"], "{}", ty);
     }
 }
@@ -804,13 +704,13 @@ enum Cause {
     /// An elided lifetime, a reference or `impl Trait`: the path cannot be leaked, and the
     /// identifier is leaked as a type (the docs name them).
     Soft,
-    /// Any other: `Self` where it is denied, `Self::A`, a type-relative path.
+    /// Any other: `Self::A`, a type-relative path, `Self` in the default of a parameter.
     Hard,
 }
 
-/// `::l::W<part, ILEN>` is analyzed in each place below, with `part` each of these, and with `Self`
-/// allowed or denied. The identifier is an entry on its own only for a soft cause, whatever the
-/// place: that is the property, and the one the bug broke (`W<[Self], ILEN>`, denied).
+/// `::l::W<part, ILEN>` is analyzed in each place below, with `part` each of these. The identifier
+/// is an entry on its own only for a soft cause, whatever the place: that is the property, and the
+/// one a bug broke before.
 #[test]
 fn the_identifier_is_leaked_alone_only_for_a_soft_cause() {
     let parts = [
@@ -871,15 +771,13 @@ fn the_identifier_is_leaked_alone_only_for_a_soft_cause() {
             ] {
                 let item: Item = syn::parse_str(&place.replace("$H", &holder))
                     .unwrap_or_else(|err| panic!("{} in {}: {}", holder, place, err));
-                for allow_self in [true, false] {
-                    let seen = format!("{} (allow_self = {}) in {}", holder, allow_self, place);
-                    match analyze(&item, allow_self) {
-                        Err(_) => rejected += 1,
-                        Ok(referrer) => {
-                            if entries(&referrer).iter().any(|entry| entry == "ILEN") {
-                                leaked += 1;
-                                assert_eq!(*cause, Cause::Soft, "{}", seen);
-                            }
+                let seen = format!("{} in {}", holder, place);
+                match analyze(&item) {
+                    Err(_) => rejected += 1,
+                    Ok(referrer) => {
+                        if entries(&referrer).iter().any(|entry| entry == "ILEN") {
+                            leaked += 1;
+                            assert_eq!(*cause, Cause::Soft, "{}", seen);
                         }
                     }
                 }
@@ -933,11 +831,7 @@ fn module_config() -> Rules<impl Allow + Clone> {
 }
 
 fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
-    analyze_with(
-        Leaker::from_config(module_config(), Options::new()),
-        item,
-        true,
-    )
+    analyze_with(Leaker::from_config(module_config()), item)
 }
 
 /// `ILEN` imported from outside the module (not declared by it), nested or not.
@@ -1044,7 +938,7 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
     // Allowed by the config: left as written, so it is no cause either.
     let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
     let config = module_config().or_if(starts_with(parse_quote!(ILEN)));
-    let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, true).unwrap();
+    let referrer = analyze_with(Leaker::from_config(config), &item).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -1247,7 +1141,7 @@ fn a_name_that_enter_mod_declares_beside_the_identifier_is_an_error_too() {
             .iter()
             .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
             .collect();
-        let mut leaker = Leaker::from_config(module_config(), Options::new());
+        let mut leaker = Leaker::from_config(module_config());
         leaker.enter_mod("m", declared, |view| view.visit_item(&item));
         leaker.result().finish()
     };

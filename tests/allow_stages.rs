@@ -363,8 +363,9 @@ fn a_trait_default_body_is_a_value_and_a_default() {
     assert!(error.in_value && error.in_default);
     // An impl's value is a value, not a default.
     let item: ItemImpl = parse_quote!(impl ::p::Tr for X { fn f(&self) { let _ = inner::f(); } });
-    let mut leaker = Leaker::from_config(reading_values(), Options::new().check_values());
-    leaker.intern_impl(&item, true);
+    let mut leaker = Leaker::from_config(reading_values());
+    leaker.check_values = true;
+    leaker.intern_impl(&item);
     let result = leaker.result();
     let error = &result.errors()[0];
     assert!(error.in_value && !error.in_default);

@@ -871,7 +871,7 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 
 fn of_trait(item: ItemTrait) -> Referrer {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     leaker.result().finish().unwrap()
 }
 
@@ -1070,7 +1070,7 @@ fn the_generics_of_a_top_level_context_are_declared_as_they_are() {
         trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); fn g(&self) -> All<'a, T>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     let all = referrer
         .iter()
@@ -1110,7 +1110,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
         }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    let top_level = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
     // The entry `All` has the generics of the trait: the context of it is the top-level one.
     let all = referrer
@@ -1165,7 +1165,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
 
 // ── The helpers against what a macro wrote by hand before them ───────────────────────────────
 
-use crate::{ErrorItem, ImplSelf, Options, Rules, SelfRequirement};
+use crate::{ErrorItem, ImplSelf, Rules, SelfRequirement};
 
 /// What a use site answers for a name: the argument at the position of the parameter of that name
 /// in `params`, if `args` reach it.
@@ -1214,13 +1214,13 @@ fn config() -> Rules {
 
 /// Analyzes a whole item the way a downstream macro does.
 fn analyze_result(item: &Item) -> (LeakerResult, ContextId) {
-    let mut leaker = Leaker::from_config(config(), Options::new());
+    let mut leaker = Leaker::from_config(config());
     let context = match item {
-        Item::Struct(i) => leaker.intern_struct(i, true),
-        Item::Enum(i) => leaker.intern_enum(i, true),
-        Item::Union(i) => leaker.intern_union(i, true),
-        Item::Trait(i) => leaker.intern_trait(i, true),
-        Item::Impl(i) => leaker.intern_impl(i, true),
+        Item::Struct(i) => leaker.intern_struct(i),
+        Item::Enum(i) => leaker.intern_enum(i),
+        Item::Union(i) => leaker.intern_union(i),
+        Item::Trait(i) => leaker.intern_trait(i),
+        Item::Impl(i) => leaker.intern_impl(i),
         Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     };
@@ -1786,8 +1786,8 @@ fn f09_fn_pointer_self_predicate_print_in_the_generics_of_an_entry() {
             fn r(&self) -> Rel<Self> where Self: Clone;
         }
     };
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_trait(&item, true);
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     let self_tys: Vec<Type> = vec![
         parse_quote!(&'static unsafe fn(i32, R0)),

@@ -386,7 +386,7 @@ fn error(reason: &str, cause: &str, tokens: &str) -> (String, String, String) {
 }
 
 /// A struct, an enum, a union, an impl, a module and a trait are each analyzed by the matching
-/// `intern_*` and accepted (or rejected, for a `Self` that is denied) as the Leaker's crate says, and
+/// `intern_*` and accepted (or rejected) as the Leaker's crate says, and
 /// the Referrer's crate checked every copied type against the original: `checked` is the number of
 /// type positions of the item which have a witness, or in a module name what it declares and are
 /// compared with the original written for the Referrer's crate. The fixtures of some findings
@@ -395,15 +395,10 @@ fn error(reason: &str, cause: &str, tokens: &str) -> (String, String, String) {
 fn every_item_kind_is_leaked_across_crates() {
     use type_leak_test_leaker::*;
     let table = [
-        // structs: `Self`, a denied `Self` that is not named, a denied `Self` that is named, and an
-        // optional entry (a type of another crate)
+        // structs: `Self`, a `Self` that is not named, and an optional entry (a type of another
+        // crate)
         (9001, __tl_report_9001!(), ok("struct", 5, 5, 5)),
         (9002, __tl_report_9002!(), ok("struct", 3, 3, 3)),
-        (
-            9003,
-            __tl_report_9003!(),
-            rejected("struct", "useabsolutepath:'Wrap<Self>'"),
-        ),
         (9004, __tl_report_9004!(), ok("struct", 3, 3, 3)),
         // a where clause on a type that is not a parameter, in the context of its entry (`Vec<T>` of
         // `::std` is no entry, F71: the predicate `Vec<T>: Clone` must stay as written, or the impl of
@@ -415,7 +410,7 @@ fn every_item_kind_is_leaked_across_crates() {
         // unions
         (9021, __tl_report_9021!(), ok("union", 3, 3, 3)),
         (9022, __tl_report_9022!(), ok("union", 2, 2, 2)),
-        // impls: inherent, of a trait (also with a relative argument), and with `Self` denied
+        // impls: inherent, of a trait (also with a relative argument), and one that names no `Self`
         (9031, __tl_report_9031!(), ok("impl-inherent", 6, 6, 6)),
         (9032, __tl_report_9032!(), ok("impl-trait", 2, 5, 5)),
         (9033, __tl_report_9033!(), ok("impl-inherent", 2, 2, 2)),
@@ -435,26 +430,13 @@ fn every_item_kind_is_leaked_across_crates() {
                 "`LEN4`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
             ),
         ),
-        // traits: `Self` denied and not named, denied and named, and an unsized implementor
+        // traits: `Self` not named, and an unsized implementor
         (9051, __tl_report_9051!(), ok("trait", 3, 3, 3)),
-        (
-            9052,
-            __tl_report_9052!(),
-            rejected("trait", "useabsolutepath:'Wrap<Self>'"),
-        ),
         (9053, __tl_report_9053!(), ok("trait", 4, 6, 6)),
         // a bare identifier that is a const (`LEN`): the path that holds it is an entry as a whole,
-        // also with `Self` in it; with `Self` denied the Leaker rejects it, as the const would not
-        // be a type; a bare identifier that is a type is leaked alone where the path cannot be
+        // also with `Self` in it; a bare identifier that is a type is leaked alone where the path
+        // cannot be
         (9081, __tl_report_9081!(), ok("struct", 2, 2, 2)),
-        (
-            9082,
-            __tl_report_9082!(),
-            rejected(
-                "struct",
-                "`LEN`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
-            ),
-        ),
         (9083, __tl_report_9083!(), ok("trait", 3, 3, 3)),
         (9084, __tl_report_9084!(), ok("trait", 1, 5, 1)),
         // items nested in a module, which name their own `Self`
@@ -473,7 +455,7 @@ fn every_item_kind_is_leaked_across_crates() {
             __tl_report_9115!(),
             rejected(
                 "struct",
-                "`Wrap<Self>`hasagenericwhoseboundmentions`Self`,whichcannotbeleaked",
+                "`Wrap<Self>`names`Self`andhasagenericwhoseboundmentions`Self`",
             ),
         ),
         // the entry is in a bound of another generic, in a where predicate, keeps a lifetime, and
@@ -1437,7 +1419,7 @@ fn accepted_conflicts_are_copied_as_written() {
     fn elided_with_sibling<T: l::ElidedWithSibling>() {}
     elided_with_sibling::<r::Host9189>();
     // (c) The copy holds the original types: `Self` is replaced by the Visitor with the Leaker's
-    // type, as it is for any struct with `allow_self = true`.
+    // type, as it is for any struct.
     let copy = r::NoSelfMeaning {
         rel: l::Rel(2),
         me: l::Wrap(PhantomData),
@@ -1560,7 +1542,7 @@ fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_no
 // Fragments of impls, analyzed with the scope API.
 // ---------------------------------------------------------------------------------------------
 
-/// `coinduction`'s shape: `enter_impl(.., false, ..)` with `visit_path_arguments()`, the
+/// `coinduction`'s shape: `enter_impl(..)` with `visit_path_arguments()`, the
 /// Repeater's impls for a marker (`ImplSelf::Marker`) of the entries, and the Referrer's copy of the self type, the trait and its
 /// arguments with `Referrer::visitor(context, ..)` and `repeater_projection()` with the generics
 /// passed by their own names. The Referrer's crate checks the copy: each type is the
@@ -1765,15 +1747,6 @@ fn errors_are_reported_item_by_item_through_a_macro() {
     }
     assert_eq!(SCOPE_ERRORS_MULTI_COMPILE_ERRORS, 3);
 
-    // `Self` is denied for the impl.
-    let denied = rows(SCOPE_ERRORS_SELF_DENIED);
-    assert_eq!(denied.len(), 1);
-    assert_eq!(denied[0].0, "useabsolutepath:'Wrap<Self>'");
-    assert_eq!(denied[0].1, "Wrap<Self>");
-    assert!(denied[0].2.starts_with("Wrap"), "{:?}", denied[0].2);
-    assert_eq!(denied[0].3, vec![(because("Self"), "Self".to_string())]);
-    assert_eq!(SCOPE_ERRORS_SELF_DENIED_COMPILE_ERRORS, 1);
-
     // `Self` where no scope declares it: one item for each mention, at the mention.
     let without = rows(SCOPE_ERRORS_SELF_WITHOUT_MEANING);
     assert_eq!(without.len(), 2);
@@ -1813,10 +1786,10 @@ fn an_optional_entry_that_holds_a_method_lifetime_is_copied_as_written() {
 /// F44 and F45: parts that the Visitor must leave as written, with a trait object inside whose
 /// lifetime comes from the path around it (`dyn SharedTr + 'a`), and the entry `dyn SharedTr`
 /// (`+ 'static`) elsewhere in the same item. The copy compiles in the Referrer's crate only if the
-/// part is not rewritten. The conflicts are about `Self`: denied and named by a bound, named by a
-/// predicate of the trait, named by the bound of an impl whose self type holds the generic, and
-/// named by the bound of a struct nested in a module (copied by a visitor without
-/// `with_nested_self()`).
+/// part is not rewritten. The conflicts are about `Self`: named by a predicate of the trait, and
+/// named by the bound of an impl whose self type holds the generic. The struct nested in a module
+/// whose bound names its `Self` (9198) is no part any more: it is an entry for any type, with the
+/// risk `NestedSelfInBounds`, which the accepted copy writes with its own type.
 #[test]
 fn parts_that_name_self_are_left_as_written() {
     use type_leak_test_leaker::kinds as l;
@@ -1824,10 +1797,9 @@ fn parts_that_name_self_are_left_as_written() {
     use type_leak_test_referrer::accepted as r;
 
     let table = [
-        (9195, __tl_report_9195!(), allowed("trait", 1, 2, 2)),
         (9196, __tl_report_9196!(), allowed("trait", 1, 1, 1)),
         (9197, __tl_report_9197!(), allowed("impl-inherent", 1, 2, 2)),
-        (9198, __tl_report_9198!(), allowed("struct", 1, 2, 2)),
+        (9198, __tl_report_9198!(), allowed("struct", 2, 2, 2)),
     ];
     for (id, text, expected) in table {
         assert_eq!(reported(id, text), expected, "item {}: {}", id, text);
@@ -1835,10 +1807,6 @@ fn parts_that_name_self_are_left_as_written() {
 
     // The errors that were allowed: the reason, the kind of the cause and its tokens.
     let obj = "::type_leak_test_leaker::kinds::ObjOf<'a,T,dynSharedTr>";
-    assert_eq!(
-        errors(__tl_errors_9195!()),
-        [error("DeniedSelfInBounds", "Type", obj)]
-    );
     assert_eq!(
         errors(__tl_errors_9196!()),
         [error(
@@ -1865,8 +1833,6 @@ fn parts_that_name_self_are_left_as_written() {
 
     // The hosts implement the traits, with `ObjOf<'a, .., dyn SharedTr + 'a>` in the signature as
     // written, and the entry in `g`.
-    fn denied<T: l::DeniedSelfObject<'static>>() {}
-    denied::<r::Host9195>();
     fn predicate<T: l::PredicateObject<'static>>() {}
     predicate::<r::Host9196>();
 }
@@ -2174,20 +2140,13 @@ fn the_bindings_in_a_discriminant_and_in_the_default_of_a_const_parameter_are_lo
 }
 
 /// Flat recovery: a type whose own path conflicts is written as it is, and the types in it are
-/// leaked as usual. `Two<T, Leaf>` is a conflict (`DeniedSelfInBounds` in a trait that denies
-/// `Self`, `SelfInImplSelfType` in an impl whose bound names it), copied with `Two` as written, and
-/// `Leaf` in it is the entry that `g` has too: the Referrer's crate replaces it
-/// (`Two<T, <..>::Type>`), and the host implements the trait of the Leaker's crate.
+/// leaked as usual. `Two<T, Leaf>` is a conflict (`SelfInImplSelfType` in an impl whose bound names
+/// `Self`), copied with `Two` as written, and `Leaf` in it is the entry that `g` has too: the
+/// Referrer's crate replaces it (`Two<T, <..>::Type>`).
 #[test]
 fn a_type_whose_own_path_conflicts_is_written_as_it_is_and_the_types_in_it_are_leaked() {
-    use type_leak_test_leaker::kinds as l;
     use type_leak_test_leaker::*;
-    use type_leak_test_referrer::accepted as r;
 
-    assert_eq!(
-        reported(9219, __tl_report_9219!()),
-        allowed("trait", 1, 2, 2)
-    );
     assert_eq!(
         reported(9220, __tl_report_9220!()),
         allowed("impl-inherent", 1, 2, 2)
@@ -2198,13 +2157,10 @@ fn a_type_whose_own_path_conflicts_is_written_as_it_is_and_the_types_in_it_are_l
             .map(|(reason, _, _)| reason)
             .collect()
     };
-    assert_eq!(reasons(__tl_errors_9219!()), ["DeniedSelfInBounds"]);
     assert_eq!(
         reasons(__tl_errors_9220!()),
         ["SelfInImplSelfType", "UnprovableBound"]
     );
-    fn denied<T: l::DeniedSelfFlat>() {}
-    denied::<r::Host9219>();
 }
 
 /// Flat recovery: the types in a type written as it is that hold the lifetime of a method are

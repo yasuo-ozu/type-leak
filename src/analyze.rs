@@ -118,9 +118,8 @@ struct Must {
 /// Each is soft or hard. A soft cause is one under which a bare identifier argument that may be a
 /// const is leaked as a type, and the copy fails if it is a const (the docs say so): an elided
 /// lifetime or reference (and a trait object that takes its lifetime from it) and `impl Trait`.
-/// Any other cause is hard (`push()`, so a new cause is hard unless it is made soft): `Self` where
-/// it is denied, `Self::A`, a method lifetime that the copy would leave unconstrained, an
-/// expression that cannot be leaked. A type that holds a bare identifier and cannot be leaked
+/// Any other cause is hard (`push()`, so a new cause is hard unless it is made soft): `Self::A`, a
+/// method lifetime that the copy would leave unconstrained, an expression that cannot be leaked. A type that holds a bare identifier and cannot be leaked
 /// because of a hard cause is an error (see [`AnalyzeVisitor::bare_conflict()`]). So is a path of
 /// another crate that holds one beside an item of the module, which is no cause in this list
 /// ([`AnalyzeVisitor::bare_beside_module_item()`]).
@@ -468,7 +467,6 @@ pub(crate) enum ScopeSpec {
 
 pub(crate) struct DeclaredSelf {
     requirement: SelfRequirement,
-    allow_self: bool,
     /// `Self` is a type that the copy writes (the self type of an impl), not the item itself.
     written: bool,
     /// The scope is that of an inherent impl: no trait declares the signatures of its methods
@@ -581,12 +579,10 @@ pub(crate) trait Scopes {
         &mut self,
         ident: &Ident,
         generics: &Generics,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::of_item(ident, generics),
-            allow_self,
             written: false,
             inherent: false,
             gats: Vec::new(),
@@ -601,12 +597,10 @@ pub(crate) trait Scopes {
         generics: &Generics,
         self_ty: &Type,
         trait_: Option<&Path>,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::Type(self_ty.clone()),
-            allow_self,
             written: true,
             inherent: trait_.is_none(),
             gats: Vec::new(),
@@ -618,10 +612,9 @@ pub(crate) trait Scopes {
         &mut self,
         ident: &Ident,
         generics: &Generics,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
-        self.enter_trait_of(ident, generics, Vec::new(), allow_self, f)
+        self.enter_trait_of(ident, generics, Vec::new(), f)
     }
 
     /// Like `enter_trait()` for a trait whose items the Leaker sees, with their `gats`.
@@ -630,12 +623,10 @@ pub(crate) trait Scopes {
         ident: &Ident,
         generics: &Generics,
         gats: Vec<Gat>,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::of_trait(ident, generics),
-            allow_self,
             written: false,
             inherent: false,
             gats,
@@ -658,7 +649,6 @@ struct ScopeMark {
     self_nested: bool,
     self_trait: Option<ImplTrait>,
     self_depth: usize,
-    allow_self: bool,
     self_type_walk: Option<bool>,
     inherent_impl: bool,
     not_optional: usize,
@@ -746,7 +736,6 @@ pub(crate) struct AnalyzeVisitor<'a, A> {
     /// from the effects, because a type leaked whole drops those of its parts.
     self_errors: Vec<SelfMention>,
     top_levels: Vec<ContextId>,
-    allow_self: bool,
     /// The generics in scope, innermost last. The first are the Leaker's.
     scopes: Vec<Scope>,
     binders: Vec<Binder>,
@@ -772,12 +761,12 @@ pub(crate) struct AnalyzeVisitor<'a, A> {
     /// item of a module, or `View::visit_item()`): the copy declares a type of its own there, so
     /// its `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
     /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
-    /// [`AnalyzeVisitor::self_in_bounds()`]), and so is one that names it with such a bound if
-    /// `nested_self_entries` is set. The default of a parameter has no entry for `Self` (see
-    /// `in_nested_default`). An absolute type that names `Self` is not an
-    /// optional entry (see [`AnalyzeVisitor::names_nested_self()`]): it is copied as written, so
-    /// its `Self` is the copy's own. The `Self` of a scope (`intern_struct()`, `enter_type()`) is
-    /// the outermost item's, which the Visitor writes as the Leaker's type.
+    /// [`AnalyzeVisitor::self_in_bounds()`]), and so is one that names it with such a bound, with
+    /// the error [`Reason::NestedSelfInBounds`] (see `nested_self_risk()`). The default of a
+    /// parameter has no entry for `Self` (see `in_nested_default`). An absolute type that names
+    /// `Self` is not an optional entry (see [`AnalyzeVisitor::names_nested_self()`]): it is copied
+    /// as written, so its `Self` is the copy's own. The `Self` of a scope (`intern_struct()`,
+    /// `enter_type()`) is the outermost item's, which the Visitor writes as the Leaker's type.
     self_nested: bool,
     /// The trait that the impl declaring `Self` implements, if it is an impl of a trait: what a
     /// `Self::A` is written through (see [`AssocSelf`]).
@@ -847,12 +836,9 @@ pub(crate) struct AnalyzeVisitor<'a, A> {
     /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
     /// effects, like `self_errors`.
     env_errors: Vec<CheckResult>,
-    /// The values of an item are read too (see [`check_values()`](crate::Options::check_values)).
+    /// The values of an item are read too (see
+    /// [`Leaker::check_values`](crate::Leaker::check_values)).
     check_values: bool,
-    /// An entry whose type names the `Self` of a struct, an enum or a union nested in the analyzed
-    /// syntax, and a bound of whose generics does, is for any type (see
-    /// [`nested_self_entries()`](crate::Options::nested_self_entries)).
-    nested_self_entries: bool,
     /// A value is being read ([`AnalyzeVisitor::place()`]).
     in_value: bool,
     /// The default body or the default value of an associated const of a trait is being read.
@@ -909,7 +895,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             contexts: Contexts::default(),
             self_errors: Vec::new(),
             top_levels: Vec::new(),
-            allow_self: true,
             scopes: vec![Scope::new(generics, None)],
             binders: Vec::new(),
             elisions: Vec::new(),
@@ -947,7 +932,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             not_optional: Vec::new(),
             env_errors: Vec::new(),
             check_values: false,
-            nested_self_entries: false,
             in_value: false,
             in_trait_default: false,
             in_param_default: false,
@@ -955,17 +939,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// Makes the visitor read the values of the items it visits, or not (see
-    /// [`check_values()`](crate::Options::check_values)).
+    /// [`Leaker::check_values`](crate::Leaker::check_values)).
     pub(crate) fn reading_values(mut self, check_values: bool) -> Self {
         self.check_values = check_values;
-        self
-    }
-
-    /// Accepts an entry whose type names the `Self` of a nested struct, enum or union together with
-    /// a bound that does, as an entry for any type (see
-    /// [`nested_self_entries()`](crate::Options::nested_self_entries)), or not.
-    pub(crate) fn with_nested_self_entries(mut self, nested_self_entries: bool) -> Self {
-        self.nested_self_entries = nested_self_entries;
         self
     }
 
@@ -1282,9 +1258,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// Returns `true` if `ty`, with `context`, names the `Self` of a struct, an enum or a union
     /// nested in the analyzed syntax (`self_nested`): the copy's own type, not the Leaker's. (A
     /// type that does not name it, but has a bound that does, is for any type,
-    /// [`SelfRequirement::Any`]. So is one that names it with such a bound, if
-    /// `nested_self_entries` is set: that is an entry to be leaked, and an absolute type of that
-    /// kind is still copied as written.)
+    /// [`SelfRequirement::Any`]. So is one that names it with such a bound: that is an entry to
+    /// be leaked, with an error (see `nested_self_risk()`), and an absolute type of that kind is
+    /// still copied as written.)
     fn names_nested_self(&self, ty: &Type, context: &Context) -> bool {
         self.self_nested
             && match context.self_ty() {
@@ -1294,8 +1270,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
     }
 
-    /// Returns the first mention of `Self` in the generics of `context`, if `Self` may not be
-    /// leaked. A written `Self: 'a` counts: it is encoded as `&'a Self`, which needs `Self` too.
+    /// Returns the first mention of `Self` in the generics of `context`, if it may not be leaked:
+    /// only in a nested item, where `Self` is not the Leaker's type (a written `Self: 'a` counts:
+    /// it is encoded as `&'a Self`, which needs `Self` too).
     ///
     /// The `Self` of a struct, an enum or a union nested in the analyzed syntax (`self_nested`) is
     /// the copy's own type there, which is not the Leaker's. A type that does not name it, but has
@@ -1303,23 +1280,18 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// for ([`SelfRequirement::Any`]), and the copy passes its own: that is fine. A type that
     /// names it too (`Rel2<Self, T>`) is for the Leaker's type, which the bound that the
     /// environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does not hold for in
-    /// the copy, whose own type has it (E0277), and the impl cannot be for any type unless the
-    /// Leaker is configured to accept the risk: what the type needs of `Self` to be well-formed is
-    /// not known ([`nested_self_entries()`](crate::Options::nested_self_entries); see `own_context()`). A
-    /// predicate on another type, which an impl proves (`Self: Sized`, `Vec<Self>: Clone`), and
-    /// `Self: 'a` are fine.
+    /// the copy, whose own type has it (E0277), so the impl is for any type, at a risk: what the
+    /// type needs of `Self` to be well-formed is not known ([`Reason::NestedSelfInBounds`]; see
+    /// `own_context()`). A predicate on another type, which an impl proves (`Self: Sized`,
+    /// `Vec<Self>: Clone`), and `Self: 'a` are fine.
     fn self_in_bounds(&self, context: &Context) -> Option<Cause> {
-        if self.self_nested {
-            return match context.self_ty() {
-                Some(SelfRequirement::Any) => None,
-                _ => self_in_environment_bounds(context),
-            };
-        }
-        if self.allow_self {
+        if !self.self_nested {
             return None;
         }
-        first_self_in_generics(context.generics())
-            .or_else(|| (!context.self_outlives().is_empty()).then(Cause::self_type))
+        match context.self_ty() {
+            Some(SelfRequirement::Any) => None,
+            _ => self_in_environment_bounds(context),
+        }
     }
 
     fn output_binder(&self, context: &Context) -> Option<(Lifetime, usize)> {
@@ -1446,7 +1418,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             self_nested: self.self_nested,
             self_trait: self.self_trait.clone(),
             self_depth: self.self_depth,
-            allow_self: self.allow_self,
             self_type_walk: self.self_type_walk,
             inherent_impl: self.inherent_impl,
             not_optional: self.not_optional.len(),
@@ -1473,7 +1444,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 self.self_nested = false;
                 self.self_trait = None;
                 self.self_depth = 0;
-                self.allow_self = true;
                 mark.module = Some(id);
             }
             ScopeSpec::Generics {
@@ -1487,7 +1457,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     self.self_nested = false;
                     self.self_trait = trait_path.as_deref().map(|path| self.impl_trait(path));
                     self.inherent_impl = declared.inherent;
-                    self.allow_self = declared.allow_self;
                 }
                 let gats = declares
                     .as_ref()
@@ -1554,7 +1523,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.self_nested = mark.self_nested;
         self.self_trait = mark.self_trait.clone();
         self.self_depth = mark.self_depth;
-        self.allow_self = mark.allow_self;
         self.self_type_walk = mark.self_type_walk;
         self.inherent_impl = mark.inherent_impl;
     }
@@ -1893,14 +1861,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
         };
         let self_in_bounds = self.self_in_bounds(&context);
-        // With the option, an entry that names the `Self` of a nested struct, enum or union and has
-        // a bound that does is for any type, and the copy passes its own: the type keeps `Self`.
-        // Not in a default, where the copy cannot write `Self` (E0735).
-        if self_in_bounds.is_some()
-            && self.self_nested
-            && self.nested_self_entries
-            && !self.in_nested_default
-        {
+        // An entry that names the `Self` of a nested struct, enum or union and has a bound that
+        // does is for any type, and the copy passes its own: the type keeps `Self` (the walk reports the
+        // risk, see `nested_self_risk()`). Not in a default, where the copy cannot write `Self`
+        // (E0735).
+        if self_in_bounds.is_some() && self.self_nested && !self.in_nested_default {
             if let Ok(any) = self.context_of_as(ty, inner, true) {
                 return match self.associated_self_in_bounds(&any) {
                     Some(conflict) => Err(conflict.of(ty, self.own_paths(inner.must_start, depth))),
@@ -1933,7 +1898,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 place: Place::default(),
                 paths: self.own_paths(inner.must_start, depth),
             }),
-            Some(self_path) if self.self_nested => Err(CheckResult {
+            Some(self_path) => Err(CheckResult {
                 must: vec![Cause::Type(ty.clone())],
                 impossible: vec![self_path.clone()],
                 is_own: true,
@@ -1959,31 +1924,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 )),
                 cause: None,
                 reason: Reason::NestedSelfInBounds,
-                seen: 0,
-                part: None,
-                place: Place::default(),
-                paths: self.own_paths(inner.must_start, depth),
-            }),
-            Some(self_path) => Err(CheckResult {
-                must: vec![Cause::Type(ty.clone())],
-                impossible: vec![self_path.clone()],
-                is_own: true,
-                optional: false,
-                note: Some(
-                    "the bounds of its generics mention `Self`, which cannot be leaked".to_string(),
-                ),
-                help: Some(format!(
-                    "write the bound of the generics of `{}` without `{}`",
-                    tidy(&quote!(#ty)),
-                    tidy(&self_path.shown())
-                )),
-                // The fault is the bound, not the path of the type that uses it.
-                headline: Some(format!(
-                    "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
-                    tidy(&quote!(#ty))
-                )),
-                cause: None,
-                reason: Reason::DeniedSelfInBounds,
                 seen: 0,
                 part: None,
                 place: Place::default(),
@@ -2122,7 +2062,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             .map(|name| tidy(&name.shown()))
             .unwrap_or_default();
         // The type itself is no cause (a default that names `Self` says so in its note), and a
-        // cause that is found twice (`Self::A`, denied and not resolvable) is told once.
+        // cause that is found twice is told once.
         let holder = Cause::Type(ty.clone());
         let mut seen: Vec<Cause> = Vec::new();
         conflict.impossible.retain(|cause| {
@@ -2423,6 +2363,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 }
             }
         }
+        let mut risk = None;
         let mut pending = match own {
             Some(Ok(context)) => {
                 let cycle = self
@@ -2437,6 +2378,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     return self.conflict_inside(conflict, inner.self_start, true, effects);
                 }
                 self.not_optional_in_bounds(&context);
+                if self.nested_self_risk(ty, &context) {
+                    risk = Some(self.nested_self_error(ty, &inner));
+                }
                 PendingType {
                     is_must_intern: true,
                     in_graph: true,
@@ -2551,6 +2495,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             for must in &mut self.musts[inner.must_start..] {
                 must.covered = true;
             }
+        }
+        // The risk comes first, as a conflict does.
+        if let Some(risk) = risk {
+            self.frame.effects.push(Effect::Error(Box::new(risk)));
         }
         self.frame.effects.push(Effect::Type(Box::new(pending)));
     }
@@ -2710,22 +2658,73 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         }
     }
 
+    /// Returns `true` if `ty`, an entry in `context`, names the `Self` of a struct, an enum or a
+    /// union nested in the analyzed syntax and uses a generic whose bound names it (`Rel2<Self, T>`
+    /// with `T: AsRef<Self>`): it is an entry for any type ([`SelfRequirement::Any`]) with `Self` in
+    /// its type, which the copy writes with its own type. That is a risk
+    /// ([`Reason::NestedSelfInBounds`]), which [`AnalyzeVisitor::nested_self_error()`] reports.
+    fn nested_self_risk(&self, ty: &Type, context: &Context) -> bool {
+        self.self_nested
+            && matches!(context.self_ty(), Some(SelfRequirement::Any))
+            && type_mentions_self(ty)
+    }
+
+    /// The error of an entry for which [`AnalyzeVisitor::nested_self_risk()`] holds. The type is
+    /// leaked all the same: nothing in it is copied as written, so the error has no paths.
+    fn nested_self_error(&self, ty: &Type, inner: &Frame) -> CheckResult {
+        let self_path = self
+            .context_of(ty, inner)
+            .ok()
+            .and_then(|plain| self.self_in_bounds(&plain))
+            .unwrap_or_else(Cause::self_type);
+        CheckResult {
+            must: vec![Cause::Type(ty.clone())],
+            impossible: Vec::new(),
+            is_own: true,
+            optional: false,
+            note: Some(
+                "it names the `Self` of an item nested in the analyzed syntax, and so do the \
+                 bounds of its generics: the entry is for any type that the bound holds for, and \
+                 the copy passes its own type as `Self`. That is right only if the declaration of \
+                 the type has no trait bound on the parameter that receives `Self` (E0277 in the \
+                 Leaker's crate), and, on rustc before 1.70, if the copy's field is not the last \
+                 field of a struct (E0275)"
+                    .to_string(),
+            ),
+            help: Some(format!(
+                "write the bound of the generics of `{}` without `{}`, write the type without \
+                 `Self`, or write the type with an absolute path (it is copied as written, and \
+                 its `Self` is the copy's own)",
+                tidy(&quote!(#ty)),
+                tidy(&self_path.shown())
+            )),
+            headline: Some(format!(
+                "`{}` names `Self` and has a generic whose bound mentions `Self`",
+                tidy(&quote!(#ty))
+            )),
+            cause: None,
+            reason: Reason::NestedSelfInBounds,
+            seen: inner.self_start,
+            part: None,
+            place: self.place(),
+            paths: Vec::new(),
+        }
+    }
+
     /// Like `env_cycle()` for an entry in a predicate that names the `Self` of a nested struct, enum
-    /// or union and is for any type ([`Options::nested_self_entries()`](crate::Options::nested_self_entries)). Its impl leaves out the generics the type does not use, so
-    /// `context` does not have a bound that names a leaked type (`T: AsRef<Rel<Self>>`), but the
-    /// impl of an entry that uses the generic has it, and the copy has only the rewritten form in
-    /// its environment (E0277, `Rel<(Self, T)>` beside it). So the type is judged with the generics
-    /// that `Self` names, as `intern_*` judges it, which writes `Self` as the Leaker's type.
+    /// or union and is for any type (`nested_self_risk()`). Its impl leaves out the generics the
+    /// type does not use, so `context` does not have a bound that names a leaked type
+    /// (`T: AsRef<Rel<Self>>`), but the impl of an entry that uses the generic has it, and the copy
+    /// has only the rewritten form in its environment (E0277, `Rel<(Self, T)>` beside it). So the
+    /// type is judged with the generics that `Self` names, as `intern_*` judges it, which writes
+    /// `Self` as the Leaker's type.
     fn nested_self_cycle(
         &mut self,
         ty: &Type,
         context: &Context,
         inner: &Frame,
     ) -> Option<CheckResult> {
-        if !(self.nested_self_entries && self.self_nested)
-            || !matches!(context.self_ty(), Some(SelfRequirement::Any))
-            || !type_mentions_self(ty)
-        {
+        if !self.nested_self_risk(ty, context) {
             return None;
         }
         let plain = self.context_of(ty, inner).ok()?;
@@ -3573,10 +3572,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         gats: Vec<Gat>,
         f: impl FnOnce(&mut Self),
     ) {
-        let allow_self = self.allow_self;
-        if self_ty.is_none() || self.item_depth > 0 {
-            self.allow_self = true;
-        }
         let declares = self_ty.is_some();
         let nested_type =
             self.item_depth > 0 && !written && matches!(self_ty, Some(SelfRequirement::Type(_)));
@@ -3594,7 +3589,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.self_nested = outer_nested;
         self.self_trait = outer_trait;
         self.self_depth = outer_depth;
-        self.allow_self = allow_self;
     }
 
     /// Visits the attributes and visibility only: the body or value is not analyzed.
@@ -4300,8 +4294,6 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             if !is_self {
                 self.push_must(written.clone(), Some(asked.bare()));
                 self.frame.relative |= self.is_relative(asked);
-            } else if !self.allow_self {
-                self.impossibles.push(written.clone());
             }
         }
         syn::visit::visit_path(self, i)
@@ -4566,9 +4558,6 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 self.frame.mentions_self |= mentions_self;
                 if mentions_self {
                     self.check_self_has_meaning(Cause::Type(i.clone()));
-                    if !self.allow_self {
-                        self.impossibles.push(Cause::self_type());
-                    }
                 }
             }
             Type::Paren(_) | Type::Group(_) => {
@@ -5004,7 +4993,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             self.check_self_has_meaning(Cause::path_expr(i));
         }
         if (i.qself.is_none() && self.starts_with_generic(&i.path))
-            || (is_self && self.allow_self)
+            || is_self
             || self.is_context_free(&causes.0)
         {
             self.walk_expr_path(i, &causes)

@@ -27,7 +27,7 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
 fn unbounded_self_error(source: &str) -> EncodeError {
     let item: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     let self_ty: Type = parse_str(source).unwrap();
     let (ix, _, context) = referrer.iter().next().unwrap();
@@ -54,7 +54,7 @@ fn params_error(generics: &str) -> EncodeError {
 fn needs_self_error(source: &str) -> EncodeError {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item);
     let result = leaker.result();
     let marker: Type = parse_quote!(crate::Marker);
     // The call fails for the first entry that names `Self`, which is `Wrap<T, Self>` here.

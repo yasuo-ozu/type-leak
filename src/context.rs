@@ -161,7 +161,7 @@ impl Scope {
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<Self, T>);), true);
+/// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<Self, T>);));
 /// let referrer = leaker.result().finish().unwrap();
 /// // `Self` of the entry `Rel<Self, T>` is the struct.
 /// let (_, _, context) = referrer.iter().next().unwrap();
@@ -227,9 +227,10 @@ pub enum SelfRequirement {
     /// ([`View::visit_item()`](crate::View::visit_item), or an item in
     /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound on its
     /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self`
-    /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)). With
-    /// [`nested_self_entries()`](crate::Options::nested_self_entries), the entry may name `Self`
-    /// too (`Rel2<Self, T>`).
+    /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)). The entry may name
+    /// `Self` too (`Rel2<Self, T>`), with the error
+    /// [`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds), which you accept with
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
     ///
     /// The impl is generic over `__S`, which takes the place of `Self` in the bounds and has no
     /// bound of its own. `__S` is `?Sized` unless a bound or the type may need `Sized`. A marker
@@ -731,7 +732,7 @@ impl ModuleScope {
 /// # use syn::*;
 /// # use type_leak::*;
 /// let mut leaker = Leaker::new();
-/// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<T>);), true);
+/// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<T>);));
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // The context of the entry `Rel<T>` uses the generic `T`, but no `Self` and no module.
@@ -1019,7 +1020,7 @@ impl Context {
 
     /// Like [`Context::of()`], for an entry of a struct, an enum or a union nested in the analyzed
     /// syntax (`nested_type`) that is for any type although its type names `Self`
-    /// ([`nested_self_entries()`](crate::Options::nested_self_entries)): `Self`
+    /// ([`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds)): `Self`
     /// in the type and in the bounds is the implementor of the impl, and the impl does not need the
     /// generics that `Self` has as arguments. Not so with `nested_type` unset, or a `Self` that is
     /// not a type. It is `of()` for a type that does not name `Self`.

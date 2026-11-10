@@ -94,10 +94,9 @@ impl<'v, 'a, A: Allow> View<'v, 'a, A> {
         &mut self,
         ident: &Ident,
         generics: &Generics,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_type(self, ident, generics, allow_self, f)
+        Scopes::enter_type(self, ident, generics, f)
     }
 
     /// Opens a scope for the parts of an impl: [`Leaker::enter_impl()`](crate::Leaker::enter_impl).
@@ -106,10 +105,9 @@ impl<'v, 'a, A: Allow> View<'v, 'a, A> {
         generics: &Generics,
         self_ty: &Type,
         trait_: Option<&Path>,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_impl(self, generics, self_ty, trait_, allow_self, f)
+        Scopes::enter_impl(self, generics, self_ty, trait_, f)
     }
 
     /// Opens a scope for the parts of a trait:
@@ -118,10 +116,9 @@ impl<'v, 'a, A: Allow> View<'v, 'a, A> {
         &mut self,
         ident: &Ident,
         generics: &Generics,
-        allow_self: bool,
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
-        Scopes::enter_trait(self, ident, generics, allow_self, f)
+        Scopes::enter_trait(self, ident, generics, f)
     }
 }
 
