@@ -89,13 +89,13 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     if let Some(error) = result.errors().first() {
         return Err(Error::new(Span::call_site(), &error.message));
     }
-    let self_param = ident("__S");
-    let repeater: Path = parse_quote!(crate::Repeater);
+    let projection = Projection::new(
+        parse_quote!(crate::Repeater),
+        id,
+        ImplSelf::Param(ident("__S")),
+    );
     let mut impls = TokenStream::new();
-    for r in result
-        .repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const)
-        .map_err(Error::from)?
-    {
+    for r in result.repeater_impls(&projection).map_err(Error::from)? {
         impls.extend(r.to_token_stream());
     }
     let referrer = result.into_referrer();
@@ -194,27 +194,18 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         .first()
         .map(|seg| seg.ident.clone())
         .ok_or_else(|| Error::new(Span::call_site(), "expected a path"))?;
-    let repeater: Path = parse_quote!(::#krate::Repeater);
+    let projection = Projection::new(
+        parse_quote!(::#krate::Repeater),
+        id,
+        ImplSelf::Param(ident("__S")),
+    );
     let mut out = TokenStream::new();
     for n in copies {
         let (mut item, context) = (items[n].clone(), contexts[n]);
-        let error = std::cell::RefCell::new(None);
+        // No entry needs `Self`: the impls are for any type.
         referrer
-            .visitor(context, |_leaked, ix, entry| {
-                let projection =
-                    repeater_projection(&repeater, &parse_quote!(()), entry, id, ix, array_const);
-                match projection {
-                    Ok(projection) => projection,
-                    Err(e) => {
-                        *error.borrow_mut() = Some(e);
-                        parse_quote!(())
-                    }
-                }
-            })
+            .visitor(context, &projection)
             .visit_item_mut(&mut item);
-        if let Some(e) = error.into_inner() {
-            return Err(Error::from(e));
-        }
         match &item {
             Item::Trait(t) => {
                 // An implementation for a host type, which rustc compares with the trait.

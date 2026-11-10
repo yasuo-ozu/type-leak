@@ -439,7 +439,7 @@ fn a_whole_part_with_a_self_without_meaning_has_no_entry_inside() {
         let found: Vec<String> = common::types(&referrer).map(text).collect();
         assert_eq!(found, entries, "{}", written);
         // The Visitor writes the part as it is, and the entries it has.
-        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(Entry<#ix>));
+        let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>));
         match (part, copy) {
             (Whole::Type(mut ty), copy) => {
                 let expected = match copy {

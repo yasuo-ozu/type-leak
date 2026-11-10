@@ -12,8 +12,8 @@
 //!
 //! whose trait and self type are resolved by name, so only their arguments are leaked:
 //! `Leaker::enter_impl(&generics, &self_ty, None, |view| { view.visit_path_arguments(..) .. })`.
-//! It emits the marker type, the Repeater's implementation of each entry (`ImplSelf::Marker(&marker)`
-//! if no entry names `Self`, nor do the generics of its context, and else `ImplSelf::Param(&ident)`
+//! It emits the marker type, the Repeater's implementation of each entry (`ImplSelf::Marker(marker)`
+//! if no entry names `Self`, nor do the generics of its context, and else `ImplSelf::Param(ident)`
 //! for all of them), a witness for each type argument,
 //! and the exported `macro_rules! __scope_apply_7001`, which carries the Referrer and the top-level
 //! context.
@@ -21,7 +21,7 @@
 //! In the Referrer's crate, `leaker::__scope_apply_7001!(path = ::leaker::m)` expands
 //! `__scope_apply!`: it rewrites the self type, the trait path and the type arguments with
 //! `Referrer::visitor(context, ..)`, whose closure writes the path through the Repeater with
-//! `repeater_projection()` on the entry's context, and emits
+//! `Projection::of()` on the entry's context, and emits
 //!
 //! - `fn __tl_chk_<id>_<j>() -> PhantomData<rewritten>`, which compiles only if the rewritten type
 //!   is the original one (the witness of the Leaker's crate returns the original),
@@ -220,8 +220,8 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
         id, marker, item, ..
     } = &input;
     let marker_ty: Type = parse_quote!(#marker);
-    let self_param = ident("__S");
     let repeater: Path = parse_quote!(crate::Repeater);
+    let with = |impl_self| Projection::new(repeater.clone(), *id, impl_self);
 
     // The Repeater's implementation of each entry, as `coinduction` writes them.
     let mut impls = TokenStream::new();
@@ -231,38 +231,18 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     // The impls are for the marker if no entry needs `Self`. Else the call for a marker fails, and
     // they are all for a parameter, which the marker is accepted for: the one of an entry that names
     // `Self` is for the self type, or for a parameter bounded by the trait.
-    let some_need_self = referrer
-        .iter()
-        .any(|(ix, _, _)| referrer.bucket_self(*id, ix).is_none());
+    let some_need_self = referrer.has_self();
     crate::check_bucket_self(
         &referrer,
         *id,
-        result.repeater_impls(
-            &repeater,
-            *id,
-            ImplSelf::Marker(&check_marker),
-            slot_const(&repeater),
-        ),
+        result.repeater_impls(&with(ImplSelf::Marker(check_marker))),
     )?;
     let targets = if some_need_self {
-        result
-            .repeater_impls(
-                &repeater,
-                *id,
-                ImplSelf::Param(&self_param),
-                slot_const(&repeater),
-            )
-            .map_err(Error::from)?
+        result.repeater_impls(&with(ImplSelf::Param(ident("__S"))))
     } else {
-        result
-            .repeater_impls(
-                &repeater,
-                *id,
-                ImplSelf::Marker(&marker_ty),
-                slot_const(&repeater),
-            )
-            .map_err(Error::from)?
-    };
+        result.repeater_impls(&with(ImplSelf::Marker(marker_ty)))
+    }
+    .map_err(Error::from)?;
     for r in targets {
         let tokens = r.to_token_stream();
         // The head is the impl without its body, the last token.
@@ -430,12 +410,20 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let mut repeater = path.clone();
     repeater.segments = repeater.segments.iter().take(1).cloned().collect();
     repeater.segments.push(ident("Repeater").into());
+
     let mut marker_path = path.clone();
     marker_path.segments.push(scope.marker.clone().into());
     let marker_ty: Type = Type::Path(TypePath {
         qself: None,
         path: marker_path,
     });
+    // The impls are for what `leak` wrote: the marker if no entry needs `Self`, else a parameter.
+    let impl_self = if referrer.has_self() {
+        ImplSelf::Param(ident("__S"))
+    } else {
+        ImplSelf::Marker(marker_ty.clone())
+    };
+    let projection = Projection::new(repeater, id, impl_self);
 
     let mut absolutize = Absolutize(&krate);
     let mut self_ty: Type = (*item.self_ty).clone();
@@ -447,49 +435,32 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         absolutize.visit_type_mut(ty);
     }
 
-    // The path of an entry through the Repeater: the impl is for the marker, or for the self type
-    // if the entry needs `Self`.
-    let error = std::cell::RefCell::new(None);
-    let project = |self_ty: Option<&Type>, ix: EntryId, entry: &Context| -> Type {
-        let result = (|| -> Result<Type> {
-            let owner: Type = if referrer.bucket_self(id, ix).is_none() {
-                self_ty
-                    .cloned()
-                    .ok_or_else(|| Error::new(Span::call_site(), "the self type names `Self`"))?
-            } else {
-                marker_ty.clone()
-            };
-            Ok(repeater_projection(
-                &repeater,
-                &owner,
-                entry,
-                id,
-                ix,
-                slot_const(&repeater),
-            )?)
-        })();
-        result.unwrap_or_else(|e| {
-            *error.borrow_mut() = Some(e);
-            parse_quote!(())
-        })
-    };
-
-    // The self type first, as `Self` of an entry is written with it.
+    // The path of an entry through the Repeater. `Self` is the self type, which a parameter's impl is
+    // for; the marker is the one of a blanket impl when the self type is not written yet.
+    //
+    // The self type first, as `Self` of an entry is written with it. It cannot name `Self`.
     referrer
-        .visitor(context, |_leaked, ix, entry| project(None, ix, entry))
+        .visitor(context, &projection)
+        .with_self(marker_ty.clone())?
         .visit_type_mut(&mut self_ty);
-    let mut visitor = referrer.visitor(context, |_leaked, ix, entry| {
-        project(Some(&self_ty), ix, entry)
-    });
+    if let Some((_, ix, _)) = crate::entries_in(&self_ty)
+        .into_iter()
+        .find(|(_, ix, _)| crate::bucket_self(&referrer, id, *ix).is_none())
+    {
+        return Err(Error::new(
+            Span::call_site(),
+            format!("the self type names `Self`: the entry {}", ix),
+        ));
+    }
+    let mut visitor = referrer
+        .visitor(context, &projection)
+        .with_self(self_ty.clone())?;
     let mut types = types;
     for ty in &mut types {
         visitor.visit_type_mut(ty);
     }
     visitor.visit_path_mut(&mut trait_path);
     drop(visitor);
-    if let Some(e) = error.into_inner() {
-        return Err(e);
-    }
 
     let mut checks = TokenStream::new();
     for (j, ty) in types.iter().enumerate() {

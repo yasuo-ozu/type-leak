@@ -5,9 +5,9 @@ use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    array_const, complete_params, repeater_projection, slot_const, substitute_args, Allow, Cause,
-    CheckResult, Context, ContextId, EncodeError, EntryId, ErrorItem, ImplSelf, Leaker,
-    LeakerResult, ModuleScope, Place, Referrer, RepeaterImpl, Rules, View,
+    substitute_args, Allow, Cause, CheckResult, Context, ContextId, EncodeError, EntryId,
+    ErrorItem, ImplSelf, Leaker, LeakerResult, ModuleScope, Place, Projection, Referrer,
+    RepeaterImpl, Rules, SelfRequirement, Substitute, View, Visitor,
 };
 
 /// The tokens of `x`, as text.
@@ -88,11 +88,257 @@ pub fn param_ident(param: &GenericParam) -> &Ident {
     }
 }
 
-/// `slot_const(repeater)` for a const `value` of a parameter of type `ty`.
+/// The projection through the Repeater at `path` for the Leaker `id`, with the impls for a
+/// parameter `__S`: for the tests where only the path, the id and the key matter.
+#[allow(dead_code)]
+pub fn projection(path: Path, id: u64) -> Projection {
+    Projection::new(path, id, ImplSelf::Param(parse_quote!(__S)))
+}
+
+/// The `KEY` of the Repeater for `entry` of the Leaker `id`.
+#[allow(dead_code)]
+pub fn key(id: u64, entry: EntryId) -> u128 {
+    projection(parse_quote!(Repeater), id).key(entry)
+}
+
+thread_local! {
+    static PROJECTION: &'static Projection =
+        Box::leak(Box::new(projection(parse_quote!(Repeater), 0)));
+}
+
+/// The projection that the tests give to `Referrer::visitor()`: the Repeater at `Repeater`, the
+/// id 0, impls for a parameter `__S`. It is leaked (one for each thread), so a visitor may borrow it
+/// as long as a test needs.
+#[allow(dead_code)]
+pub fn test_projection() -> &'static Projection {
+    PROJECTION.with(|projection| *projection)
+}
+
+/// The entry of a path through the Repeater that the visitor wrote,
+/// `<S as Repeater<ARGS, KEY>>::Type` (the entry is in the low half of the `KEY`,
+/// `Projection::key()`). `None` for another type.
+#[allow(dead_code)]
+pub fn written_entry(ty: &Type) -> Option<EntryId> {
+    let Type::Path(TypePath {
+        qself: Some(qself),
+        path,
+    }) = ty
+    else {
+        return None;
+    };
+    let repeater = path.segments.iter().nth(qself.position.checked_sub(1)?)?;
+    let PathArguments::AngleBracketed(args) = &repeater.arguments else {
+        return None;
+    };
+    if repeater.ident != "Repeater" || args.args.len() != 2 {
+        return None;
+    }
+    let key: u128 = match args.args.last()? {
+        GenericArgument::Const(Expr::Lit(ExprLit {
+            lit: Lit::Int(key), ..
+        })) => key.base10_parse().ok()?,
+        _ => return None,
+    };
+    let low = (key as u64) as usize;
+    Some(parse_quote!(#low))
+}
+
+/// Turns each path through the Repeater that the visitor wrote back into what `replace` makes of
+/// its entry: `replace(leaked, entry, context)` with the type of the entry as the Referrer has it,
+/// as the closure of `Referrer::visitor()` was called before it held the `Projection`. Apply it to
+/// the node that the visitor visited, with the method that visited it.
+///
+/// With `host` (`Visitor::with_self()`), `Self` in the type of the entry is the host.
+#[allow(dead_code)]
+pub struct Replace<'r, F> {
+    referrer: &'r Referrer,
+    replace: F,
+    host: Option<Type>,
+}
+
+impl<'r, F: FnMut(Type, EntryId, &Context) -> Type> Replace<'r, F> {
+    pub fn new(referrer: &'r Referrer, replace: F) -> Self {
+        Self {
+            referrer,
+            replace,
+            host: None,
+        }
+    }
+}
+
+impl<F: FnMut(Type, EntryId, &Context) -> Type> syn::visit_mut::VisitMut for Replace<'_, F> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let entry = match written_entry(ty) {
+            Some(entry) => entry,
+            None => return syn::visit_mut::visit_type_mut(self, ty),
+        };
+        let (_, leaked, context) = self
+            .referrer
+            .iter()
+            .find(|(ix, _, _)| *ix == entry)
+            .expect("the visitor wrote the path of an entry of the referrer");
+        let mut leaked = leaked.clone();
+        if let Some(host) = &self.host {
+            syn::visit_mut::VisitMut::visit_type_mut(&mut HostForSelf(host), &mut leaked);
+        }
+        *ty = (self.replace)(leaked, entry, context);
+    }
+}
+
+/// `Self` is the host, where it is a type of its own.
+#[allow(dead_code)]
+struct HostForSelf<'a>(&'a Type);
+
+impl syn::visit_mut::VisitMut for HostForSelf<'_> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        match ty {
+            Type::Path(TypePath { qself: None, path }) if path.is_ident("Self") => {
+                *ty = self.0.clone()
+            }
+            _ => syn::visit_mut::visit_type_mut(self, ty),
+        }
+    }
+}
+
+/// A visitor of `Referrer::visitor(context, test_projection())` that turns what it writes into what
+/// `replace` makes of each entry (see [`Replace`]) after each visit: the closure that
+/// `Referrer::visitor()` took before it held the `Projection`.
+///
+/// It forwards the methods of `VisitMut` that the tests call, and `with_outer_generics()`,
+/// `with_self()` and `with_nested_self()`.
+#[allow(dead_code)]
+pub struct Replacing<'r, F, N = fn(&SelfRequirement) -> Option<Type>> {
+    visitor: Option<Visitor<'r, N>>,
+    replace: Replace<'r, F>,
+}
+
+/// [`Replacing`] for the entries of `referrer`, in the scope `context`.
+#[allow(dead_code)]
+pub fn visitor<'r, F: FnMut(Type, EntryId, &Context) -> Type>(
+    referrer: &'r Referrer,
+    context: ContextId,
+    replace: F,
+) -> Replacing<'r, F> {
+    Replacing {
+        visitor: Some(referrer.visitor(context, test_projection())),
+        replace: Replace::new(referrer, replace),
+    }
+}
+
+impl<'r, F, N: FnMut(&SelfRequirement) -> Option<Type>> Replacing<'r, F, N> {
+    /// `Visitor::with_outer_generics()`.
+    #[allow(dead_code)]
+    pub fn with_outer_generics(mut self) -> Self {
+        self.visitor = self.visitor.take().map(Visitor::with_outer_generics);
+        self
+    }
+
+    /// `Visitor::with_self()`, which must not fail here.
+    #[allow(dead_code)]
+    pub fn with_self(mut self, host: Type) -> Self {
+        let visitor = self.visitor.take().expect("the visitor");
+        self.visitor = Some(visitor.with_self(host.clone()).expect("a host that fits"));
+        self.replace.host = Some(host);
+        self
+    }
+
+    /// `Visitor::with_nested_self()`.
+    #[allow(dead_code)]
+    pub fn with_nested_self<M: FnMut(&SelfRequirement) -> Option<Type>>(
+        self,
+        hook: M,
+    ) -> Replacing<'r, F, M> {
+        Replacing {
+            visitor: self.visitor.map(|visitor| visitor.with_nested_self(hook)),
+            replace: self.replace,
+        }
+    }
+}
+
+macro_rules! forward {
+    ($($method:ident: $node:ty),* $(,)?) => {
+        $(
+            fn $method(&mut self, node: &mut $node) {
+                let visitor = self.visitor.as_mut().expect("the visitor");
+                syn::visit_mut::VisitMut::$method(visitor, node);
+                syn::visit_mut::VisitMut::$method(&mut self.replace, node);
+            }
+        )*
+    };
+}
+
+impl<F: FnMut(Type, EntryId, &Context) -> Type, N: FnMut(&SelfRequirement) -> Option<Type>>
+    syn::visit_mut::VisitMut for Replacing<'_, F, N>
+{
+    forward! {
+        visit_item_mut: Item,
+        visit_item_trait_mut: ItemTrait,
+        visit_signature_mut: Signature,
+        visit_file_mut: File,
+        visit_item_impl_mut: ItemImpl,
+        visit_item_mod_mut: ItemMod,
+        visit_item_struct_mut: ItemStruct,
+        visit_type_mut: Type,
+        visit_impl_item_fn_mut: ImplItemFn,
+        visit_item_fn_mut: ItemFn,
+        visit_generic_argument_mut: GenericArgument,
+        visit_where_clause_mut: WhereClause,
+        visit_type_param_bound_mut: TypeParamBound,
+        visit_trait_item_type_mut: TraitItemType,
+        visit_trait_item_mut: TraitItem,
+        visit_path_mut: Path,
+        visit_impl_item_mut: ImplItem,
+        visit_fields_mut: Fields,
+    }
+}
+
+/// The primitive type that `ImplSelf::Bucket` is for as the self type of the impl of the entry
+/// `ix` for the Leaker `id`, or `None` if the entry needs `Self`: what `Projection::of()` writes the
+/// entry for, which is the type it is given for an entry that needs `Self`.
+#[allow(dead_code)]
+pub fn bucket_self(referrer: &Referrer, id: u64, ix: EntryId) -> Option<Type> {
+    let projection = Projection::new(
+        parse_quote!(Repeater),
+        id,
+        ImplSelf::Bucket {
+            param: parse_quote!(__S),
+        },
+    );
+    let probe: Type = parse_quote!(__Probe);
+    let (_, _, context) = referrer.iter().find(|(entry, _, _)| *entry == ix)?;
+    match projection.of(&probe, context, ix) {
+        Ok(Type::Path(TypePath {
+            qself: Some(qself), ..
+        })) if *qself.ty != probe => Some(*qself.ty),
+        _ => None,
+    }
+}
+
+/// What the Repeater at `repeater` makes of a const `value` of the type `ty`: the slot of the
+/// entry `Wrap<{ N }>` of the scope `<const N: ty>`, as written at a site that gives `N` the
+/// `value`.
 #[allow(dead_code)]
 pub fn slot(repeater: &Path, value: &Expr, ty: &Type) -> std::result::Result<Type, EncodeError> {
-    let param: ConstParam = parse_quote!(const N: #ty);
-    slot_const(repeater)(value, &param)
+    let generics: Generics = parse_quote!(<const N: #ty>);
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&generics, |view| {
+        view.visit_type(&parse_quote!(Wrap<{ N }>))
+    });
+    let referrer = leaker.result().into_referrer();
+    let (entry, _, context) = referrer.iter().next().expect("the entry Wrap<{ N }>");
+    let own = projection(repeater.clone(), 0).of(&parse_quote!(Self), context, entry)?;
+    let site = |name: &Ident| (name == "N").then(|| GenericArgument::Const(value.clone()));
+    match projection_args(&own) {
+        Type::Tuple(tuple) => {
+            let mut arg = GenericArgument::Type(tuple.elems.first().expect("one slot").clone());
+            substitute_args(std::iter::once(&mut arg), site)?;
+            match arg {
+                GenericArgument::Type(ty) => Ok(ty),
+                other => Err(EncodeError::UnexpectedArgument(Box::new(other))),
+            }
+        }
+        other => panic!("not a tuple: {}", quote!(#other)),
+    }
 }
 
 /// A site where every generic is passed by its own name (the scope of the analysis).
@@ -183,6 +429,17 @@ pub fn projection_args(projection: &Type) -> Type {
     }
 }
 
+/// The self type that a projection `<S as Repeater<..>>::Type` is written for: `S`.
+#[allow(dead_code)]
+pub fn projection_self(projection: &Type) -> Type {
+    match projection {
+        Type::Path(TypePath {
+            qself: Some(qself), ..
+        }) => (*qself.ty).clone(),
+        other => panic!("not a projection: {}", quote!(#other)),
+    }
+}
+
 /// The errors as one `syn::Error`, one for each in order. Panics if there is none.
 #[allow(dead_code)]
 pub fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
@@ -213,44 +470,50 @@ pub fn impl_args(r: &RepeaterImpl) -> Type {
 }
 
 /// The first argument of the Repeater for an entry with `context`, as written at a site that
-/// answers names with `f`: the one of `repeater_projection()` (the generics of the context by
-/// their own names, encoded), with the site substituted (`substitute_args()`). `self_ty` is what
-/// `Self: 'a` names (`None`: `Self`).
+/// answers names with `f`: the one of `Projection::of()` (the generics of the context by their own
+/// names, encoded), with the site substituted (`substitute_args()`). `self_ty` is what `Self: 'a`
+/// names (`None`: `Self`).
 #[allow(dead_code)]
 pub fn repeater_args(
     context: &Context,
     f: impl FnMut(&Ident) -> Option<GenericArgument>,
     self_ty: Option<&Type>,
-    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    repeater_args_at(&parse_quote!(Repeater), context, f, self_ty)
+}
+
+/// Like [`repeater_args()`], for the Repeater at the path `repeater`.
+#[allow(dead_code)]
+pub fn repeater_args_at(
+    repeater: &Path,
+    context: &Context,
+    f: impl FnMut(&Ident) -> Option<GenericArgument>,
+    self_ty: Option<&Type>,
 ) -> std::result::Result<Type, EncodeError> {
     let default: Type = parse_quote!(Self);
-    let repeater: Path = parse_quote!(Repeater);
-    let projection = repeater_projection(
-        &repeater,
+    let written = projection(repeater.clone(), 0).of(
         self_ty.unwrap_or(&default),
         context,
-        0,
         parse_str::<EntryId>("0").unwrap(),
-        const_fn,
     )?;
-    substitute_type(&projection_args(&projection), f, None)
+    substitute_type(&projection_args(&written), f, None)
 }
 
 /// Replaces the leaked types in the type `ty`, which is inside the scope `context`, with what
-/// `type_fn` returns: the visitor of `context` on the type.
+/// `replace` makes of each entry: the visitor of `context` on the type.
 #[allow(dead_code)]
 pub fn expand(
     referrer: &Referrer,
     context: ContextId,
     mut ty: Type,
-    type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
+    replace: impl FnMut(Type, EntryId, &Context) -> Type,
 ) -> Type {
     use syn::visit_mut::VisitMut;
-    referrer.visitor(context, type_fn).visit_type_mut(&mut ty);
+    visitor(referrer, context, replace).visit_type_mut(&mut ty);
     ty
 }
 
-/// The trait `tr` as the Referrer's crate visits it to write a copy at `context`, where `type_fn`
+/// The trait `tr` as the Referrer's crate visits it to write a copy at `context`, where `replace`
 /// writes the entries: only its generics are visited, so the defaults of its parameters are the
 /// entries written (step 1 of the recipe of `Referrer::visitor()`).
 #[allow(dead_code)]
@@ -258,7 +521,7 @@ pub fn visited_trait(
     referrer: &Referrer,
     context: ContextId,
     tr: &ItemTrait,
-    type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
+    replace: impl FnMut(Type, EntryId, &Context) -> Type,
 ) -> ItemTrait {
     use syn::visit_mut::VisitMut;
     let mut shell = tr.clone();
@@ -269,29 +532,88 @@ pub fn visited_trait(
         attrs: Vec::new(),
         items: vec![Item::Trait(shell)],
     };
-    referrer.visitor(context, type_fn).visit_file_mut(&mut file);
+    visitor(referrer, context, replace).visit_file_mut(&mut file);
     match file.items.remove(0) {
         Item::Trait(shell) => shell,
         _ => unreachable!(),
     }
 }
 
-/// The arguments of an impl of `tr`: `given` completed by `complete_params()` on the parameters of
-/// the visited trait (steps 1 and 2 of the recipe).
+/// The arguments of an impl of the item with the `generics` analyzed at `context`: `given`
+/// completed by `Referrer::complete_args()` (the Repeater is `Repeater`, the id `0`, and a leaked
+/// type in a default is `<Self as Repeater<..>>::Type`). Each parameter is read back by writing its
+/// own name through the `Substitute`.
 #[allow(dead_code)]
 pub fn completed_args<'a>(
     referrer: &Referrer,
     context: ContextId,
-    tr: &ItemTrait,
+    generics: &Generics,
     given: impl IntoIterator<Item = &'a GenericArgument>,
-    type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
 ) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
-    complete_params(
-        &visited_trait(referrer, context, tr, type_fn)
-            .generics
-            .params,
+    completed_args_for(
+        referrer,
+        context,
+        generics,
         given,
+        &projection(parse_quote!(Repeater), 0),
     )
+}
+
+/// Like [`completed_args()`], for another `projection`.
+#[allow(dead_code)]
+pub fn completed_args_for<'a>(
+    referrer: &Referrer,
+    context: ContextId,
+    generics: &Generics,
+    given: impl IntoIterator<Item = &'a GenericArgument>,
+    projection: &Projection,
+) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
+    use syn::visit_mut::VisitMut;
+    let mut substitute = referrer.complete_args(context, given, projection)?;
+    Ok(generics
+        .params
+        .iter()
+        .map(|param| {
+            let mut arg = own_name_arg(param);
+            substitute.visit_generic_argument_mut(&mut arg);
+            arg
+        })
+        .collect())
+}
+
+/// The `Substitute` for an impl of an item that declares `generics`, given the arguments `given`
+/// (`Referrer::complete_args()`): the scope is `enter_generics()` of a Leaker that writes every
+/// relative path as it is, so a default has no entry and is what it says.
+#[allow(dead_code)]
+pub fn substitute_for(
+    generics: &Generics,
+    given: &[GenericArgument],
+) -> std::result::Result<Substitute, EncodeError> {
+    let mut leaker = Leaker::with_rule(|_: &Cause, _: Place| true);
+    let (context, ()) = leaker.enter_generics(generics, |_| ());
+    let referrer = leaker.result().into_referrer();
+    referrer.complete_args(context, given, &projection(parse_quote!(Repeater), 0))
+}
+
+/// The arguments for the generics `generics` as an impl of an item that declares them has them:
+/// `given` completed as [`substitute_for()`] does it, each parameter read back by writing its own
+/// name through the `Substitute`.
+#[allow(dead_code)]
+pub fn complete_generics(
+    generics: &Generics,
+    given: &[GenericArgument],
+) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
+    use syn::visit_mut::VisitMut;
+    let mut substitute = substitute_for(generics, given)?;
+    Ok(generics
+        .params
+        .iter()
+        .map(|param| {
+            let mut arg = own_name_arg(param);
+            substitute.visit_generic_argument_mut(&mut arg);
+            arg
+        })
+        .collect())
 }
 
 /// Writes what a site answers into the syntax of a copy (step 3 of the recipe of
@@ -377,9 +699,9 @@ pub struct SerializedIds {
 ///
 /// The form is the format tag, the groups of parts (`[ .. ]`) if there are any, the number of groups
 /// if there is more than one, and then the groups in the order of the entries. A group is `[# id]`,
-/// then, if the context is not declared yet, its declaration (the items `<generics> where .. ;`,
-/// `Self .. ;`, `type G .. ;` and `mod .. ;`, in this order, each ending with a `;` at the top level
-/// of the tokens), then the entries `( Type, .. )`. A group with no `# id` is for the id after that
+/// then, if the context is not declared yet, its declaration (the items `<generics> where .. ;` or
+/// `declared <params> where .. ;`, then `Self .. ;`, `type G .. ;` and `mod .. ;`, in this order,
+/// each ending with a `;` at the top level of the tokens), then the entries `( Type, .. )`. A group with no `# id` is for the id after that
 /// of the group before. A declared context has a group of entries only. It panics with the tokens
 /// for any other shape.
 #[allow(dead_code)]
@@ -444,25 +766,36 @@ fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
             }
         } else {
             declared.push(context);
-            // The declaration: items that end with `;`, in the order of the stages 0 to 3. Only
-            // generics (0) and a module (3) may come once.
+            // The declaration: items that end with `;`, in the order of the stages 0 to 4. Only
+            // generics (0) or the generics as declared (1), not both, and a module (4) may come
+            // once.
             let mut stage = 0;
             while !input.peek(token::Paren) {
                 let at = if input.peek(Token![<]) || input.peek(Token![where]) {
                     0
-                } else if input.peek(Token![Self]) {
+                } else if input
+                    .cursor()
+                    .ident()
+                    .map_or(false, |(word, _)| word == "declared")
+                {
                     1
-                } else if input.peek(Token![type]) {
+                } else if input.peek(Token![Self]) {
                     2
-                } else if input.peek(Token![mod]) {
+                } else if input.peek(Token![type]) {
                     3
+                } else if input.peek(Token![mod]) {
+                    4
                 } else {
                     return Err(input.error("expected an item of a declaration or the entries"));
                 };
                 if at < stage {
                     return Err(input.error("an item of a declaration out of its place"));
                 }
-                stage = if at == 0 || at == 3 { at + 1 } else { at };
+                stage = match at {
+                    0 | 1 => 2,
+                    4 => 5,
+                    _ => at,
+                };
                 loop {
                     let token: TokenTree = input.parse()?;
                     if matches!(&token, TokenTree::Punct(punct) if punct.as_char() == ';') {
@@ -513,14 +846,8 @@ pub fn in_module(context: &Context) -> Option<ContextId> {
 /// the entry is in no module.
 #[allow(dead_code)]
 pub fn entry_module(result: &LeakerResult, ix: usize) -> Option<ModuleScope> {
-    let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
-            7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+        .repeater_impls(&projection(parse_quote!(crate::Repeater), 7))
         .unwrap_or_else(|error| panic!("the impls: {}", error))
         .into_iter()
         .nth(ix)

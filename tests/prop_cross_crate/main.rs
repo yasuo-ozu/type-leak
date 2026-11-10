@@ -270,9 +270,9 @@
 //! - **Use sites with arguments** (`inst(N)`, `prop.rs: Instance`): the item is also used at an
 //!   instantiation of its generics (lifetimes `'static` or named by the use site, types `(u8, u16)`,
 //!   `Vec<u8>`, `str`, consts `3`, `{ 2 + 1 }`, the defaults at the end left out for
-//!   `complete_params()`): a trait is implemented for a host with them, each position is
+//!   `complete_args()`, `complete_defaults()` of the test macro): a trait is implemented for a host with them, each position is
 //!   compared with the witness called with them, `S<given>` must be `S<completed>`, and the library
-//!   must refuse a list with an argument too many or the last missing (`complete_params()`),
+//!   must refuse a list with an argument too many or the last missing (`complete_args()`),
 //!   or one of another kind (`substitute_args()`). A parameter that a function pointer or `Fn(..)` with an elided output names in
 //!   its inputs is given a type that holds a lifetime (`&'static str`) in a share of the items, and
 //!   the copy must name the elided lifetime there (F69, `substitute_args()`, and F70 where the
@@ -334,15 +334,15 @@
 //! contexts do not give; the macro cannot write a nested impl's own `Self`), and `enter_trait` for a
 //! trait with a generic associated type (the scope does not know its items). A struct, an enum, a
 //! union or a trait nested in `enter_mod` names its own `Self` (`nested_self` below): the macro
-//! writes its entries with `Visitor::with_nested_self()`, and the check writes the Leaker's type
-//! for a `Self` that no entry has.
+//! writes its entries for the Leaker's type with the closure of `Visitor::with_nested_self()`, and
+//! the check writes the Leaker's type for a `Self` that no entry has.
 //!
 //! A fifth of the traits analyzed one by one have parameters with defaults that use a parameter with
 //! a bound (`trait Tr<T: AsRef<Self>, U = Rel<T>>`, `trait_self_defaults` below, F39). The bound
 //! names the trait's `Self` in 58%, and the rest is the control (`T: Clone`; the shape draws 70%,
 //! and only a nested trait or one of the 70% of the items where `Self` is common may name it). Those
-//! traits are nested in `enter_mod` in 45% (the Visitor writes the default through the host,
-//! `with_nested_self()`), and analyzed as the item itself by `intern_trait` or `enter_trait`
+//! traits are nested in `enter_mod` in 45% (the closure of `with_nested_self()` gives the host for
+//! the default), and analyzed as the item itself by `intern_trait` or `enter_trait`
 //! otherwise (the Visitor finds the default without `Self`, and the macro picks the host as the
 //! implementor for an entry whose bound names `Self`). Of the nested ones, 60% are declared again in
 //! the Referrer's crate (`redeclare`, `Args::redeclare` of `tests/crates/macro/prop.rs`), which

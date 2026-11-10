@@ -1,6 +1,5 @@
 //! The analysis of items and types by the [`Leaker`].
 
-use crate::allow::{Allow, Place};
 #[cfg(doc)]
 use crate::analysis::drop_optional;
 use crate::analysis::{
@@ -19,6 +18,7 @@ use crate::error::{report, Cause, ErrorItem, Reason, SELF_HELP, SELF_NOTE};
 use crate::graph::is_whole_reference;
 #[cfg(doc)]
 use crate::leaker::Leaker;
+use crate::result::{Allow, Place};
 use crate::unstable::{
     bindings, equated_generics, hidden_projection, Instability, Projections, Unstable, Why,
 };
@@ -1724,7 +1724,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let top_level = module.unwrap_or_else(|| {
             // The scope is in the module around it, if any.
             let around = self.modules.last().map(|module| module.id);
-            let context = Context::new(spec.declared_generics(), scope_self).with_gats(scope_gats);
+            let declared = spec.declared_generics();
+            let context = Context::new(declared.clone(), scope_self)
+                .with_gats(scope_gats)
+                .with_declared(declared);
             self.records.contexts.intern(context.with_module(around))
         });
         self.records.top_levels.push(top_level);
@@ -4690,8 +4693,8 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         let alone = self.own_alone_defaults(&self_ty, &i.generics);
         self.with_item_of(&i.generics, Some(self_ty), false, gats, |visitor| {
             // A trait that is nested in the walk analyzes the defaults that do not name `Self`
-            // alone too, as a trait that a scope was entered for does: that is the entry
-            // the visitor looks up for the defaults of a copy of the trait, which `complete_params()`
+            // alone too, as a trait that a scope was entered for does: that is the entry the
+            // visitor looks up for the defaults of a copy of the trait, which `complete_args()`
             // takes: an impl cannot use one for the implementors of the trait (`Self: Tr<T, U>`
             // names the parameter that it is the default of).
             let idents = alone.unwrap_or_else(|| visitor.analyze_defaults_alone(&i.generics));

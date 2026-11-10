@@ -110,11 +110,13 @@ fn generics_are_those_of_the_leaker() {
             e("Rel4 < T , U >", "< T , U : :: core :: marker :: Copy >"),
         ]
     );
-    // The top-level context is that of the generics: the entry that uses all of them has it.
+    // The top-level context has the generics as declared, and takes its id after those of the
+    // entries: the entry that uses all of them has a context of its own.
     let all = common::types(&referrer)
         .position(|ty| s(ty) == "Rel4 < T , U >")
         .unwrap();
-    assert_eq!(common::entry_id(&referrer, all), context);
+    assert_eq!(context, id(4));
+    assert_eq!(common::entry_id(&referrer, all), id(3));
     assert!(common::context_ids(&referrer)
         .into_iter()
         .any(|c| c == context));
@@ -143,9 +145,18 @@ fn a_struct_an_enum_and_a_union_declare_self_as_the_item() {
             "{}",
             kind
         );
-        // The top-level context has the generics of the item and, as an entry names `Self`, what
-        // `Self` is: it is the context of the entry.
-        assert_eq!(context, common::entry_id(&referrer, 0));
+        // The top-level context has the generics of the item as declared and, as an entry names
+        // `Self`, what `Self` is: it is a context of its own, after the entry's.
+        assert_eq!(common::entry_id(&referrer, 0), id(0));
+        assert_eq!(context, id(1), "{}", kind);
+        assert!(
+            referrer.to_token_stream().to_string().ends_with(&format!(
+                "declared < 'a , T > ; Self = {} < 'a , T > ; ()",
+                name
+            )),
+            "{}",
+            kind
+        );
         assert_eq!(s(&common::entry(&referrer, 0).generics), "< 'a , T >");
         assert!(common::entry(&referrer, 0).self_ty.is_some());
     }
@@ -167,8 +178,15 @@ fn an_impl_declares_self_as_the_self_type() {
     );
     assert_eq!(self_of(&referrer, 0), "Self = :: p :: Wrap < T >");
     assert_eq!(self_of(&referrer, 1), "-");
-    // The top-level context has the generics of the impl and what `Self` is: that of `Rel<Self>`.
-    assert_eq!(context, common::entry_id(&referrer, 0));
+    // The top-level context has the generics of the impl as declared and what `Self` is, and is a
+    // context of its own: not that of `Rel<Self>` (0), nor that of `Rel2<T>` (1).
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
+    assert_eq!(common::entry_id(&referrer, 1), id(1));
+    assert_eq!(context, id(2));
+    assert!(referrer
+        .to_token_stream()
+        .to_string()
+        .ends_with("declared < T > ; Self = :: p :: Wrap < T > ; ()"));
 }
 
 #[test]
@@ -330,11 +348,13 @@ fn an_item_in_a_scope_has_local_generics() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Rel < T >", "< T >")]);
-    // The top-level context has no generics here, whereas that of `intern_struct()` has them.
+    // The top-level context has no generics here, whereas that of `intern_struct()` has them (as
+    // declared), and is a context of its own, not that of the entry.
     let mut leaker = Leaker::new();
     let top = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(common::entry_id(&referrer, 0), top);
+    assert_eq!(top, id(1));
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
     assert_eq!(s(&common::entry(&referrer, 0).generics), "< T >");
 }
 
@@ -790,8 +810,9 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
             .collect::<Vec<_>>()
     };
     assert!(ids(&failed_referrer).len() > ids(&ok).len());
-    // The ids which were returned are valid, and are the generics of their scopes: the entries
-    // that use them are in those contexts.
+    // The ids which were returned are valid, and are the generics of their scopes as declared:
+    // contexts of their own, not those of the entries that use the same generics.
+    let text = failed_referrer.to_token_stream().to_string();
     for (id, ty, generics) in [
         (failed.first, "RelA < A >", "< A >"),
         (failed.last, "RelC < C >", "< C >"),
@@ -799,7 +820,18 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
         let ix = common::types(&failed_referrer)
             .position(|found| s(found) == ty)
             .unwrap();
-        assert_eq!(common::entry_id(&failed_referrer, ix), id, "{}", ty);
+        assert!(
+            common::context_ids(&failed_referrer).contains(&id),
+            "{}",
+            ty
+        );
+        assert_ne!(common::entry_id(&failed_referrer, ix), id, "{}", ty);
+        assert!(
+            text.contains(&format!("declared {} ;", generics)),
+            "{}: {}",
+            ty,
+            text
+        );
         assert_eq!(
             s(&common::entry(&failed_referrer, ix).generics),
             generics,
@@ -894,8 +926,10 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
         entries(&referrer),
         [e("Rel < T >", "< T >"), e("RelU < U >", "< U >")]
     );
-    // The scope's generics are those of the entry `Rel<T>`.
-    assert_eq!(common::entry_id(&referrer, 0), inner.unwrap());
+    // The scope's top-level context is a context of its own: it took its id when the scope was
+    // left, before the context of the entry `Rel<T>`, which the outermost call records.
+    assert_eq!(inner.unwrap(), id(0));
+    assert_eq!(common::entry_id(&referrer, 0), id(1));
 }
 
 /// A Leaker that allows the primitive types and the names of the standard prelude.
@@ -928,9 +962,10 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     let referrer = result.into_referrer();
-    // The outermost context, the failed scope, and its inner scopes: the ids returned, and the
+    // The outermost context, the failed scope, and its inner scopes: the ids returned; the
+    // contexts of the two entries, which are not those of the scopes that made them; and the
     // context of `Rel2<'_>`, which is copied as written and is a part, as its error is about it.
-    assert_eq!(common::context_ids(&referrer).len(), 5);
+    assert_eq!(common::context_ids(&referrer).len(), 7);
     for id in &ids {
         assert!(common::context_ids(&referrer)
             .into_iter()
@@ -1058,9 +1093,10 @@ fn a_panic_after_a_recovery_rolls_back_the_scope_and_what_it_recovered() {
     assert!(messages(err).contains("Bad2"));
     let referrer = result.into_referrer();
     assert_eq!(entries(&referrer), [e("Kept", "")]);
-    // Nothing of the scope that panicked is left, not its context either.
+    // Nothing of the scope that panicked is left, not its context either: the contexts are
+    // that of `Kept` and the outer scope's own.
     assert!(!common::types(&referrer).any(|ty| s(ty).contains("RelLost") || s(ty).contains("Bad")));
-    assert_eq!(common::context_ids(&referrer).len(), 1);
+    assert_eq!(common::context_ids(&referrer), [id(0), id(1)]);
 }
 
 // ── the numbers of the modules ───────────────────────────────────────────────────────────────
@@ -1193,8 +1229,9 @@ fn the_visitor_enters_the_module_by_its_id() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let copy = |module: ContextId| {
-        let mut visitor =
-            referrer.visitor(module, |_, ix, _| parse_str(&format!("P{}", ix)).unwrap());
+        let mut visitor = common::visitor(&referrer, module, |_, ix, _| {
+            parse_str(&format!("P{}", ix)).unwrap()
+        });
         let mut item: ItemStruct = parse_quote!(
             struct C {
                 y: Rel,
@@ -1229,7 +1266,7 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
     });
     let referrer = leaker.result().finish().unwrap();
     let copy = |item: &ItemMod, module: ContextId| {
-        let mut visitor = referrer.visitor(module, |_, _, _| parse_quote!(P));
+        let mut visitor = common::visitor(&referrer, module, |_, _, _| parse_quote!(P));
         let mut item = item.clone();
         visitor.visit_item_mod_mut(&mut item);
         s(&item)
@@ -1331,9 +1368,7 @@ fn modules_are_serialized() {
             }
         }
     );
-    parsed
-        .visitor(root, |_, _, _| parse_quote!(P))
-        .visit_item_mod_mut(&mut item);
+    common::visitor(&parsed, root, |_, _, _| parse_quote!(P)).visit_item_mod_mut(&mut item);
     assert_eq!(
         s(&item),
         s(&parse_quote!(
@@ -1447,8 +1482,11 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
             e("Wrap < U >", "")
         ]
     );
-    // The top-level context is that of the generics, with no module.
-    assert_eq!(common::entry_id(&referrer, 0), top);
+    // The top-level context is the generics as declared, with no module: it is not the context of
+    // the entries that use the same generics, and it comes after the context of `Wrap<U>`.
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
+    assert_eq!(common::entry_id(&referrer, 2), id(1));
+    assert_eq!(top, id(2));
     assert_eq!(common::entry_module(&result, 0), None);
     assert_eq!(
         referrer.to_token_stream().to_string(),
@@ -1524,8 +1562,8 @@ fn a_panic_caught_in_a_nested_module_restores_the_module() {
 
 #[test]
 fn a_panic_caught_in_the_outermost_scope_of_a_generics_scope_keeps_the_top_level_id() {
-    // The top-level context of the outer scope is its generics, not the module of the nested one
-    // which panicked (the module stack was not unwound).
+    // The top-level context of the outer scope is its generics as declared, not the module of the
+    // nested one which panicked (the module stack was not unwound), and the module took no id.
     let mut leaker = Leaker::new();
     let (top, ()) = leaker.enter_generics(&parse_quote!(<T>), |view| {
         caught(|| {
@@ -1535,7 +1573,9 @@ fn a_panic_caught_in_the_outermost_scope_of_a_generics_scope_keeps_the_top_level
     });
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
-    assert_eq!(common::entry_id(&referrer, 0), top);
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
+    assert_eq!(top, id(1));
+    assert_eq!(common::context_ids(&referrer), [id(0), id(1)]);
     assert_eq!(s(&common::entry(&referrer, 0).generics), "< T >");
     assert_eq!(common::entry_module(&result, 0), None);
     assert_eq!(common::in_module(common::entry(&referrer, 0)), None);
@@ -1625,20 +1665,22 @@ fn a_panic_in_an_outermost_scope_keeps_the_earlier_contexts_and_ids() {
         expected.to_token_stream().to_string()
     );
     // The earlier calls, then the new ones in order, and then `<T>` of the trait again.
-    assert_eq!(ids, [id(0), id(1), id(2), id(3), id(0)]);
-    // Each of the first three is the context of the entry that uses its generics, and the fourth
-    // is the module of its entry.
+    assert_eq!(ids, [id(1), id(3), id(5), id(6), id(1)]);
+    // Each of the first three is the generics of its call as declared, taken after the context of
+    // the entry that uses the same generics (0, 2 and 4), and the fourth is the module of its
+    // entry.
     let at = |text: &str| {
         common::types(&referrer)
             .position(|ty| s(ty) == text)
             .unwrap()
     };
-    for (id, ty, generics) in [
-        (ids[0], "Rel < T >", "< T >"),
-        (ids[1], "Rel2 < U >", "< U >"),
-        (ids[2], "Rel3 < W >", "< W >"),
+    for (top, entry, ty, generics) in [
+        (ids[0], 0, "Rel < T >", "< T >"),
+        (ids[1], 2, "Rel2 < U >", "< U >"),
+        (ids[2], 4, "Rel3 < W >", "< W >"),
     ] {
-        assert_eq!(common::entry_id(&referrer, at(ty)), id, "{}", ty);
+        assert_eq!(common::entry_id(&referrer, at(ty)), id(entry), "{}", ty);
+        assert_eq!(top, id(entry + 1), "{}", ty);
         assert_eq!(s(&common::entry(&referrer, at(ty)).generics), generics);
     }
     assert_eq!(
@@ -1704,7 +1746,8 @@ fn a_nested_panic_not_caught_in_an_outermost_scope_ends_at_the_leaker_with_its_c
     let (expected_ids, expected) = after_a_nested_panic(false);
     assert_eq!(ids, expected_ids);
     assert_eq!(referrer, expected);
-    assert_eq!(ids, [id(0), id(1), id(2), id(3)]);
+    // Each call takes the id of its generics after the context of its entry.
+    assert_eq!(ids, [id(1), id(3), id(5), id(7)]);
     assert_eq!(
         entries(&referrer),
         [
@@ -2080,7 +2123,10 @@ fn a_function_which_is_the_analyzed_item_is_analyzed_in_a_scope_of_its_generics(
         entries(&referrer),
         [e(":: p :: W < 'b , dyn RelTr >", "< 'b >")]
     );
-    assert_eq!(common::entry_id(&referrer, 0), top);
+    // The scope's top-level context is the generics as declared: a context of its own, after the
+    // entry's.
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
+    assert_eq!(top, id(1));
     // The lifetime is a generic of the scope: the signature is not compared with a declaration, so
     // it is not checked for E0195, which only the generics of a method or a nested function are.
     // Nor is it when the scope is nested in another one.
@@ -2476,9 +2522,11 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
 // of the module) around `enter_generics()` of its generics: what they return, record and roll back
 // is what `enter_generics()` does, plus what the item declares (`Self`, or the module). The
 // expected values below were taken from the scopes before they were composed that way, so they pin
-// what has not changed: the ids (the same contexts, and no other one), the entries, the panics and
-// what `Self` means. A scope that finds errors keeps its corrected result, and its errors are
-// recorded once, in place, in the list of the outermost call (`Leaker::result()`).
+// what has not changed: the entries, the panics and what `Self` means. The ids moved when the
+// generics of a scope as declared became a context of their own (numbered when the scope is left:
+// a nested one before the contexts of the entries, the outermost one after them). A scope that
+// finds errors keeps its corrected result, and its errors are recorded once, in place, in the list
+// of the outermost call (`Leaker::result()`).
 
 /// The kinds of the scopes with a layer around their generics, and the module.
 const KINDS: [&str; 6] = ["struct", "enum", "union", "impl", "trait", "mod"];
@@ -2625,8 +2673,11 @@ fn root_item(kind: &str) -> String {
     let (id, value) = enter!(leaker, kind, &generics, body);
     assert_eq!(value, 7);
     let result = leaker.result();
-    result.clone().finish().unwrap();
-    dump(&result, &[("top", id)])
+    let referrer = result.clone().finish().unwrap();
+    // The top-level context has no entry, so its declaration is read from the last group.
+    let text = referrer.to_token_stream().to_string();
+    let declared = &text[text.rfind("declared").unwrap()..];
+    format!("{}\ntop {}", dump(&result, &[("top", id)]), declared)
 }
 
 #[test]
@@ -2640,7 +2691,7 @@ fn the_outermost_scope_of_an_item_returns_the_generics_context() {
 }
 
 const ROOT_ITEM: &str = r#"
-id top = 0
+id top = 3
 context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self = S < 'a , T , U > ; in module -
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
@@ -2650,9 +2701,10 @@ entry 2: Rel0 in 2
 entry 3: Rel3 in 2
 entry 4: Rel4 in 2
 entry 5: Rel5 in 2
+top declared < 'a , T : :: p :: Tr < Self > , U = Rel0 > ; Self = S < 'a , T , U > ; ()
 "#;
 const ROOT_ITEM_IMPL: &str = r#"
-id top = 0
+id top = 3
 context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self = :: p :: W < 'a , T , U > ; in module -
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
@@ -2662,9 +2714,10 @@ entry 2: Rel0 in 2
 entry 3: Rel3 in 2
 entry 4: Rel4 in 2
 entry 5: Rel5 in 2
+top declared < 'a , T : :: p :: Tr < Self > , U = Rel0 > ; Self = :: p :: W < 'a , T , U > ; ()
 "#;
 const ROOT_ITEM_TRAIT: &str = r#"
-id top = 0
+id top = 3
 context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self: S < 'a , T , U > ; in module -
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
@@ -2674,10 +2727,13 @@ entry 2: Rel0 in 2
 entry 3: Rel3 in 2
 entry 4: Rel4 in 2
 entry 5: Rel5 in 2
+top declared < 'a , T : :: p :: Tr < Self > , U = Rel0 > ; Self : S < 'a , T , U > ; ()
 "#;
 
-/// The ids of several scopes in one: the contexts of the generics are those of the generics, and
-/// the items and the modules add none, except `Self` if an entry of the scope names it.
+/// The ids of several scopes in one: the generics of a scope as declared are a context of its own,
+/// numbered when the scope is left, as a module is when it is entered; the contexts of the entries
+/// (with `Self` if the entry names it) are numbered after them, when the outermost call is
+/// recorded, and the outermost scope takes the last id.
 fn nested_ids() -> String {
     let mut leaker = Leaker::new();
     let s_ident = ident("S");
@@ -2688,7 +2744,7 @@ fn nested_ids() -> String {
             view.visit_type(&parse_quote!(Rel<Self, U>))
         });
         // The same generics, but another `Self`, which an entry names: another context. (`d`
-        // below has no entry that names `Self`, so its context is that of the generics.)
+        // below has no entry that names `Self`, so its context has none either.)
         let (b, ()) = view.enter_type(&ident("E"), &generics, |view| {
             view.visit_type(&parse_quote!(Rel<Self, U>))
         });
@@ -2703,7 +2759,7 @@ fn nested_ids() -> String {
             .0
         });
         let (m2, ()) = view.enter_mod("m2", [], |view| view.visit_type(&parse_quote!(Rel3)));
-        // After the modules, the same generics are still the same context.
+        // After the modules, a scope is numbered as before.
         let (d, ()) = view.enter_type(&s_ident, &generics, |_| ());
         let (e, ()) = view.enter_impl(&generics, &parse_quote!(::p::Wrap<U>), None, |view| {
             view.visit_type(&parse_quote!(Rel6<Self, U>))
@@ -2749,27 +2805,27 @@ id d = 6
 id e = 7
 id f = 10
 id m3 = 11
-id top = 15
-context 0: < U > ; Self = S < U > ; in module -
-context 1: < U > ; Self = E < U > ; in module -
-context 2: < 'a > ; - ; in module -
-context 4: < V > ; Self = S2 < V > ; in module 3 Some("m") None
-context 6: < U > ; - ; in module -
-context 7: < U > ; Self = :: p :: Wrap < U > ; in module -
-context 9: < W > ; Self: Tr2 < W > ; in module 8 Some("m4") None
-context 12:  ; - ; in module 3 Some("m") None
-context 13:  ; - ; in module 5 Some("m2") None
-context 14: < X > ; - ; in module 11 Some("m3") None
-entry 0: Rel < Self , U > in 0
-entry 1: Rel < Self , U > in 1
-entry 2: Rel2 < & 'a () > in 2
-entry 3: Rel4 < Self , V > in 4
-entry 4: Rel7 < U > in 6
-entry 5: Rel6 < Self , U > in 7
-entry 6: Rel8 < Self , W > in 9
-entry 7: Rel3 in 12
-entry 8: Rel3 in 13
-entry 9: Rel5 < X > in 14
+id top = 22
+context 12: < U > ; Self = S < U > ; in module -
+context 13: < U > ; Self = E < U > ; in module -
+context 14: < 'a > ; - ; in module -
+context 15:  ; - ; in module 3 Some("m") None
+context 16: < V > ; Self = S2 < V > ; in module 3 Some("m") None
+context 17:  ; - ; in module 5 Some("m2") None
+context 18: < U > ; Self = :: p :: Wrap < U > ; in module -
+context 19: < U > ; - ; in module -
+context 20: < W > ; Self: Tr2 < W > ; in module 8 Some("m4") None
+context 21: < X > ; - ; in module 11 Some("m3") None
+entry 0: Rel < Self , U > in 12
+entry 1: Rel < Self , U > in 13
+entry 2: Rel2 < & 'a () > in 14
+entry 3: Rel3 in 15
+entry 4: Rel4 < Self , V > in 16
+entry 5: Rel3 in 17
+entry 6: Rel6 < Self , U > in 18
+entry 7: Rel7 < U > in 19
+entry 8: Rel8 < Self , W > in 20
+entry 9: Rel5 < X > in 21
 "#;
 
 #[test]
@@ -2859,32 +2915,32 @@ const FAILING_KEPT: &str = r#"
 id outer = 0
 id first = 1
 id last = 6
-context 1: < A > ; Self = F < A > ; in module 0 Some("outer") None
-context 4: < A , B > ; Self = S < A , B > ; in module 0 Some("outer") None
-context 6: < C > ; Self = L < C > ; in module 0 Some("outer") None
 context 7:  ; - ; in module 0 Some("outer") None
-context 8:  ; - ; in module 2 Some("lost") None
-context 9:  ; - ; in module 5 Some("kept") None
-entry 0: RelA < Self , A > in 1
-entry 1: RelU < Self , A > in 4
-entry 2: RelC < Self , C > in 6
-entry 3: Rel in 7
-entry 4: RelM in 8
-entry 5: RelK in 9
+context 8: < A > ; Self = F < A > ; in module 0 Some("outer") None
+context 9: < A , B > ; Self = S < A , B > ; in module 0 Some("outer") None
+context 10:  ; - ; in module 2 Some("lost") None
+context 11: < C > ; Self = L < C > ; in module 0 Some("outer") None
+context 12:  ; - ; in module 5 Some("kept") None
+entry 0: Rel in 7
+entry 1: RelA < Self , A > in 8
+entry 2: RelU < Self , A > in 9
+entry 3: RelM in 10
+entry 4: RelC < Self , C > in 11
+entry 5: RelK in 12
 "#;
 
 const FAILING_OK: &str = r#"
 id outer = 0
 id first = 1
 id last = 3
-context 1: < A > ; Self = F < A > ; in module 0 Some("outer") None
-context 3: < C > ; Self = L < C > ; in module 0 Some("outer") None
 context 4:  ; - ; in module 0 Some("outer") None
-context 5:  ; - ; in module 2 Some("kept") None
-entry 0: RelA < Self , A > in 1
-entry 1: RelC < Self , C > in 3
-entry 2: Rel in 4
-entry 3: RelK in 5
+context 5: < A > ; Self = F < A > ; in module 0 Some("outer") None
+context 6: < C > ; Self = L < C > ; in module 0 Some("outer") None
+context 7:  ; - ; in module 2 Some("kept") None
+entry 0: Rel in 4
+entry 1: RelA < Self , A > in 5
+entry 2: RelC < Self , C > in 6
+entry 3: RelK in 7
 "#;
 const FAILING_ERRORS: &str = r#"
 use absolute path: 'Bad1<'_>'
@@ -2933,8 +2989,10 @@ fn a_failing_outermost_scope_of_each_kind_keeps_its_corrected_result() {
         tokens
     );
     // The ids and the module are those of the corrected results, whatever is accepted afterwards.
-    assert_eq!(ids, [1, 1, 1, 8, 11, 13]);
-    assert_eq!(module.index(), 17);
+    // The first three declare the same generics and `Self`: one top-level context, numbered after
+    // the module `inner` and the contexts of the entries of the first.
+    assert_eq!(ids, [3, 3, 3, 11, 15, 16]);
+    assert_eq!(module.index(), 20);
     pin(
         "outermost errors",
         &messages(result.errors()),
@@ -3085,7 +3143,7 @@ fn a_panic_caught_in_a_scope_restores_the_scope_around() {
 }
 
 const PANICKING: &str = r#"
-id top = 1
+id top = 4
 id module = 0
 context 1: < T > ; - ; in module -
 context 2:  ; - ; in module -
@@ -3095,7 +3153,7 @@ entry 1: Wrap < U , Lost > in 2
 entry 2: RelK in 3
 "#;
 const PANICKING_SELF: &str = r#"
-id top = 3
+id top = 5
 id module = 0
 context 1: < T > ; - ; in module -
 context 2:  ; - ; in module -

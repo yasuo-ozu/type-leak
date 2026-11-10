@@ -4,8 +4,8 @@
 //! `intern_union()`, `intern_impl()`, `intern_trait()` and `intern_mod()`) come first. Their
 //! expected values are those of the constructors of the Leaker which analyzed an item and which
 //! they replace (`Leaker::from_*()`), taken from the previous version of the crate: the item is
-//! analyzed with its own generics as those of the Leaker, which is what the top-level context is
-//! that of. Then come the configuration, the other ways to build a Leaker, and the regressions.
+//! analyzed with its own generics as those of the Leaker, which is what the top-level context has,
+//! as declared. Then come the configuration, the other ways to build a Leaker, and the regressions.
 
 mod common;
 
@@ -139,7 +139,7 @@ fn intern_struct() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
-    // `MyType6` uses all the generics: it is the entry of the top-level context.
+    // `MyType6` uses all the generics, but its context is not the top-level one.
     assert_eq!(
         entries(&referrer),
         [
@@ -150,8 +150,8 @@ fn intern_struct() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 0, 0, 1]);
-    assert_eq!(top_level.index(), 1);
-    assert_eq!(common::context_ids(&referrer).len(), 2);
+    assert_eq!(top_level.index(), 2);
+    assert_eq!(common::context_ids(&referrer).len(), 3);
     assert!(!referrer.has_self());
     // `Self` alone is never leaked.
     let mut leaker = Leaker::new();
@@ -215,10 +215,10 @@ fn intern_enum() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 0, 1, 2]);
-    // The top-level context has the generics of the enum and, as `Rel2<Self>` names `Self`, what
-    // `Self` is: it is the context of that entry.
-    assert_eq!(top_level.index(), 2);
-    assert_eq!(top_level, common::entry_id(&referrer, 3));
+    // The top-level context has the generics of the enum as declared and, as `Rel2<Self>` names
+    // `Self`, what `Self` is: it is a context of its own, after that of the entry.
+    assert_eq!(top_level.index(), 3);
+    assert_ne!(top_level, common::entry_id(&referrer, 3));
     assert!(referrer.has_self());
 }
 
@@ -234,7 +234,7 @@ fn intern_union() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_union(&item);
     let referrer = leaker.result().finish().unwrap();
-    // `Wrap<T>` uses the generics of the union: it is the entry of the top-level context.
+    // `Wrap<T>` uses the generics of the union, but its context is not the top-level one.
     assert_eq!(
         entries(&referrer),
         [
@@ -243,7 +243,7 @@ fn intern_union() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 1]);
-    assert_eq!(top_level.index(), 1);
+    assert_eq!(top_level.index(), 2);
     // A union with a lifetime, a reference, a tuple and the type of an external crate.
     let item: ItemUnion = parse_quote! {
         pub union MyUnion<'a, T: ::core::marker::Copy> {
@@ -292,10 +292,10 @@ fn intern_trait() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 1, 2]);
-    // The top-level context has the generics of the trait and, as `Rel2<Self>` names `Self`, what
-    // `Self` is: it is the context of that entry.
-    assert_eq!(top_level.index(), 0);
-    assert_eq!(top_level, common::entry_id(&referrer, 0));
+    // The top-level context has the generics of the trait as declared and, as `Rel2<Self>` names
+    // `Self`, what `Self` is: it is a context of its own, after that of the entry.
+    assert_eq!(top_level.index(), 3);
+    assert_ne!(top_level, common::entry_id(&referrer, 0));
 }
 
 #[test]
@@ -323,9 +323,10 @@ fn intern_impl() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 0, 0, 1]);
-    // The generics of the impl are those of the Leaker, which entries use exactly.
-    assert_eq!(top_level.index(), 0);
-    assert_eq!(top_level, common::entry_id(&referrer, 0));
+    // The generics of the impl as declared are the top-level context, which the entries that use
+    // them exactly do not have: it is a context of its own, after theirs.
+    assert_eq!(top_level.index(), 2);
+    assert_ne!(top_level, common::entry_id(&referrer, 0));
 
     // `Self` is the self type, which is leaked as a whole with it.
     let item: ItemImpl = parse_quote!(
@@ -440,9 +441,9 @@ fn with_rule_and_the_items_accumulate() {
             x: Wrap<V>,
         }
     ));
-    assert_eq!(d, id(2));
+    assert_eq!(d, id(5));
     let referrer = leaker.result().finish().unwrap();
-    // `Rel` is leaked once, in the context of no generics, which is that of `E`.
+    // `Rel` is leaked once, in the context of no generics.
     assert_eq!(
         entries(&referrer),
         [
@@ -453,13 +454,14 @@ fn with_rule_and_the_items_accumulate() {
         ]
     );
     assert_eq!(a, id(1));
-    // The same generics are the same context, whichever item they are the generics of.
+    // The same generics as declared are the same context, whichever item they are the generics of.
     assert_eq!(b, a);
-    assert_eq!(c, id(0));
-    // `Wrap<T>` is the entry of the generics `<T>` of both, and `Rel` of those of `E`.
-    assert_eq!(common::entry_id(&referrer, 2), a);
+    assert_eq!(c, id(3));
+    // `Wrap<T>` is the entry of the generics `<T>` of both, and `Rel` of the no generics of `E`,
+    // each in a context of its own: neither is the top-level context of an item.
+    assert_eq!(common::entry_id(&referrer, 2), id(2));
     assert_eq!(s(&common::entry(&referrer, 2).generics), "< T >");
-    assert_eq!(common::entry_id(&referrer, 0), c);
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
     assert!(common::entry(&referrer, 0).generics.params.is_empty());
     // `with_rule()` is what `new()` is with the allowed paths.
     let config = Rules::new().or_if(starts_with(parse_quote!(Vec)));

@@ -1,7 +1,6 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
 //! visiting it, which the [`Analysis`] turns into the graph of the entries.
 
-use crate::allow::Place;
 use crate::analyze::{
     input_type, unconstrained_in_copy, unconstrained_in_output, Anchoring, Elision,
 };
@@ -10,6 +9,7 @@ use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 #[cfg(doc)]
 use crate::leaker::Leaker;
+use crate::result::Place;
 #[cfg(doc)]
 use crate::view::View;
 use std::collections::{HashMap, HashSet};

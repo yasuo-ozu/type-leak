@@ -25,13 +25,13 @@
 //!   implements it for any `Self` (`impl<S: ?Sized> Repeater<..> for S`), which the orphan rule
 //!   allows only for a local trait. The macros write the Repeater impls with `ToTokens` of
 //!   `RepeaterImpl` (which writes the `KEY` itself) and the projection with
-//!   `repeater_projection()`, not by hand.
+//!   `Projection::of()`, not by hand.
 //! - Crate B cannot be given the Referrer by crate A directly, because crate A does not know the
 //!   input of B's macro. So crate A defines a `macro_rules!` which B calls; it adds what only A
 //!   knows (`$crate::Repeater`, the id, the Referrer, the top-level `ContextId`, the trait) to the
 //!   input and calls the proc macro of crate B's side. `repo` re-exports this crate, so that B
 //!   needs `repo` alone.
-//! - The id of a trait (the high half of the `KEY` of the Repeater, `repeater_key(id, ix)`) is a
+//! - The id of a trait (the high half of the `KEY` of the Repeater, `Projection::key()`) is a
 //!   hash of the name of the crate and of the trait. A proc macro does not know the path of the
 //!   item, and it needs only a number that no other exported trait of the crate has. It is written
 //!   into both the impls and the macro of A, so both sides agree.
@@ -51,10 +51,7 @@ use syn::{
     parse_macro_input, parse_quote, GenericArgument, GenericParam, ImplItem, ItemStruct, ItemTrait,
     Path, PathArguments, Token, TraitItem, Type,
 };
-use type_leak::{
-    array_const, repeater_projection, Context, ContextId, EntryId, ErrorItem, ImplSelf, Leaker,
-    Referrer, Substitute,
-};
+use type_leak::{ContextId, ErrorItem, ImplSelf, Leaker, Projection, Referrer};
 
 // ---------------------------------------------------------------------------------------------
 // Crate A: `#[export_trait]`
@@ -79,13 +76,15 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
     //    the entries mean what they mean in the trait. `ToTokens` of each writes its `KEY`.
     let id = id_of(&item_trait);
-    let repeater: Path = parse_quote!(crate::Repeater);
-    let self_param: syn::Ident = parse_quote!(__S);
-    let impls =
-        match result.repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const) {
-            Ok(impls) => impls,
-            Err(error) => return syn::Error::from(error).to_compile_error().into(),
-        };
+    let projection = Projection::new(
+        parse_quote!(crate::Repeater),
+        id,
+        ImplSelf::Param(parse_quote!(__S)),
+    );
+    let impls = match result.repeater_impls(&projection) {
+        Ok(impls) => impls,
+        Err(error) => return syn::Error::from(error).to_compile_error().into(),
+    };
 
     // The Referrer goes to crate B.
     let referrer = result.into_referrer();
@@ -141,8 +140,8 @@ pub fn forward(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// The input that `repo::__tl_<Trait>!` gives, then the arguments of `#[forward(..)]` and the item.
 struct Finish {
-    repeater: Path,
-    id: u64,
+    /// The Repeater as crate B names it. Crate A wrote its impls for a parameter.
+    projection: Projection,
     referrer: Referrer,
     top_level: ContextId,
     item_trait: ItemTrait,
@@ -156,6 +155,7 @@ impl Parse for Finish {
         input.parse::<Token![,]>()?;
         let id = input.parse::<syn::LitInt>()?.base10_parse()?;
         input.parse::<Token![,]>()?;
+        let projection = Projection::new(repeater, id, ImplSelf::Param(parse_quote!(__S)));
         // `Referrer` and `ContextId` read what `ToTokens` wrote.
         let referrer = input.parse()?;
         input.parse::<Token![,]>()?;
@@ -167,8 +167,7 @@ impl Parse for Finish {
         input.parse::<Token![;]>()?;
         let wrapper = input.parse()?;
         Ok(Finish {
-            repeater,
-            id,
+            projection,
             referrer,
             top_level,
             item_trait,
@@ -190,8 +189,7 @@ pub fn __forward_finish(input: TokenStream) -> TokenStream {
 
 fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     let Finish {
-        repeater,
-        id,
+        projection,
         referrer,
         top_level,
         item_trait,
@@ -210,35 +208,22 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     };
     let generics = &item_trait.generics;
 
-    // 1. Write each leaked type with its path through the Repeater, by the names of the generics of
-    //    the entry. The paths come out as the impls of crate A have them, because both encode the
-    //    generics of the same context.
-    let project = |_leaked: Type, ix: EntryId, context: &Context| -> Type {
-        let self_ty: Type = parse_quote!(Self);
-        // With `Self` as the host, the projection cannot fail.
-        repeater_projection(&repeater, &self_ty, context, id, ix, array_const).unwrap()
-    };
-
     // Where the copy is: `impl<K> Repo<K> for W` declares the generics of the trait itself (nothing
-    // is substituted). `impl Repo<u8> for W` gives them arguments, which `Substitute` writes into
-    // the signatures of the copy (`t: K`, `&'a self`, and the paths through the Repeater).
+    // is substituted). `impl Repo<u8> for W` gives them arguments, which the `Substitute` of
+    // `complete_args()` writes into the signatures of the copy (`t: K`, `&'a self`, and the paths
+    // through the Repeater).
     let explicit: Option<Vec<GenericArgument>> =
         match &trait_path.segments.last().unwrap().arguments {
             PathArguments::AngleBracketed(args) => Some(args.args.iter().cloned().collect()),
             _ => None,
         };
-    let (impl_generics, trait_path, mut site) = match &explicit {
+    let (impl_generics, trait_path, mut substitute) = match &explicit {
         Some(args) => {
-            // 2. Arguments the copy omits take the defaults of the trait, which the visitor writes
-            //    in the trait itself. The site answers each parameter of the trait with its
-            //    argument.
-            let mut visited = item_trait.clone();
-            visited.items.clear();
-            referrer
-                .visitor(top_level, project)
-                .visit_item_trait_mut(&mut visited);
-            let site = Substitute::with_params(&visited.generics.params, args)?;
-            (quote!(), trait_path, Some(site))
+            // 2. Arguments the copy omits take the defaults of the trait, with the leaked types in
+            //    them written through the Repeater. The `Substitute` answers each parameter of the
+            //    trait with its argument.
+            let substitute = referrer.complete_args(top_level, args, &projection)?;
+            (quote!(), trait_path, Some(substitute))
         }
         None => {
             let args: Vec<GenericArgument> = generics.params.iter().map(own_name).collect();
@@ -261,16 +246,18 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
             }
             TraitItem::Fn(method) => {
                 let mut sig = method.sig.clone();
-                // 1. Replace each leaked type with its path through the Repeater. The visitor
-                //    needs the whole signature, and the `ContextId` of the trait.
+                // 1. Replace each leaked type with its path through the Repeater, by the names of
+                //    the generics of the entry. The paths come out as the impls of crate A have
+                //    them, because both use the same `Projection`. The visitor needs the whole
+                //    signature, and the `ContextId` of the trait.
                 referrer
-                    .visitor(top_level, project)
+                    .visitor(top_level, &projection)
                     .visit_signature_mut(&mut sig);
                 // 3. Write the arguments of the impl into the signature: its types, and the lifetimes
                 //    outside them (`&'a self`, `T: 'a`). The names that the method declares itself
-                //    get no answer (`site` knows the trait's parameters only).
-                if let Some(site) = &mut site {
-                    site.visit_signature_mut(&mut sig);
+                //    stay (`substitute` knows the trait's parameters only).
+                if let Some(substitute) = &mut substitute {
+                    substitute.visit_signature_mut(&mut sig);
                 }
                 let receiver = match sig.receiver() {
                     Some(r) if r.reference.is_some() && r.mutability.is_some() => {
@@ -295,9 +282,6 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
             }
             _ => {}
         }
-    }
-    if let Some(site) = site {
-        site.finish()?;
     }
     Ok(quote! {
         #wrapper

@@ -1,9 +1,9 @@
 //! The errors of the analysis by the [`Leaker`](crate::Leaker): an [`ErrorItem`] for each part of
 //! an item that cannot be interned ([recovery](crate::Leaker#errors-and-recovery)).
 
-use crate::allow::Place;
 use crate::analysis::{CheckResult, Part, SelfMention};
 use crate::context::Context;
+use crate::result::Place;
 use crate::util::{
     has_lifetime_bound, is_std_crate_path, or_list, path_starts_with, path_type, tidy,
     without_arguments, without_crate_prefix, KNOWN_NAMES,

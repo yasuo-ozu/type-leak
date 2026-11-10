@@ -40,7 +40,7 @@ mod tests {
         text.split_whitespace().collect()
     }
 
-    /// The `KEY` of the Repeater (`type_leak::repeater_key(id, entry)`) as the tokens write it.
+    /// The `KEY` of the Repeater (`type_leak::Projection::key()`) as the tokens write it.
     fn key(id: u64, entry: usize) -> String {
         format!("{}u128", (u128::from(id) << 64) | entry as u128)
     }

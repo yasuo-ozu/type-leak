@@ -517,6 +517,33 @@ pub mod s {
         }
     }
 
+    /// 9253: the bound of `T` is in the where clause, and the default `D = Wrap<T>` names a leaked
+    /// type, for an impl that gives a concrete type for `T` and leaves `D` out. The Referrer's
+    /// crate completes the arguments from the declaration of the trait that the Referrer carries
+    /// (`Referrer::complete_args()`): `D` is the projection through the Repeater, and `T::Item`
+    /// is written through the bound of the where clause, which the library did not know before.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Where9253<T, D = Wrap<T>>
+    where
+        T: ::core::iter::Iterator,
+    {
+        fn f(&self, x: Wrap<T::Item>) -> ::core::option::Option<T::Item>;
+        fn d(&self, t: T) -> D;
+    }
+
+    impl<T: ::core::iter::Iterator> Where9253<T> for Inner {
+        fn f(&self, x: Wrap<T::Item>) -> ::core::option::Option<T::Item> {
+            Some(x.0)
+        }
+        fn d(&self, t: T) -> Wrap<T> {
+            Wrap(t)
+        }
+    }
+
     /// A trait object whose lifetime bound defaults to the lifetime of the path it is an argument
     /// of (`Ref<'a, T: 'a>`), so it must not be leaked alone (it would be `dyn RelTr + 'static`):
     /// the path is leaked as a whole if the trait object has to be (it names a relative trait),
@@ -1217,8 +1244,8 @@ pub mod kinds {
     // Items nested in a module (`scope = "mod"`: `enter_mod(..)` and `View::visit_item()`, as the
     // items of `intern_mod()` are). The item has a `Self` of its own, and the types that name it
     // are relative (`Wrap<Self>`), so the Repeater's impl of such an entry is for the item itself,
-    // here. The copy cannot name that type as `Self`: `Visitor::with_nested_self()` gives the macro
-    // the item to write it with.
+    // here. The copy cannot name that type as `Self`: the visitor writes `Self`, and the test macro
+    // gives the Leaker's type for it to `Visitor::with_nested_self()` (`nested_self()` in `prop.rs`).
 
     /// A struct that names its own `Self` in relative types, next to ones that do not.
     #[prop_leak(id = 9061, scope = "mod")]
@@ -1251,8 +1278,8 @@ pub mod kinds {
     // Items nested in a module whose generics have a bound that names their own `Self` (`T:
     // AsRef<Self>`), and whose fields use the generic (`Wrap<T>`, which does not name `Self`). The
     // copy declares a type of its own, which has the bound for itself, so the Repeater's impl of
-    // the entry is for any type that the bound holds for, and `Visitor::with_nested_self()` lets
-    // the copy pass its own type (`SelfRequirement::Any`).
+    // the entry is for any type that the bound holds for, and the visitor writes the copy's own
+    // type, `Self` (`SelfRequirement::Any`).
 
     /// The bound is on the parameter.
     #[prop_leak(id = 9111, scope = "mod", prelude = true)]
@@ -2524,7 +2551,7 @@ pub mod kinds {
     );
 
     /// F66: the default of a type parameter that names a braced const parameter, which
-    /// `complete_params()` substitutes.
+    /// the use site substitutes (`complete_args()` of the Referrer).
     #[prop_leak(id = 9227, prelude = true)]
     pub struct BracedDefault<const N: usize, T: Into<[u8; N]>, U = [u8; { N }]>(
         pub T,
@@ -2616,7 +2643,7 @@ pub mod kinds {
     }
 
     /// F69: the default of a parameter that is such a function pointer, which
-    /// `complete_params()` completes when the use site leaves it out.
+    /// the use site completes when it leaves it out (`complete_args()`).
     #[prop_leak(id = 9233, prelude = true)]
     pub struct ElidedDefault<T, U = fn(&T) -> &u8>(pub T, pub U, pub Rel);
 
@@ -2739,16 +2766,16 @@ pub mod kinds {
         pub cl: ClConcrete<U>,
     }
 
-    /// A type with const parameters of the two types that `slot_const()` puts where no other
-    /// goes.
+    /// A type with const parameters of the two types that the Repeater's const slots put where no
+    /// other goes.
     pub struct Keyed<const N: u64, const M: u128>;
 
     /// The marker type of 9236.
     pub struct Marker9236;
 
     /// 9236: const generics of type `u64` and `u128` in the arguments of the Repeater.
-    /// `slot_const()` puts a `u128` into the `KEY` argument (with the id and the index,
-    /// `repeater_key()`) and a `u64` into the slot `U64`, so the entries use one, the other and
+    /// The Repeater's slots put a `u128` into the `KEY` argument (with the id and the index,
+    /// `Projection::key()`) and a `u64` into the slot `U64`, so the entries use one, the other and
     /// both.
     #[prop_leak(
         id = 9236,

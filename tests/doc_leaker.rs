@@ -73,13 +73,13 @@ fn intern_mod_does_not_leak_the_names_the_module_declares() {
     assert_eq!(referrer.iter().count(), 2);
     // The Repeater impl of `Outside2` is written in `inner`.
     let param: Ident = parse_quote!(__S);
+    let repeater: Path = parse_quote!(crate::Repeater);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(1);
     match &r.module {
@@ -261,16 +261,14 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     let mut copy = item.clone();
-    let repeater: Path = parse_quote!(Repeater);
+    let projection = common::projection(parse_quote!(Repeater), 7);
     referrer
-        .visitor(context, |_, ix, context| {
-            repeater_projection(&repeater, &parse_quote!(()), context, 7, ix, array_const).unwrap()
-        })
+        .visitor(context, &projection)
         .visit_item_trait_mut(&mut copy);
-    let key = repeater_key(7, common::entry_id_at(&referrer, 0));
+    let key = common::key(7, common::entry_id_at(&referrer, 0));
     let expected: ItemTrait = parse_quote! {
         trait Tr {
-            const N: usize = ::core::mem::size_of::<<() as Repeater<(), #key>>::Type>();
+            const N: usize = ::core::mem::size_of::<<Self as Repeater<(), #key>>::Type>();
         }
     };
     assert_eq!(copy, expected);
@@ -317,11 +315,15 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
     let repeater: Path = parse_quote!(Repeater);
     let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
+            7,
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(0);
     // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
-    let key = repeater_key(7, r.entry);
+    let key = common::key(7, r.entry);
     let imp: ItemImpl = parse_quote!(#r);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), #key> for __S {

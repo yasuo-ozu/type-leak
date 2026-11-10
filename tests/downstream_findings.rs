@@ -4,7 +4,7 @@
 //! `announce` is a macro crate which re-emits an item in another crate. It found that its own
 //! table of Repeater impls chose the generics of an entry by name across all the scopes of the item
 //! (findings A, 1, 2, 3 and 4), which `type-leak` 0.8 does not do: `LeakerResult::repeater_impls()`
-//! and `repeater_projection()` give every entry the generics, bounds and where clause of the scope in
+//! and `Projection::of()` give every entry the generics, bounds and where clause of the scope in
 //! which it is written. The tests here pin that for each repro of the report, so a macro that
 //! builds its impls from them gets them right:
 //!
@@ -78,7 +78,7 @@ fn index(referrer: &Referrer, ty: Type) -> usize {
 
 /// The key of the entry 0 of the Leaker 7, which `impl_of()` writes whatever the entry is.
 fn key_of_first(result: &LeakerResult) -> u128 {
-    repeater_key(7, common::entry_id_at(&result.clone().into_referrer(), 0))
+    common::key(7, common::entry_id_at(&result.clone().into_referrer(), 0))
 }
 
 /// The Repeater impl of the entry `ix`, for any type `__S`, as a macro writes it from
@@ -88,13 +88,13 @@ fn key_of_first(result: &LeakerResult) -> u128 {
 fn impl_of(result: &LeakerResult, ix: usize) -> ItemImpl {
     let first = common::entry_id_at(&result.clone().into_referrer(), 0);
     let param: Ident = parse_quote!(__S);
+    let repeater: Path = parse_quote!(crate::Repeater);
     let mut r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(ix);
     r.entry = first;
@@ -107,23 +107,17 @@ fn impl_and_args(result: &LeakerResult, ty: Type) -> ItemImpl {
     let referrer = result.clone().into_referrer();
     let ix = index(&referrer, ty);
     let param: Ident = parse_quote!(__S);
+    let repeater: Path = parse_quote!(crate::Repeater);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(ix);
     assert_eq!(
-        common::repeater_args(
-            common::entry(&referrer, ix),
-            common::identity,
-            None,
-            array_const
-        )
-        .unwrap(),
+        common::repeater_args(common::entry(&referrer, ix), common::identity, None).unwrap(),
         common::impl_args(&r),
         "the arguments at an identity site are those of the impl"
     );
@@ -307,13 +301,8 @@ fn one_a_method_bound_naming_a_trait_parameter_brings_it_in() {
     // A site that passes `T` by its own name writes both arguments.
     let ix = common::entry_id_at(&referrer, index(&referrer, parse_quote!(inner::LocalG<U>)));
     assert_eq!(
-        common::repeater_args(
-            common::entry(&referrer, ix.index()),
-            common::identity,
-            None,
-            array_const
-        )
-        .unwrap(),
+        common::repeater_args(common::entry(&referrer, ix.index()), common::identity, None)
+            .unwrap(),
         parse_quote!((T, U))
     );
 }
@@ -621,7 +610,7 @@ fn found_by_visitor(source: &str) -> (usize, std::collections::BTreeSet<usize>) 
         .unwrap_or_else(|e| panic!("{}: {}", source, messages(&e)));
     let count = referrer.iter().count();
     let found = RefCell::new(std::collections::BTreeSet::new());
-    let mut visitor = referrer.visitor(context, |ty, ix, _| {
+    let mut visitor = common::visitor(&referrer, context, |ty, ix, _| {
         found.borrow_mut().insert(ix.index());
         ty
     });
@@ -944,8 +933,7 @@ fn fourteen_a_type_in_an_associated_const_default_is_carried() {
         ["inner :: Local"]
     );
     let mut copy = item.clone();
-    referrer
-        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
+    common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut copy);
     let expected: ItemTrait = parse_quote! {
         trait Tr {

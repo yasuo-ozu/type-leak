@@ -289,7 +289,7 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     let mut replaced = copy.clone();
     // A macro replaces the `String` as well.
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+        &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut replaced,
     );
     let expected: ItemStruct = syn::parse2(quote! {
@@ -345,7 +345,7 @@ fn rewritten(item: &ItemTrait) -> String {
     let referrer = leaker.result().finish().unwrap();
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+        &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut copy,
     );
     quote!(#copy).to_string()
@@ -1391,15 +1391,13 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     };
     // The copy of the trait declares `<'a>` as the context does, so it does not declare it again.
     let by_scope = rewrite(&mut |copy| {
-        referrer
-            .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
+        common::visitor(&referrer, top_level, |_, ix, _| parse_quote!(P<#ix>))
             .visit_item_trait_mut(copy)
     });
     assert_eq!(by_scope, printed_expected);
     // With the generics of the trait as those of the context, whatever the copy declares.
     let by_leakers = rewrite(&mut |copy| {
-        referrer
-            .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
+        common::visitor(&referrer, top_level, |_, ix, _| parse_quote!(P<#ix>))
             .with_outer_generics()
             .visit_item_trait_mut(copy)
     });
@@ -1412,7 +1410,7 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
             seen.push(ty_string(ty));
             parse_quote!(P<#ix>)
         };
-        let visitor = referrer.visitor(top_level, record);
+        let visitor = common::visitor(&referrer, top_level, record);
         if leakers {
             visitor
                 .with_outer_generics()
@@ -1429,8 +1427,7 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     let mut sig: Signature = parse_quote! {
         fn f<'b>(&'b self, x: &'b dyn RelTr, y: &'a mut dyn RelTr) -> &'b dyn RelTr
     };
-    referrer
-        .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
+    common::visitor(&referrer, top_level, |_, ix, _| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut sig);
     let expected: Signature = parse_quote! {
         fn f<'b>(&'b self, x: P<{b}>, y: P<{a}>) -> P<{b}>
@@ -2268,7 +2265,7 @@ fn test_reduce_roots_one_cut() {
     let referrer = leaker.result().finish().unwrap();
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+        &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut copy,
     );
     assert_eq!(
@@ -2561,7 +2558,7 @@ fn test_reduce_roots_changes_nothing_for_result() {
 /// The copy of `item` that the visitor of `referrer` makes in `context`: every entry is `P<ix>`.
 fn copy_of(referrer: &Referrer, context: ContextId, item: &ItemStruct) -> ItemStruct {
     let mut copy = item.clone();
-    let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
+    let mut visitor = common::visitor(referrer, context, |_, ix, _| parse_quote!(P<#ix>));
     syn::visit_mut::VisitMut::visit_item_struct_mut(&mut visitor, &mut copy);
     copy
 }
@@ -2665,7 +2662,7 @@ fn test_reduce_roots_a_later_parent_of_a_kept_entry() {
             "(R1 , R2) 0",
             ":: ext :: W < (R1 , R2) > 0",
             "R3 0",
-            "& 'a (R1 , R2) 1",
+            "& 'a (R1 , R2) 2",
         ]
     );
     let (copy1, copy2): (ItemStruct, ItemStruct) = (
@@ -2731,12 +2728,13 @@ fn test_reduce_roots_a_kept_entry_stays_when_a_later_scope_forbids_it() {
         let context = leaker.intern_impl(&item);
         let referrer = leaker.result().finish().unwrap();
         let mut copy = item.clone();
-        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
+        let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>));
         syn::visit_mut::VisitMut::visit_item_impl_mut(&mut visitor, &mut copy);
         (kept(&referrer), copy)
     };
     let (entries, copy) = copy_with(false);
-    assert_eq!(entries, ["Rel < U > 1", "Rel3 < U > 1", "Rel2 < u8 > 2"]);
+    // The ids 0 to 2 are those of the first call: its type, `<U>`, and its generics as declared.
+    assert_eq!(entries, ["Rel < U > 1", "Rel3 < U > 1", "Rel2 < u8 > 3"]);
     let expected: ItemImpl = parse_quote! {
         impl<T: Fn(P<2usize>), U> ::p::Tr<U> for ::p::W2<::p::W1<T, P<0usize>>, P<1usize>>
         where
@@ -2753,7 +2751,7 @@ fn test_reduce_roots_a_kept_entry_stays_when_a_later_scope_forbids_it() {
         entries,
         [
             ":: p :: W2 < :: p :: W1 < T , Rel < U > > , Rel3 < U > > 0",
-            "Rel2 < u8 > 2"
+            "Rel2 < u8 > 3"
         ]
     );
     let expected: ItemImpl = parse_quote! {

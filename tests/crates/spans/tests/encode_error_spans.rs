@@ -10,15 +10,25 @@ use support::assert_span_at;
 use syn::*;
 use type_leak::*;
 
-fn repeater() -> Path {
-    parse_quote!(crate::Repeater)
+fn projection(impl_self: ImplSelf) -> Projection {
+    Projection::new(parse_quote!(crate::Repeater), 7, impl_self)
 }
 
 /// The error of completing the arguments in `args` for the parameters in `generics`.
 fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
-    complete_params(&generics.params, &args.args).unwrap_err()
+    // The scope of the generics, where every path is written as it is: the defaults are what they say.
+    let mut leaker = Leaker::with_rule(|_: &Cause, _: Place| true);
+    let (context, ()) = leaker.enter_generics(&generics, |_| ());
+    let referrer = leaker.result().into_referrer();
+    referrer
+        .complete_args(
+            context,
+            &args.args,
+            &projection(ImplSelf::Param(parse_quote!(__S))),
+        )
+        .unwrap_err()
 }
 
 /// The error of writing the path through the Repeater for an entry that needs `Self: 'a`, for the
@@ -34,29 +44,23 @@ fn unbounded_self_error(source: &str) -> EncodeError {
     let referrer = leaker.result().finish().unwrap();
     let self_ty: Type = parse_str(source).unwrap();
     let (ix, _, context) = referrer.iter().next().unwrap();
-    repeater_projection(
-        &repeater(),
-        &self_ty,
-        context,
-        7,
-        ix,
-        slot_const(&repeater()),
-    )
-    .unwrap_err()
+    projection(ImplSelf::Param(parse_quote!(__S)))
+        .of(&self_ty, context, ix)
+        .unwrap_err()
 }
 
-/// The error of encoding `generics` itself: the const parameter of the first one.
+/// The error of encoding the const parameter `N` of `generics` for the entry `Wrap<{ N }>`.
 fn params_error(generics: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
-    let param = generics
-        .params
-        .iter()
-        .find_map(|param| match param {
-            GenericParam::Const(param) => Some(param),
-            _ => None,
-        })
-        .unwrap();
-    slot_const(&repeater())(&parse_quote!(N), param).unwrap_err()
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&generics, |view| {
+        view.visit_type(&parse_quote!(Wrap<{ N }>))
+    });
+    let referrer = leaker.result().into_referrer();
+    let (entry, _, context) = referrer.iter().next().unwrap();
+    projection(ImplSelf::Param(parse_quote!(__S)))
+        .of(&parse_quote!(Self), context, entry)
+        .unwrap_err()
 }
 
 /// The error of `repeater_impls()` for a marker, which cannot name `Self`: the entry `Wrap<T,
@@ -66,17 +70,9 @@ fn needs_self_error(source: &str) -> EncodeError {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item);
     let result = leaker.result();
-    let marker: Type = parse_quote!(crate::Marker);
+    let marker = projection(ImplSelf::Marker(parse_quote!(crate::Marker)));
     // The call fails for the first entry that names `Self`, which is `Wrap<T, Self>` here.
-    let error = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
-            7,
-            ImplSelf::Marker(&marker),
-            array_const,
-        )
-        .err()
-        .unwrap();
+    let error = result.repeater_impls(&marker).err().unwrap();
     assert!(matches!(&error, EncodeError::NeedsSelf(ty)
         if template_quote::quote!(#ty).to_string() == "Wrap < T , Self >"));
     error

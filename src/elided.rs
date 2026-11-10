@@ -5,11 +5,11 @@
 //! a type with lifetimes adds some, and rustc cannot tell which one the output has (E0106). That is
 //! `Self` for `Visitor::with_self()`: `fn(&Self) -> &u8` is valid in `struct S<'a>`, but
 //! `fn(&::p::S<'a>) -> &u8` has two lifetimes in its inputs. It is a type parameter that
-//! `substitute_args()` or `complete_params()` replaces, too: `fn(&U) -> &u8` with
+//! `substitute_args()` or `Substitute` replaces, too: `fn(&U) -> &u8` with
 //! `U := &'static str`. And it is the path through the Repeater that replaces an entry, whose
 //! arguments name the lifetimes of the site: `fn(&Vec<U>) -> &u8` with the entry `Vec<U>` is
 //! `fn(&<X as Repeater<(&'static str,), ..>>::Type) -> &u8`, which the Visitor cannot know until
-//! `type_fn` has written it. The copy names the lifetime that elision gives instead, with a fresh
+//! the path is written. The copy names the lifetime that elision gives instead, with a fresh
 //! `for<'e>` binder: `for<'e> fn(&'e ::p::S<'a>) -> &'e u8`.
 //!
 //! What the copy writes is known before it folds the signature for `Self` and the type parameters
@@ -83,9 +83,9 @@ impl Writer for SelfWriter<'_> {
     }
 }
 
-/// The fresh lifetimes of a signature that the Visitor has written, with the types that `type_fn`
-/// returned in it: `'__tl_e<n>` as for `Self`, and none that the signature names already (what
-/// `type_fn` wrote may name any: a binder inside it is not in `scopes`).
+/// The fresh lifetimes of a signature that the Visitor has written, with the paths through the
+/// Repeater in it: `'__tl_e<n>` as for `Self`, and none that the signature names already (what the
+/// Visitor wrote may name any: a binder inside it is not in `scopes`).
 pub(crate) struct WrittenNames<'a> {
     scopes: &'a [Scope],
     taken: HashSet<String>,
@@ -124,7 +124,7 @@ fn collect_lifetimes(tokens: TokenStream, names: &mut HashSet<String>) {
 }
 
 /// The fresh lifetimes of the copy of a type at a use site (`substitute_args()`,
-/// `complete_params()`).
+/// `Substitute`).
 ///
 /// The generics in scope there are not known, so a name is `'__tl_s<n>` for the first `n` that no
 /// lifetime in what the copy is made of (the arguments, what replaces a name) is named
@@ -309,7 +309,7 @@ impl Elision {
     }
 
     /// Names the elided lifetime of the function pointer `i`, which the copy has written (what
-    /// `type_fn` returned is in it), if its inputs show more than their one lifetime.
+    /// the paths through the Repeater are in it), if its inputs show more than their one lifetime.
     pub(crate) fn name_written_bare_fn(&self, fresh: &mut impl Fresh, i: &mut TypeBareFn) {
         self.name_written(
             fresh,
@@ -348,11 +348,11 @@ impl Elision {
             return;
         }
         match &self.kept {
-            // The lifetime that the inputs named is in what `type_fn` wrote (the entry held it), as
-            // the site writes it: what the output takes is not known.
+            // The lifetime that the inputs named is in what the Visitor wrote (the entry held it),
+            // as the site writes it: what the output takes is not known.
             Some(kept) if !shown.named.contains(kept) => return,
-            // Only the one elided lifetime that the original had can be named: `type_fn` may have
-            // written an elided lifetime of its own (`&str` in an argument), which cannot be told
+            // Only the one elided lifetime that the original had can be named: what was written
+            // may have an elided lifetime of its own (`&str` in an argument), which cannot be told
             // from it, and naming both would make them one.
             None if shown.elided != 1 => return,
             _ => (),

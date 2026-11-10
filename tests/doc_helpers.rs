@@ -25,11 +25,15 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
     let repeater: Path = parse_quote!(crate::Repeater);
     let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
+            7,
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(0);
     // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
-    let key = repeater_key(7, r.entry);
+    let key = common::key(7, r.entry);
     let imp: ItemImpl = parse_quote!(#r);
     let expected: ItemImpl = parse_quote! {
         impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
@@ -64,13 +68,13 @@ fn substitute_args_gives_the_arguments_of_a_use_site() {
 
     // `impl<'a, T: 'a> Tr<'a, T> for ..` declares the generics: each is passed by its own name.
     let context = common::entry(&referrer, 0);
-    let args = common::repeater_args(context, common::identity, None, array_const).unwrap();
+    let args = common::repeater_args(context, common::identity, None).unwrap();
     assert_eq!(args, parse_quote!((&'a (), T, &'a T)));
 
     // `impl Tr<'static, u8> for ..` gives them arguments.
     let trait_args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
     let site = common::answers(&tr.generics.params, &trait_args);
-    let args = common::repeater_args(context, site, None, array_const).unwrap();
+    let args = common::repeater_args(context, site, None).unwrap();
     assert_eq!(args, parse_quote!((&'static (), u8, &'static u8)));
 }
 
@@ -87,11 +91,11 @@ fn the_self_type_of_the_encoder_names_the_type_in_self_outlives() {
     let referrer = leaker.result().finish().unwrap();
     // The entry `&'a Wrap<Self>` needs `Self: 'a`, which the arguments encode as `&'a Self`.
     let context = common::entry(&referrer, 0);
-    let args = common::repeater_args(context, common::identity, None, array_const).unwrap();
+    let args = common::repeater_args(context, common::identity, None).unwrap();
     assert_eq!(args, parse_quote!((&'a (), &'a Self)));
     // At a site where `Self` is not available, name the type instead.
     let host: Type = parse_quote!(Host);
-    let args = common::repeater_args(context, common::identity, Some(&host), array_const).unwrap();
+    let args = common::repeater_args(context, common::identity, Some(&host)).unwrap();
     assert_eq!(args, parse_quote!((&'a (), &'a Host)));
 }
 
@@ -118,9 +122,10 @@ fn substitute_args_passes_method_generics_by_name() {
     assert_eq!(args, expected);
 }
 
-/// `bucket_self()` is `None` for an entry that names `Self` or whose context does, a type otherwise.
+/// `Projection::of()` for `ImplSelf::Bucket` writes the type it is given for an entry that names
+/// `Self` or whose context does, a bucket type otherwise (`common::bucket_self()` reads it).
 #[test]
-fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
+fn a_bucket_projection_is_for_self_when_the_type_or_the_context_names_it() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
             fn f(&self, t: T) -> U;
@@ -143,7 +148,10 @@ fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
         common::entry_id_at(&referrer, wrap),
         common::entry_id_at(&referrer, rel),
     );
-    assert!(referrer.bucket_self(7, wrap).is_none() && referrer.bucket_self(7, rel).is_none());
+    assert!(
+        common::bucket_self(&referrer, 7, wrap).is_none()
+            && common::bucket_self(&referrer, 7, rel).is_none()
+    );
 
     let mut leaker = Leaker::new();
     leaker.intern_trait(&parse_quote!(
@@ -152,14 +160,13 @@ fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
         }
     ));
     let referrer = leaker.result().finish().unwrap();
-    assert!(referrer
-        .bucket_self(7, common::entry_id_at(&referrer, 0))
-        .is_some());
+    assert!(common::bucket_self(&referrer, 7, common::entry_id_at(&referrer, 0)).is_some());
 }
 
-/// `bucket_self()` is a primitive type for an entry without `Self`, and `None` for one with it.
+/// The bucket type that `Projection::of()` writes is a primitive type for an entry without `Self`,
+/// and the impl of `ImplSelf::Bucket` is for it; for an entry with `Self` the impl is for `__S`.
 #[test]
-fn bucket_self_is_a_primitive_unless_the_entry_needs_self() {
+fn a_bucket_projection_is_a_primitive_unless_the_entry_needs_self() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<T> { fn f(&self) -> Wrap<T>; fn g(&self) -> Wrap2<Self>; }
     };
@@ -175,15 +182,15 @@ fn bucket_self_is_a_primitive_unless_the_entry_needs_self() {
         .iter()
         .position(|(_, ty, _)| *ty == parse_quote!(Wrap2<Self>))
         .unwrap();
-    let param: Ident = parse_quote!(__S);
-    let target = ImplSelf::Bucket { param: &param };
+    let target = ImplSelf::Bucket {
+        param: parse_quote!(__S),
+    };
+    let repeater: Path = parse_quote!(crate::Repeater);
 
     // `Wrap<T>` does not name `Self`: a primitive type, and no `__S`.
-    let bucket = referrer
-        .bucket_self(7, common::entry_id_at(&referrer, wrap))
-        .unwrap();
+    let bucket = common::bucket_self(&referrer, 7, common::entry_id_at(&referrer, wrap)).unwrap();
     let r = result
-        .repeater_impls(&parse_quote!(crate::Repeater), 7, target, array_const)
+        .repeater_impls(&Projection::new(repeater.clone(), 7, target.clone()))
         .unwrap()
         .remove(wrap);
     assert_eq!(r.self_ty, bucket);
@@ -191,11 +198,11 @@ fn bucket_self_is_a_primitive_unless_the_entry_needs_self() {
 
     // `Wrap2<Self>` does: the implementors of the trait, as with `ImplSelf::Param`.
     assert_eq!(
-        referrer.bucket_self(7, common::entry_id_at(&referrer, wrap2)),
+        common::bucket_self(&referrer, 7, common::entry_id_at(&referrer, wrap2)),
         None
     );
     let r = result
-        .repeater_impls(&parse_quote!(crate::Repeater), 7, target, array_const)
+        .repeater_impls(&Projection::new(repeater.clone(), 7, target.clone()))
         .unwrap()
         .remove(wrap2);
     assert_eq!(r.self_ty, parse_quote!(__S));
@@ -276,7 +283,7 @@ fn view_visit_type_skips_the_paths_of_the_standard_library() {
     );
 }
 
-/// `slot_const()` encodes const parameters of the impl and of the use site into the same slots.
+/// The const parameters of the impl and of the use site are encoded into the same slots.
 #[test]
 fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     let tr: ItemTrait = parse_quote! {
@@ -291,7 +298,11 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     // The impl encodes the parameters themselves...
     let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
+            7,
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(0);
     assert_eq!(
@@ -304,11 +315,11 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
 
     // ...and a copy in `impl Tr<true, 'x'> for ..` the arguments.
     let trait_args: Vec<GenericArgument> = vec![parse_quote!(true), parse_quote!('x')];
-    let args = common::repeater_args(
+    let args = common::repeater_args_at(
+        &repeater,
         common::entry(&referrer, 0),
         common::answers(&tr.generics.params, &trait_args),
         None,
-        slot_const(&repeater),
     )
     .unwrap();
     assert_eq!(
@@ -365,37 +376,35 @@ fn impl_self_marker_fails_the_call_if_an_entry_names_self() {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&only_wrap);
     let marker: Type = parse_quote!(crate::Marker);
+    let repeater: Path = parse_quote!(crate::Repeater);
     let r = leaker
         .result()
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Marker(&marker),
-            array_const,
-        )
+            ImplSelf::Marker(marker.clone()),
+        ))
         .unwrap()
         .remove(0);
     assert_eq!(r.self_ty, marker);
     // `Wrap2<Self>` does: it is for the implementors of the trait, so a marker will not do, and the
     // call fails for it.
     let err = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Marker(&marker),
-            array_const,
-        )
+            ImplSelf::Marker(marker.clone()),
+        ))
         .err()
         .unwrap();
     assert!(matches!(err, EncodeError::NeedsSelf(ty) if *ty == parse_quote!(Wrap2<Self>)));
     let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(wrap2);
     assert_eq!(
@@ -442,8 +451,8 @@ fn self_requirement_is_the_type_in_a_struct_and_the_bound_in_a_trait() {
     }
 }
 
-/// The top-level context differs from that of an entry with fewer generics, and the id is an
-/// integer literal.
+/// The top-level context is a context of its own: it differs from that of an entry, also from
+/// that of one with the same generics, and the id is an integer literal.
 #[test]
 fn context_id_is_the_top_level_context_and_an_integer_literal() {
     let item: ItemStruct = parse_quote!(
@@ -455,8 +464,9 @@ fn context_id_is_the_top_level_context_and_an_integer_literal() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
-    // `Wrap<T>` uses the generics of the struct, as the top-level context has them.
-    // `Rel` uses no generic, so its context is another one.
+    // `Wrap<T>` uses the generics of the struct, as the top-level context has them, but its
+    // context is another one (the ids 0 and 2). `Rel` uses no generic, so its context is a third
+    // one (the id 1).
     let wrap = referrer
         .iter()
         .position(|(_, ty, _)| *ty == parse_quote!(Wrap<T>))
@@ -465,8 +475,9 @@ fn context_id_is_the_top_level_context_and_an_integer_literal() {
         .iter()
         .position(|(_, ty, _)| *ty == parse_quote!(Rel))
         .unwrap();
-    assert_eq!(common::entry_id(&referrer, wrap), top_level);
-    assert_ne!(common::entry_id(&referrer, rel), top_level);
+    assert_eq!(top_level.index(), 2);
+    assert_eq!(common::entry_id(&referrer, wrap).index(), 0);
+    assert_eq!(common::entry_id(&referrer, rel).index(), 1);
 
     // It is written as an integer literal, so it travels with the Referrer in a macro call.
     let id: ContextId = parse_str("3usize").unwrap();
@@ -493,12 +504,11 @@ fn repeater_impl_for_each_entry_of_a_trait() {
     let self_param: Ident = parse_quote!(__S);
     let repeater: Path = parse_quote!(crate::Repeater);
     let impls: Vec<ItemImpl> = result
-        .repeater_impls(
-            &repeater,
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             7,
-            ImplSelf::Param(&self_param),
-            slot_const(&repeater),
-        )
+            ImplSelf::Param(self_param.clone()),
+        ))
         .unwrap()
         .into_iter()
         .map(|r| parse_quote!(#r))
@@ -507,7 +517,7 @@ fn repeater_impl_for_each_entry_of_a_trait() {
         common::entry_id_at(&referrer, 1),
         common::entry_id_at(&referrer, 2),
     );
-    let (key1, key2) = (repeater_key(7, rel_ix), repeater_key(7, wrap2_ix));
+    let (key1, key2) = (common::key(7, rel_ix), common::key(7, wrap2_ix));
     let rel: ItemImpl = parse_quote! {
         impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key1> for __S {
             type Type = Rel;
@@ -524,24 +534,29 @@ fn repeater_impl_for_each_entry_of_a_trait() {
     assert!(impls.contains(&wrap2));
 }
 
-/// `slot_const()` encodes `usize` as an array length, `u64` into its slot, and `u128` as the `KEY`.
+/// `Projection::of()` encodes `usize` as an array length, `u64` into its slot, and `u128` as the
+/// `KEY`.
 #[test]
-fn slot_const_encodes_usize_u64_and_u128() {
-    let repeater: Path = parse_quote!(crate::Repeater);
-    let mut const_fn = slot_const(&repeater);
-    let param: ConstParam = parse_quote!(const N: usize);
+fn projection_encodes_usize_u64_and_u128_consts() {
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&parse_quote!(
+        trait Tr<const N: usize, const K: u64, const L: u128> {
+            fn f(&self) -> Wrap<{ N }, { K }, { L }>;
+        }
+    ));
+    let referrer = leaker.result().finish().unwrap();
+    let (entry, _, context) = referrer.iter().next().unwrap();
+    let projection = common::projection(parse_quote!(crate::Repeater), 7);
+    let written = projection.of(&parse_quote!(Self), context, entry).unwrap();
+    let expected: Type =
+        // The context sorts the consts by name.
+        parse_quote!((
+            *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, K, Type = ()>,
+            *const dyn crate::Repeater<(), L, Type = ()>,
+            [(); N]
+        ));
     assert_eq!(
-        const_fn(&parse_quote!(3), &param).unwrap(),
-        parse_quote!([(); 3])
-    );
-    let param: ConstParam = parse_quote!(const K: u64);
-    assert_eq!(
-        const_fn(&parse_quote!(4), &param).unwrap(),
-        parse_quote!(*const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 4, Type = ()>)
-    );
-    let param: ConstParam = parse_quote!(const L: u128);
-    assert_eq!(
-        const_fn(&parse_quote!(5), &param).unwrap(),
-        parse_quote!(*const dyn crate::Repeater<(), 5, Type = ()>)
+        common::s(&common::projection_args(&written)),
+        common::s(&expected)
     );
 }

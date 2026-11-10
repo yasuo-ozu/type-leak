@@ -74,6 +74,8 @@ type_leak_test_leaker::s::Q!(impl<I: ::core::iter::Iterator> Q<I> for Concrete =
 // `T::Item` of a parameter of the trait, with a concrete type for `T` (F90): the macro writes the
 // trait of the bound, as `<IntoIter<u8>>::Item` is E0223.
 type_leak_test_leaker::s::Proj9252!(impl Proj9252<::std::vec::IntoIter<u8>> for Concrete => 0);
+// The same with the bound in the where clause, and a default that names a leaked type, left out.
+type_leak_test_leaker::s::Where9253!(impl Where9253<::std::vec::IntoIter<u8>> for Concrete => 0);
 
 // A trait object inheriting the lifetime of its path, a bare identifier argument which is a const
 // and types in expressions, which are leaked as a whole. The implementors of the last are generic, where a

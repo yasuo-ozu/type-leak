@@ -4,10 +4,11 @@ use crate::encode::params_as_args;
 use crate::error::Cause;
 use crate::unstable::is_std_trait;
 use crate::util::{
-    bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
-    ident_name, projection, projection_head, self_in_param, self_in_predicate, sorted_by_tokens,
-    tidy, token_names, type_contains, type_mentions_self, type_names, unwrap_type_group,
-    where_predicate_mentions_self, without_default, without_self_bounds, ReplaceSelf, SelfMentions,
+    bound_mentions_self, canonical_bounds, first_self_in_generics, generic_param_mentions_self,
+    generic_param_name, ident_name, projection, projection_head, self_in_param, self_in_predicate,
+    sorted_by_tokens, tidy, token_names, type_contains, type_mentions_self, type_names,
+    unwrap_type_group, where_predicate_mentions_self, without_default, without_self_bounds,
+    ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -194,8 +195,7 @@ pub enum SelfRequirement {
     ///
     /// In a struct, enum or union nested in the analyzed code, only an entry that must be
     /// replaced has this requirement (`Rel2<Self>`). An absolute type that names `Self`
-    /// (`::path::Wrap<Self>`) has none: the copy keeps it as written, with its own `Self`. See
-    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
+    /// (`::path::Wrap<Self>`) has none: the copy keeps it as written, with its own `Self`.
     ///
     /// The type is written as `Self` means it in the item's module, without the module path:
     ///
@@ -209,8 +209,10 @@ pub enum SelfRequirement {
     ///
     /// The impl is for this type. A copy in another crate cannot write `Self` for it, because
     /// there `Self` is the copy's own type. So the copy writes the item's type with its module path
-    /// in front. A proc macro cannot find that path by itself: it must come from the macro's
-    /// input. For a nested item, add [`NestedSelf::modules`](crate::NestedSelf::modules). If the
+    /// in front ([`Visitor::with_self()`](crate::Visitor::with_self)). A proc macro cannot find
+    /// that path by itself: it must come from the macro's input. For a nested item, give it to
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self), which gets this
+    /// requirement; without it the entry is left as written. If the
     /// self type of an impl is a relative path, rewrite it like any other type
     /// ([`Referrer::visitor()`](crate::Referrer::visitor)).
     ///
@@ -230,7 +232,7 @@ pub enum SelfRequirement {
     /// ([`View::visit_item()`](crate::View::visit_item), or an item in
     /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound on its
     /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self`
-    /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)). The entry may name
+    /// ([`Referrer::visitor()`](crate::Referrer::visitor) does it). The entry may name
     /// `Self` too (`Rel2<Self, T>`), with the error
     /// [`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds), which you accept with
     /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
@@ -703,8 +705,9 @@ impl ModuleScope {
 /// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. The fields are
 /// public to be read. You cannot build a `Context`, and more fields may come. Two contexts are
 /// equal if all their fields are equal, but the path, hint and parent of a module
-/// ([`ModuleScope::Itself`]) are not compared. A Referrer that is written as tokens and read back
-/// keeps every field.
+/// ([`ModuleScope::Itself`]) are not compared. The top-level context of a scope also holds the
+/// generics as written (not a public field), so it is never the context of an entry. A Referrer
+/// that is written as tokens and read back keeps every field.
 ///
 /// ```
 /// # use syn::*;
@@ -805,6 +808,22 @@ pub struct Context {
     ///
     /// A Referrer read back from tokens keeps it.
     pub module: Option<ModuleScope>,
+    /// The generics of the item as written, only in the top-level context of a scope: the
+    /// parameters in their order, with their defaults, and the where clause.
+    ///
+    /// ```ignore
+    /// // In crate a:
+    /// pub trait Store<'a, K: 'a, D = Page<K>> where K: Clone { fn get(&self, key: &'a K) -> D; }
+    ///
+    /// // `generics` of the top-level context of `Store`:
+    /// <'a, D, K: 'a + Clone>
+    /// // `declared` of it:
+    /// <'a, K: 'a, D = Page<K>> where K: Clone
+    /// ```
+    ///
+    /// It is part of the identity: two scopes with equal `generics` and other `declared` are two
+    /// contexts. The context of an entry has none.
+    pub(crate) declared: Option<Generics>,
     /// The `Self` of the outer scopes whose bounds this context depends on (`S<T>` for the entry
     /// `Wrap<S<T>>` of `struct S<T: Fn(T::Item) + Iterator<Item = u8>>`), so that the scope that
     /// declares it records it in its `self_ty`. Not part of the identity, not kept in tokens.
@@ -834,6 +853,7 @@ impl Context {
             self_outlives: Vec::new(),
             gats: Vec::new(),
             module: None,
+            declared: None,
             substituted: Vec::new(),
         }
     }
@@ -853,6 +873,13 @@ impl Context {
             parent,
         });
         context
+    }
+
+    /// Returns `true` if an entry of this context needs what `Self` stands for: the context has a
+    /// self type, or its generics name `Self`, even only in `Self: 'a`. The Referrer,
+    /// `Projection::of()` and the impls of `repeater_impls()` all decide it here.
+    pub(crate) fn needs_self(&self) -> bool {
+        self.self_ty.is_some() || first_self_in_generics(&self.generics).is_some()
     }
 
     pub(crate) fn with_self_outlives(mut self, lifetimes: Vec<Lifetime>) -> Self {
@@ -883,6 +910,12 @@ impl Context {
         self
     }
 
+    /// Sets the generics of the scope as written: its top-level context.
+    pub(crate) fn with_declared(mut self, declared: Generics) -> Self {
+        self.declared = Some(declared);
+        self
+    }
+
     /// Sets the module that the context is in. A module's own context stays itself.
     pub(crate) fn with_module(mut self, module: Option<ContextId>) -> Self {
         if !self.is_module_scope() {
@@ -905,6 +938,10 @@ impl Context {
         for gat in &self.gats {
             rendered.push(' ');
             rendered.push_str(&gat.render());
+        }
+        if let Some(declared) = &self.declared {
+            let where_clause = &declared.where_clause;
+            rendered.push_str(&format!(" declared {}", quote!(#declared #where_clause)));
         }
         // The path, the hint and the parent of a module are not part of its identity.
         match &self.module {
@@ -1352,9 +1389,10 @@ impl std::hash::Hash for Context {
 ///
 /// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the context of what it
 /// analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) takes the generics, `Self`
-/// and module of the copy from it). A [`ModuleScope`] has the id of a module. Ids count from 0 in
-/// order of first appearance, and the Referrer may skip some. `ToTokens` writes it as an integer
-/// literal, and `Parse` reads one with or without `usize`.
+/// and module of the copy from it, and [`Referrer::complete_args()`](crate::Referrer::complete_args)
+/// the generics as declared). A [`ModuleScope`] has the id of a module. Ids count from 0 in order
+/// of first appearance, and the Referrer may skip some. `ToTokens` writes it as an integer literal,
+/// and `Parse` reads one with or without `usize`.
 ///
 /// The generics of a context are the ones its entries use: those the type names, those that their
 /// bounds name and, if it names `Self`, those of the description of `Self`. A where predicate on

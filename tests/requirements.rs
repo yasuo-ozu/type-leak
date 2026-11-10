@@ -8,7 +8,7 @@ use common::{entries_with_generics as entries, s};
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Context, ContextId, EntryId, Leaker, Referrer, SelfRequirement, Visitor};
+use type_leak::{Context, ContextId, EntryId, Leaker, Referrer, SelfRequirement};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -79,12 +79,21 @@ fn types_are_shared_by_calls() {
         common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Rel", "RelA", "RelB < u8 >"]
     );
-    // They use no generics, whichever the generics of the calls are: the generics of `A` (none)
-    // are the context of the types, and those of `B` are another context without an entry.
+    // They use no generics, whichever the generics of the calls are: one context for the types,
+    // and the generics of each call as declared (none for `A`, `<T>` for `B`) are a context of
+    // its own without an entry.
     assert_eq!(common::entry(&referrer, 0).generics.params.len(), 0);
-    assert_eq!(common::context_ids(&referrer).len(), 2);
-    assert_eq!(tops[0], common::entry_id(&referrer, 0));
-    assert_ne!(tops[1], common::entry_id(&referrer, 0));
+    assert_eq!(common::context_ids(&referrer).len(), 3);
+    assert_eq!(
+        (0..3)
+            .map(|ix| common::entry_id(&referrer, ix).index())
+            .collect::<Vec<_>>(),
+        [0, 0, 0]
+    );
+    assert_eq!(
+        tops.iter().map(|top| top.index()).collect::<Vec<_>>(),
+        [1, 2]
+    );
 }
 
 #[test]
@@ -120,13 +129,14 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
             entry(parse_quote!(Wrap<T>), parse_quote!(<const T: usize>)),
         ]
     );
-    assert_eq!(common::context_ids(&referrer).len(), 2);
+    // Each call also has its generics as declared, a context of its own (the ids 1 and 3).
+    assert_eq!(common::context_ids(&referrer).len(), 4);
     assert_eq!(
         (
             common::entry_id(&referrer, 0).index(),
             common::entry_id(&referrer, 1).index()
         ),
-        (0, 1)
+        (0, 2)
     );
     // The bounds are different.
     let referrer = leak(&[
@@ -154,7 +164,8 @@ fn equal_lifetime_bounds_give_equal_contexts() {
     // The order of the bounds of a lifetime.
     let referrer = leak(&["<'a, 'b, 'c: 'a + 'b>", "<'a, 'b, 'c: 'b + 'a>"]);
     assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(common::context_ids(&referrer).len(), 1);
+    // The entry has one context, and each call has the generics as it declared them: two more.
+    assert_eq!(common::context_ids(&referrer).len(), 3);
     assert_eq!(
         s(&common::entry(&referrer, 0).generics),
         "< 'a , 'b , 'c : 'a + 'b >"
@@ -248,9 +259,10 @@ fn the_gats_are_part_of_the_identity_of_the_top_level_context() {
     assert_ne!(without, other_bound);
     // The same GAT is the same context.
     assert_eq!(with_gat, again);
+    // The context of `Rel<Self>`, which names no GAT, and the three top-level contexts.
     assert_eq!(
         common::context_ids(&leaker.result().finish().unwrap()).len(),
-        3
+        4
     );
 }
 
@@ -353,14 +365,15 @@ fn self_of_a_trait() {
             "-"
         ]
     );
-    // The two types are in one context, which is also the top-level one: it has the generics of
-    // the trait and, as an entry names `Self`, what `Self` is.
-    assert_eq!(common::context_ids(&referrer).len(), 2);
+    // The two types are in one context. The top-level one is another: it has the generics of the
+    // trait as declared and, as an entry names `Self`, what `Self` is.
+    assert_eq!(common::context_ids(&referrer).len(), 3);
     assert_eq!(
         common::entry_id(&referrer, 0),
         common::entry_id(&referrer, 1)
     );
-    assert_eq!(common::entry_id(&referrer, 0), contexts[0]);
+    assert_ne!(common::entry_id(&referrer, 0), contexts[0]);
+    assert_eq!(contexts[0].index(), 2);
     assert!(referrer.has_self());
 
     // A trait without parameters.
@@ -395,14 +408,19 @@ fn self_in_different_traits_is_different() {
     );
     assert_eq!(selfs(&referrer), ["Self: X < T >", "-", "Self: Y < T >"]);
     // The generics of the traits are the same (`<T>`), but the top-level context has `Self` as an
-    // entry names it, so it is not shared by the calls: it is the context of `Rel<Self>`.
-    assert_eq!(common::context_ids(&referrer).len(), 3);
+    // entry names it, so it is not shared by the calls: each is a context of its own, after the
+    // context of `Rel<Self>` of its call.
+    assert_eq!(common::context_ids(&referrer).len(), 5);
+    assert_ne!(contexts[0], contexts[1]);
     assert_eq!(
-        contexts,
-        [
-            common::entry_id(&referrer, 0),
-            common::entry_id(&referrer, 2)
-        ]
+        contexts.iter().map(|top| top.index()).collect::<Vec<_>>(),
+        [2, 4]
+    );
+    assert_eq!(
+        (0..3)
+            .map(|ix| common::entry_id(&referrer, ix).index())
+            .collect::<Vec<_>>(),
+        [0, 1, 3]
     );
 
     // The same trait twice is shared.
@@ -576,7 +594,7 @@ fn the_generics_of_an_entry_are_arguments_with_the_names_of_the_site_substituted
 }
 
 fn rewrite<F: FnMut(Type, EntryId, &Context) -> Type>(
-    mut visitor: Visitor<'_, F>,
+    mut visitor: common::Replacing<'_, F>,
     sig: &str,
 ) -> String {
     let mut sig: Signature = parse_str(sig).unwrap();
@@ -610,7 +628,7 @@ fn matching_with_the_generics_of_the_context() {
     // declares them.
     assert_eq!(
         rewrite(
-            referrer.visitor(context, placeholder),
+            common::visitor(&referrer, context, placeholder),
             "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
         ),
         rewritten(
@@ -621,7 +639,7 @@ fn matching_with_the_generics_of_the_context() {
     // assumed to be the Leaker's), but what uses none is found.
     assert_eq!(
         rewrite(
-            referrer.visitor(none, placeholder),
+            common::visitor(&referrer, none, placeholder),
             "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
         ),
         rewritten("fn f<const B: bool>(&self, a: Wrap<T>, b: P<1usize>, c: P<2usize>, d: Wrap<U>)")
@@ -637,7 +655,7 @@ fn matching_with_the_generics_of_the_context() {
         let sig = format!("fn f{}(&self, a: Wrap<T>)", generics);
         let expected = format!("fn f{}(&self, a: {})", generics, a);
         assert_eq!(
-            rewrite(referrer.visitor(context, placeholder), &sig),
+            rewrite(common::visitor(&referrer, context, placeholder), &sig),
             rewritten(&expected),
             "{}",
             generics
@@ -646,14 +664,14 @@ fn matching_with_the_generics_of_the_context() {
     // `Wrap<B>` is for a `bool`.
     assert_eq!(
         rewrite(
-            referrer.visitor(context, placeholder),
+            common::visitor(&referrer, context, placeholder),
             "fn f<const B: bool>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: bool>(&self, b: P<1usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.visitor(context, placeholder),
+            common::visitor(&referrer, context, placeholder),
             "fn f<const B: u8>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: u8>(&self, b: Wrap<B>)")
@@ -673,14 +691,14 @@ fn matching_is_exact_where_a_name_is_declared_or_not() {
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
         rewrite(
-            referrer.visitor(contexts[0], placeholder),
+            common::visitor(&referrer, contexts[0], placeholder),
             "fn g(&self) -> Wrap<B>"
         ),
         rewritten("fn g(&self) -> P<1usize>")
     );
     assert_eq!(
         rewrite(
-            referrer.visitor(contexts[0], placeholder),
+            common::visitor(&referrer, contexts[0], placeholder),
             "fn f<const B: bool>(&self) -> Wrap<B>"
         ),
         rewritten("fn f<const B: bool>(&self) -> P<0usize>")
@@ -716,12 +734,12 @@ fn matching_with_the_generics_of_each_scope() {
     let sig = "fn f(&self) -> Wrap<T>";
     for (context, ix) in [(contexts[0], 0usize), (contexts[1], 1)] {
         assert_eq!(
-            rewrite(referrer.visitor(context, placeholder), sig),
+            rewrite(common::visitor(&referrer, context, placeholder), sig),
             rewritten(&format!("fn f(&self) -> P<{}usize>", ix))
         );
     }
     assert_eq!(
-        rewrite(referrer.visitor(other, placeholder), sig),
+        rewrite(common::visitor(&referrer, other, placeholder), sig),
         rewritten(sig)
     );
     // A type which does not use the generics is found whatever they are.
@@ -730,7 +748,10 @@ fn matching_with_the_generics_of_each_scope() {
     let (other, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ());
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        rewrite(referrer.visitor(other, placeholder), "fn f(&self) -> Rel"),
+        rewrite(
+            common::visitor(&referrer, other, placeholder),
+            "fn f(&self) -> Rel"
+        ),
         rewritten("fn f(&self) -> P<0usize>")
     );
 }
@@ -769,18 +790,18 @@ fn matching_self() {
     // `Self` is that of the context, as it records it: the entries that do not mention `Self` are
     // not affected by it.
     assert_eq!(
-        rewrite(referrer.visitor(contexts[0], placeholder), sig),
+        rewrite(common::visitor(&referrer, contexts[0], placeholder), sig),
         rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
-        rewrite(referrer.visitor(contexts[1], placeholder), sig),
+        rewrite(common::visitor(&referrer, contexts[1], placeholder), sig),
         rewritten("fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>)")
     );
     // The context of `Z` has no `Self` that an entry names, and the one of `enter_generics()` has
     // none at all: `Rel<Self>` is not found.
     for context in [contexts[2], generics] {
         assert_eq!(
-            rewrite(referrer.visitor(context, placeholder), sig),
+            rewrite(common::visitor(&referrer, context, placeholder), sig),
             rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
         );
     }
@@ -790,9 +811,7 @@ fn matching_self() {
             fn f(&self, a: Rel<Self>, b: Rel2, c: Wrap<T>);
         }
     );
-    referrer
-        .visitor(contexts[1], placeholder)
-        .visit_item_trait_mut(&mut copy);
+    common::visitor(&referrer, contexts[1], placeholder).visit_item_trait_mut(&mut copy);
     let expected: ItemTrait = parse_quote!(
         trait Y<T> {
             fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>);
@@ -828,11 +847,14 @@ fn serialization_with_self() {
     assert_eq!(
         tokens.to_string(),
         format!(
-            "\"{}\" 4 \
+            "\"{}\" 7 \
              < T > ; Self : X < T > ; (Rel < Self >) \
              < T > ; (Wrap < T >) \
+             declared < T > ; Self : X < T > ; () \
              < T > ; Self = S < T > ; (RelS < Self >) \
-             (RelP)",
+             declared < T > ; Self = S < T > ; () \
+             (RelP) \
+             declared < > ; ()",
             tag()
         )
     );

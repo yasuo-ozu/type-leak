@@ -141,13 +141,13 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
         return Err(Error::new(Span::call_site(), &error.message));
     }
     let id = nested.id;
-    let self_param = ident("__S");
-    let repeater: Path = parse_quote!(crate::Repeater);
+    let projection = Projection::new(
+        parse_quote!(crate::Repeater),
+        id,
+        ImplSelf::Param(ident("__S")),
+    );
     let mut impls = TokenStream::new();
-    for r in result
-        .repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const)
-        .map_err(Error::from)?
-    {
+    for r in result.repeater_impls(&projection).map_err(Error::from)? {
         impls.extend(r.to_token_stream());
     }
     let witnesses = nested.types.iter().enumerate().map(|(j, (generics, ty))| {
@@ -251,7 +251,11 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         .first()
         .map(|seg| seg.ident.clone())
         .ok_or_else(|| Error::new(Span::call_site(), "expected a path"))?;
-    let repeater: Path = parse_quote!(::#krate::Repeater);
+    let projection = Projection::new(
+        parse_quote!(::#krate::Repeater),
+        id,
+        ImplSelf::Param(ident("__S")),
+    );
 
     // The copy nests the impl in the body of a method of the trait, as the Leaker nested the scopes.
     let (trait_generics, impl_generics, self_ty) = (
@@ -270,25 +274,17 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             }
         }
     };
-    let error = std::cell::RefCell::new(None);
+    // The entries are for any type: inside the impl `Self` is its self type.
     referrer
-        .visitor(context, |_leaked, ix, entry| {
-            let projection =
-                repeater_projection(&repeater, &parse_quote!(()), entry, id, ix, array_const);
-            match projection {
-                Ok(projection) => projection,
-                Err(e) => {
-                    *error.borrow_mut() = Some(e);
-                    parse_quote!(())
-                }
-            }
-        })
+        .visitor(context, &projection)
         .visit_item_trait_mut(&mut wrapper);
-    if let Some(e) = error.into_inner() {
-        return Err(Error::from(e));
-    }
-    let rewritten = probe_types(&wrapper);
+    // The probes are free functions, where there is no `Self`: the entries are for any type, and
+    // `()` is one.
+    let mut rewritten = probe_types(&wrapper);
     assert_eq!(rewritten.len(), nested.types.len());
+    for ty in &mut rewritten {
+        crate::host_projections(&referrer, &projection, ty, &parse_quote!(()))?;
+    }
 
     let mut checks = TokenStream::new();
     for (j, ((generics, _), ty)) in nested.types.iter().zip(&rewritten).enumerate() {

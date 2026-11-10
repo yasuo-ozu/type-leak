@@ -635,7 +635,7 @@ fn the_copy_is_rewritten_to_the_type_holding_the_binder() {
     );
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+        &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1184,7 +1184,7 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     let (referrer, context) = analyze_in(leaker(), &item).unwrap();
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |ty, _, _| {
+        &mut common::visitor(&referrer, context, |ty, _, _| {
             let ty = s(&ty);
             parse_quote!(P<#ty>)
         }),
@@ -1219,7 +1219,7 @@ fn the_copy_keeps_the_trait_object_holding_the_anchor() {
     );
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+        &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1641,7 +1641,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+        &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
         &mut replaced,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1671,7 +1671,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
         let referrer = leaker.result().finish().unwrap();
         let mut copy = item.clone();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+            &mut common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {
@@ -2280,7 +2280,7 @@ mod elided {
         );
         let mut copy = item.clone();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>)),
+            &mut crate::common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {

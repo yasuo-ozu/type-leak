@@ -88,16 +88,17 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
 fn replace(
     referrer: &Referrer,
     context: ContextId,
-    visit: impl FnOnce(&mut Visitor<'_, &mut dyn FnMut(Type, EntryId, &Context) -> Type>),
+    visit: impl FnOnce(&mut common::Replacing<'_, &mut dyn FnMut(Type, EntryId, &Context) -> Type>),
 ) -> BTreeSet<usize> {
     let found = RefCell::new(BTreeSet::new());
-    let mut type_fn = |_: Type, ix: EntryId, _: &Context| -> Type {
+    let mut write = |_: Type, ix: EntryId, _: &Context| -> Type {
         found.borrow_mut().insert(ix.index());
         parse_quote!(Replaced<#ix>)
     };
-    let mut visitor = referrer.visitor(
+    let mut visitor = common::visitor(
+        referrer,
         context,
-        &mut type_fn as &mut dyn FnMut(Type, EntryId, &Context) -> Type,
+        &mut write as &mut dyn FnMut(Type, EntryId, &Context) -> Type,
     );
     visit(&mut visitor);
     drop(visitor);

@@ -12,8 +12,8 @@ pub use repo_macros::{export_trait, forward};
 /// types the signatures of an exported trait name; the copy in another crate names them through
 /// it. It must be at the root of this crate, and local to it (the impls are for any type).
 ///
-/// `T` encodes the generics the type uses, and `KEY` is `repeater_key(ID, ENTRY)`: `ID` is the
-/// Leaker's id (here one for each trait), and `ENTRY` the entry of that trait.
+/// `T` encodes the generics the type uses, and `KEY` is `Projection::key(ENTRY)`: its high half is
+/// the Leaker's id (here one for each trait), and its low half the entry of that trait.
 pub trait Repeater<T: ?Sized, const KEY: u128> {
     type Type: ?Sized;
 }

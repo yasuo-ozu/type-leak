@@ -2,8 +2,7 @@
 //! that the error is about is removed.
 //!
 //! - A table of the errors of every kind, with what `ignore()` of each leaves: the errors, the
-//!   copy (`E<ix>` for an entry, `N<ix>` for one that names the own `Self` of a nested item), the
-//!   live entries and the impls. An entry that is used elsewhere stays one there.
+//!   copy (`E<ix>` for an entry), the live entries and the impls. An entry that is used elsewhere stays one there.
 //! - The errors that share a part go together, as do the errors inside the part. An error that is
 //!   not one of the errors, or that `allow()` dropped, changes nothing.
 //! - An entry that is removed keeps its `EntryId`, its Repeater key and its bucket type for the
@@ -43,16 +42,13 @@ fn plain(mut item: Item) -> Item {
     item
 }
 
-/// The copy of `item` with `E<ix>` for an entry, and `N<ix>` for an entry that names the own
-/// `Self` of a nested item.
+/// The copy of `item` with `E<ix>` for an entry.
 fn copy_of(referrer: &Referrer, top: ContextId, item: &Item) -> Item {
     let mut copy = item.clone();
-    referrer
-        .visitor(top, |_, ix, _| {
-            parse_str(&format!("E{}", ix.index())).unwrap()
-        })
-        .with_nested_self(|_, _, ix, _| parse_str(&format!("N{}", ix.index())).unwrap())
-        .visit_item_mut(&mut copy);
+    common::visitor(referrer, top, |_, ix, _| {
+        parse_str(&format!("E{}", ix.index())).unwrap()
+    })
+    .visit_item_mut(&mut copy);
     plain(copy)
 }
 
@@ -102,12 +98,13 @@ fn impls(result: &LeakerResult) -> Vec<RepeaterImpl> {
     let repeater: Path = parse_quote!(Repeater);
     let param: Ident = parse_quote!(__S);
     result
-        .repeater_impls(
-            &repeater,
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
             1,
-            ImplSelf::Bucket { param: &param },
-            array_const,
-        )
+            ImplSelf::Bucket {
+                param: param.clone(),
+            },
+        ))
         .unwrap()
 }
 
@@ -499,7 +496,7 @@ fn rows() -> Vec<Row> {
             ],
         },
         // The error is about an entry, found twice: it is removed, and its type is written as
-        // written wherever it would have been replaced (`N0` is the entry for the own `Self`).
+        // written wherever it would have been replaced.
         Row {
             name: "an entry for any type",
             item: parse_quote!(
@@ -517,7 +514,7 @@ fn rows() -> Vec<Row> {
             live: vec![(0, parse_quote!(Rel2<Self, T>))],
             copy: parse_quote!(
                 mod m {
-                    struct N<T: ::core::convert::AsRef<Self>>(N0, ::core::option::Option<N0>);
+                    struct N<T: ::core::convert::AsRef<Self>>(E0, ::core::option::Option<E0>);
                 }
             ),
             ignored: vec![
@@ -824,7 +821,7 @@ fn an_error_about_an_entry_inside_a_part_stays() {
     // The entry is still one: the part is as written, and the other field has the entry.
     let expected: Item = parse_quote!(
         mod m {
-            struct N<T: ::core::convert::AsRef<Self>>(MyType<'_, Rel2<Self, T>>, N0);
+            struct N<T: ::core::convert::AsRef<Self>>(MyType<'_, Rel2<Self, T>>, E0);
         }
     );
     assert_eq!(copy_after(&after, top, &item), expected);
@@ -894,8 +891,9 @@ fn a_removed_entry_keeps_its_place_and_the_others_keep_theirs() {
     );
     // The others keep the primitive type of their impls, the KEY of their impls and their impls.
     let id = 1;
-    let bucket =
-        |referrer: &Referrer, n: usize| referrer.bucket_self(id, common::entry_id_at(referrer, n));
+    let bucket = |referrer: &Referrer, n: usize| {
+        common::bucket_self(referrer, id, common::entry_id_at(referrer, n))
+    };
     assert_eq!(bucket(&before, 1), bucket(&after, 0));
     assert_eq!(bucket(&before, 2), bucket(&after, 1));
     let kept: Vec<String> = impls(&result)[1..]
@@ -920,7 +918,11 @@ fn a_removed_entry_keeps_its_place_and_the_others_keep_theirs() {
     let repeater: Path = parse_quote!(Repeater);
     let with = |result: &LeakerResult| {
         result
-            .repeater_impls(&repeater, 1, ImplSelf::Marker(&marker), array_const)
+            .repeater_impls(&Projection::new(
+                repeater.clone(),
+                1,
+                ImplSelf::Marker(marker.clone()),
+            ))
             .map(|impls| impls.len())
     };
     assert!(matches!(with(&result), Err(EncodeError::NeedsSelf(_))));
@@ -952,9 +954,13 @@ fn removing_the_only_entry_leaves_a_referrer_with_none() {
             }
         )
     );
-    // The index of the removed entry is still one of the Referrer: `bucket_self()` is `None`.
+    // The index of the removed entry is still one of the Referrer: the bucket helper has none.
     assert_eq!(
-        referrer.bucket_self(1, common::entry_id_at(&result.into_referrer(), 0)),
+        common::bucket_self(
+            &referrer,
+            1,
+            common::entry_id_at(&result.into_referrer(), 0)
+        ),
         None
     );
 }

@@ -1,7 +1,7 @@
 //! Uses `type-leak` across crate boundaries through a proc macro, as a downstream crate would.
 //!
 //! - `tests/crates/macro`: the proc macro using `type-leak` (`Leaker`, `Referrer` and
-//!   `slot_const()`).
+//!   the const slots of the Repeater).
 //! - `tests/crates/leaker`: the Leaker's crate, defining traits with relative types.
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
 //!   forward to `Inner`, and copying items of every kind (struct, enum, union, impl, module, trait)
@@ -15,7 +15,7 @@
 //! The tests here read what the macros reported and what they wrote.
 
 use syn::parse_quote;
-use type_leak::{repeater_key, EntryId};
+use type_leak::{EntryId, ImplSelf, Projection};
 use type_leak_test_leaker::m::{
     Braced9246, Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault,
     RelType,
@@ -170,6 +170,22 @@ fn the_associated_type_of_a_concrete_argument_is_written_with_its_trait() {
     assert_eq!(got, Some(7));
 }
 
+/// Fixture 9253: `Where9253<T, D = Wrap<T>> where T: Iterator` has `T::Item` in a signature, and
+/// the Referrer's crate implements it for `::std::vec::IntoIter<u8>`, leaving `D` out. The
+/// arguments are completed from the declaration that the Referrer carries: `D` is `Wrap<IntoIter<u8>>`
+/// through the Repeater, and the bound of the where clause gives the trait of `T::Item`. Before,
+/// the macro knew only the bounds of the parameters themselves, and `<IntoIter<u8>>::Item` is E0223.
+#[test]
+fn the_declaration_of_the_trait_completes_a_default_and_a_where_clause_at_the_use_site() {
+    use type_leak_test_leaker::s::{Where9253, Wrap};
+    let c = Concrete(Inner);
+    let item: Option<u8> = <Concrete as Where9253<::std::vec::IntoIter<u8>>>::f(&c, Wrap(7));
+    assert_eq!(item, Some(7));
+    let wrapped: Wrap<::std::vec::IntoIter<u8>> =
+        <Concrete as Where9253<::std::vec::IntoIter<u8>>>::d(&c, vec![1u8, 2].into_iter());
+    assert_eq!(wrapped.0.collect::<Vec<u8>>(), [1, 2]);
+}
+
 #[test]
 fn lifetimes_trait_objects_and_projections() {
     use type_leak_test_leaker::s::{DynRoot, Out, RelImpl, Wrap, Q};
@@ -276,10 +292,18 @@ fn squash(text: &str) -> String {
 /// The `KEY` of the entry `entry` of the Leaker `id`, as the tokens write it (and `squash()` leaves it).
 fn key_text(id: u64, entry: usize) -> String {
     let entry: EntryId = parse_quote!(#entry);
-    format!("{}u128", repeater_key(id, entry))
+    format!(
+        "{}u128",
+        Projection::new(
+            parse_quote!(Repeater),
+            id,
+            ImplSelf::Param(parse_quote!(__S))
+        )
+        .key(entry)
+    )
 }
 
-/// `repeater_key(id, entry)` in a type, where the argument of a path is a const expression.
+/// `Projection::key()` in a type, where the argument of a path is a const expression.
 const fn key(id: u64, entry: usize) -> u128 {
     ((id as u128) << 64) | entry as u128
 }
@@ -288,7 +312,15 @@ const fn key(id: u64, entry: usize) -> u128 {
 fn the_const_key_is_the_key_of_the_library() {
     for (id, index) in [(0, 0), (7, 3), (9209, 2), (u64::MAX, usize::MAX)] {
         let entry: EntryId = parse_quote!(#index);
-        assert_eq!(key(id, index), repeater_key(id, entry));
+        assert_eq!(
+            key(id, index),
+            Projection::new(
+                parse_quote!(Repeater),
+                id,
+                ImplSelf::Param(parse_quote!(__S))
+            )
+            .key(entry)
+        );
     }
 }
 
@@ -631,7 +663,7 @@ fn every_item_kind_is_leaked_across_crates() {
         // F69: the copy is used at an instantiation that gives the type parameter a type with a
         // lifetime, where it is in the inputs of a function pointer or `Fn(..)` whose output has an
         // elided lifetime: a struct, the arguments of a trait's method, and the default of a
-        // parameter that `complete_params()` completes. The elided one is named.
+        // parameter that `complete_args()` completes. The elided one is named.
         (9231, __tl_report_9231!(), ok("struct", 1, 4, 4)),
         (9232, __tl_report_9232!(), ok("trait", 1, 3, 2)),
         (9233, __tl_report_9233!(), ok("struct", 1, 4, 4)),
@@ -741,9 +773,10 @@ fn copies_of_items_hold_the_original_types() {
 }
 
 /// A struct, an enum and a trait nested in a module name their own `Self` in relative types
-/// (`Wrap<Self>`), and the copy holds the Leaker's: `Visitor::with_nested_self()` writes
-/// `<::type_leak_test_leaker::kinds::Links<T> as Repeater<..>>::Type` for the `Self` of the struct,
-/// which the copy's own `Links` could not stand for (the Repeater's impl is for the Leaker's one).
+/// (`Wrap<Self>`), and the copy holds the Leaker's: the closure that the test macro gives to
+/// `Visitor::with_nested_self()` returns `::type_leak_test_leaker::kinds::Links<T>` for the `Self`
+/// of the struct, which the copy's own `Links` could not stand for (the Repeater's impl is for the
+/// Leaker's one).
 /// The Referrer's crate compares each position with a witness of the original when it compiles; here
 /// the fields go in and out of the Leaker's types, which `same()` and the assignments check.
 #[test]
@@ -808,8 +841,8 @@ fn items_nested_in_a_module_name_their_own_self() {
 /// A struct, an enum and a union nested in a module, whose generic has a bound that names their
 /// own `Self` (`T: AsRef<Self>`, `where T: AsRef<(Self, u8)>`), use the generic in a relative type
 /// (`Wrap<T>`) that does not name `Self`. The copy declares a type of its own, which has the bound
-/// for itself, so `Visitor::with_nested_self()` lets the macro write `<Self as Repeater<..>>::Type`:
-/// the Repeater's impl of the entry is for any type that the bound holds for. The field is the
+/// for itself, so the visitor's `<Self as Repeater<..>>::Type` is right, with no closure of
+/// `with_nested_self()`: the Repeater's impl of the entry is for any type that the bound holds for. The field is the
 /// Leaker's `Wrap<T>`; had the macro passed the Leaker's type, the bound would not hold for it
 /// (E0277). The Referrer's crate compiles only if rustc accepts the copy and the witnesses.
 #[test]
@@ -1589,7 +1622,7 @@ fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_no
 
 /// `coinduction`'s shape: `enter_impl(..)` with `visit_path_arguments()`, the
 /// Repeater's impls for a marker (`ImplSelf::Marker`) of the entries, and the Referrer's copy of the self type, the trait and its
-/// arguments with `Referrer::visitor(context, ..)` and `repeater_projection()` with the generics
+/// arguments with `Referrer::visitor(context, ..)` and `Projection::of()` with the generics
 /// passed by their own names. The Referrer's crate checks the copy: each type is the
 /// original (a witness), and rustc finds
 /// the Leaker's impl of the trait for the rewritten self type.
@@ -1660,8 +1693,8 @@ fn the_scope_api_with_a_marker() {
 
 /// `newer-type`'s shape: `Self` is allowed, and the Repeater's impl of an entry that names it is for
 /// the self type (`ImplSelf::Param`). A marker is refused then (the call of `repeater_impls()`
-/// fails), so the impl of the one that does not is for a parameter, which the marker is accepted
-/// for.
+/// fails), so the impl of the one that does not is for a parameter too, and `Projection::of()`
+/// writes both for `Self`.
 #[test]
 fn the_scope_api_with_self() {
     assert_eq!(
@@ -1669,13 +1702,13 @@ fn the_scope_api_with_self() {
         "7002|entries=2 impls=2 types=4"
     );
     let trait_path = squash(type_leak_test_referrer::scoped::SCOPE_7002_TRAIT);
-    // `Wrap<Self>` is in the impl of the self type itself, `Rel<T>` in the marker's.
+    // `Wrap<Self>` is in the impl of the self type itself, `Rel<T>` in a blanket impl for `Self`.
     assert_eq!(
         trait_path,
         format!(
             "::type_leak_test_leaker::scoped::Tr<\
              <::type_leak_test_leaker::scoped::Holder<T,u8>as::type_leak_test_leaker::Repeater<(T,),{}>>::Type,\
-             <::type_leak_test_leaker::scoped::M7002as::type_leak_test_leaker::Repeater<(T,),{}>>::Type>",
+             <::type_leak_test_leaker::scoped::Holder<T,u8>as::type_leak_test_leaker::Repeater<(T,),{}>>::Type>",
             key_text(7002, 0),
             key_text(7002, 1)
         )
@@ -2129,7 +2162,7 @@ fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
         __tl_report_9209!()
     );
     // The entries `Defd2<Rel, u8>` and `Rel`, that no generic is used in, are for the primitive
-    // type that `Referrer::bucket_self(id, ix)` gives (the bucket is part of the format, so these
+    // type that `Projection::of()` writes for `ImplSelf::Bucket` (the bucket is part of the format, so these
     // do not change without a bump of `Referrer::FORMAT_VERSION`). `Wrap<Self>` has none.
     assert_eq!(
         type_name::<<u64 as Repeater<(), { key(9209, 1) }>>::Type>(),

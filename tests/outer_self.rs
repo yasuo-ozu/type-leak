@@ -12,7 +12,7 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    array_const, Context, EncodeError, EntryId, ImplSelf, Leaker, Reason, Referrer, SelfRequirement,
+    Context, EncodeError, EntryId, ImplSelf, Leaker, Projection, Reason, Referrer, SelfRequirement,
 };
 
 fn ident(name: &str) -> Ident {
@@ -115,7 +115,11 @@ fn the_same_type_in_the_scope_itself_keeps_self() {
         ]
     );
     assert_eq!(self_of(&referrer, 0), "Self = S < T >");
-    assert_eq!(common::entry_id(&referrer, 0), outer);
+    // The scope's own context has the bound as declared and `Self`, and is not the entry's.
+    assert_ne!(common::entry_id(&referrer, 0), outer);
+    assert!(quote!(#referrer)
+        .to_string()
+        .ends_with("declared < T : :: p :: Tr < Self > > ; Self = S < T > ; ()"));
 }
 
 #[test]
@@ -484,7 +488,11 @@ fn the_items_nested_in_a_struct_scope_use_its_generic() {
         common::entry_id(&referrer, 3)
     );
     assert_eq!(self_of(&referrer, 4), "Self = S < T >");
-    assert_eq!(common::entry_id(&referrer, 4), outer);
+    // The scope's own context records it too, and is not the entry's.
+    assert_ne!(common::entry_id(&referrer, 4), outer);
+    assert!(quote!(#referrer)
+        .to_string()
+        .ends_with("declared < T : :: p :: Tr < Self > > ; Self = S < T > ; ()"));
 }
 
 #[test]
@@ -526,7 +534,11 @@ fn a_rewritten_bound_needs_no_self_so_a_marker_can_have_the_entry() {
     let result = leaker.result();
     assert!(result.errors().is_empty());
     let impls = result
-        .repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const)
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
+            7,
+            ImplSelf::Marker(marker.clone()),
+        ))
         .unwrap();
     assert_eq!(impls.len(), 1);
     // Where `Self` is the struct, the bound keeps it, and a marker cannot have the entry.
@@ -539,7 +551,11 @@ fn a_rewritten_bound_needs_no_self_so_a_marker_can_have_the_entry() {
     let result = leaker.result();
     assert!(result.errors().is_empty());
     let err = result
-        .repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const)
+        .repeater_impls(&Projection::new(
+            repeater.clone(),
+            7,
+            ImplSelf::Marker(marker.clone()),
+        ))
         .err();
     assert!(matches!(err, Some(EncodeError::NeedsSelf(_))));
 }
@@ -714,18 +730,14 @@ fn the_referrer_finds_the_entry_of_a_nested_scope() {
         }
     );
     let mut rewritten = copy.clone();
-    referrer
-        .visitor(outer, replace)
-        .visit_item_impl_mut(&mut rewritten);
+    common::visitor(&referrer, outer, replace).visit_item_impl_mut(&mut rewritten);
     assert_eq!(s(&rewritten), s(&expected));
     // The same after the Referrer was written and read back: the context knows the `Self`.
     let tokens = quote!(#referrer);
     let parsed: Referrer = syn::parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
     let mut rewritten = copy.clone();
-    parsed
-        .visitor(outer, replace)
-        .visit_item_impl_mut(&mut rewritten);
+    common::visitor(&parsed, outer, replace).visit_item_impl_mut(&mut rewritten);
     assert_eq!(s(&rewritten), s(&expected));
 }
 
@@ -753,9 +765,7 @@ fn the_referrer_needs_the_nesting_of_the_leaker() {
             }
         }
     );
-    referrer
-        .visitor(outer, replace)
-        .visit_item_impl_mut(&mut copy);
+    common::visitor(&referrer, outer, replace).visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {
             fn m(x: Rel<T>) {
@@ -811,9 +821,7 @@ fn the_referrer_nests_the_scopes_like_the_leaker() {
             }
         }
     );
-    referrer
-        .visitor(outer, replace)
-        .visit_item_impl_mut(&mut copy);
+    common::visitor(&referrer, outer, replace).visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {
             fn m() {
@@ -891,9 +899,7 @@ fn the_referrer_takes_the_self_of_each_nested_item() {
         }
     );
     // The type of another crate (`::p::W`) is an entry too, after the others.
-    referrer
-        .visitor(outer, replace)
-        .visit_item_impl_mut(&mut copy);
+    common::visitor(&referrer, outer, replace).visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {
             fn m() {
@@ -959,9 +965,7 @@ fn the_referrer_finds_the_default_of_a_nested_scope() {
     assert_eq!(parsed, referrer);
     for referrer in [referrer, parsed] {
         let mut rewritten = copy.clone();
-        referrer
-            .visitor(outer, replace)
-            .visit_item_impl_mut(&mut rewritten);
+        common::visitor(&referrer, outer, replace).visit_item_impl_mut(&mut rewritten);
         assert_eq!(s(&rewritten), s(&expected));
     }
 }
@@ -988,9 +992,7 @@ fn the_referrer_finds_a_default_that_uses_a_bound_of_its_own_scope() {
             trait Tr2<T: ::p::Bar<Self>, U = Rel<T>> {}
         }
     );
-    referrer
-        .visitor(outer, replace)
-        .visit_item_fn_mut(&mut copy);
+    common::visitor(&referrer, outer, replace).visit_item_fn_mut(&mut copy);
     let expected: ItemFn = parse_quote!(
         fn f<X>() {
             trait Tr2<T: ::p::Bar<Self>, U = P<0>> {}

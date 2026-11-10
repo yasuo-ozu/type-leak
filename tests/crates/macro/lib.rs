@@ -18,7 +18,7 @@
 //!
 //! The generics each leaked type uses (those of the trait and those of its methods, see
 //! [`Context::generics`]) are encoded into the Repeater's trait arguments with
-//! [`slot_const()`], so the Repeater (defined by [`repeater_definition()`]) is the only item
+//! the Repeater's const slots, so the Repeater (defined by [`repeater_definition()`]) is the only item
 //! shared by the Leaker and the Referrer. The lifetime bounds in them (`T: 'a`) are encoded too
 //! (`&'a T`), so the Repeater's implementations declare the generics without them
 //! ([`LeakerResult::repeater_impls()`]).
@@ -113,7 +113,7 @@ pub fn define_repeater(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
     quote!(#def).into()
 }
 
-/// Returns a deterministic ID of the trait, used in the Repeater's `KEY` (`repeater_key()`).
+/// Returns a deterministic ID of the trait, used in the Repeater's `KEY` (`Projection::key()`).
 fn trait_id(module: &Path, ident: &Ident) -> u64 {
     // FNV-1a
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -151,10 +151,113 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
     }
 }
 
+/// The self type of the impl of the entry `ix` under `ImplSelf::Bucket` for the Leaker `id`: its
+/// primitive type, or `None` if the entry needs `Self`. It is the type that `Projection::of()`
+/// writes the entry for: the one it is given for an entry that needs `Self`, else the bucket.
+pub(crate) fn bucket_self(referrer: &Referrer, id: u64, ix: EntryId) -> Option<Type> {
+    let projection = Projection::new(
+        parse_quote!(Repeater),
+        id,
+        ImplSelf::Bucket {
+            param: parse_quote!(__S),
+        },
+    );
+    let probe: Type = parse_quote!(__Probe);
+    match projection.of(&probe, entry_context(referrer, ix), ix) {
+        Ok(Type::Path(TypePath {
+            qself: Some(qself), ..
+        })) if *qself.ty != probe => Some(*qself.ty),
+        _ => None,
+    }
+}
+
+/// The Leaker id and the entry (`Projection::key()`) of a path through the Repeater,
+/// `<S as Repeater<ARGS, KEY>>::Type`, with the path of its trait. `None` for another type.
+pub(crate) fn projected_entry(ty: &Type) -> Option<(u64, EntryId, Path)> {
+    let Type::Path(TypePath {
+        qself: Some(qself),
+        path,
+    }) = ty
+    else {
+        return None;
+    };
+    let trait_path = Path {
+        leading_colon: path.leading_colon,
+        segments: path.segments.iter().take(qself.position).cloned().collect(),
+    };
+    let PathArguments::AngleBracketed(args) = &trait_path.segments.last()?.arguments else {
+        return None;
+    };
+    let key: u128 = match args.args.last()? {
+        GenericArgument::Const(Expr::Lit(ExprLit {
+            lit: Lit::Int(key), ..
+        })) => key.base10_parse().ok()?,
+        _ => return None,
+    };
+    let low = (key as u64) as usize;
+    let entry: EntryId = parse_quote!(#low);
+    Some(((key >> 64) as u64, entry, trait_path))
+}
+
+/// Writes `host` for the `Self` that the visitor wrote in each path through the Repeater in `ty`
+/// (`<Self as Repeater<..>>::Type`), by `Projection::of()`: for a type outside an impl, where
+/// there is no `Self`.
+pub(crate) fn host_projections(
+    referrer: &Referrer,
+    projection: &Projection,
+    ty: &mut Type,
+    host: &Type,
+) -> Result<()> {
+    struct Hosts<'a> {
+        referrer: &'a Referrer,
+        projection: &'a Projection,
+        host: &'a Type,
+        error: Option<Error>,
+    }
+    impl VisitMut for Hosts<'_> {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            match projected_entry(ty) {
+                Some((id, entry, _)) if id == self.projection.id => {
+                    let context = entry_context(self.referrer, entry);
+                    match self.projection.of(self.host, context, entry) {
+                        Ok(written) => *ty = written,
+                        Err(error) => {
+                            self.error.get_or_insert(Error::from(error));
+                        }
+                    }
+                }
+                _ => syn::visit_mut::visit_type_mut(self, ty),
+            }
+        }
+    }
+    let mut hosts = Hosts {
+        referrer,
+        projection,
+        host,
+        error: None,
+    };
+    hosts.visit_type_mut(ty);
+    hosts.error.map_or(Ok(()), Err)
+}
+
+/// The paths through the Repeater in `ty` (`projected_entry()`), outermost first.
+pub(crate) fn entries_in(ty: &Type) -> Vec<(u64, EntryId, Path)> {
+    struct Find(Vec<(u64, EntryId, Path)>);
+    impl<'ast> syn::visit::Visit<'ast> for Find {
+        fn visit_type(&mut self, ty: &'ast Type) {
+            self.0.extend(projected_entry(ty));
+            syn::visit::visit_type(self, ty);
+        }
+    }
+    let mut find = Find(Vec::new());
+    syn::visit::Visit::visit_type(&mut find, ty);
+    find.0
+}
+
 /// Checks the contract of the call of `LeakerResult::repeater_impls()` for `ImplSelf::Marker(..)`
 /// (`marked`): it fails with `EncodeError::NeedsSelf`, for the first entry that needs `Self`,
-/// exactly when `Referrer::bucket_self()` is `None` for some entry, and when it succeeds,
-/// `bucket_self()` is a type for every entry.
+/// exactly when `bucket_self()` is `None` for some entry, and when it succeeds, `bucket_self()` is
+/// a type for every entry.
 pub(crate) fn check_bucket_self<I>(
     referrer: &Referrer,
     id: u64,
@@ -163,7 +266,7 @@ pub(crate) fn check_bucket_self<I>(
     let first = referrer
         .iter()
         .map(|(ix, _, _)| ix)
-        .find(|ix| referrer.bucket_self(id, *ix).is_none());
+        .find(|ix| bucket_self(referrer, id, *ix).is_none());
     match (marked, first) {
         (Ok(_), None) => Ok(()),
         (Ok(_), Some(ix)) => {
@@ -171,7 +274,7 @@ pub(crate) fn check_bucket_self<I>(
             Err(Error::new(
                 Span::call_site(),
                 format!(
-                    "`Referrer::bucket_self({}, {})` is None, but `NeedsSelf` of the call for a marker is not: {}",
+                    "`bucket_self({}, {})` is None, but `NeedsSelf` of the call for a marker is not: {}",
                     id,
                     ix,
                     quote!(#ty)
@@ -195,7 +298,7 @@ pub(crate) fn check_bucket_self<I>(
             None => Err(Error::new(
                 Span::call_site(),
                 format!(
-                    "`Referrer::bucket_self({}, ..)` is a type for every entry, but the call for a marker fails with `NeedsSelf`: {}",
+                    "`bucket_self({}, ..)` is a type for every entry, but the call for a marker fails with `NeedsSelf`: {}",
                     id,
                     quote!(#ty)
                 ),
@@ -499,38 +602,6 @@ pub(crate) fn substitute_type(
     }
 }
 
-/// Writes `T::A` as `<T as Tr>::A` for a parameter `T` of the trait with the trait bound `Tr` (its
-/// first, without the associated types it fixes), which `substitute_args()` needs for a type that is
-/// not a type parameter (`EncodeError::AmbiguousAssociatedType`).
-struct QualifyProjections<'a> {
-    params: &'a Punctuated<GenericParam, Token![,]>,
-}
-
-impl VisitMut for QualifyProjections<'_> {
-    fn visit_type_mut(&mut self, ty: &mut Type) {
-        syn::visit_mut::visit_type_mut(self, ty);
-        let (name, rest) = match &*ty {
-            Type::Path(TypePath { qself: None, path }) if path.segments.len() == 2 => {
-                (&path.segments[0].ident, &path.segments[1])
-            }
-            _ => return,
-        };
-        let bound = self.params.iter().find_map(|param| match param {
-            GenericParam::Type(param) if param.ident == *name => {
-                param.bounds.iter().find_map(|bound| match bound {
-                    TypeParamBound::Trait(bound) => Some(bound.path.clone()),
-                    _ => None,
-                })
-            }
-            _ => None,
-        });
-        if let Some(bound) = bound {
-            let (name, rest) = (name.clone(), rest.clone());
-            *ty = parse_quote!(<#name as #bound>::#rest);
-        }
-    }
-}
-
 /// The context of the entry `ix`.
 pub(crate) fn entry_context(referrer: &Referrer, ix: EntryId) -> &Context {
     referrer.iter().find(|(id, _, _)| *id == ix).unwrap().2
@@ -696,24 +767,10 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let mut repeater_impls = TokenStream::new();
     let self_param: Ident = parse_quote!(__S);
     let check_marker: Type = parse_quote!(__Marker);
-    let params = result
-        .repeater_impls(
-            repeater,
-            id,
-            ImplSelf::Param(&self_param),
-            slot_const(repeater),
-        )
-        .map_err(Error::from)?;
-    check_bucket_self(
-        &referrer,
-        id,
-        result.repeater_impls(
-            repeater,
-            id,
-            ImplSelf::Marker(&check_marker),
-            slot_const(repeater),
-        ),
-    )?;
+    let projection = Projection::new(repeater.clone(), id, ImplSelf::Param(self_param));
+    let params = result.repeater_impls(&projection).map_err(Error::from)?;
+    let marker = Projection::new(repeater.clone(), id, ImplSelf::Marker(check_marker));
+    check_bucket_self(&referrer, id, result.repeater_impls(&marker))?;
     for r in params {
         repeater_impls.extend(r.to_token_stream());
     }
@@ -763,8 +820,8 @@ struct Header {
     referrer: Referrer,
     /// The top-level context of the trait: the scope of the copies.
     context: ContextId,
-    id: LitInt,
-    repeater: Path,
+    /// The Repeater, as the crate of the copy names it: the impls are for `__S`.
+    projection: Projection,
     module: Path,
 }
 
@@ -786,8 +843,7 @@ struct ImplementInput {
     item_trait: ItemTrait,
     referrer: Referrer,
     context: ContextId,
-    id: LitInt,
-    repeater: Path,
+    projection: Projection,
     module: Path,
     generics: Generics,
     trait_args: AngleBracketedGenericArguments,
@@ -814,15 +870,14 @@ impl Parse for Input {
             content.parse::<Token![,]>()?;
             (result, content.parse()?)
         };
-        let id = braced_parse(input)?;
+        let id = braced_parse::<LitInt>(input)?.base10_parse()?;
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
         let header = Header {
             item_trait,
             referrer: result.into_referrer(),
             context,
-            id,
-            repeater,
+            projection: Projection::new(repeater, id, ImplSelf::Param(parse_quote!(__S))),
             module,
         };
         if input.peek(Ident) && !input.peek(Token![impl]) {
@@ -862,8 +917,7 @@ impl Parse for Input {
             item_trait,
             referrer,
             context,
-            id,
-            repeater,
+            projection,
             module,
         } = header;
         input.parse::<Token![impl]>()?;
@@ -903,8 +957,7 @@ impl Parse for Input {
             item_trait,
             referrer,
             context,
-            id,
-            repeater,
+            projection,
             module,
             generics,
             trait_args,
@@ -980,38 +1033,21 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
                 item_trait,
                 referrer,
                 context,
-                id,
-                repeater,
+                projection,
                 ..
             },
         show,
         self_ty,
         items,
     } = input;
-    let id: u64 = id.base10_parse()?;
     let params = &item_trait.generics.params;
-    let self_in_copy: Type = self_ty.clone().unwrap_or_else(|| parse_quote!(Self));
-    let mut error = None;
     let mut copies = TokenStream::new();
     for mut item in items {
-        // `Self` is what the context says: the implementor of the trait.
-        let mut visitor = referrer.visitor(context, |_leaked, ix, entry| {
-            // The generics of the trait are passed by their own names.
-            let projection = repeater_projection(
-                &repeater,
-                &self_in_copy,
-                entry,
-                id,
-                ix,
-                slot_const(&repeater),
-            );
-            projection.unwrap_or_else(|e| {
-                error = Some(Error::from(e));
-                parse_quote!(())
-            })
-        });
+        // `Self` is what the context says: the implementor of the trait. The generics of the trait
+        // are passed by their own names.
+        let mut visitor = referrer.visitor(context, &projection);
         if let Some(self_ty) = &self_ty {
-            visitor = visitor.with_self(self_ty.clone());
+            visitor = visitor.with_self(self_ty.clone())?;
         }
         // An impl of the trait declares its parameters again (`impl<'a> Trait<'a> for ..`), with
         // the bounds it needs there, which are not those of the trait: they are the trait's.
@@ -1022,13 +1058,12 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         drop(visitor);
         copies.extend(quote!(#item));
     }
-    match (error, show) {
-        (Some(e), _) => Err(e),
-        (None, Some(name)) => {
+    match show {
+        Some(name) => {
             let text = copies.to_string();
             Ok(quote!(pub const #name: &str = #text;))
         }
-        (None, None) => Ok(copies),
+        None => Ok(copies),
     }
 }
 
@@ -1037,8 +1072,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         item_trait,
         referrer,
         context,
-        id,
-        repeater,
+        projection,
         module,
         generics,
         trait_args,
@@ -1046,37 +1080,20 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         field,
         extra,
     } = input;
-    let params = &item_trait.generics.params;
     let trait_ident = &item_trait.ident;
-    let id: u64 = id.base10_parse()?;
 
     // 1. Write the entries of the trait with their own generics, the methods and the defaults of
     // the parameters. `Self` is the implementor.
-    let mut encode_error = None;
     let mut visited = item_trait.clone();
     referrer
-        .visitor(context, |_leaked, ix, entry| {
-            repeater_projection(
-                &repeater,
-                &parse_quote!(Self),
-                entry,
-                id,
-                ix,
-                slot_const(&repeater),
-            )
-            .unwrap_or_else(|e| {
-                encode_error = Some(e);
-                parse_quote!(())
-            })
-        })
+        .visitor(context, &projection)
         .visit_item_trait_mut(&mut visited);
-    if let Some(e) = encode_error {
-        return Err(Error::from(e));
-    }
-    // 2. Complete the arguments (an omitted argument takes its default) and answer each parameter
-    // of the trait with its argument: one site for each signature written.
-    let site =
-        || Substitute::with_params(&visited.generics.params, &trait_args.args).map_err(Error::from);
+    // 2. Complete the arguments (an omitted argument takes its default, with the entries of the
+    // default written through the Repeater) and write them into each signature. `T::A` for a
+    // `T` given a type that is not a type parameter is written through the bound of `T` (F90).
+    let mut substitute = referrer
+        .complete_args(context, &trait_args.args, &projection)
+        .map_err(Error::from)?;
 
     let mut methods = TokenStream::new();
     for trait_item in &visited.items {
@@ -1101,21 +1118,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         // 3. Write the arguments of the impl into the signature, in one pass: the generics of the
         // trait are replaced, also in the paths through the Repeater.
         let mut sig = trait_fn.sig.clone();
-        let mut written = site()?;
-        written.visit_signature_mut(&mut sig);
-        if let Err(e) = written.finish() {
-            // `T::A` for a `T` given a type that is not a type parameter is refused (F90): the
-            // macro writes the trait of the parameter's bound, `<T as Tr>::A`, and `T` is
-            // replaced in it.
-            if !matches!(e, EncodeError::AmbiguousAssociatedType(_)) {
-                return Err(Error::from(e));
-            }
-            sig = trait_fn.sig.clone();
-            QualifyProjections { params }.visit_signature_mut(&mut sig);
-            let mut written = site()?;
-            written.visit_signature_mut(&mut sig);
-            written.finish().map_err(Error::from)?;
-        }
+        substitute.visit_signature_mut(&mut sig);
 
         // Forward to the field: `Trait::<args>::method::<generics>(&self.field, args..)`.
         let receiver = match sig.receiver() {

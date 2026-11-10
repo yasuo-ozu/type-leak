@@ -1499,8 +1499,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
         referrer.to_token_stream()
     );
     let mut copy = item.clone();
-    referrer
-        .visitor(id, |_, ix, _| parse_quote!(Entry<#ix>))
+    common::visitor(&referrer, id, |_, ix, _| parse_quote!(Entry<#ix>))
         .visit_item_struct_mut(&mut copy);
     let expected: ItemStruct = parse_quote!(
         struct S {
@@ -1662,14 +1661,14 @@ mod limits {
             Ok(vec!["RelType".to_string()].into_iter().collect())
         );
 
-        // `slot_const()` cannot encode an alias (relative or absolute), because it cannot
+        // The const slots cannot encode an alias (relative or absolute), because they cannot
         // know which slot to use.
         let repeater: Path = parse2(quote!(crate::Repeater)).unwrap();
         let alias = match &abs_item.generics.params[0] {
             GenericParam::Const(param) => param,
             _ => unreachable!(),
         };
-        let err = slot_const(&repeater)(&parse_quote!(N), alias).unwrap_err();
+        let err = crate::common::slot(&repeater, &parse_quote!(N), &alias.ty).unwrap_err();
         assert_eq!(
             err.to_string(),
             "unsupported type of const parameter: ':: my_crate :: Idx'"

@@ -39,7 +39,7 @@
 //! Rel<T>>`, a parameter with a bound that names the trait's own `Self` (written in the parameter or
 //! in a where predicate) and trailing parameters whose defaults name it. The control has a bound
 //! that names no `Self` (`T: Clone`). A trait of that shape is nested in `enter_mod` in 45% of the
-//! cases, where the Visitor writes the default through the host (`with_nested_self()`); then
+//! cases, where the Visitor writes the default for the trait's own `Self`; then
 //! 60% are declared again in the Referrer's crate (`redeclare = true` in the attribute), with a body
 //! that names no entry. The others are analyzed by `intern_trait` or `enter_trait`, where the
 //! default is looked up without `Self`. The traits carry the tags `shape:self_default`,
@@ -332,7 +332,7 @@ pub struct Features {
     /// `Self` in a struct, an enum, a union or a trait analyzed as an item nested in `enter_mod`
     /// (`View::visit_item()`, like the items of `intern_mod()`): the entry that names the item's
     /// own `Self` is recorded, and the Visitor finds it in the nested item and writes it with
-    /// `Visitor::with_nested_self()` (F36: fixed, on by default). Before the fix the Visitor never
+    /// `Self` (F36: fixed, on by default). Before the fix the Visitor never
     /// found it, so the copy kept the leaked type (`Rel<Self>`), which the Referrer's crate cannot
     /// resolve. Off, such an item names no `Self`. F38 (fixed, on by default): an absolute type
     /// that names it is no entry, so the strict items copy it as written.
@@ -356,8 +356,8 @@ pub struct Features {
     /// A trait whose type parameters have defaults that use a generic whose bound names the
     /// trait's own `Self` (`trait Tr<T: AsRef<Self>, U = Rel<T>>`; F39, fixed: on by default), and
     /// the control, where the bound names no `Self` (`T: Clone`). The entry of such a default is
-    /// for the implementors of the trait, which the Visitor writes through the host
-    /// (`with_nested_self()`) for a trait nested in `enter_mod`, and finds without `Self` for a
+    /// for the implementors of the trait, which the Visitor writes with `with_nested_self()` (the test macro
+    /// writes the host) for a trait nested in `enter_mod`, and finds without `Self` for a
     /// trait analyzed as the item itself (`intern_trait`, `enter_trait`). A trait nested in
     /// `enter_mod` is often declared again in the Referrer's crate (`redeclare`), whose
     /// declaration cannot pass the defaulted parameter to its own default (E0128). Before the fix

@@ -6,7 +6,6 @@
 #[cfg(type_leak_diagnostic)]
 extern crate proc_macro;
 
-mod allow;
 mod analysis;
 mod analyze;
 mod context;
@@ -17,22 +16,19 @@ mod graph;
 mod leaker;
 mod referrer;
 mod repeater;
+mod result;
 mod unstable;
 mod util;
 mod view;
 
 pub use syn;
 
-pub use crate::allow::{Allow, Place, Rules};
 pub use crate::analysis::CheckResult;
 pub use crate::context::{Context, ContextId, ModuleScope, SelfRequirement};
-pub use crate::encode::{
-    array_const, complete_params, substitute_args, ByParams, EncodeError, Substitute,
-};
+pub use crate::encode::{substitute_args, EncodeError, Substitute};
 pub use crate::error::{Cause, ErrorItem, Reason};
-pub use crate::leaker::{Leaker, LeakerResult};
-pub use crate::referrer::{EntryId, NestedSelf, Referrer, Visitor};
-pub use crate::repeater::{
-    repeater_definition, repeater_key, repeater_projection, slot_const, ImplSelf, RepeaterImpl,
-};
+pub use crate::leaker::Leaker;
+pub use crate::referrer::{EntryId, Referrer, Visitor};
+pub use crate::repeater::{repeater_definition, ImplSelf, Projection, RepeaterImpl};
+pub use crate::result::{Allow, LeakerResult, Place, Rules};
 pub use crate::view::View;

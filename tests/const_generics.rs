@@ -36,9 +36,7 @@ fn entry(ty: Type, generics: Generics) -> (String, String) {
 /// Rewrites `item`, a copy in the scope `context`, replacing the `ix`-th leaked type with `P<ix>`.
 fn rewrite(referrer: Referrer, context: ContextId, item: ItemTrait) -> String {
     let mut item = Item::Trait(item);
-    referrer
-        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
-        .visit_item_mut(&mut item);
+    common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)).visit_item_mut(&mut item);
     quote!(#item).to_string()
 }
 

@@ -291,23 +291,25 @@ fn an_error_in_an_inner_scope_is_recovered_and_recorded_once() {
         assert_eq!(result.errors().len(), 1);
         assert_eq!(result.errors()[0].cause, rel_tr());
         // The inner scope keeps what it found: `Rel<T>` and `dyn RelTr` are entries, and the
-        // conflict is copied as written, though it holds the same `dyn RelTr`.
+        // conflict is copied as written, though it holds the same `dyn RelTr`. The entries are in
+        // the order of their contexts, which are numbered as the types are found: `dyn RelTr`
+        // inside the conflict comes first.
         let referrer = result.into_referrer();
         let required: Vec<&Type> = common::types(&referrer).collect();
-        assert_eq!(required, [&parse_quote!(Rel<T>), &parse_quote!(dyn RelTr)]);
+        assert_eq!(required, [&parse_quote!(dyn RelTr), &parse_quote!(Rel<T>)]);
         let mut copy: Vec<Type> = vec![
             conflict(),
             parse_quote!(Rel<T>),
             parse_quote!(::core::marker::PhantomData<dyn RelTr>),
         ];
-        let mut visitor = referrer.visitor(inner, |_, ix, _| parse_quote!(Entry<#ix>));
+        let mut visitor = common::visitor(&referrer, inner, |_, ix, _| parse_quote!(Entry<#ix>));
         for ty in &mut copy {
             visitor.visit_type_mut(ty);
         }
         let expected: Vec<Type> = vec![
             conflict(),
-            parse_quote!(Entry<0usize>),
-            parse_quote!(::core::marker::PhantomData<Entry<1usize>>),
+            parse_quote!(Entry<1usize>),
+            parse_quote!(::core::marker::PhantomData<Entry<0usize>>),
         ];
         assert_eq!(copy, expected);
     }
@@ -560,7 +562,7 @@ fn an_entry_whose_bounds_name_a_self_without_meaning_is_copied_whole() {
             parse_quote!(Other<U>),
             parse_quote!(::p::Opt<T>),
         ];
-        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(Entry<#ix>));
+        let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>));
         for ty in &mut copy {
             visitor.visit_type_mut(ty);
         }
@@ -1275,8 +1277,7 @@ fn referrer_of<A: Allow>(config: A, item: &ItemTrait) -> (Referrer, ContextId) {
 /// The copy of `item` in which each entry is replaced by `Entry<ix>`.
 fn rewritten(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> ItemTrait {
     let mut copy = item.clone();
-    referrer
-        .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
+    common::visitor(referrer, context, |_, ix, _| parse_quote!(Entry<#ix>))
         .visit_item_trait_mut(&mut copy);
     copy
 }
@@ -1316,13 +1317,12 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
     assert_eq!(result.errors()[0].cause, rel_tr());
     let referrer = result.into_referrer();
     // The part is the type that conflicts (the trait object, not the trait that is the cause),
-    // inside the path that owns the elided lifetime.
+    // inside the path that owns the elided lifetime. They are in the context of the types, which
+    // use no generics (the id 0), not in the top-level one (the id 1).
+    assert_eq!(context.index(), 1);
     assert_eq!(
         parts_of(&referrer),
-        [format!(
-            "type (dyn RelTr) {} in (:: p :: Elided < '_ , dyn RelTr >) {}",
-            context, context
-        )]
+        ["type (dyn RelTr) 0 in (:: p :: Elided < '_ , dyn RelTr >) 0".to_string()]
     );
     // `dyn RelTr` of `g` is an entry.
     assert_eq!(listed(&referrer), ["dyn RelTr".to_string()]);
@@ -1376,8 +1376,7 @@ fn an_item_beside_the_conflict_in_the_same_context_is_still_replaced() {
     let referrer = result.into_referrer();
     assert_eq!(parts_of(&referrer).len(), 1);
     let mut copy = st.clone();
-    referrer
-        .visitor(in_struct, |_, ix, _| parse_quote!(Entry<#ix>))
+    common::visitor(&referrer, in_struct, |_, ix, _| parse_quote!(Entry<#ix>))
         .visit_item_struct_mut(&mut copy);
     let expected: ItemStruct = parse_quote!(
         struct S {
@@ -1497,8 +1496,7 @@ fn a_silent_correction_is_no_error_of_its_own_and_a_signature_makes_it_a_part() 
     let referrer = result.into_referrer();
     assert!(parts_of(&referrer).is_empty());
     let mut copy: Vec<Type> = vec![parse_quote!(Rel), parse_quote!(Wrap<Self>)];
-    let mut visitor = referrer
-        .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
+    let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>))
         .with_self(parse_quote!(Host));
     for ty in &mut copy {
         visitor.visit_type_mut(ty);
@@ -1534,8 +1532,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
         let referrer = result.into_referrer();
         let entries = listed(&referrer);
         let mut copy = ty;
-        referrer
-            .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
+        common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>))
             .visit_type_mut(&mut copy);
         (entries, copy)
     };
@@ -1676,7 +1673,7 @@ fn a_part_of_a_module_is_left_as_written_in_that_module_only() {
     assert_eq!(parts.len(), 2);
     assert_ne!(parts[0], parts[1]);
     let mut items = item.content.unwrap().1;
-    let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(Entry<#ix>));
+    let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>));
     for item in &mut items {
         visitor.visit_item_mut(item);
     }
@@ -1744,8 +1741,7 @@ fn self_is_replaced_in_a_part_when_the_caller_asks() {
     );
     let (referrer, context) = referrer_of(Rules::new(), &item);
     let mut copy = item.clone();
-    referrer
-        .visitor(context, |_, ix, _| parse_quote!(Entry<#ix>))
+    common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>))
         .with_self(parse_quote!(__S))
         .visit_item_trait_mut(&mut copy);
     // `Self` is replaced inside the part, which is otherwise as written, and the entry is replaced.
@@ -1832,7 +1828,7 @@ fn the_parts_are_serialized_with_the_referrer() {
 }
 
 #[test]
-fn a_referrer_without_parts_writes_what_it_wrote_before() {
+fn a_referrer_without_parts_writes_no_list_of_parts() {
     let mut leaker = Leaker::new();
     leaker.intern_struct(&parse_quote!(
         struct S {
@@ -1844,7 +1840,7 @@ fn a_referrer_without_parts_writes_what_it_wrote_before() {
     let tag = format!("\"type-leak-format-{}\"", Referrer::FORMAT_VERSION);
     assert_eq!(
         referrer.to_token_stream().to_string(),
-        format!("{} (Rel)", tag)
+        format!("{} 2 (Rel) declared < > ; ()", tag)
     );
     // Referrers that differ by the parts are not equal.
     let (with, _) = referrer_of(Rules::new(), &elided_and_bare());

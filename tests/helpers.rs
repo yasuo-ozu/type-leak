@@ -1,9 +1,9 @@
 //! Tests for the helpers for macro authors: the order of the entries, the description of the Repeater
 //! impl of an entry (`LeakerResult::repeater_impls()`), the path of an entry through the Repeater
-//! (`repeater_projection()`), and the items of the errors of the analysis (`Vec<ErrorItem>`).
+//! (`Projection::of()`), and the items of the errors of the analysis (`Vec<ErrorItem>`).
 //!
 //! The pieces of the impl and the arguments of an entry are compared with the entry, its context
-//! and `repeater_projection()`, over all the entries of a set of items (the last tests of the
+//! and `Projection::of()`, over all the entries of a set of items (the last tests of the
 //! section on the pieces of the impls).
 
 mod common;
@@ -220,12 +220,11 @@ fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marke
         assert!(common::entry(&referrer, ix).generics.params.is_empty());
         // The impl for the marker, which is what the macro emits (`type Type = #ty`).
         let r = result
-            .repeater_impls(
-                &repeater(),
+            .repeater_impls(&Projection::new(
+                repeater(),
                 7,
-                ImplSelf::Marker(&marker),
-                slot_const(&repeater()),
-            )
+                ImplSelf::Marker(marker.clone()),
+            ))
             .unwrap()
             .remove(ix);
         assert_declares_nothing(&r);
@@ -254,12 +253,11 @@ fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marke
     let result = leaker.result();
     assert_eq!(result.clone().finish().unwrap().iter().count(), 1);
     let error = result
-        .repeater_impls(
-            &repeater(),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Marker(&marker),
-            slot_const(&repeater()),
-        )
+            ImplSelf::Marker(marker.clone()),
+        ))
         .err()
         .unwrap();
     assert!(
@@ -288,12 +286,11 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
     // Any type implements it: the parameter is declared last, and `T: 'a` is encoded, not
     // declared.
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(wrap);
     assert_eq!(
@@ -312,12 +309,11 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
     // For a marker, nothing else is declared.
     let marker: Type = parse_quote!(crate::Marker);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Marker(&marker),
-            array_const,
-        )
+            ImplSelf::Marker(marker.clone()),
+        ))
         .unwrap()
         .remove(wrap);
     assert_eq!(
@@ -334,12 +330,11 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
         .position(|ty| s(ty) == "Rel")
         .unwrap();
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Marker(&marker),
-            array_const,
-        )
+            ImplSelf::Marker(marker.clone()),
+        ))
         .unwrap()
         .remove(rel);
     assert_declares_nothing(&r);
@@ -361,12 +356,11 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
         .unwrap();
     // The parameter has the bound of the trait with its arguments, and replaces `Self`.
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(wrap);
     assert_eq!(
@@ -381,12 +375,11 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
         .position(|ty| s(ty) == "& 'a Rel < Self :: A >")
         .unwrap();
     let marker: Type = parse_quote!(crate::Marker);
-    match result.repeater_impls(
-        &parse_quote!(crate::Repeater),
+    match result.repeater_impls(&Projection::new(
+        repeater(),
         7,
-        ImplSelf::Marker(&marker),
-        array_const,
-    ) {
+        ImplSelf::Marker(marker.clone()),
+    )) {
         Err(EncodeError::NeedsSelf(ty)) => {
             let first = common::types(&referrer).nth(wrap.min(rel)).unwrap();
             assert_eq!(s(&*ty), s(first));
@@ -397,12 +390,11 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
     // `&'a Rel<Self::A>` is under a reference: the predicate of `Self::A` is in its where clause,
     // and as the first predicate it is parenthesized, or rustc takes `where <__Impl>` for generics.
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(rel);
     let clause = r.generics.where_clause.as_ref().unwrap();
@@ -425,12 +417,11 @@ fn repeater_impl_for_a_type_is_for_the_type() {
         .unwrap();
     // The impl is for the struct, with `Self` as written and as the argument of `Self: 'a`.
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(rel);
     assert_eq!(s(&r.self_ty), "S < 'a , T >");
@@ -443,12 +434,11 @@ fn repeater_impl_for_a_type_is_for_the_type() {
     // It cannot be for a marker: the call fails for `rel`, the only entry that names `Self`.
     let marker: Type = parse_quote!(crate::Marker);
     let marked = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Marker(&marker),
-            array_const,
-        )
+            ImplSelf::Marker(marker.clone()),
+        ))
         .err();
     assert!(matches!(
         &marked,
@@ -459,12 +449,11 @@ fn repeater_impl_for_a_type_is_for_the_type() {
         .position(|ty| s(ty) == "Wrap < T >")
         .unwrap();
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .remove(wrap);
     assert_eq!(s(&r.self_ty), "__S");
@@ -477,12 +466,11 @@ fn repeater_impl_in_a_module_tells_the_module() {
     });
     let param: Ident = parse_quote!(__S);
     let modules: Vec<Option<ModuleScope>> = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+            ImplSelf::Param(param.clone()),
+        ))
         .unwrap()
         .into_iter()
         .map(|r| r.module)
@@ -505,71 +493,38 @@ fn repeater_impl_in_a_module_tells_the_module() {
     let _ = context;
 }
 
+/// A const parameter is encoded into the slots of the Repeater, on both sides: an array length for
+/// `usize`, a slot for another primitive, and nothing for an alias.
 #[test]
-fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
+fn const_parameters_are_encoded_into_the_slots_of_the_repeater() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<const N: usize> { fn f(&self) -> Wrap<N>; }
     });
     let referrer = result.clone().into_referrer();
-    let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
-            7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+        .repeater_impls(&common::projection(repeater(), 7))
         .unwrap()
         .remove(0);
     assert_eq!(s(&common::impl_args(&r)), t(parse_quote!(([(); N],))));
+    // At a site that gives `N` the value `3`.
     let params: punctuated::Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
     let values: Vec<GenericArgument> = vec![parse_quote!(3)];
-    // The same closure encodes the parameter in the impl and in the projection.
-    let calls = std::cell::RefCell::new(Vec::new());
-    let mut encode = |value: &Expr, param: &ConstParam| {
-        calls.borrow_mut().push((s(value), s(&param.ty)));
-        Ok(parse_quote!(Const<#value>))
-    };
-    let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
-            7,
-            ImplSelf::Param(&param),
-            &mut encode,
-        )
-        .unwrap()
-        .remove(0);
-    assert_eq!(s(&common::impl_args(&r)), t(parse_quote!((Const<N>,))));
     let first = common::entry_id_at(&referrer, 0);
-    let args = common::repeater_args(
+    let args = common::repeater_args_at(
+        &repeater(),
         common::entry(&referrer, first.index()),
         common::answers(&params, &values),
         None,
-        &mut encode,
     )
     .unwrap();
-    assert_eq!(s(&args), t(parse_quote!((Const<3>,))));
-    // The call encodes the parameter once, and so does the projection: the closure always gets the
-    // parameter (`N`), and the argument of the site is written afterwards.
-    assert_eq!(
-        *calls.borrow(),
-        [
-            ("N".to_string(), "usize".to_string()),
-            ("N".to_string(), "usize".to_string())
-        ]
-    );
-    // Without a closure, only `usize` has an encoding.
-    let (result, _) = analyze_result(&parse_quote! {
-        trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; }
+    assert_eq!(s(&args), t(parse_quote!(([(); { 3 }],))));
+    // There is no slot for an alias, on both sides.
+    let (alias_result, _) = analyze_result(&parse_quote! {
+        trait Tr<const B: ::my_crate::Idx> { fn f(&self) -> Wrap<B>; }
     });
-    let referrer = result.clone().into_referrer();
-    let err = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
-            7,
-            ImplSelf::Param(&param),
-            array_const,
-        )
+    let alias_referrer = alias_result.clone().into_referrer();
+    let err = alias_result
+        .repeater_impls(&common::projection(repeater(), 7))
         .err()
         .unwrap();
     assert!(
@@ -577,13 +532,14 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
         "{}",
         err
     );
-    let params: punctuated::Punctuated<GenericParam, Token![,]> = parse_quote!(const B: bool);
-    let values: Vec<GenericArgument> = vec![parse_quote!(true)];
-    let err = common::repeater_args(
-        common::entry(&referrer, first.index()),
+    let params: punctuated::Punctuated<GenericParam, Token![,]> =
+        parse_quote!(const B: ::my_crate::Idx);
+    let values: Vec<GenericArgument> = vec![parse_quote!(3)];
+    let err = common::repeater_args_at(
+        &repeater(),
+        common::entry(&alias_referrer, first.index()),
         common::answers(&params, &values),
         None,
-        array_const,
     )
     .unwrap_err();
     assert!(
@@ -591,17 +547,20 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
         "{}",
         err
     );
-    // The slots take any primitive, on both sides, with the same closure.
-    let repeater = repeater();
+    // The slots take any primitive, on both sides.
+    let (result, _) = analyze_result(&parse_quote! {
+        trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; }
+    });
+    let referrer = result.clone().into_referrer();
     let r = result
-        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
+        .repeater_impls(&common::projection(repeater(), 7))
         .unwrap()
         .remove(0);
-    let args = common::repeater_args(
+    let args = common::repeater_args_at(
+        &repeater(),
         common::entry(&referrer, 0),
         common::identity,
         None,
-        slot_const(&repeater),
     )
     .unwrap();
     assert_eq!(s(&common::impl_args(&r)), s(&args));
@@ -613,102 +572,59 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     );
 }
 
-/// `const_fn` is called once for each const parameter of each entry, in order, and the call stops
-/// at the first error.
+/// The call fails with the first const that has no slot, in the order of the entries, and makes the
+/// impls if there is none.
 #[test]
-fn repeater_impls_calls_const_fn_once_for_each_const_parameter() {
-    let (result, _) = analyze_result(&parse_quote! {
-        trait Tr<const N: usize, const M: usize> {
-            fn f(&self) -> Wrap<N>;
-            fn g(&self) -> Wrap2<M>;
-        }
-    });
-    let param: Ident = parse_quote!(__S);
-    let repeater = repeater();
-    let calls = std::cell::RefCell::new(Vec::new());
-    let encode = |fail: Option<&'static str>| {
-        let calls = &calls;
-        move |value: &Expr, param: &ConstParam| {
-            calls.borrow_mut().push(s(value));
-            if fail == Some(param.ident.to_string().as_str()) {
-                return Err(EncodeError::UnsupportedConstType(Box::new(
-                    param.ty.clone(),
-                )));
-            }
-            Ok(parse_quote!([(); 0]))
-        }
+fn repeater_impls_fails_with_the_first_const_that_has_no_slot() {
+    let unsupported = |generics: &str| {
+        let (result, _) = analyze_result(&parse_str(&format!(
+            "trait Tr{} {{ fn f(&self) -> Wrap<N>; fn g(&self) -> Wrap2<M>; fn h(&self) -> Wrap3<K>; }}",
+            generics
+        ))
+        .unwrap());
+        result.repeater_impls(&common::projection(repeater(), 7))
     };
-    // The first error is that of `M`, the parameter of the second entry: `N` was called before it.
-    let result_for_m =
-        result.repeater_impls(&repeater, 7, ImplSelf::Param(&param), encode(Some("M")));
-    assert!(matches!(
-        result_for_m,
-        Err(EncodeError::UnsupportedConstType(_))
-    ));
-    assert_eq!(*calls.borrow(), ["N", "M"]);
-    // An error of the first entry stops the call: `M` is not asked.
-    calls.borrow_mut().clear();
-    let result_for_n =
-        result.repeater_impls(&repeater, 7, ImplSelf::Param(&param), encode(Some("N")));
-    assert!(matches!(
-        result_for_n,
-        Err(EncodeError::UnsupportedConstType(_))
-    ));
-    assert_eq!(*calls.borrow(), ["N"]);
-    // No error: each parameter is asked once, and the impls are made.
-    calls.borrow_mut().clear();
-    let impls = result
-        .repeater_impls(&repeater, 7, ImplSelf::Param(&param), encode(None))
-        .unwrap();
-    assert_eq!(*calls.borrow(), ["N", "M"]);
-    assert_eq!(impls.len(), 2);
+    // `M` and `K` have no slot: the error is that of `M`, the parameter of the first entry that fails.
+    match unsupported("<const N: usize, const M: ::my_crate::AliasM, const K: ::my_crate::AliasK>")
+    {
+        Err(EncodeError::UnsupportedConstType(ty)) => assert_eq!(s(&*ty), ":: my_crate :: AliasM"),
+        other => panic!("{:?}", other.map(|impls| impls.len())),
+    }
+    match unsupported("<const N: ::my_crate::AliasN, const M: ::my_crate::AliasM, const K: usize>")
+    {
+        Err(EncodeError::UnsupportedConstType(ty)) => assert_eq!(s(&*ty), ":: my_crate :: AliasN"),
+        other => panic!("{:?}", other.map(|impls| impls.len())),
+    }
+    // No error: the impls are made.
+    let impls = unsupported("<const N: usize, const M: usize, const K: bool>").unwrap();
+    assert_eq!(impls.len(), 3);
     assert_eq!(s(&impls[0].ty), "Wrap < N >");
     assert_eq!(s(&impls[1].ty), "Wrap2 < M >");
+    assert_eq!(s(&impls[2].ty), "Wrap3 < K >");
 }
 
-/// The error for a marker comes first: the call makes no call of `const_fn` then.
+/// The error for a marker comes first: the call fails for `Self` before it looks at the consts.
 #[test]
 fn repeater_impls_checks_a_marker_before_the_const_parameters() {
     let (result, _) = analyze_result(&parse_quote! {
-        trait Tr<const N: usize> {
+        trait Tr<const N: ::my_crate::Alias> {
             fn f(&self) -> Wrap<N>;
             fn g(&self) -> Wrap2<Self>;
         }
     });
     let marker: Type = parse_quote!(crate::Marker);
-    let repeater = repeater();
-    let calls = std::cell::Cell::new(0);
+    let at = |impl_self| Projection::new(repeater(), 3, impl_self);
     let error = result
-        .repeater_impls(
-            &repeater,
-            3,
-            ImplSelf::Marker(&marker),
-            |_: &Expr, param: &ConstParam| {
-                calls.set(calls.get() + 1);
-                Err(EncodeError::UnsupportedConstType(Box::new(
-                    param.ty.clone(),
-                )))
-            },
-        )
+        .repeater_impls(&at(ImplSelf::Marker(marker)))
         .err()
         .unwrap();
     assert!(matches!(&error, EncodeError::NeedsSelf(ty) if s(&**ty) == "Wrap2 < Self >"));
-    assert_eq!(calls.get(), 0);
-    // A parameter or a bucket does not fail for `Self`, only for `const_fn`.
+    // A parameter or a bucket does not fail for `Self`, only for the const.
     let param: Ident = parse_quote!(__S);
-    for target in [ImplSelf::Param(&param), ImplSelf::Bucket { param: &param }] {
-        let error = result
-            .repeater_impls(&repeater, 3, target, |_: &Expr, param: &ConstParam| {
-                calls.set(calls.get() + 1);
-                Err(EncodeError::UnsupportedConstType(Box::new(
-                    param.ty.clone(),
-                )))
-            })
-            .err()
-            .unwrap();
+    for impl_self in [ImplSelf::Param(param.clone()), ImplSelf::Bucket { param }] {
+        let error = result.repeater_impls(&at(impl_self)).err().unwrap();
         assert!(matches!(error, EncodeError::UnsupportedConstType(_)));
     }
-    assert_eq!(calls.get(), 2);
 }
 
 /// Asserts that `generics` are declared in the order that every rustc accepts: the lifetimes, then
@@ -739,12 +655,16 @@ fn the_generics_of_every_impl_are_declared_in_the_order_of_every_rustc() {
         let (result, _) = analyze_result(&item);
         let repeater = repeater();
         for target in [
-            ImplSelf::Param(&param),
-            ImplSelf::Marker(&marker),
-            ImplSelf::Bucket { param: &param },
+            ImplSelf::Param(param.clone()),
+            ImplSelf::Marker(marker.clone()),
+            ImplSelf::Bucket {
+                param: param.clone(),
+            },
         ] {
             // The call for a marker fails if an entry names `Self`: only the others are compared.
-            if let Ok(impls) = result.repeater_impls(&repeater, 5, target, slot_const(&repeater)) {
+            if let Ok(impls) =
+                result.repeater_impls(&Projection::new(repeater.clone(), 5, target.clone()))
+            {
                 for r in impls {
                     let what = format!("{}: {} {:?}", s(&item), r.entry, target);
                     assert_declared_in_order(&r.generics, &what);
@@ -772,15 +692,19 @@ fn the_tokens_of_a_repeater_impl_are_the_impl_written_by_hand() {
         let (result, _) = analyze_result(&item);
         let repeater = repeater();
         for target in [
-            ImplSelf::Param(&param),
-            ImplSelf::Marker(&marker),
-            ImplSelf::Bucket { param: &param },
+            ImplSelf::Param(param.clone()),
+            ImplSelf::Marker(marker.clone()),
+            ImplSelf::Bucket {
+                param: param.clone(),
+            },
         ] {
-            if let Ok(impls) = result.repeater_impls(&repeater, 5, target, slot_const(&repeater)) {
+            if let Ok(impls) =
+                result.repeater_impls(&Projection::new(repeater.clone(), 5, target.clone()))
+            {
                 for r in impls {
                     let what = format!("{}: {} {:?}", s(&item), r.entry, target);
                     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-                    let (args, key) = (common::impl_args(&r), repeater_key(5, r.entry));
+                    let (args, key) = (common::impl_args(&r), common::key(5, r.entry));
                     let path: Path = parse_quote!(#repeater<#args, #key>);
                     let (self_ty, ty) = (&r.self_ty, &r.ty);
                     let by_hand = quote! {
@@ -820,7 +744,7 @@ fn the_encoder_substitutes_the_generics_of_the_trait_and_not_those_of_a_method()
     // `'b` and `U` are the method's, passed by their own names.
     assert_eq!(
         s(
-            &common::repeater_args(common::entry(&referrer, wrap2), site, None, array_const)
+            &common::repeater_args_at(&repeater(), common::entry(&referrer, wrap2), site, None)
                 .unwrap()
         ),
         t(parse_quote!((
@@ -837,7 +761,7 @@ fn the_encoder_substitutes_the_generics_of_the_trait_and_not_those_of_a_method()
     let site = common::answers(&tr.generics.params, &args[..1]);
     assert_eq!(
         s(
-            &common::repeater_args(common::entry(&referrer, wrap2), site, None, array_const)
+            &common::repeater_args_at(&repeater(), common::entry(&referrer, wrap2), site, None)
                 .unwrap()
         ),
         t(parse_quote!((
@@ -861,22 +785,17 @@ fn the_encoder_with_the_defaults_completed() {
     };
     let (referrer, context) = analyze(&Item::Trait(tr.clone()));
     let written: AngleBracketedGenericArguments = parse_quote!(<u8>);
-    let completed =
-        common::completed_args(&referrer, context, &tr, &written.args, |_, ix, context| {
-            // The entry of the default is written by its own generics (`(T,)`), which
-            // `complete_params()` replaces by the argument.
-            repeater_projection(
-                &repeater(),
-                &parse_quote!(Self),
-                context,
-                1,
-                ix,
-                array_const,
-            )
-            .unwrap()
-        })
-        .unwrap();
-    let key = repeater_key(1, common::entry_id_at(&referrer, 0));
+    // The entry of the default is written by its own generics (`(T,)`), which `complete_args()`
+    // replaces by the argument.
+    let completed = common::completed_args_for(
+        &referrer,
+        context,
+        &tr.generics,
+        &written.args,
+        &common::projection(repeater(), 1),
+    )
+    .unwrap();
+    let key = common::key(1, common::entry_id_at(&referrer, 0));
     assert_eq!(
         completed.iter().map(s).collect::<Vec<_>>(),
         [
@@ -920,12 +839,13 @@ fn declared(generics: &Generics) -> String {
     with_where(generics).trim().to_string()
 }
 
-/// The first argument of the Repeater that `repeater_projection()` writes for an entry, with
+/// The first argument of the Repeater that `Projection::of()` writes for an entry, with
 /// `self_ty` for `Self` (the entry's own generics, by their names).
 fn projected(context: &Context, entry: EntryId, self_ty: &Type) -> Type {
     let repeater = repeater();
-    let projection =
-        repeater_projection(&repeater, self_ty, context, 7, entry, slot_const(&repeater)).unwrap();
+    let projection = common::projection(repeater.clone(), 7)
+        .of(self_ty, context, entry)
+        .unwrap();
     common::projection_args(&projection)
 }
 
@@ -970,7 +890,11 @@ fn the_impl_of_an_entry_that_needs_self_outlives_encodes_the_bound_and_never_dec
         // The impl: neither `T: 'a` nor `Self: 'a` is declared, and `Self` is the parameter.
         let param: Ident = parse_quote!(__S);
         let r = result
-            .repeater_impls(&repeater(), 7, ImplSelf::Param(&param), array_const)
+            .repeater_impls(&Projection::new(
+                repeater(),
+                7,
+                ImplSelf::Param(param.clone()),
+            ))
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -1054,7 +978,11 @@ fn the_impl_declares_the_generics_but_the_bounds_that_the_argument_encodes() {
         let referrer = result.clone().into_referrer();
         let (entry, _, context) = referrer.iter().next().unwrap();
         let r = result
-            .repeater_impls(&repeater(), 7, ImplSelf::Marker(&marker), array_const)
+            .repeater_impls(&Projection::new(
+                repeater(),
+                7,
+                ImplSelf::Marker(marker.clone()),
+            ))
             .unwrap()
             .remove(0);
         assert_eq!(declared(&r.generics), expected, "{}", what);
@@ -1097,7 +1025,11 @@ fn the_generics_of_a_top_level_context_are_those_of_the_call() {
     );
     let marker: Type = parse_quote!(crate::Marker);
     let impls = result
-        .repeater_impls(&repeater(), 7, ImplSelf::Marker(&marker), array_const)
+        .repeater_impls(&Projection::new(
+            repeater(),
+            7,
+            ImplSelf::Marker(marker.clone()),
+        ))
         .unwrap();
     assert_eq!(declared(&impls[all].generics), "< 'a , T >");
     assert_eq!(declared(&impls[rel].generics), "< 'a , T >");
@@ -1169,19 +1101,18 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     );
 
     // The arguments of the trait, as written at a site: in the order of the trait's generics, and
-    // the default for `U` is omitted. The context's generics are in another order, so they do not
-    // take the arguments by position.
+    // the default for `U` is omitted. The generics of the context are in another order, so they
+    // do not take the arguments by position: `complete_args()` has the generics as the trait
+    // declares them.
     let args: AngleBracketedGenericArguments = parse_quote!(<'q, 3, u16>);
-    let err = complete_params(&context.generics.params, &args.args).unwrap_err();
-    assert!(matches!(err, EncodeError::UnexpectedArgument(_)), "{}", err);
-    let completed = complete_params(&tr.generics.params, &args.args).unwrap();
+    let completed = common::completed_args(&referrer, top_level, &tr.generics, &args.args).unwrap();
     let site = || common::answers(&tr.generics.params, &completed);
     let generic_args = common::generic_args(&context.generics, site()).unwrap();
     assert_eq!(
         generic_args.iter().map(s).collect::<Vec<_>>(),
         ["'q", "u16", ":: core :: primitive :: u8", "3"]
     );
-    let on_referrer_side = common::repeater_args(context, site(), None, array_const).unwrap();
+    let on_referrer_side = common::repeater_args_at(&repeater(), context, site(), None).unwrap();
     assert_eq!(
         s(&on_referrer_side),
         t(parse_quote!((
@@ -1222,7 +1153,7 @@ fn replace_self(text: &str) -> String {
 
 /// The pieces of the impl of every entry of every sample, for a parameter that stands for the
 /// implementor: the entry and the module, the argument of the Repeater (the one that
-/// `repeater_projection()` writes with the same `Self`), the type (`Self` is the parameter where
+/// `Projection::of()` writes with the same `Self`), the type (`Self` is the parameter where
 /// the implementor is one), the type it is for, and the generics it declares: the generics of the
 /// context with the parameter for the implementor before the consts, no bound that the argument
 /// encodes, and no `Self` left where it is a parameter
@@ -1235,12 +1166,11 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
         let referrer = result.clone().into_referrer();
         let repeater = repeater();
         let impls = result
-            .repeater_impls(
-                &repeater,
+            .repeater_impls(&Projection::new(
+                repeater.clone(),
                 7,
-                ImplSelf::Param(&self_param),
-                slot_const(&repeater),
-            )
+                ImplSelf::Param(self_param.clone()),
+            ))
             .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
         for (n, r) in impls.into_iter().enumerate() {
             let (entry, ty, context) = referrer.iter().nth(n).unwrap();
@@ -1399,11 +1329,11 @@ fn the_arguments_at_a_site_are_the_projection_with_the_names_of_the_site_replace
         let ix = common::types(&referrer)
             .position(|ty| s(ty) == entry)
             .unwrap();
-        let got = common::repeater_args(
+        let got = common::repeater_args_at(
+            &repeater(),
             common::entry(&referrer, ix),
             common::identity,
             Some(&own_host),
-            slot_const(&repeater()),
         )
         .unwrap();
         let expected: Type = parse_str(expected).unwrap();
@@ -1449,17 +1379,17 @@ fn the_arguments_at_a_site_are_the_projection_with_the_names_of_the_site_replace
             Item::Struct(item) => &item.generics,
             other => panic!("{}", s(other)),
         };
-        let (referrer, _) = analyze(item);
+        let (referrer, top_level) = analyze(item);
         let ix = common::types(&referrer)
             .position(|ty| s(ty) == entry)
             .unwrap();
         let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
-        let completed = complete_params(&generics.params, &args.args).unwrap();
-        let got = common::repeater_args(
+        let completed = common::completed_args(&referrer, top_level, generics, &args.args).unwrap();
+        let got = common::repeater_args_at(
+            &repeater(),
             common::entry(&referrer, ix),
             common::answers(&generics.params, &completed),
             Some(&host),
-            slot_const(&repeater()),
         )
         .unwrap();
         let expected: Type = parse_str(expected).unwrap();
@@ -1581,7 +1511,8 @@ fn names_self(generics: &Generics) -> bool {
     has_self(quote!(#generics #where_clause))
 }
 
-/// `Referrer::bucket_self()` and `repeater_impls(ImplSelf::Bucket)` agree for every entry: the
+/// `Projection::of()` and `repeater_impls(ImplSelf::Bucket)` agree for every entry (`common::bucket_self()`
+/// reads the bucket from the first): the
 /// impl of an entry that has a bucket is the one for it as for a marker, any other is the one for a
 /// parameter, an entry has a bucket exactly if neither its type nor its generics name `Self`, and
 /// the call for `ImplSelf::Marker` fails exactly if some entry has none (for the first of them).
@@ -1604,13 +1535,12 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
             let marker: Type = parse_quote!(crate::Marker);
             let first_without = referrer
                 .iter()
-                .find(|(entry, _, _)| referrer.bucket_self(id, *entry).is_none());
-            let as_marker = result.repeater_impls(
-                &repeater,
+                .find(|(entry, _, _)| common::bucket_self(&referrer, id, *entry).is_none());
+            let as_marker = result.repeater_impls(&Projection::new(
+                repeater.clone(),
                 id,
-                ImplSelf::Marker(&marker),
-                slot_const(&repeater),
-            );
+                ImplSelf::Marker(marker.clone()),
+            ));
             match (&as_marker, first_without) {
                 (Err(EncodeError::NeedsSelf(ty)), Some((_, first, _))) => {
                     assert_eq!(s(&**ty), s(first), "{}", what);
@@ -1625,26 +1555,26 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
             for ix in 0..referrer.iter().count() {
                 let what = format!("{}: {} ({})", s(&item), ix, id);
                 let entry = common::entry_id_at(&referrer, ix);
-                let bucket = referrer.bucket_self(id, entry);
+                let bucket = common::bucket_self(&referrer, id, entry);
                 let r = result
-                    .repeater_impls(
-                        &repeater,
+                    .repeater_impls(&Projection::new(
+                        repeater.clone(),
                         id,
-                        ImplSelf::Bucket { param: &param },
-                        slot_const(&repeater),
-                    )
+                        ImplSelf::Bucket {
+                            param: param.clone(),
+                        },
+                    ))
                     .unwrap_or_else(|e| panic!("{}: {}", what, e))
                     .remove(ix);
                 let own_self = common::entry(&referrer, ix).self_ty.is_some();
                 let generics_self = names_self(&common::entry(&referrer, ix).generics);
                 assert_eq!(bucket.is_some(), !own_self && !generics_self, "{}", what);
                 let for_param = result
-                    .repeater_impls(
-                        &repeater,
+                    .repeater_impls(&Projection::new(
+                        repeater.clone(),
                         id,
-                        ImplSelf::Param(&param),
-                        slot_const(&repeater),
-                    )
+                        ImplSelf::Param(param.clone()),
+                    ))
                     .unwrap()
                     .remove(ix);
                 match bucket {
@@ -1653,12 +1583,11 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                         bucket_name(&ty);
                         assert_eq!(r.self_ty, ty, "{}", what);
                         // The impl for a marker, where there is one.
-                        if let Ok(mut impls) = result.repeater_impls(
-                            &repeater,
+                        if let Ok(mut impls) = result.repeater_impls(&Projection::new(
+                            repeater.clone(),
                             id,
-                            ImplSelf::Marker(&ty),
-                            slot_const(&repeater),
-                        ) {
+                            ImplSelf::Marker(ty.clone()),
+                        )) {
                             assert_eq!(r, impls.remove(ix), "{}", what);
                         }
                         // The impl for the parameter, for the type and without the parameter.
@@ -1680,7 +1609,12 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                         // No `__S`.
                         assert!(!with_where(&r.generics).contains("__S"), "{}", what);
                         // It does not depend on how often it is asked.
-                        assert_eq!(referrer.bucket_self(id, entry), Some(ty), "{}", what);
+                        assert_eq!(
+                            common::bucket_self(&referrer, id, entry),
+                            Some(ty),
+                            "{}",
+                            what
+                        );
                     }
                     None => {
                         other += 1;
@@ -1701,6 +1635,164 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
     );
     // The entries of a default whose generics name `Self` while it does not: they were looked for.
     assert!(generic_self > 0);
+}
+
+/// `Projection::of()` writes the self type of the impl of every entry, for every target: `Self` as
+/// given where the impl is for it (`Param`, and `Bucket` for an entry that needs `Self`), the
+/// marker for `Marker`, and the bucket type for the other entries of `Bucket`.
+/// With the self type of the impl given for `Self`, it is the trait path of the impl, `KEY` and
+/// arguments included.
+#[test]
+fn projection_of_writes_the_self_type_of_the_impl_of_every_entry() {
+    let param: Ident = parse_quote!(__S);
+    let marker: Type = parse_quote!(crate::Marker);
+    let host: Type = parse_quote!(Host);
+    // The entries written for the host, for the marker, for a bucket, refused, and compared with
+    // an impl.
+    let mut counts = [0; 5];
+    for item in bucket_samples() {
+        let (result, _) = analyze_result(&item);
+        let referrer = result.clone().into_referrer();
+        for id in [0, 7, 12345] {
+            for target in [
+                ImplSelf::Param(param.clone()),
+                ImplSelf::Marker(marker.clone()),
+                ImplSelf::Bucket {
+                    param: param.clone(),
+                },
+            ] {
+                let projection = Projection::new(repeater(), id, target.clone());
+                // The call for a marker fails if an entry needs `Self`.
+                let impls = result.repeater_impls(&projection).ok();
+                for (entry, _, context) in referrer.iter() {
+                    let what = format!("{}: {} ({}) {:?}", s(&item), entry, id, target);
+                    let bucket = common::bucket_self(&referrer, id, entry);
+                    let written = projection.of(&host, context, entry);
+                    let (expected, count) = match (&target, bucket) {
+                        (ImplSelf::Marker(_), None) => {
+                            let error = written.err().unwrap_or_else(|| panic!("{}", what));
+                            assert!(matches!(error, EncodeError::NeedsSelf(_)), "{}", what);
+                            counts[3] += 1;
+                            continue;
+                        }
+                        (ImplSelf::Marker(marker), Some(_)) => (marker.clone(), 1),
+                        (ImplSelf::Bucket { .. }, Some(bucket)) => (bucket, 2),
+                        _ => (host.clone(), 0),
+                    };
+                    let written = written.unwrap_or_else(|e| panic!("{}: {}", what, e));
+                    assert_eq!(common::projection_self(&written), expected, "{}", what);
+                    counts[count] += 1;
+
+                    // The impl is for that type, or for `Self` as the impl writes it: with that in
+                    // place of `Self`, the path is the one of the impl.
+                    if let Some(impls) = &impls {
+                        let r = impls.iter().find(|r| r.entry == entry).unwrap();
+                        let self_in_impl: Type = match context.self_ty {
+                            Some(SelfRequirement::Type(_)) => parse_quote!(Self),
+                            _ => r.self_ty.clone(),
+                        };
+                        let in_impl = projection.of(&self_in_impl, context, entry).unwrap();
+                        let path = ItemImpl::from(r.clone()).trait_.unwrap().1;
+                        assert_eq!(
+                            in_impl,
+                            parse_quote!(<#self_in_impl as #path>::Type),
+                            "{}",
+                            what
+                        );
+                        if count != 0 {
+                            assert_eq!(r.self_ty, expected, "{}", what);
+                        }
+                        counts[4] += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(counts.iter().all(|count| *count > 30), "{:?}", counts);
+}
+
+/// `Projection::of()` with a marker refuses an entry that needs `Self` (the type of the entry, or
+/// the generics of its context, name it), as `repeater_impls()` does, and writes the marker for the
+/// others. The error has the type that would be written for the host.
+#[test]
+fn projection_of_with_a_marker_refuses_an_entry_that_needs_self() {
+    let items: [(ItemTrait, &str); 3] = [
+        // The type names it.
+        (
+            parse_quote!(
+                trait Tr<T> {
+                    fn f(&self) -> Wrap<T>;
+                    fn g(&self) -> Wrap2<Self>;
+                }
+            ),
+            "Wrap2 < Self >",
+        ),
+        // Only the generics of the context do.
+        (
+            parse_quote!(
+                trait Tr<T: AsRef<Self>, U = Rel<T>> {
+                    fn f(&self, t: T) -> Rel<T>;
+                }
+            ),
+            "Rel < T >",
+        ),
+        // Only `Self: 'a` does.
+        (
+            parse_quote!(
+                trait Tr<'a>
+                where
+                    Self: 'a,
+                {
+                    fn f(&self) -> Rel<'a>;
+                    fn g(&self) -> Wrap<'a, u8>;
+                }
+            ),
+            "Rel < 'a >",
+        ),
+    ];
+    let marker: Type = parse_quote!(crate::Marker);
+    let host: Type = parse_quote!(Host);
+    let projection = Projection::new(repeater(), 7, ImplSelf::Marker(marker.clone()));
+    let mut refused = 0;
+    for (item, first) in items {
+        let what = s(&item);
+        let (result, _) = analyze_result(&Item::Trait(item));
+        let referrer = result.clone().into_referrer();
+        // `repeater_impls()` fails for the first entry that needs `Self`.
+        match result.repeater_impls(&projection) {
+            Err(EncodeError::NeedsSelf(ty)) => assert_eq!(s(&*ty), first, "{}", what),
+            other => panic!("{}: {:?}", what, other.map(|impls| impls.len())),
+        }
+        for (entry, ty, context) in referrer.iter() {
+            let written = projection.of(&host, context, entry);
+            if common::bucket_self(&referrer, 7, entry).is_some() {
+                let written = written.unwrap_or_else(|e| panic!("{}: {}", what, e));
+                assert_eq!(common::projection_self(&written), marker, "{}", what);
+                continue;
+            }
+            // `of()` does not know the entry's type: the error has the path written for the host.
+            let key = projection.key(entry);
+            let args = common::projection_args(
+                &common::projection(repeater(), 7)
+                    .of(&host, context, entry)
+                    .unwrap(),
+            );
+            match written {
+                Err(EncodeError::NeedsSelf(error)) => {
+                    assert_eq!(
+                        *error,
+                        parse_quote!(<Host as crate::Repeater<#args, #key>>::Type),
+                        "{}: {}",
+                        what,
+                        s(ty)
+                    );
+                    refused += 1;
+                }
+                other => panic!("{}: {}: {:?}", what, s(ty), other),
+            }
+        }
+    }
+    assert!(refused >= 5, "{}", refused);
 }
 
 /// The entries of one item do not all share a bucket, and the same entry of other ids does not
@@ -1726,8 +1818,7 @@ fn bucket_types_follow_the_documented_hash() {
             let expected = BUCKETS[(h % 17) as usize];
             assert_eq!(
                 bucket_name(
-                    &referrer
-                        .bucket_self(id, common::entry_id_at(&referrer, ix))
+                    &common::bucket_self(&referrer, id, common::entry_id_at(&referrer, ix))
                         .unwrap()
                 ),
                 expected,
@@ -1751,9 +1842,7 @@ fn bucket_types_follow_the_documented_hash() {
     ] {
         assert_eq!(
             bucket_name(
-                &referrer
-                    .bucket_self(id, common::entry_id_at(&referrer, ix))
-                    .unwrap()
+                &common::bucket_self(&referrer, id, common::entry_id_at(&referrer, ix)).unwrap()
             ),
             expected,
             "{} {}",
@@ -1791,7 +1880,7 @@ fn assert_spread(names: impl Iterator<Item = String>, what: &str) {
 fn bucket_types_spread_over_ids_and_entries() {
     let (referrer, _) = analyze(&parse_quote! { struct S { a: Rel } });
     let first = common::entry_id_at(&referrer, 0);
-    let bucket = |id: u64| bucket_name(&referrer.bucket_self(id, first).unwrap());
+    let bucket = |id: u64| bucket_name(&common::bucket_self(&referrer, id, first).unwrap());
     assert_spread((0..1000u64).map(bucket), "ids 0..1000");
     assert_spread((0..1000u64).map(|k| k << 8).map(bucket), "k << 8");
     assert_spread((0..1000u64).map(|k| k << 16).map(bucket), "k << 16");
@@ -1813,7 +1902,7 @@ fn bucket_types_spread_over_ids_and_entries() {
         assert_spread(
             referrer
                 .iter()
-                .map(|(ix, _, _)| bucket_name(&referrer.bucket_self(id, ix).unwrap())),
+                .map(|(ix, _, _)| bucket_name(&common::bucket_self(&referrer, id, ix).unwrap())),
             "the entries of one item",
         );
     }
@@ -1823,16 +1912,20 @@ fn format_ident(name: &str) -> Ident {
     Ident::new(name, proc_macro2::Span::call_site())
 }
 
-/// `ImplSelf` stays `Clone`, `Copy` and `Debug`.
+/// `ImplSelf` owns its data, and is `Clone`, `Debug` and `Eq`.
 #[test]
-fn impl_self_bucket_is_copy_and_debug() {
+fn impl_self_is_clone_debug_and_eq() {
     let param: Ident = parse_quote!(__S);
-    let target = ImplSelf::Bucket { param: &param };
-    let copy = target;
+    let target = ImplSelf::Bucket {
+        param: param.clone(),
+    };
+    let copy = target.clone();
     assert_eq!(format!("{:?}", target), format!("{:?}", copy));
     assert!(format!("{:?}", target).contains("Bucket"));
-    fn is_clone<T: Clone>() {}
-    is_clone::<ImplSelf<'_>>();
+    assert_eq!(target, copy);
+    assert_ne!(target, ImplSelf::Param(param));
+    fn is_owned<T: Clone + Eq + 'static>() {}
+    is_owned::<ImplSelf>();
 }
 
 // ── An entry whose generics name Self ────────────────────────────────────────────────────────
@@ -1862,29 +1955,29 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
         common::entry_id_at(&referrer, wrap),
         common::entry_id_at(&referrer, rel),
     );
-    assert_eq!(referrer.bucket_self(7, wrap_id), None);
-    assert_eq!(referrer.bucket_self(7, rel_id), None);
+    assert_eq!(common::bucket_self(&referrer, 7, wrap_id), None);
+    assert_eq!(common::bucket_self(&referrer, 7, rel_id), None);
     // A bucket falls back to a parameter, for which `Self` of the generics is the parameter.
     let param: Ident = parse_quote!(__S);
     let r = result
-        .repeater_impls(
-            &parse_quote!(crate::Repeater),
+        .repeater_impls(&Projection::new(
+            repeater(),
             7,
-            ImplSelf::Bucket { param: &param },
-            array_const,
-        )
+            ImplSelf::Bucket {
+                param: param.clone(),
+            },
+        ))
         .unwrap()
         .remove(rel);
     assert_eq!(s(&r.self_ty), "__S");
     assert_eq!(
         r,
         result
-            .repeater_impls(
-                &parse_quote!(crate::Repeater),
+            .repeater_impls(&Projection::new(
+                repeater(),
                 7,
-                ImplSelf::Param(&param),
-                array_const
-            )
+                ImplSelf::Param(param.clone())
+            ))
             .unwrap()
             .remove(rel)
     );
@@ -1895,12 +1988,11 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     // A marker is refused: the call fails for the first entry that needs `Self`, `Wrap<Self>` or
     // `Rel<T>`, whichever is first.
     let marker: Type = parse_quote!(crate::Marker);
-    match result.repeater_impls(
-        &parse_quote!(crate::Repeater),
+    match result.repeater_impls(&Projection::new(
+        repeater(),
         7,
-        ImplSelf::Marker(&marker),
-        array_const,
-    ) {
+        ImplSelf::Marker(marker.clone()),
+    )) {
         Err(EncodeError::NeedsSelf(ty)) => {
             let first = common::types(&referrer).nth(wrap.min(rel)).unwrap();
             assert_eq!(s(&*ty), s(first));
@@ -1912,12 +2004,11 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; }
     });
-    match result.repeater_impls(
-        &parse_quote!(crate::Repeater),
+    match result.repeater_impls(&Projection::new(
+        repeater(),
         7,
-        ImplSelf::Marker(&marker),
-        array_const,
-    ) {
+        ImplSelf::Marker(marker.clone()),
+    )) {
         Err(EncodeError::NeedsSelf(ty)) => assert_eq!(s(&*ty), "Rel < T >"),
         Err(other) => panic!("{:?}", other),
         Ok(_) => panic!("no error"),
@@ -1929,34 +2020,26 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     assert!(referrer.iter().count() > 0);
     assert!(referrer
         .iter()
-        .all(|(ix, _, _)| referrer.bucket_self(7, ix).is_some()));
+        .all(|(ix, _, _)| common::bucket_self(&referrer, 7, ix).is_some()));
 }
 
-/// The call gives `const_fn` the const parameters of the impl, once, also for an entry whose impl
-/// replaces `Self` by the parameter for the implementor. (The default of a const parameter, which
-/// names `Self` here, is not in the context, so the replacement changes no const parameter.)
+/// An entry whose impl replaces `Self` by the parameter for the implementor has its const
+/// parameters encoded as any other. (The default of a const parameter, which names `Self` here, is
+/// not in the context, so the replacement changes no const parameter.)
 #[test]
-fn repeater_impls_gives_const_fn_the_const_parameters_of_the_impl() {
+fn the_const_parameters_of_an_impl_that_replaces_self_are_encoded_as_any_other() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<const N: usize = { Self::LEN }> {
             const LEN: usize;
             fn f(&self) -> Wrap<N, Self>;
         }
     });
-    let param: Ident = parse_quote!(__S);
-    let repeater = repeater();
-    let seen = std::cell::RefCell::new(Vec::new());
     let impls = result
-        .repeater_impls(
-            &repeater,
-            7,
-            ImplSelf::Param(&param),
-            |_: &Expr, param: &ConstParam| {
-                seen.borrow_mut().push(s(param));
-                Ok(parse_quote!([(); 0]))
-            },
-        )
+        .repeater_impls(&common::projection(repeater(), 7))
         .unwrap();
     assert_eq!(impls.len(), 1);
-    assert_eq!(*seen.borrow(), ["const N : usize"]);
+    assert_eq!(
+        s(&common::impl_args(&impls[0])),
+        t(parse_quote!(([(); N],)))
+    );
 }

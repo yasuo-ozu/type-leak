@@ -122,10 +122,6 @@ pub(crate) struct Args {
     /// impl is for a parameter (`ImplSelf::Param`), which accepts the marker as the owner. The type
     /// is the Leaker's, written by hand, by an absolute path that both crates resolve.
     marker: Option<Type>,
-    /// The Referrer's visitor is not given `Visitor::with_nested_self()`: a macro that has no entry
-    /// to write for the own `Self` of a nested item does not need it, and the parts of the item
-    /// must be left as written all the same.
-    no_nested_self: bool,
     /// `TYPE_LEAK_PROP_FEATURES=allow_stages`: for each [`Rule`] the macro also tells how many errors
     /// remain with the rule given to the config and to the result, and makes a copy after each
     /// ([`rule_stage()`]).
@@ -160,7 +156,6 @@ impl Parse for Args {
             nested_self_entries: false,
             ignore_risks: false,
             ignore: false,
-            no_nested_self: false,
             stages: false,
             accepted: false,
             stage: 0,
@@ -188,7 +183,6 @@ impl Parse for Args {
                 ("nested_self_entries", Lit::Bool(b)) => args.nested_self_entries = b.value,
                 ("ignore_risks", Lit::Bool(b)) => args.ignore_risks = b.value,
                 ("ignore", Lit::Bool(b)) => args.ignore = b.value,
-                ("no_nested_self", Lit::Bool(b)) => args.no_nested_self = b.value,
                 ("stages", Lit::Bool(b)) => args.stages = b.value,
                 ("accepted", Lit::Bool(b)) => args.accepted = b.value,
                 ("stage", Lit::Int(i)) => args.stage = i.base10_parse()?,
@@ -213,7 +207,6 @@ impl Args {
         let bodies = self.bodies;
         let (nested_self_entries, accepted) = (self.nested_self_entries, self.accepted);
         let (ignore_risks, ignore) = (self.ignore_risks, self.ignore);
-        let no_nested_self = self.no_nested_self;
         let (stages, stage) = (self.stages, self.stage);
         let via = &self.via;
         let marker = self.marker.as_ref().map(|marker| {
@@ -227,12 +220,13 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, ignore_risks = #ignore_risks, ignore = #ignore, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
+        quote!(id = #id, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, ignore_risks = #ignore_risks, ignore = #ignore, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
     }
 
     /// The item is nested in `enter_mod` and has a `Self` of its own: the copy is wrapped in a
-    /// file and the visitor is given `with_nested_self()`. Not with `via = "nested"`, which opens
-    /// the scope of the type inside the module's: the copy is that of a type analyzed by itself.
+    /// file, and the entries that name its `Self` are finished ([`Finish`]). Not with `via =
+    /// "nested"`, which opens the scope of the type inside the module's: the copy is that of a type
+    /// analyzed by itself.
     fn nested(&self) -> bool {
         self.scope == "mod" && self.via != "nested"
     }
@@ -393,7 +387,7 @@ fn ident(name: &str) -> Ident {
 /// - `mod`: a struct, an enum, a union or a trait, as a nested item of `enter_mod(..)`
 ///   (`View::visit_item()`), the module declaring its name. Its context is the module's, its
 ///   generics are local, and it has a `Self` of its own, whose entries the copy's visitor writes
-///   with `Visitor::with_nested_self()` (`Projector::project_nested()`).
+///   with `Self` (`Finish` writes them for the Leaker's type).
 /// - `generics`: a struct, an enum or a union with no `Self`, in `enter_generics(..)`.
 /// - `trait`: a trait without a generic associated type, in `enter_trait(..)`.
 /// - `impl`: an impl in `enter_impl(.., None, ..)`, where only the self type and the arguments of
@@ -815,6 +809,21 @@ enum Used<'a> {
     Param,
 }
 
+/// What the impls of an item are for: the marker of the item if it has one and no entry needs
+/// `Self`, else a parameter (the blanket impls accept the marker as `Self`, so the copy still
+/// compiles), and a bucket type for an item without a marker.
+fn impl_self_for(referrer: &Referrer, marker: Option<&Type>) -> ImplSelf {
+    let param = ImplSelf::Param(ident("__S"));
+    let some_need_self = referrer.has_self();
+    match marker {
+        Some(marker) if !some_need_self => ImplSelf::Marker(marker.clone()),
+        Some(_) => param,
+        None => ImplSelf::Bucket {
+            param: ident("__S"),
+        },
+    }
+}
+
 /// The Repeater's implementation of each entry with the path of the module it is keyed by,
 /// relative to the analyzed module (`[]` for it and for the entries of no module), as a downstream
 /// crate writes them.
@@ -825,61 +834,25 @@ fn repeater_impls(
     marker: Option<&Type>,
 ) -> Result<Impls> {
     let repeater: Path = parse_quote!(crate::Repeater);
+    let with = |impl_self| Projection::new(repeater.clone(), id, impl_self);
     // For `Self` bounded by the trait, the implementation is for `__S` (the implementor).
     let self_param = ident("__S");
     check_entry_helpers(result, referrer)?;
-    let check_marker: Type = parse_quote!(__Marker);
     // The call for a marker fails exactly when some entry needs `Self`.
     crate::check_bucket_self(
         referrer,
         id,
-        result.repeater_impls(
-            &repeater,
-            id,
-            ImplSelf::Marker(&check_marker),
-            slot_const(&repeater),
-        ),
+        result.repeater_impls(&with(ImplSelf::Marker(parse_quote!(__Marker)))),
     )?;
-    let some_need_self = referrer
-        .iter()
-        .any(|(ix, _, _)| referrer.bucket_self(id, ix).is_none());
-    let (used, targets): (Used, Vec<_>) = match marker {
-        // Every entry is for the marker, or, if one of them needs `Self`, for the parameter (the
-        // blanket impls accept the marker as `Self`, so the copy still compiles).
-        Some(marker) if !some_need_self => (
-            Used::Marker(marker),
-            result
-                .repeater_impls(
-                    &repeater,
-                    id,
-                    ImplSelf::Marker(marker),
-                    slot_const(&repeater),
-                )
-                .map_err(Error::from)?,
-        ),
-        Some(_) => (
-            Used::Param,
-            result
-                .repeater_impls(
-                    &repeater,
-                    id,
-                    ImplSelf::Param(&self_param),
-                    slot_const(&repeater),
-                )
-                .map_err(Error::from)?,
-        ),
-        None => (
-            Used::Bucket,
-            result
-                .repeater_impls(
-                    &repeater,
-                    id,
-                    ImplSelf::Bucket { param: &self_param },
-                    slot_const(&repeater),
-                )
-                .map_err(Error::from)?,
-        ),
+    // Every entry is for the marker, or, if one of them needs `Self`, for the parameter.
+    let impl_self = impl_self_for(referrer, marker);
+    let used = match (&impl_self, marker) {
+        (ImplSelf::Marker(_), Some(marker)) => Used::Marker(marker),
+        (ImplSelf::Bucket { .. }, _) => Used::Bucket,
+        _ => Used::Param,
     };
+    let projection = with(impl_self);
+    let targets = result.repeater_impls(&projection).map_err(Error::from)?;
     let mut impls = Vec::new();
     for r in targets {
         let ix = r.entry;
@@ -896,17 +869,24 @@ fn repeater_impls(
             Some(SelfRequirement::Type(_)) => parse_quote!(Self),
             _ => r.self_ty.clone(),
         };
-        let trait_path = projected_trait_path(
-            &repeater_projection(
-                &repeater,
-                &self_in_impl,
-                context,
-                id,
-                ix,
-                slot_const(&repeater),
-            )
-            .map_err(Error::from)?,
-        )?;
+        // `of()` chooses the type of an impl that is for a bucket or the marker, so it is `r.self_ty`.
+        let projected = projection
+            .of(&self_in_impl, context, ix)
+            .map_err(Error::from)?;
+        let trait_path = projected_trait_path(&projected)?;
+        match &projected {
+            Type::Path(TypePath {
+                qself: Some(qself), ..
+            }) if *qself.ty == self_in_impl => (),
+            other => {
+                return Err(helpers_disagree(format!(
+                    "`Projection::of()` wrote `{}` for the entry {}, but its impl is for `{}`",
+                    quote!(#other),
+                    ix,
+                    quote!(#self_in_impl)
+                )))
+            }
+        }
         let written: ItemImpl = parse2(tokens.clone())?;
         match &written.trait_ {
             Some((_, path, _)) if *path == trait_path => (),
@@ -951,11 +931,12 @@ fn check_entry_helpers(result: &LeakerResult, referrer: &Referrer) -> Result<()>
             "`is_empty()` and `iter()` differ".to_string(),
         ));
     }
-    let param = ident("__S");
-    let repeater: Path = parse_quote!(crate::Repeater);
-    let impls = result
-        .repeater_impls(&repeater, 0, ImplSelf::Param(&param), slot_const(&repeater))
-        .map_err(Error::from)?;
+    let projection = Projection::new(
+        parse_quote!(crate::Repeater),
+        0,
+        ImplSelf::Param(ident("__S")),
+    );
+    let impls = result.repeater_impls(&projection).map_err(Error::from)?;
     for ((ix, _, context), r) in referrer.iter().zip(impls) {
         if r.entry != ix {
             return Err(helpers_disagree(format!(
@@ -1053,7 +1034,7 @@ fn declared_generics(generics: &Generics) -> Generics {
 /// (`__S: ?Sized`, and the trait for a `Self` that a trait bounds) unless the impl is for a type;
 /// its module is the context's.
 ///
-/// An entry that `Referrer::bucket_self()` gives a type for (and only one that does not name `Self`,
+/// An entry that `crate::bucket_self()` gives a type for (and only one that does not name `Self`,
 /// in its type or in the generics of its context) is for that type, and declares no parameter,
 /// unless `used` is `Used::Param`: then it is for the parameter, like the others.
 fn check_impl_pieces(
@@ -1067,7 +1048,7 @@ fn check_impl_pieces(
     let context = crate::entry_context(referrer, ix);
     let declared = declared_generics(&context.generics);
     let mut got = r.generics.clone();
-    let bucket = referrer.bucket_self(id, ix);
+    let bucket = crate::bucket_self(referrer, id, ix);
     let bucketable = context.self_ty.is_none() && !names_self(&context.generics);
     if bucket.is_some() != bucketable {
         return Err(helpers_disagree(format!(
@@ -2039,7 +2020,7 @@ fn projected_trait_path(projection: &Type) -> Result<Path> {
             segments: path.segments.iter().take(qself.position).cloned().collect(),
         }),
         _ => Err(helpers_disagree(format!(
-            "`repeater_projection()` wrote `{}`, not a projection",
+            "`Projection::of()` wrote `{}`, not a projection",
             quote!(#projection)
         ))),
     }
@@ -2048,8 +2029,8 @@ fn projected_trait_path(projection: &Type) -> Result<Path> {
 /// Builds `<Self as Repeater<..>>::Type` for an entry.
 struct Projector<'a> {
     referrer: &'a Referrer,
-    repeater: Path,
-    id: u64,
+    /// The Repeater of the Leaker, as the copy names it.
+    projection: Projection,
     root_params: Punctuated<GenericParam, Token![,]>,
     root_args: Vec<GenericArgument>,
     /// `Self` of an entry whose context bounds `Self` by the trait: the host type.
@@ -2061,9 +2042,6 @@ struct Projector<'a> {
     marker: Option<Type>,
     /// The entries that the copy replaced.
     used: std::cell::RefCell<std::collections::BTreeSet<EntryId>>,
-    /// `root_args` are the arguments of an instantiation (`Instance`): what an entry names `Self`
-    /// as is written with them too.
-    at_instance: bool,
 }
 
 impl Projector<'_> {
@@ -2082,11 +2060,15 @@ impl Projector<'_> {
             // AsRef<Self>, U = Rel<T>>`): the Leaker analyzed it without `Self`, and the entry is
             // for any type that the bound holds for. The implementor is the host, which has it
             // (`T: AsRef<Host>`), not `()`.
-            _ => match (self.referrer.bucket_self(self.id, ix), &self.marker) {
-                // The impl is for the marker of the item (`Args::marker`), or for this primitive
-                // type (`ImplSelf::Bucket`).
+            _ => match (
+                crate::bucket_self(self.referrer, self.projection.id, ix),
+                &self.marker,
+            ) {
+                // The impl is for the marker or for a primitive type, which `of()` writes whatever
+                // it is given (`ImplSelf::Marker` and `Bucket`). If every impl is for a parameter
+                // (`ImplSelf::Param`), they are blanket impls, which accept the marker too.
                 (Some(_), Some(marker)) => marker.clone(),
-                (Some(bucket), None) => bucket,
+                (Some(_), None) => parse_quote!(()),
                 (None, _) if self.bound_self.is_some() && names_self(&context.generics) => {
                     self.bound_self.clone().unwrap()
                 }
@@ -2096,66 +2078,245 @@ impl Projector<'_> {
         self.project_with(ix, context, self_ty)
     }
 
-    /// The path through the Repeater of an entry that depends on the own `Self` of a nested item
-    /// (`Visitor::with_nested_self()`). `base` is the module of the Leaker's crate that the
-    /// Visitor's context is in. The Repeater's impl is for the Leaker's own type, which the copy
-    /// cannot name as `Self`: a struct, an enum or a union is `base::<modules>::Name<args>`, and a
-    /// trait is the host. An impl would need its self type written out in the Leaker's crate,
-    /// which the generator does not make.
-    ///
-    /// An entry whose type does not name `Self`, and whose bounds do (`SelfRequirement::Any`), has
-    /// an impl for any type that the bounds hold for: the copy passes its own type, `Self`.
-    fn project_nested(
-        &self,
-        nested: &NestedSelf,
-        base: &Path,
-        ix: EntryId,
-        context: &Context,
-    ) -> Result<Type> {
-        if let Some(SelfRequirement::Any) = context.self_ty {
-            return self.project_with(ix, context, parse_quote!(Self));
-        }
-        let self_ty: Type = match &nested.requirement {
-            SelfRequirement::Bound(_) => self
-                .bound_self
-                .clone()
-                .ok_or_else(|| Error::new(Span::call_site(), "test macro: no host for Self"))?,
-            SelfRequirement::Type(Type::Path(TypePath { qself: None, path }))
-                if nested.ident.is_some() =>
-            {
-                let mut full = base.clone();
-                full.segments
-                    .extend(nested.modules.iter().cloned().map(PathSegment::from));
-                full.segments.extend(path.segments.iter().cloned());
-                Type::Path(TypePath {
-                    qself: None,
-                    path: full,
-                })
-            }
-            _ => {
-                return Err(Error::new(
-                    Span::call_site(),
-                    "test macro: no type for the Self of a nested impl",
-                ))
-            }
-        };
-        self.project_with(ix, context, self_ty)
-    }
-
     fn project_with(&self, ix: EntryId, context: &Context, self_ty: Type) -> Result<Type> {
         self.used.borrow_mut().insert(ix);
         // The entry by its own generics, then the arguments of the site in one pass: the type of
         // `Self` is written with the generics of the item (`Name<'a, T>`) too.
-        let projection = repeater_projection(
-            &self.repeater,
-            &self_ty,
-            context,
-            self.id,
-            ix,
-            slot_const(&self.repeater),
-        )?;
+        let projection = self.projection.of(&self_ty, context, ix)?;
         let site = crate::answers(&self.root_params, &self.root_args);
         Ok(crate::substitute_type(&projection, &site, None)?)
+    }
+}
+
+/// The nested structs, enums and unions of `item` (`type_with_params()` as text) with the `mod` items
+/// between the module that the Visitor's context is in and each, for [`nested_self()`].
+fn nested_adts(item: &Item) -> Vec<(String, Vec<Ident>)> {
+    #[derive(Default)]
+    struct Adts {
+        modules: Vec<Ident>,
+        found: Vec<(String, Vec<Ident>)>,
+    }
+    impl Adts {
+        fn add(&mut self, ident: &Ident, generics: &Generics) {
+            // As the requirement writes it: `S`, not `S<>`, for no generics.
+            let text = if generics.params.is_empty() {
+                quote!(#ident).to_string()
+            } else {
+                let ty = type_with_params(ident, generics);
+                quote!(#ty).to_string()
+            };
+            self.found.push((text, self.modules.clone()));
+        }
+    }
+    impl<'ast> Visit<'ast> for Adts {
+        fn visit_item_mod(&mut self, i: &'ast ItemMod) {
+            self.modules.push(i.ident.clone());
+            syn::visit::visit_item_mod(self, i);
+            self.modules.pop();
+        }
+        fn visit_item_struct(&mut self, i: &'ast ItemStruct) {
+            self.add(&i.ident, &i.generics);
+            syn::visit::visit_item_struct(self, i);
+        }
+        fn visit_item_enum(&mut self, i: &'ast ItemEnum) {
+            self.add(&i.ident, &i.generics);
+            syn::visit::visit_item_enum(self, i);
+        }
+        fn visit_item_union(&mut self, i: &'ast ItemUnion) {
+            self.add(&i.ident, &i.generics);
+            syn::visit::visit_item_union(self, i);
+        }
+    }
+    let mut adts = Adts::default();
+    match item {
+        // The module that is analyzed is the context itself.
+        Item::Mod(ItemMod {
+            content: Some((_, items)),
+            ..
+        }) => items.iter().for_each(|item| adts.visit_item(item)),
+        other => adts.visit_item(other),
+    }
+    adts.found
+}
+
+/// The closure of `Visitor::with_nested_self()`: the self type that the Repeater's impl of an entry
+/// that depends on the own `Self` of a nested item is for, in the Referrer's crate. The copy cannot
+/// name it as `Self`: a struct, an enum or a union is `base::<modules>::Name<args>` (the Leaker's),
+/// and a trait is the host. `base` is the module of the Leaker's crate that the Visitor's context is
+/// in. A nested impl has none (its self type would have to be written out in the Leaker's crate,
+/// which the generator does not make), nor has a name that two nested items have: the entries are
+/// left as written then, and the Referrer's crate does not compile.
+fn nested_self<'a>(
+    projector: &'a Projector<'a>,
+    base: &'a Path,
+    adts: &'a [(String, Vec<Ident>)],
+) -> impl FnMut(&SelfRequirement) -> Option<Type> + 'a {
+    move |requirement| match requirement {
+        SelfRequirement::Bound(_) => projector.bound_self.clone(),
+        SelfRequirement::Type(Type::Path(TypePath { qself: None, path })) => {
+            let name = quote!(#path).to_string();
+            let mut found = adts.iter().filter(|(text, _)| *text == name);
+            let (_, modules) = found.next()?;
+            if found.next().is_some() {
+                return None;
+            }
+            let mut full = base.clone();
+            full.segments
+                .extend(modules.iter().cloned().map(PathSegment::from));
+            full.segments.extend(path.segments.iter().cloned());
+            Some(Type::Path(TypePath {
+                qself: None,
+                path: full,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Finishes a copy that the Visitor has written: each path through the Repeater that it wrote,
+/// `<Self as Repeater<..>>::Type`, is written again for what the Leaker's impl of the entry is for
+/// in this crate, with the arguments of the site.
+///
+/// The Visitor does not know that type. The Leaker's impl of an entry that names `Self` is for the
+/// Leaker's own type or for the implementor of its trait (`Bound`), and the `Self` of the copy is
+/// neither where a trait is declared again (`<Name>Copy`: its `Self` has not the Leaker's trait),
+/// and in the self type of an impl (it has no `Self`). So the host of a trait and the type of an
+/// impl are written here, as the closure of the Visitor wrote them before it held the
+/// `Projection`, and the entries that need no `Self` are for the marker or for any type. The
+/// entries that depend on the own `Self` of a nested item are not touched when they are for its
+/// own type (`Type`, `Bound`): `Visitor::with_nested_self()` wrote those ([`nested_self()`]). The
+/// site is the instantiation of the item or the placeholder of a default (`rewrite_defaults()`):
+/// its arguments go into the entry's arguments ([`substitute_type()`](crate::substitute_type)),
+/// which the Visitor, which writes the item by its own generics, does not do. Every path it finds
+/// is an entry that the copy replaced (`Projector::used`).
+///
+/// It also checks what the Visitor wrote outside the nested items: the path is what
+/// `Projection::of()` writes for the entry, with `Self` (or the host that `with_self()` was given)
+/// as the self type.
+struct Finish<'a> {
+    projector: &'a Projector<'a>,
+    /// What the Visitor was given for `Self` (`Visitor::with_self()`) outside nested items.
+    host: Option<&'a Type>,
+    /// How many items the visit is in, as the Visitor counts them: a nested item that declares
+    /// `Self` has one of its own if this is not 0.
+    depth: usize,
+    /// In a nested item that has a `Self` of its own.
+    nested: bool,
+    /// The first error.
+    error: Option<Error>,
+}
+
+impl<'a> Finish<'a> {
+    /// `module_scope`: the Visitor's context is a module, whose items are nested.
+    fn new(projector: &'a Projector<'a>, host: Option<&'a Type>, module_scope: bool) -> Self {
+        Finish {
+            projector,
+            host,
+            depth: usize::from(module_scope),
+            nested: false,
+            error: None,
+        }
+    }
+
+    /// Visits what is in an item, which counts one more, and has a `Self` of its own if it declares
+    /// one and is nested.
+    fn within(&mut self, declares: bool, visit: impl FnOnce(&mut Self)) {
+        let outer = self.nested;
+        if self.depth > 0 && declares {
+            self.nested = true;
+        }
+        self.depth += 1;
+        visit(self);
+        self.depth -= 1;
+        self.nested = outer;
+    }
+
+    /// Whether `ty` is a path that the Visitor wrote through this Repeater: the entry it is for.
+    fn written(&self, ty: &Type) -> Option<EntryId> {
+        let (id, entry, mut path) = crate::projected_entry(ty)?;
+        let mut repeater = self.projector.projection.path.clone();
+        for path in [&mut path, &mut repeater] {
+            if let Some(last) = path.segments.last_mut() {
+                last.arguments = PathArguments::None;
+            }
+        }
+        (id == self.projector.projection.id && path == repeater).then(|| entry)
+    }
+
+    fn finish(&mut self, ty: &mut Type, ix: EntryId) -> Result<()> {
+        let projector = self.projector;
+        let context = crate::entry_context(projector.referrer, ix);
+        // What the hook wrote in a nested item: its own type, which the visitor does not decide.
+        let hooked = self.nested
+            && matches!(
+                context.self_ty,
+                Some(SelfRequirement::Type(_) | SelfRequirement::Bound(_))
+            );
+        if hooked {
+            projector.used.borrow_mut().insert(ix);
+            let site = crate::answers(&projector.root_params, &projector.root_args);
+            *ty = crate::substitute_type(ty, &site, None)?;
+            return Ok(());
+        }
+        // What the Visitor wrote: `Projection::of()` with `Self`, or with the host given to it.
+        let of = |self_ty: &Type| projector.projection.of(self_ty, context, ix);
+        let written = of(&parse_quote!(Self))?;
+        let hosted = match self.host {
+            Some(host) if !self.nested => Some(of(host)?),
+            _ => None,
+        };
+        if *ty != written && hosted.as_ref() != Some(&*ty) {
+            return Err(Error::new(
+                Span::call_site(),
+                format!(
+                    "the visitor wrote `{}` for the entry {}, but `Projection::of()` writes `{}`",
+                    quote!(#ty),
+                    ix,
+                    quote!(#written)
+                ),
+            ));
+        }
+        *ty = match context.self_ty {
+            // An entry for any type: the copy's own type, `Self`.
+            Some(SelfRequirement::Any) if self.nested => {
+                projector.project_with(ix, context, parse_quote!(Self))?
+            }
+            _ => projector.project(ix, context)?,
+        };
+        Ok(())
+    }
+}
+
+impl VisitMut for Finish<'_> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let ix = match self.written(ty) {
+            Some(ix) => ix,
+            None => return syn::visit_mut::visit_type_mut(self, ty),
+        };
+        // An entry the copy cannot write is left as the Visitor wrote it: the check of the item
+        // reports it (a nested item inside a module or a block cannot write its `Self`).
+        if let Err(error) = self.finish(ty, ix) {
+            self.error.get_or_insert(error);
+        }
+    }
+
+    fn visit_item_mut(&mut self, item: &mut Item) {
+        match item {
+            Item::Mod(_) => {
+                let outer = std::mem::take(&mut self.nested);
+                self.depth += 1;
+                syn::visit_mut::visit_item_mut(self, item);
+                self.depth -= 1;
+                self.nested = outer;
+            }
+            Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_) | Item::Impl(_) => {
+                self.within(true, |this| syn::visit_mut::visit_item_mut(this, item))
+            }
+            Item::TraitAlias(_) | Item::Type(_) | Item::Fn(_) => {
+                self.within(false, |this| syn::visit_mut::visit_item_mut(this, item))
+            }
+            _ => syn::visit_mut::visit_item_mut(self, item),
+        }
     }
 }
 
@@ -2233,20 +2394,20 @@ fn rewrite_with(
         Item::Impl(i) => Some(&i.generics),
         _ => None,
     };
+    let id = args.repeater_id();
     let mut projector = Projector {
         referrer,
-        repeater,
-        id: args.repeater_id(),
+        projection: Projection::new(repeater, id, impl_self_for(referrer, args.marker.as_ref())),
         root_params: generics.map(|g| g.params.clone()).unwrap_or_default(),
-        root_args: match inst {
-            Some(inst) => inst.completed.clone(),
-            None => generics.map(identity_args).unwrap_or_default(),
-        },
+        // The arguments of an instantiation are not written here: the visitor writes the entries by
+        // the names of their generics, and the position of the copy gets the arguments in one pass
+        // at the site (`instance_check_fn()`, `substituted_trait()`: `substitute_args()`), which
+        // names the lifetime that an argument adds to the inputs of an elided signature (F70).
+        root_args: generics.map(identity_args).unwrap_or_default(),
         bound_self: None,
         type_self: None,
         marker: args.marker.clone(),
         used: Default::default(),
-        at_instance: inst.is_some(),
     };
     let host = matches!(item, Item::Trait(_)).then(|| match inst {
         Some(inst) => inst.host(),
@@ -2275,18 +2436,15 @@ fn rewrite_with(
             projector.bound_self = Some(host_type(host.as_ref().unwrap(), dyn_host));
         }
         Item::Impl(i) => {
-            // The self type is written in the Leaker's crate: rewrite it like any type.
-            let error = std::cell::RefCell::new(None);
+            // The self type is written in the Leaker's crate: rewrite it like any type. It cannot
+            // name `Self`.
             let mut rewritten = (*i.self_ty).clone();
             referrer
-                .visitor(context, |_leaked, ix, entry| {
-                    projector.project(ix, entry).unwrap_or_else(|e| {
-                        *error.borrow_mut() = Some(e);
-                        parse_quote!(())
-                    })
-                })
+                .visitor(context, &projector.projection)
                 .visit_type_mut(&mut rewritten);
-            if let Some(e) = error.into_inner() {
+            let mut finish = Finish::new(&projector, None, false);
+            finish.visit_type_mut(&mut rewritten);
+            if let Some(e) = finish.error {
                 return Err(e);
             }
             projector.type_self = Some(rewritten);
@@ -2297,7 +2455,7 @@ fn rewrite_with(
         }
         _ => (),
     }
-    let error = std::cell::RefCell::new(None);
+    let error;
     let mut rewritten = item.clone();
     {
         // The module of the Leaker's crate that the context is in: the module of the item, or the
@@ -2306,31 +2464,22 @@ fn rewrite_with(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        let visitor = referrer.visitor(context, |_leaked, ix, entry| {
-            projector.project(ix, entry).unwrap_or_else(|e| {
-                *error.borrow_mut() = Some(e);
-                parse_quote!(())
-            })
-        });
+        let visitor = referrer.visitor(context, &projector.projection);
         // The item of a scope `mod` is a nested item, which has a `Self` of its own.
-        let visitor = match (self_ty, args.nested()) {
-            (Some(self_ty), false) => visitor.with_self(self_ty),
-            _ => visitor,
+        let host = match (&self_ty, args.nested()) {
+            (Some(self_ty), false) => Some(self_ty),
+            _ => None,
+        };
+        let visitor = match host {
+            Some(host) => visitor.with_self(host.clone())?,
+            None => visitor,
         };
         // A struct, an enum, a union or a trait nested in the module (the item of a scope `mod`)
-        // has a `Self` of its own, whose entries the visitor finds.
-        let mut visitor: Box<dyn VisitMut + '_> = if args.no_nested_self {
-            Box::new(visitor)
-        } else {
-            Box::new(visitor.with_nested_self(|nested, _leaked, ix, entry| {
-                projector
-                    .project_nested(nested, &base, ix, entry)
-                    .unwrap_or_else(|e| {
-                        *error.borrow_mut() = Some(e);
-                        parse_quote!(())
-                    })
-            }))
-        };
+        // has a `Self` of its own, whose entries for its own type the hook writes.
+        let adts = nested_adts(item);
+        let mut visitor = visitor.with_nested_self(nested_self(&projector, &base, &adts));
+        let module_scope = matches!(item, Item::Mod(_)) || args.nested();
+        let mut finish = Finish::new(&projector, host, module_scope);
         match &mut rewritten {
             // The item inside a module or a block that declares names (`shadow_check()`).
             other if wrap.is_some() => {
@@ -2343,6 +2492,7 @@ fn rewrite_with(
                     ],
                 };
                 visitor.visit_file_mut(&mut file);
+                finish.visit_file_mut(&mut file);
                 *other = wrap.inside(file.items.remove(0));
             }
             other if args.nested() => {
@@ -2352,6 +2502,7 @@ fn rewrite_with(
                     items: vec![std::mem::replace(other, Item::Verbatim(TokenStream::new()))],
                 };
                 visitor.visit_file_mut(&mut file);
+                finish.visit_file_mut(&mut file);
                 *other = file.items.remove(0);
             }
             Item::Mod(m) => {
@@ -2363,14 +2514,19 @@ fn rewrite_with(
                         items: std::mem::take(items),
                     };
                     visitor.visit_file_mut(&mut file);
+                    finish.visit_file_mut(&mut file);
                     *items = file.items;
                 }
             }
-            other => visitor.visit_item_mut(other),
+            other => {
+                visitor.visit_item_mut(other);
+                finish.visit_item_mut(other);
+            }
         }
+        error = finish.error;
     }
     // An item nested in a module or a block has a `Self` of its own: an impl cannot write it.
-    if let (Some(e), None) = (error.into_inner(), wrap) {
+    if let (Some(e), None) = (error, wrap) {
         return Err(e);
     }
     if let (true, Item::Trait(original), Item::Trait(copy)) = (args.redeclare, item, &mut rewritten)
@@ -2385,7 +2541,15 @@ fn rewrite_with(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        rewrite_defaults(referrer, context, original, copy, &projector, &base)?;
+        let module_scope = matches!(item, Item::Mod(_)) || args.nested();
+        rewrite_defaults(
+            referrer,
+            context,
+            original,
+            copy,
+            &projector,
+            (&base, module_scope),
+        )?;
     }
     Ok(Rewritten {
         item: rewritten,
@@ -2906,9 +3070,9 @@ fn concrete_const(ty: &Type, draw: &mut Draw) -> GenericArgument {
 ///   in no bound, a value; and otherwise the parameter itself, which the use site declares as the
 ///   item does;
 /// - left out for the defaults at the end of the list (if no predicate or bound names them):
-///   [`complete_params()`] gives them.
+///   [`complete_defaults()`] gives them.
 ///
-/// The copy is written with the arguments ([`repeater_projection()`],
+/// The copy is written with the arguments ([`Projection::of()`],
 /// [`substitute_args()`]) and compared with the original at them: the witness of each
 /// position is called with them.
 pub(crate) struct Instance {
@@ -3060,7 +3224,7 @@ struct InstAsk {
 
 /// Plans the instantiation of `generics` that `ask` draws (see [`Instance`]), or `None` if it has
 /// no generic. `visited` are the parameters of the visited copy, whose defaults name the leaked
-/// types through the Repeater, for [`complete_params()`].
+/// types through the Repeater, for [`complete_defaults()`].
 fn plan_instance(
     id: u64,
     item: &Item,
@@ -3170,7 +3334,7 @@ fn plan_instance(
             }
         }
     }
-    let mut completed = complete_params(visited, given.iter()).map_err(Error::from)?;
+    let mut completed = complete_defaults(visited, &given)?;
     // A const parameter that is its own argument is written bare (`{ N }` is not allowed in the
     // arguments of a path where `N` is a generic).
     for (param, arg) in generics.params.iter().zip(completed.iter_mut()) {
@@ -3190,6 +3354,62 @@ fn plan_instance(
         lifetimes,
         concrete,
     }))
+}
+
+/// The arguments of the instantiation: `given`, and for each parameter left out the default of
+/// the visited copy (its leaked types written through the host the Referrer chooses, which
+/// `Referrer::complete_args()` cannot know), with the arguments before it written in.
+fn complete_defaults(
+    visited: &Punctuated<GenericParam, Token![,]>,
+    given: &[GenericArgument],
+) -> Result<Vec<GenericArgument>> {
+    let mut completed = given.to_vec();
+    for param in visited.iter().skip(given.len()) {
+        let mut arg = match param {
+            GenericParam::Type(TypeParam {
+                default: Some(default),
+                ..
+            }) => GenericArgument::Type(default.clone()),
+            GenericParam::Const(ConstParam {
+                default: Some(default),
+                ..
+            }) => GenericArgument::Const(braced_unless_simple(default)),
+            _ => {
+                return Err(Error::new(
+                    Span::call_site(),
+                    format!(
+                        "test macro: `{}` is left out and has no default",
+                        param_name(param)
+                    ),
+                ))
+            }
+        };
+        substitute_args(
+            std::iter::once(&mut arg),
+            crate::answers(visited, &completed),
+        )
+        .map_err(Error::from)?;
+        completed.push(arg);
+    }
+    Ok(completed)
+}
+
+/// `expr` in braces, unless it is a literal or an identifier, which a path takes as it is.
+fn braced_unless_simple(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Lit(_) => expr.clone(),
+        Expr::Path(ExprPath {
+            qself: None, path, ..
+        }) if path.get_ident().is_some() => expr.clone(),
+        // `{ N }` is `N`, not `{ { N } }`.
+        Expr::Block(ExprBlock {
+            label: None, block, ..
+        }) if block.stmts.len() == 1 => match &block.stmts[0] {
+            Stmt::Expr(inner, None) => braced_unless_simple(inner),
+            _ => parse_quote!({ #expr }),
+        },
+        _ => parse_quote!({ #expr }),
+    }
 }
 
 /// Substitutes the instantiation in the syntax of a copy (a signature, an associated type): the
@@ -3396,7 +3616,7 @@ fn instance_check_fn(
     })
 }
 
-/// The check that the arguments that `complete_params()` gave for the defaults that the use
+/// The check that the arguments that `complete_defaults()` gave for the defaults that the use
 /// site left out are the defaults that rustc takes: for a struct, an enum or a union, `S<given>` is
 /// `S<completed>` (a function takes one and returns the other); for a trait, the host that
 /// implements `Tr<given>` implements `Tr<completed>`.
@@ -3504,13 +3724,18 @@ fn defaults_check(inst: &Instance, item: &Item, target: &Path, host: Option<&Typ
     }
 }
 
-/// Checks the refusals of the arguments of the generics of the item. `complete_params()` takes the
-/// generics' own names, and refuses a list with one argument too many (`UnexpectedArgument`), one
-/// with the last missing (`MissingArgument`, unless that parameter has a default) and one of
-/// another kind in the first place. `substitute_args()` on the generics of the context of each
-/// entry that names the first parameter takes the same arguments, and refuses the one of another
-/// kind too (`UnexpectedArgument`).
-fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![,]>) -> Result<()> {
+/// Checks the refusals of the arguments of the generics of the item. `Referrer::complete_args()`
+/// takes the generics' own names, and refuses a list with one argument too many
+/// (`UnexpectedArgument`), one with the last missing (`MissingArgument`, unless that parameter has a
+/// default) and one of another kind in the first place. `substitute_args()` on the generics of the
+/// context of each entry that names the first parameter takes the same arguments, and refuses the one
+/// of another kind too (`UnexpectedArgument`).
+fn check_refusals(
+    referrer: &Referrer,
+    top_level: Option<ContextId>,
+    projection: &Projection,
+    params: &Punctuated<GenericParam, Token![,]>,
+) -> Result<()> {
     let (first, last) = match (params.first(), params.last()) {
         (Some(first), Some(last)) => (first, last),
         _ => return Ok(()),
@@ -3530,50 +3755,67 @@ fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![
     };
     let mut short = valid.clone();
     short.pop();
-    // The defaults of the item, if any, are left as they are.
-    match complete_params(params, &valid) {
-        Ok(completed) if completed.len() == valid.len() => (),
-        other => {
-            return Err(fail(format!(
-                "refused the arguments that are the generics' own names in the item: {:?}",
-                other.map(|a| a.len())
-            )))
+    // A trait nested in a module that `intern_mod()` analyzed has no context of its own.
+    if let Some(context) = top_level {
+        let complete = |args: &[GenericArgument]| referrer.complete_args(context, args, projection);
+        // The defaults of the item, if any, are left as they are.
+        match complete(&valid) {
+            Ok(mut substitute) => {
+                // Each parameter, written by its own name, comes out as its own name.
+                for (param, arg) in params.iter().zip(&valid) {
+                    let mut written = own_name_arg(param);
+                    substitute.visit_generic_argument_mut(&mut written);
+                    let (written, arg) = (quote!(#written).to_string(), quote!(#arg).to_string());
+                    if written.replace([' ', '{', '}'], "") != arg.replace([' ', '{', '}'], "") {
+                        return Err(fail(format!(
+                            "the arguments that are the generics' own names in the item gave `{}` for `{}`",
+                            written, param_name(param)
+                        )));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(fail(format!(
+                    "refused the arguments that are the generics' own names in the item: {:?}",
+                    error
+                )))
+            }
         }
-    }
-    match complete_params(params, &extra) {
-        Err(EncodeError::UnexpectedArgument(_)) => (),
-        other => {
-            return Err(fail(format!(
-                "one too many in the item is not an `UnexpectedArgument`: {:?}",
-                other.map(|a| a.len())
-            )))
+        match complete(&extra) {
+            Err(EncodeError::UnexpectedArgument(_)) => (),
+            other => {
+                return Err(fail(format!(
+                    "one too many in the item is not an `UnexpectedArgument`: {:?}",
+                    other.map(|_| "accepted")
+                )))
+            }
         }
-    }
-    let has_default = match last {
-        GenericParam::Lifetime(_) => false,
-        GenericParam::Type(param) => param.default.is_some(),
-        GenericParam::Const(param) => param.default.is_some(),
-    };
-    match (has_default, complete_params(params, &short)) {
-        (false, Err(EncodeError::MissingArgument(_))) | (true, Ok(_)) => (),
-        (_, other) => {
-            return Err(fail(format!(
-                "the last argument missing in the item (`{}` {}) gives {:?}",
-                param_name(last),
-                if has_default {
-                    "has a default"
-                } else {
-                    "has none"
-                },
-                other.map(|a| a.len())
-            )))
+        let has_default = match last {
+            GenericParam::Lifetime(_) => false,
+            GenericParam::Type(param) => param.default.is_some(),
+            GenericParam::Const(param) => param.default.is_some(),
+        };
+        match (has_default, complete(&short)) {
+            (false, Err(EncodeError::MissingArgument(_))) | (true, Ok(_)) => (),
+            (_, other) => {
+                return Err(fail(format!(
+                    "the last argument missing in the item (`{}` {}) gives {:?}",
+                    param_name(last),
+                    if has_default {
+                        "has a default"
+                    } else {
+                        "has none"
+                    },
+                    other.map(|_| "accepted")
+                )))
+            }
         }
-    }
-    if complete_params(params, &wrong).is_ok() {
-        return Err(fail(format!(
-            "one of another kind in the item (for `{}`) is accepted",
-            param_name(first)
-        )));
+        if complete(&wrong).is_ok() {
+            return Err(fail(format!(
+                "one of another kind in the item (for `{}`) is accepted",
+                param_name(first)
+            )));
+        }
     }
     let entries = referrer
         .iter()
@@ -3835,7 +4077,16 @@ fn instance_part(
     if generics.params.is_empty() || args.redeclare {
         return Ok((TokenStream::new(), 0, [0; 4]));
     }
-    check_refusals(referrer, &generics.params)?;
+    check_refusals(
+        referrer,
+        (!args.nested()).then(|| context),
+        &Projection::new(
+            repeater_path(path),
+            args.repeater_id(),
+            impl_self_for(referrer, args.marker.as_ref()),
+        ),
+        &generics.params,
+    )?;
     // The copy of the item, with the defaults of its parameters written by their own generics, and
     // the host of the instantiation for `Self`.
     let visited = rewrite_with(
@@ -3927,7 +4178,7 @@ fn rewrite_defaults(
     original: &ItemTrait,
     copy: &mut ItemTrait,
     projector: &Projector<'_>,
-    base: &Path,
+    (base, module_scope): (&Path, bool),
 ) -> Result<()> {
     let first = original.generics.params.iter().position(|param| {
         matches!(
@@ -3954,43 +4205,30 @@ fn rewrite_defaults(
     }
     let placeholder = Projector {
         referrer,
-        repeater: projector.repeater.clone(),
-        id: projector.id,
+        projection: projector.projection.clone(),
         root_params: projector.root_params.clone(),
         root_args,
         bound_self: projector.bound_self.clone(),
         type_self: projector.type_self.clone(),
         marker: projector.marker.clone(),
         used: Default::default(),
-        at_instance: projector.at_instance,
     };
     // The generics only: the same scope, and so the same entries, with no item to rewrite.
     let mut shell = original.clone();
     shell.items.clear();
     shell.supertraits.clear();
-    let error = std::cell::RefCell::new(None);
     let mut file = File {
         shebang: None,
         attrs: Vec::new(),
         items: vec![Item::Trait(shell)],
     };
     referrer
-        .visitor(context, |_leaked, ix, entry| {
-            placeholder.project(ix, entry).unwrap_or_else(|e| {
-                *error.borrow_mut() = Some(e);
-                parse_quote!(())
-            })
-        })
-        .with_nested_self(|nested, _leaked, ix, entry| {
-            placeholder
-                .project_nested(nested, base, ix, entry)
-                .unwrap_or_else(|e| {
-                    *error.borrow_mut() = Some(e);
-                    parse_quote!(())
-                })
-        })
+        .visitor(context, &placeholder.projection)
+        .with_nested_self(nested_self(&placeholder, base, &[]))
         .visit_file_mut(&mut file);
-    if let Some(e) = error.into_inner() {
+    let mut finish = Finish::new(&placeholder, None, module_scope);
+    finish.visit_file_mut(&mut file);
+    if let Some(e) = finish.error {
         return Err(e);
     }
     projector
@@ -6949,8 +7187,13 @@ mod tests {
             header_cycles(&header_position(&item, &args).unwrap())
         };
         // The projection of the entry `ix` of the Leaker 1, through `::k::Repeater`.
+        let projection = Projection::new(
+            parse_quote!(::k::Repeater),
+            1,
+            ImplSelf::Param(parse_quote!(__S)),
+        );
         let entry = |host: &str, args: &str, ix: EntryId| {
-            let key = repeater_key(1, ix);
+            let key = projection.key(ix);
             format!("<{} as ::k::Repeater<{}, {}>>::Type", host, args, key)
         };
         let with_args = entry("u8", "(T,)", parse_quote!(2));
@@ -6982,5 +7225,42 @@ mod tests {
         // But the inputs of `Fn` are arguments.
         let call = format!("Fn({}) -> u8", entry("u16", "()", parse_quote!(3)));
         assert!(cycles(&call, with_args));
+    }
+
+    /// The table of `nested_self()` names an item as its requirement does: `S`, not `S<>`, without
+    /// generics (a name that differs leaves the entries as written), and an item in a module of the
+    /// one that is analyzed has the module.
+    #[test]
+    fn nested_adts_are_named_as_the_requirement_writes_them() {
+        let item: Item = parse_quote!(
+            mod m {
+                pub struct S;
+                pub enum E<'a, T, const N: usize> {
+                    A(&'a T, [u8; N]),
+                }
+                mod inner {
+                    pub union U {
+                        a: u8,
+                    }
+                }
+            }
+        );
+        let found: Vec<(String, Vec<String>)> = nested_adts(&item)
+            .into_iter()
+            .map(|(name, modules)| (name, modules.iter().map(|m| m.to_string()).collect()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("S".to_string(), vec![]),
+                ("E < 'a , T , N >".to_string(), vec![]),
+                ("U".to_string(), vec!["inner".to_string()]),
+            ]
+        );
+        // An item that is not a module: itself.
+        let item: Item = parse_quote!(
+            struct S<T>(T);
+        );
+        assert_eq!(nested_adts(&item)[0].0, "S < T >");
     }
 }

@@ -575,8 +575,7 @@ fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
         .iter()
         .all(|(_, _, context)| context.self_ty.is_some()));
     let mut copy = item.clone();
-    referrer
-        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
+    common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut copy);
     let expected: ItemTrait = parse_quote!(
         trait T {
@@ -593,38 +592,22 @@ fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
 }
 
 #[test]
-fn referrer_visitor_keeps_what_type_fn_returns() {
+fn referrer_visitor_writes_the_optional_entry_through_the_repeater_too() {
     let mut item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self, a: ::foo::X) -> Rel;
         }
     );
-    let mut replaced = item.clone();
     let (result, context) = result_with_foo();
     let referrer = result.finish().unwrap();
-    let foo = index_of(&referrer, "::foo::X");
+    // Both entries are replaced: the type of another crate is one too, unless the Leaker's rule
+    // allows its path (`Rules::external_crates()`).
     referrer
-        .visitor(
-            context,
-            |ty, ix, _| {
-                if ix == foo {
-                    ty
-                } else {
-                    parse_quote!(P<#ix>)
-                }
-            },
-        )
+        .visitor(context, common::test_projection())
         .visit_item_trait_mut(&mut item);
     let s = quote!(#item).to_string();
-    assert!(s.contains(":: foo :: X"), "{}", s);
-    assert!(s.contains("P <"), "{}", s);
-    // A `type_fn` that returns `P<ix>` replaces both.
-    referrer
-        .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
-        .visit_item_trait_mut(&mut replaced);
-    let s = quote!(#replaced).to_string();
     assert!(!s.contains(":: foo"), "{}", s);
-    assert_eq!(s.matches("P <").count(), 2, "{}", s);
+    assert_eq!(s.matches("as Repeater <").count(), 2, "{}", s);
 }
 
 /// A Referrer, and the result read back from its tokens, are equal, also those of a result whose

@@ -1,9 +1,9 @@
 //! The [`View`], which a scope of the [`Leaker`](crate::Leaker) gives to its closure.
 
-use crate::allow::Allow;
 use crate::analysis::CheckResult;
 use crate::analyze::{AnalyzeVisitor, ScopeSpec, Scopes};
 use crate::context::ContextId;
+use crate::result::Allow;
 use std::fmt::Display;
 use syn::*;
 
@@ -158,7 +158,7 @@ impl<A: Allow> View<'_, '_, A> {
     ///
     /// Its generics are local and the generics around stay in scope; to make the generics of an
     /// item the root, use an `intern_*` method. A struct, enum, union, trait or impl declares its
-    /// own `Self` ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) finds its
+    /// own `Self` ([`Referrer::visitor()`](crate::Referrer::visitor) finds its
     /// entries); the other items keep the one around. The copy must nest the same scopes as the Leaker did.
     ///
     /// In a nested struct, enum or union, `Self` is the copy's own type. A type that names it is
