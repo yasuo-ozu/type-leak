@@ -5165,6 +5165,22 @@ fn rejection_text(errors: &[ErrorItem]) -> String {
         .join("\u{1d}")
 }
 
+/// [`crate::allow_every_cause()`], which must drop every error (they are a flat list). If one
+/// remains the macro panics, so the Leaker's crate does not build and the run fails (`ALLOW LEFT
+/// ERRORS`, which `tests/prop_cross_crate` reads).
+fn allow_all(result: LeakerResult, what: &str) -> LeakerResult {
+    let allowed = crate::allow_every_cause(result);
+    if !allowed.errors().is_empty() {
+        panic!(
+            "ALLOW LEFT ERRORS: {}: allow() of the cause of every error left {}: {}",
+            what,
+            allowed.errors().len(),
+            crate::messages(allowed.errors()).replace('\n', " ; ")
+        );
+    }
+    allowed
+}
+
 /// What [`leak()`] does with an item that the Leaker rejects.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Mode {
@@ -5180,11 +5196,10 @@ pub(crate) enum Mode {
 ///
 /// With `accept`, an item that the Leaker rejects is emitted with the recovered Referrer
 /// (`LeakerResult::into_referrer()`) as an accepted item (the Repeater's impls, the witnesses, the
-/// macro of the Referrer, which copies the part that conflicts as written), with the status `acc`,
-/// if `LeakerResult::allow(cause)` for the cause of every error drops every error
-/// ([`crate::allow_every_cause()`]; else `accfail`, and the remaining
-/// errors follow the first ones: it cannot happen). The errors are what the
-/// report says (and what `family()` of the harness explains).
+/// macro of the Referrer, which copies the part that conflicts as written), with the status `acc`.
+/// `LeakerResult::allow(cause)` for the cause of every error must drop every error
+/// ([`allow_all()`]: the macro panics otherwise). The errors are what the report says (and what
+/// `family()` of the harness explains).
 ///
 /// With `Mode::Result` the same item is emitted whatever the errors, and the macro of the Referrer
 /// carries the `LeakerResult` with them in place of the Referrer.
@@ -5268,18 +5283,14 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     if !errors.is_empty() {
         // With `accept`, the cause of every error is allowed, which must drop every error: the
         // Referrer is the recovered one either way.
-        let allowed = crate::allow_every_cause(result.clone());
-        let remaining = allowed.errors().to_vec();
-        if mode != Mode::Result && (!accept || !remaining.is_empty()) {
+        if accept {
+            allow_all(result.clone(), &format!("item {}", id));
+        }
+        if mode == Mode::Plain {
             // The item is not leaked: the Leaker's crate still has it.
-            let status = if accept { "accfail" } else { "rej" };
             let reason = crate::messages(&errors).replace(['\n', '|'], " ");
-            let report = format!("{}|{}|{}|{}", id, kind, status, reason);
-            let mut errors = rejection_text(&errors);
-            if accept {
-                errors.push('\u{1c}');
-                errors.push_str(&rejection_text(&remaining));
-            }
+            let report = format!("{}|{}|rej|{}", id, kind, reason);
+            let errors = rejection_text(&errors);
             // The copy of `allow_stages` is made all the same, and compares with the witnesses,
             // which the item has no other output for.
             let (head, tail, stage_macros) = if stage_copies.is_empty() {
@@ -5880,9 +5891,9 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
 /// rule allows resolve (`clean`).
 ///
 /// The status of its report is `ok` if the analysis leaves no error, `acc` if the causes of the
-/// errors were allowed (and dropped them all), `accfail` if an error remains (the macro emits no
-/// copy then) and `skip` if the rule does not matter. A macro error of the copy is no error of the
-/// Leaker's crate: it is a `rewrite-error` of the report.
+/// errors were allowed (and dropped them all: [`allow_all()`]) and `skip` if the rule does not
+/// matter. A macro error of the copy is no error of the Leaker's crate: it is a `rewrite-error` of
+/// the report.
 fn stage_copy(
     original: &Item,
     args: &Args,
@@ -5925,15 +5936,10 @@ fn stage_copy(
     // The errors that the rule does not drop are allowed by their causes, and so are those that
     // come up from inside them.
     let errors: Vec<ErrorItem> = result.errors().to_vec();
-    let result = crate::allow_every_cause(result);
-    let remaining = result.errors().to_vec();
-    if !remaining.is_empty() {
-        let reason = crate::messages(&remaining).replace(['\n', '|'], " ");
-        let mut text = rejection_text(&errors);
-        text.push('\u{1c}');
-        text.push_str(&rejection_text(&remaining));
-        return nothing(format!("{}|{}|accfail|{}", id, kind, reason), text);
-    }
+    let result = allow_all(
+        result,
+        &format!("item {}, the copy after the rule `{}`", id, rule.name()),
+    );
     let status = if errors.is_empty() { "ok" } else { "acc" };
     // The Referrer's crate of the stage copies: the arguments of the macro say so.
     let mut copy_args = args.clone();

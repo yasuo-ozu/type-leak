@@ -70,3 +70,42 @@ jobs:
     - uses: actions/checkout@v4
     - name: Run clippy
       run: cargo clippy --all-targets -- -D warnings
+
+  prop:
+
+    # The property test (tests/prop_cross_crate): random items leaked across two generated crates.
+    # The seeds are fixed, so a run is the same every time; the failure prints the command that
+    # repeats it. Each run builds its crates in target/tmp/prop, which is deleted between the runs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      CARGO_INCREMENTAL: 0
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Property test, seed 1
+      run: |
+        rm -rf target/tmp/prop
+        cargo +stable test -q --test prop_cross_crate -- --ignored --nocapture
+      env:
+        TYPE_LEAK_PROP_SEED: 1
+        TYPE_LEAK_PROP_CASES: 60
+    - name: Property test, the items rejected are accepted by allow() (seed 3)
+      run: |
+        rm -rf target/tmp/prop
+        cargo +stable test -q --test prop_cross_crate -- --ignored --nocapture
+      env:
+        TYPE_LEAK_PROP_SEED: 3
+        TYPE_LEAK_PROP_CASES: 60
+        TYPE_LEAK_PROP_ACCEPT: 1
+    - name: Property test, the copies after a rule given to the result (seed 1, fewer cases)
+      run: |
+        rm -rf target/tmp/prop
+        cargo +stable test -q --test prop_cross_crate -- --ignored --nocapture
+      env:
+        TYPE_LEAK_PROP_SEED: 1
+        TYPE_LEAK_PROP_CASES: 30
+        TYPE_LEAK_PROP_FEATURES: allow_stages
+    - name: Tests of the macro crate of the property test
+      run: cargo +stable test -q --manifest-path tests/crates/macro/Cargo.toml

@@ -1366,29 +1366,41 @@ fn is_shadow_name(name: &str) -> bool {
     SHADOW_NAMES.contains(&name)
 }
 
-/// The full path of a trait of the prelude that the generator spells bare in bounds.
+/// The traits of the prelude that the generator spells bare in bounds, with their full paths: the
+/// names of the tags `bare:<Name>`. `tests/crates/macro/bare.rs` has these and more.
+pub const PRELUDE_TRAITS: &[(&str, &str)] = &[
+    ("Sized", "::core::marker::Sized"),
+    ("Send", "::core::marker::Send"),
+    ("Sync", "::core::marker::Sync"),
+    ("Unpin", "::core::marker::Unpin"),
+    ("Copy", "::core::marker::Copy"),
+    ("Clone", "::core::clone::Clone"),
+    ("Default", "::core::default::Default"),
+    ("Fn", "::core::ops::Fn"),
+    ("FnMut", "::core::ops::FnMut"),
+    ("FnOnce", "::core::ops::FnOnce"),
+    ("Into", "::core::convert::Into"),
+    ("From", "::core::convert::From"),
+    ("AsRef", "::core::convert::AsRef"),
+    ("Iterator", "::core::iter::Iterator"),
+    ("PartialEq", "::core::cmp::PartialEq"),
+    ("PartialOrd", "::core::cmp::PartialOrd"),
+    ("Eq", "::core::cmp::Eq"),
+    ("Ord", "::core::cmp::Ord"),
+];
+
+/// The full path of a trait of `PRELUDE_TRAITS`.
 fn absolute_trait(name: &str) -> &'static str {
-    match name {
-        "Sized" => "::core::marker::Sized",
-        "Send" => "::core::marker::Send",
-        "Sync" => "::core::marker::Sync",
-        "Unpin" => "::core::marker::Unpin",
-        "Copy" => "::core::marker::Copy",
-        "Clone" => "::core::clone::Clone",
-        "Default" => "::core::default::Default",
-        "Fn" => "::core::ops::Fn",
-        "FnMut" => "::core::ops::FnMut",
-        "FnOnce" => "::core::ops::FnOnce",
-        "Into" => "::core::convert::Into",
-        "From" => "::core::convert::From",
-        "AsRef" => "::core::convert::AsRef",
-        "Iterator" => "::core::iter::Iterator",
-        "PartialEq" => "::core::cmp::PartialEq",
-        "PartialOrd" => "::core::cmp::PartialOrd",
-        "Eq" => "::core::cmp::Eq",
-        "Ord" => "::core::cmp::Ord",
-        other => panic!("generator: `{}` is not a prelude trait it writes", other),
-    }
+    PRELUDE_TRAITS
+        .iter()
+        .find(|(bare, _)| *bare == name)
+        .map(|(_, absolute)| *absolute)
+        .unwrap_or_else(|| panic!("generator: `{}` is not a prelude trait it writes", name))
+}
+
+/// Whether `name` is a trait of `PRELUDE_TRAITS`.
+pub fn is_prelude_trait(name: &str) -> bool {
+    PRELUDE_TRAITS.iter().any(|(bare, _)| *bare == name)
 }
 
 /// The marker traits (and comparisons) that a type parameter may have as a bound, each of which a
@@ -4116,9 +4128,7 @@ impl Gen {
                     "Self" => true,
                     _ if generics.contains(head) => false,
                     _ if PRIMITIVE_NAMES.contains(&head) => !self.cfg.primitive,
-                    _ if BARE_PRELUDE_TRAITS.contains(&head) => {
-                        dyn_at == Some(depth) && !self.cfg.prelude
-                    }
+                    _ if is_prelude_trait(head) => dyn_at == Some(depth) && !self.cfg.prelude,
                     "String" | "Vec" | "Box" | "Option" | "Result" => !self.cfg.prelude,
                     _ => true,
                 }
@@ -7024,31 +7034,9 @@ fn accept_referrer(
 }
 
 /// The primitive types, by name.
-const PRIMITIVE_NAMES: &[&str] = &[
+pub const PRIMITIVE_NAMES: &[&str] = &[
     "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "f32",
     "f64", "bool", "char", "str",
-];
-
-/// The traits of the prelude that the generator spells bare (`absolute_trait()`).
-const BARE_PRELUDE_TRAITS: &[&str] = &[
-    "Sized",
-    "Send",
-    "Sync",
-    "Unpin",
-    "Copy",
-    "Clone",
-    "Default",
-    "Fn",
-    "FnMut",
-    "FnOnce",
-    "Into",
-    "From",
-    "AsRef",
-    "Iterator",
-    "PartialEq",
-    "PartialOrd",
-    "Eq",
-    "Ord",
 ];
 
 /// The traits of the prelude that the text names bare (`Fn(..)`, `T: Default`, `dyn Iterator`): a
@@ -7056,9 +7044,9 @@ const BARE_PRELUDE_TRAITS: &[&str] = &[
 /// Leaker accepts bare whatever the prelude.
 pub fn bare_traits_in(text: &str) -> Vec<&'static str> {
     let is_id = |c: char| c.is_alphanumeric() || c == '_';
-    BARE_PRELUDE_TRAITS
+    PRELUDE_TRAITS
         .iter()
-        .copied()
+        .map(|(name, _)| *name)
         .filter(|name| {
             text.match_indices(name).any(|(at, _)| {
                 let before = text[..at].chars().next_back();
@@ -7730,7 +7718,7 @@ fn fixes_assoc(bound: &str, name: &str) -> bool {
     let path = bound[..open].trim();
     let std = match path.strip_prefix("::") {
         Some(rest) => matches!(rest.split("::").next(), Some("core" | "std" | "alloc")),
-        None => BARE_PRELUDE_TRAITS.contains(&path),
+        None => is_prelude_trait(path),
     };
     !std && !has_word(&bound[open..], name)
 }

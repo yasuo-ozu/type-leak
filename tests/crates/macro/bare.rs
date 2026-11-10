@@ -22,7 +22,9 @@ use syn::*;
 use template_quote::quote;
 use type_leak::*;
 
-/// The traits the generator spells bare, and their absolute paths.
+/// The traits the generator spells bare, and their absolute paths. The generator's own table
+/// (`PRELUDE_TRAITS` in `tests/prop_cross_crate/gen.rs`) is a subset; a unit test of the harness
+/// checks it.
 pub(crate) const PRELUDE_TRAITS: &[(&str, &str)] = &[
     ("Sized", "::core::marker::Sized"),
     ("Send", "::core::marker::Send"),
