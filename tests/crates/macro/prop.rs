@@ -264,19 +264,19 @@ impl Args {
     }
 }
 
-/// Which optional entries (a type of another crate by an absolute path) a Referrer trusts: the rule
-/// it gives to `LeakerResult::allow()`. A trusted entry is written as it is in the copy and needs no
-/// Repeater impl; the others are replaced through the Repeater. A trusted crate is promised to be
-/// the same crate in the Referrer's crate.
+/// Which optional entries (a type of another crate by an absolute path) a Referrer trusts: the
+/// crates its `type_fn` and `nested_fn` keep as written ([`Keep`]). A trusted entry is written as
+/// it is in the copy and needs no Repeater impl; the others are replaced through the Repeater. A
+/// trusted crate is promised to be the same crate in the Referrer's crate.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Trust {
     /// Nothing (`strict`): the library's default.
     None,
-    /// Every crate (`Rules::external_crates()`).
+    /// Every crate.
     All,
-    /// `std`, `alloc` and `core` (`Rules::std_crates()`).
+    /// `std`, `alloc` and `core`.
     Std,
-    /// The Leaker's crate only (`Args::krate`, a path rule of `LeakerResult::allow()`).
+    /// The Leaker's crate only (`Args::krate`).
     Leaker,
 }
 
@@ -299,28 +299,14 @@ impl Trust {
             .find(|trust| trust.name() == word)
     }
 
-    /// `result` after the `allow()` of the mode. `krate` is the Leaker's crate.
-    fn apply(self, result: LeakerResult, krate: &str) -> LeakerResult {
-        match self {
-            Trust::None => result,
-            Trust::All => result.allow(Rules::new().external_crates()),
-            Trust::Std => result.allow(Rules::new().std_crates()),
-            Trust::Leaker => {
-                assert!(
-                    !krate.is_empty(),
-                    "test macro: `trust leaker` needs `krate`"
-                );
-                let prefix: Path = parse_str(&format!("::{}", krate)).unwrap();
-                result.allow(crate::starts_with(vec![prefix]))
-            }
-        }
-    }
-
     /// Whether the mode trusts an optional entry that names `crates`
-    /// (`Referrer::external_crates_require()`): it allows every one of them. Written out here and
-    /// not asked of the library, so that a library that trusts too much or too little differs
-    /// ([`check_trust()`]).
+    /// (`Referrer::external_crates_require()`): it trusts every one of them. `krate` is the
+    /// Leaker's crate.
     fn trusts(self, crates: &[String], krate: &str) -> bool {
+        assert!(
+            self != Trust::Leaker || !krate.is_empty(),
+            "test macro: `trust leaker` needs `krate`"
+        );
         self != Trust::None
             && crates.iter().all(|name| match self {
                 Trust::None => false,
@@ -336,6 +322,32 @@ impl Trust {
             Rule::StdCrates => Trust::Std,
             _ => Trust::None,
         }
+    }
+}
+
+/// What the `type_fn` and `nested_fn` of a Referrer of the mode `trust` keep as written: the
+/// optional entries ([`Referrer::must()`]) whose crates the mode trusts. They return the leaked
+/// type for them and write a path through the Repeater for the others.
+#[derive(Clone, Copy)]
+struct Keep<'a> {
+    trust: Trust,
+    /// The Leaker's crate.
+    krate: &'a str,
+}
+
+impl<'a> Keep<'a> {
+    fn new(trust: Trust, krate: &'a str) -> Self {
+        Keep { trust, krate }
+    }
+
+    /// Keeps nothing: a strict Referrer.
+    fn none() -> Self {
+        Keep::new(Trust::None, "")
+    }
+
+    /// Whether the copy keeps the entry `ix` of `referrer` as written.
+    fn keeps(self, referrer: &Referrer, ix: usize) -> bool {
+        !referrer.must(ix) && self.trust.trusts(referrer.external_crates_require(ix), self.krate)
     }
 }
 
@@ -2213,16 +2225,28 @@ fn repeater_path(leaker_path: &Path) -> Path {
     repeater
 }
 
-/// Rewrites a copy of `item`, which is in the module `leaker_path` of the Leaker's crate.
+/// Rewrites a copy of `item`, which is in the module `leaker_path` of the Leaker's crate. The copy
+/// keeps the entries that `keep` says as written.
 fn rewrite(
     referrer: &Referrer,
+    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
     leaker_path: &Path,
     dyn_host: bool,
 ) -> Result<Rewritten> {
-    rewrite_with(referrer, context, item, args, leaker_path, dyn_host, None, None)
+    rewrite_with(
+        referrer,
+        keep,
+        context,
+        item,
+        args,
+        leaker_path,
+        dyn_host,
+        None,
+        None,
+    )
 }
 
 /// [`rewrite()`] for a use of the item at an instantiation of its generics (`inst`: the entries are
@@ -2231,6 +2255,7 @@ fn rewrite(
 #[allow(clippy::too_many_arguments)]
 fn rewrite_with(
     referrer: &Referrer,
+    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -2291,7 +2316,10 @@ fn rewrite_with(
         Item::Impl(i) => {
             // The self type is written in the Leaker's crate: rewrite it like any type.
             let error = std::cell::RefCell::new(None);
-            let rewritten = referrer.expand(context, (*i.self_ty).clone(), |_, ix| {
+            let rewritten = referrer.expand(context, (*i.self_ty).clone(), |leaked, ix| {
+                if keep.keeps(referrer, ix) {
+                    return leaked;
+                }
                 projector.project(ix).unwrap_or_else(|e| {
                     *error.borrow_mut() = Some(e);
                     parse_quote!(())
@@ -2317,7 +2345,10 @@ fn rewrite_with(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        let visitor = referrer.visitor(context, |_, ix| {
+        let visitor = referrer.visitor(context, |leaked, ix| {
+            if keep.keeps(referrer, ix) {
+                return leaked;
+            }
             projector.project(ix).unwrap_or_else(|e| {
                 *error.borrow_mut() = Some(e);
                 parse_quote!(())
@@ -2333,7 +2364,10 @@ fn rewrite_with(
         let mut visitor: Box<dyn VisitMut + '_> = if args.no_nested_self {
             Box::new(visitor)
         } else {
-            Box::new(visitor.with_nested_self(|nested, _, ix| {
+            Box::new(visitor.with_nested_self(|nested, leaked, ix| {
+                if keep.keeps(referrer, ix) {
+                    return leaked;
+                }
                 projector
                     .project_nested(nested, &base, ix)
                     .unwrap_or_else(|e| {
@@ -2397,7 +2431,7 @@ fn rewrite_with(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        rewrite_defaults(referrer, context, original, copy, &projector, &base)?;
+        rewrite_defaults(referrer, keep, context, original, copy, &projector, &base)?;
     }
     Ok(Rewritten {
         item: rewritten,
@@ -3621,6 +3655,7 @@ impl Wrap {
 /// entries were hidden.
 fn shadow_check(
     referrer: &Referrer,
+    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -3656,6 +3691,7 @@ fn shadow_check(
     let shadowing = Wrap { block, names };
     let control = rewrite_with(
         referrer,
+        keep,
         context,
         item,
         args,
@@ -3666,6 +3702,7 @@ fn shadow_check(
     )?;
     let shadowed = rewrite_with(
         referrer,
+        keep,
         context,
         item,
         args,
@@ -3708,6 +3745,7 @@ fn shadow_check(
 /// ([`Instance::lifetime_args_in_elided_signatures()`]).
 fn instance_part(
     referrer: &Referrer,
+    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -3742,7 +3780,7 @@ fn instance_part(
         used: Default::default(),
         at_instance: true,
     };
-    let replaced: Vec<String> = rewrite(referrer, context, item, args, path, dyn_host)?
+    let replaced: Vec<String> = rewrite(referrer, keep, context, item, args, path, dyn_host)?
         .used
         .iter()
         .filter_map(|ix| referrer.iter().nth(*ix))
@@ -3756,7 +3794,13 @@ fn instance_part(
         generics,
         ask,
         &replaced,
-        |_, ix, prefix| {
+        |leaked, ix, prefix| {
+            // A default kept as written is not substituted again: write it at the site.
+            if keep.keeps(referrer, ix) {
+                let before: Punctuated<GenericParam, Token![,]> =
+                    generics.params.iter().take(prefix.len()).cloned().collect();
+                return UseSite::substituting(&before, prefix).substitute(&leaked);
+            }
             projector_with(prefix.to_vec())
                 .project(ix)
                 .unwrap_or_else(|e| {
@@ -3773,7 +3817,17 @@ fn instance_part(
         None => return Ok((TokenStream::new(), 0, [0; 4])),
     };
     let mut inst = inst;
-    let rewritten = rewrite_with(referrer, context, item, args, path, dyn_host, Some(&inst), None)?;
+    let rewritten = rewrite_with(
+        referrer,
+        keep,
+        context,
+        item,
+        args,
+        path,
+        dyn_host,
+        Some(&inst),
+        None,
+    )?;
     match &rewritten.item {
         Item::Struct(i) => inst.declare(&i.generics),
         Item::Enum(i) => inst.declare(&i.generics),
@@ -3816,6 +3870,7 @@ fn instance_part(
 /// same type: the entry does not depend on them.
 fn rewrite_defaults(
     referrer: &Referrer,
+    keep: Keep<'_>,
     context: ContextId,
     original: &ItemTrait,
     copy: &mut ItemTrait,
@@ -3862,13 +3917,19 @@ fn rewrite_defaults(
         items: vec![Item::Trait(shell)],
     };
     referrer
-        .visitor(context, |_, ix| {
+        .visitor(context, |leaked, ix| {
+            if keep.keeps(referrer, ix) {
+                return leaked;
+            }
             placeholder.project(ix).unwrap_or_else(|e| {
                 *error.borrow_mut() = Some(e);
                 parse_quote!(())
             })
         })
-        .with_nested_self(|nested, _, ix| {
+        .with_nested_self(|nested, leaked, ix| {
+            if keep.keeps(referrer, ix) {
+                return leaked;
+            }
             placeholder
                 .project_nested(nested, base, ix)
                 .unwrap_or_else(|e| {
@@ -5635,7 +5696,7 @@ fn count_copy(
     let positions = collect_positions(original, None, args);
     let dummy: Path = parse_quote!(::__dummy);
     // A Referrer that is not told its mode trusts everything. The result is read back from its
-    // tokens, as the Referrer's macro gets it: the trust is not serialized.
+    // tokens, as the Referrer's macro gets it.
     let trust = args.trust.unwrap_or(Trust::All);
     let plain: LeakerResult = parse2(result.to_token_stream())?;
     let copies = trusting_copy(&plain, context, original, args, &dummy, false, trust, krate)?;
@@ -5654,8 +5715,9 @@ fn count_copy(
                 check_primitives_replaced(&rewritten.item, original, args, host.as_ref())?;
                 // The copy of a Referrer that trusts every crate writes the optional entries as they are.
                 if !checked.is_empty() {
-                    let all = Trust::All.apply(plain.clone(), krate).into_referrer();
-                    if let Ok(all) = rewrite(&all, context, original, args, &dummy, false) {
+                    let all = Keep::new(Trust::All, krate);
+                    let referrer = plain.clone().into_referrer();
+                    if let Ok(all) = rewrite(&referrer, all, context, original, args, &dummy, false) {
                         check_against_copy(checked, original, &all.item, args, host.as_ref())?;
                     }
                 }
@@ -5730,7 +5792,7 @@ fn optional_entries(referrer: &Referrer, trust: Trust, krate: &str) -> String {
 }
 
 /// The copy of `item` that a Referrer of the mode `trust` makes from `plain`, a result as it is
-/// serialized (it trusts nothing), and the copy that a strict Referrer makes of the same.
+/// serialized, and the copy that a strict Referrer makes of the same.
 struct Copies {
     rewritten: Result<Rewritten>,
     /// The item of the strict copy, if there is one.
@@ -5739,9 +5801,9 @@ struct Copies {
 
 /// Makes the copies of `item` of a Referrer of the mode `trust` ([`Copies`]) and checks the mode:
 /// it replaces the entries that a strict Referrer replaces but for the optional ones that the mode
-/// trusts, written out in [`Trust::trusts()`] from the crates each entry names. A library that
-/// trusts too much (an entry whose context names a crate the mode does not trust) or too little
-/// differs (`TRUST DISAGREES`).
+/// trusts, written out in [`Trust::trusts()`] from the crates each entry names. A Visitor that asks
+/// `type_fn` for an entry that the strict one does not, or the other way round, differs (`TRUST
+/// DISAGREES`).
 #[allow(clippy::too_many_arguments)]
 fn trusting_copy(
     plain: &LeakerResult,
@@ -5754,11 +5816,11 @@ fn trusting_copy(
     krate: &str,
 ) -> Result<Copies> {
     let strict = plain.clone().into_referrer();
-    let trusting = trust.apply(plain.clone(), krate).into_referrer();
-    let rewritten = rewrite(&trusting, context, item, args, path, dyn_host);
+    let keep = Keep::new(trust, krate);
+    let rewritten = rewrite(&strict, keep, context, item, args, path, dyn_host);
     let strict_copy = match trust {
         Trust::None => None,
-        _ => rewrite(&strict, context, item, args, path, dyn_host).ok(),
+        _ => rewrite(&strict, Keep::none(), context, item, args, path, dyn_host).ok(),
     };
     if let (Ok(copy), Some(all)) = (&rewritten, &strict_copy) {
         let expected: Vec<usize> = all
@@ -6004,10 +6066,10 @@ fn stage_copy(
     copy_args.stages = false;
     copy_args.stage = rule.number(side);
     copy_args.accepted = true;
-    // The serialized Referrer trusts nothing: the Referrer's crate gives it the rule's trust again,
-    // which the Leaker writes the impls for (`Trust::of_rule()`), not the item's own mode. An item
-    // invoked with every crate trusted keeps it: that is also how the generator invokes the items
-    // with a shape that breaks when an optional entry is replaced (`gen::Gen::item_trust()`).
+    // The Referrer's crate trusts the crates that the rule's stage trusts (`Trust::of_rule()`), which
+    // the Leaker writes the impls for, not the item's own mode. An item invoked with every crate
+    // trusted keeps it: that is also how the generator invokes the items with a shape that breaks
+    // when an optional entry is replaced (`gen::Gen::item_trust()`).
     copy_args.trust = Some(match args.trust {
         Some(Trust::All) => Trust::All,
         _ => Trust::of_rule(rule),
@@ -6396,14 +6458,15 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     // names it leaks: the ordinary Referrer's crate only (the others are `accept` and `decoy`).
     let mut more = TokenStream::new();
     if decoy.is_none() && (inst.is_some() || shadow.is_some()) {
-        let referrer = trust.apply(result.clone(), &args.krate).into_referrer();
+        let referrer = result.clone().into_referrer();
+        let keep = Keep::new(trust, &args.krate);
         if let Some(seed) = inst {
             let ask = InstAsk {
                 seed,
                 lifetime_args,
             };
             let (tokens, n, [elided, entry, elided_pairs, entry_pairs]) =
-                instance_part(&referrer, context, &item, &args, &path, dyn_host, ask)?;
+                instance_part(&referrer, keep, context, &item, &args, &path, dyn_host, ask)?;
             more.extend(tokens);
             counted("inst", id, n);
             counted("inst_elided", id, elided);
@@ -6412,7 +6475,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             counted("inst_elided_entry_candidates", id, entry_pairs);
         }
         if let Some(seed) = shadow {
-            let hidden = shadow_check(&referrer, context, &item, &args, &path, dyn_host, seed)?;
+            let hidden = shadow_check(
+                &referrer, keep, context, &item, &args, &path, dyn_host, seed,
+            )?;
             counted("shadow", id, hidden);
         }
     }

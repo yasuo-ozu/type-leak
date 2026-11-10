@@ -1560,8 +1560,8 @@ fn the_anchor_of_an_external_crate_type_is_checked_by_check() {
 
 #[test]
 fn the_copy_keeps_what_anchors_with_external_crate_types() {
-    // The Referrer which trusts the optional entries keeps the type of the external crate where it
-    // is written (it is as anchored as the Leaker's was), and the one which replaces it has the
+    // A macro that keeps the optional entries as written keeps the type of the external crate where
+    // it is written (it is as anchored as the Leaker's was), and the one which replaces it has the
     // type replaced, with `&'x u8` anchoring `'x` in both.
     let item: ItemTrait = parse_quote! {
         trait Tr {
@@ -1571,25 +1571,24 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     let mut leaker = leaker_allowing_nothing();
     let context = leaker.intern_trait(&item, true);
     let result = leaker.result();
+    let referrer = result.finish().unwrap();
     let mut kept = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut result
-            .clone()
-            .allow(Rules::new().external_crates())
-            .finish()
-            .unwrap()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |ty, ix| {
+            if referrer.must(ix) {
+                parse_quote!(P<#ix>)
+            } else {
+                ty
+            }
+        }),
         &mut kept,
     );
     assert_eq!(s(&kept), s(&item));
-    // The Referrer which replaces them: the type is replaced (with its entry), and `&'x u8`
+    // The macro which replaces them: the type is replaced (with its entry), and `&'x u8`
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut result
-            .finish()
-            .unwrap()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut replaced,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1608,17 +1607,17 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     let mut leaker = leaker_allowing_nothing();
     let context = leaker.intern_trait(&item, true);
     let result = leaker.result();
-    for allow in [true, false] {
+    for keeps_optional in [true, false] {
         let mut copy = item.clone();
-        let mut result = result.clone();
-        if allow {
-            result = result.allow(Rules::new().external_crates());
-        }
+        let referrer = result.clone().finish().unwrap();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut result
-                .finish()
-                .unwrap()
-                .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut referrer.visitor(context, |ty, ix| {
+                if keeps_optional && !referrer.must(ix) {
+                    ty
+                } else {
+                    parse_quote!(P<#ix>)
+                }
+            }),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {
@@ -1635,17 +1634,17 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     let mut leaker = leaker_allowing_nothing();
     let context = leaker.intern_trait(&item, true);
     let result = leaker.result();
-    for allow in [true, false] {
+    for keeps_optional in [true, false] {
         let mut copy = item.clone();
-        let mut result = result.clone();
-        if allow {
-            result = result.allow(Rules::new().external_crates());
-        }
+        let referrer = result.clone().finish().unwrap();
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut result
-                .finish()
-                .unwrap()
-                .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut referrer.visitor(context, |ty, ix| {
+                if keeps_optional && !referrer.must(ix) {
+                    ty
+                } else {
+                    parse_quote!(P<#ix>)
+                }
+            }),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {

@@ -306,9 +306,8 @@ fn the_rules_chain_and_a_rule_may_count() {
     // accept: the counting rule saw at least one question for each error.
     assert!(asked.get() >= result.errors().len());
     assert!(seen.borrow().iter().any(|path| path == "Rel"), "{:?}", seen);
-    // Chained: the same errors as one call after the other. The rules chained trust nothing, so the
-    // Referrer replaces the optional entry `::foo::X`; the one that trusts all does not (`==`
-    // ignores the trust).
+    // Chained: the same errors as one call after the other. No rule changes an entry, so the
+    // Referrer replaces the optional entry `::foo::X` whether or not a rule allows its crate.
     let one_by_one = result
         .clone()
         .allow(Rules::new().std_crates())
@@ -329,8 +328,7 @@ fn the_rules_chain_and_a_rule_may_count() {
     };
     let (ix, replaced) = expand(chained);
     assert_eq!(replaced, format!("P < {}usize >", ix));
-    let one_by_one = expand(one_by_one).1;
-    assert_eq!(one_by_one, ":: foo :: X");
+    assert_eq!(expand(one_by_one), (ix, replaced));
 }
 
 /// The tokens after the result are left for the caller: an ident and a `;` after the errors, and

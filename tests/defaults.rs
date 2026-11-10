@@ -3,7 +3,7 @@
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, Referrer, Rules};
+use type_leak::{ContextId, Leaker, Referrer, UseSite};
 
 fn referrer(tr: &ItemTrait) -> Referrer {
     {
@@ -258,8 +258,7 @@ fn test_defaults_of_several_calls_are_shared() {
     leaker.intern_trait(&bad, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.clone().allow(Rules::new().external_crates());
-    let referrer = referrer.into_referrer();
+    let referrer = result.into_referrer();
     // The types use no generics, so they are in one context, whichever call found them, and the
     // generics of the calls (without the defaults) are two other contexts. The default of `U`,
     // the type of an external crate, is an optional entry (after the required ones), which uses
@@ -283,23 +282,33 @@ fn test_defaults_of_several_calls_are_shared() {
     assert_eq!(referrer.context(2), top_plain);
     assert_eq!(referrer.context_generics(top_plain).params.len(), 1);
     assert_eq!(referrer.context_generics(top_tr).params.len(), 2);
-    // The default is copied (the trusted optional entry is left as it is), as in any call.
+    // A macro that trusts the crate keeps the optional entry as it is, written at the site (the
+    // arguments of `type_fn` are not substituted again), as in any call.
     let completed = referrer
         .complete_args(
             top_tr,
             &tr.generics.params,
             &args(parse_quote!(<u8>)),
-            |_, _, _| unreachable!(),
+            |ty, ix, prefix| {
+                assert!(!referrer.must(ix));
+                let before: punctuated::Punctuated<GenericParam, Token![,]> = tr
+                    .generics
+                    .params
+                    .iter()
+                    .take(prefix.len())
+                    .cloned()
+                    .collect();
+                UseSite::substituting(&before, prefix).substitute(&ty)
+            },
         )
         .unwrap();
     assert_eq!(
         completed.iter().map(s).collect::<Vec<_>>(),
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
-    // A Referrer which does not trust the names of the crates replaces the default by the entry.
-    let strict = result.into_referrer();
+    // A macro that does not trust the names of the crates replaces the default by the entry.
     let mut replaced = Vec::new();
-    let completed = strict
+    let completed = referrer
         .complete_args(
             top_tr,
             &tr.generics.params,

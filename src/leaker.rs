@@ -66,10 +66,11 @@ use template_quote::{quote, ToTokens};
 ///
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path
 ///   (`Self: Sized` needs [`Rules::prelude()`](crate::Rules::prelude)).
-/// - An absolute path of another crate (`::foo::X`) is an optional entry: the Referrer replaces it
-///   through the Repeater unless [`LeakerResult::allow()`] trusts it (the crate is the same on both
-///   sides), or the Leaker's rule allows it and it makes no entry. With a type that depends on the
-///   context in it (`::foo::W<Rel>`) it is required, and always replaced.
+/// - An absolute path of another crate (`::foo::X`) is an optional entry: the copy replaces it
+///   through the Repeater unless the macro keeps it as written (the crate is the same on both
+///   sides, see [`Referrer::external_crates_require()`]), or the Leaker's rule allows it and it
+///   makes no entry. With a type that depends on the context in it (`::foo::W<Rel>`) it is
+///   required, and always replaced.
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
 /// - Values and bodies are not analyzed unless [`Options::check_values()`] is on.
 ///
@@ -517,8 +518,7 @@ impl<A: Allow> Leaker<A> {
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
 ///
 /// [`allow()`](LeakerResult::allow) takes and returns the result, so it chains. It drops the errors
-/// that an [`Allow`] accepts (you promise that the part compiles as written), and trusts the
-/// optional entries whose absolute paths it allows (see [`Referrer::must()`]). It leaves the
+/// that an [`Allow`] accepts (you promise that the part compiles as written). It leaves the
 /// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::from_config()`]. A rule
 /// here only approximates the one of the Leaker (more errors may remain, and a copy may fail to
 /// build): give rules to the Leaker when you can.
@@ -548,27 +548,19 @@ impl LeakerResult {
     /// by its [`paths`](ErrorItem::paths) if it has any, else by its cause. The other errors stay,
     /// in order.
     ///
-    /// It also trusts each optional entry ([`Referrer::must()`]) for which `rule` allows every
-    /// absolute path that the entry names, in its type, in the bounds of its context and in its
-    /// `Self` requirement (the `::core` and `$crate` paths are always fine). A Referrer copies a
-    /// trusted entry as written, and replaces the others through the Repeater. You promise that
-    /// the crates mean the same in the Referrer's crate; the trust is not serialized, and stays
-    /// when `allow()` is called again. A path is asked bare, at no [`Place`](crate::Place), as the
-    /// cause of its kind (see [`Allow`]); [`Rules::external_crates()`](crate::Rules::external_crates)
-    /// allows all.
-    ///
     /// You promise that the part can be written as it is in the copy. The cause may be smaller
     /// than the part that is copied: in `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`,
     /// and the array is copied whole. Allowing a [`Reason::UnprovableBound`] does not make the copy
     /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
-    /// ignored). An absolute path is never an error, so a rule for `::serde` changes no error.
+    /// ignored). An absolute path is never an error, so a rule for `::serde` changes no error. It
+    /// changes no entry either: a copy keeps an optional entry as written in `type_fn`
+    /// ([`Referrer::external_crates_require()`]).
     ///
     /// See [`Allow`] for what the rule is asked. A closure needs `&Cause` and
     /// [`Place`](crate::Place) annotated when it is not written in the call
     /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none.
     pub fn allow(mut self, rule: impl Allow) -> Self {
         filter(&rule, &mut self.errors);
-        self.referrer.trust(&rule);
         self
     }
 

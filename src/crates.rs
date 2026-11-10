@@ -18,7 +18,7 @@ use syn::*;
 /// type is a [`Cause::Type`], the trait of a bound or of a qualified path a [`Cause::Trait`], the
 /// path of a macro a [`Cause::Macro`], and any other (a path in an expression, in the tokens of a
 /// macro, or in a qualified path with no trait) a [`Cause::Unknown`].
-pub(crate) fn absolute_paths(ty: &Type, context: &Context) -> Vec<Cause> {
+fn absolute_paths(ty: &Type, context: &Context) -> Vec<Cause> {
     let mut finder = Finder::default();
     finder.visit_type(ty);
     finder.visit_generics(context.generics());

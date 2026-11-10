@@ -7,7 +7,7 @@
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, ErrorItem, Leaker, Reason, Referrer, Rules, SelfRequirement};
+use type_leak::{ContextId, ErrorItem, Leaker, Reason, Referrer, SelfRequirement};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -888,9 +888,7 @@ fn the_referrer_takes_the_self_of_each_nested_item() {
             v.visit_item(&item);
         }
     });
-    // A Referrer that trusts the optional entry (`::p::W`) copies it as written.
-    let result = leaker.result().allow(Rules::new().external_crates());
-    let referrer = result.finish().unwrap();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer).len(), 5);
     let mut copy: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {
@@ -913,8 +911,15 @@ fn the_referrer_takes_the_self_of_each_nested_item() {
             }
         }
     );
+    // A macro that trusts the optional entry (`::p::W`) copies it as written.
     referrer
-        .visitor(outer, replace)
+        .visitor(outer, |ty, ix| {
+            if referrer.must(ix) {
+                replace(ty, ix)
+            } else {
+                ty
+            }
+        })
         .visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {

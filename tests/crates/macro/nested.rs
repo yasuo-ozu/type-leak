@@ -254,15 +254,13 @@ fn probe_types(wrapper: &ItemTrait) -> Vec<Type> {
 /// `__nested_apply!`, the Referrer's side.
 pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let Apply {
-        mut result,
+        result,
         context,
         nested,
         path,
         strict,
     } = parse2(input)?;
-    if !strict {
-        result = result.allow(Rules::new().external_crates());
-    }
+    // A Referrer that trusts every crate keeps the optional entries as written.
     let referrer = result.into_referrer();
     let id = nested.id;
     let krate = path
@@ -291,7 +289,10 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     };
     let error = std::cell::RefCell::new(None);
     referrer
-        .visitor(context, |_, ix| {
+        .visitor(context, |leaked, ix| {
+            if !strict && !referrer.must(ix) {
+                return leaked;
+            }
             let args = referrer.entry_args(ix, &UseSite::identity(), array_const);
             match args {
                 Ok(args) => slots.projection(&parse_quote!(()), &args, id, ix),

@@ -150,9 +150,8 @@ impl Parse for Apply {
     fn parse(input: ParseStream) -> Result<Self> {
         let content;
         braced!(content in input);
-        // A Referrer that trusts every crate: it copies the optional entries as written.
         let result: LeakerResult = content.parse()?;
-        let referrer = result.allow(Rules::new().external_crates()).into_referrer();
+        let referrer = result.into_referrer();
         let content;
         braced!(content in input);
         let contexts = content
@@ -208,7 +207,11 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         let (mut item, context) = (items[n].clone(), contexts[n]);
         let error = std::cell::RefCell::new(None);
         referrer
-            .visitor(context, |_, ix| {
+            .visitor(context, |leaked, ix| {
+                // A Referrer that trusts every crate: it copies the optional entries as written.
+                if !referrer.must(ix) {
+                    return leaked;
+                }
                 match referrer.entry_args(ix, &UseSite::identity(), array_const) {
                     Ok(args) => slots.projection(&parse_quote!(()), &args, id, ix),
                     Err(e) => {

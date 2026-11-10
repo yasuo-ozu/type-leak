@@ -2,9 +2,9 @@
 //! no dependency on the crate of an optional entry (`tests/crates/trusting`).
 //!
 //! `type_leak_test_leaker::x::ExtDep` names `::type_leak_test_ext::Ext<..>`. It is an optional
-//! entry (see `Referrer::must()`): a Referrer that trusts it (`LeakerResult::allow()`, which the
-//! test macro does unless it is told `strict`) leaves it as written, and the copy then names a
-//! crate that the Referrer's crate does not have; the default Referrer, which trusts nothing,
+//! entry (see `Referrer::must()`): a macro that trusts it (its `type_fn` returns the leaked type,
+//! which the test macro does unless it is told `strict`) leaves it as written, and the copy then
+//! names a crate that the Referrer's crate does not have; the strict macro, which trusts nothing,
 //! replaces the whole type with the Repeater's projection, and the crate does not need it.
 //! `tests/cross_crate.rs` has the text of both copies. This is the trusting one, which rustc
 //! rejects, and the same crate with the strict flag, which it accepts and whose own tests (the

@@ -9,13 +9,11 @@ use syn::*;
 use template_quote::quote;
 use type_leak::{ContextId, Leaker, Options, Referrer, Rules};
 
-/// Leaks the types of `item`, and returns the top-level context of the trait. The Referrer trusts
-/// the optional entries: it copies them as written.
+/// Leaks the types of `item`, and returns the top-level context of the trait.
 fn leak(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = Leaker::new();
     let context = leaker.intern_trait(item, true);
-    let result = leaker.result().allow(Rules::new().external_crates());
-    (result.finish().unwrap(), context)
+    (leaker.result().finish().unwrap(), context)
 }
 
 /// Returns the leaked types with their local generics (with the where clause), by index.

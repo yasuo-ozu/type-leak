@@ -645,6 +645,15 @@ struct Header {
     id: LitInt,
     repeater: Path,
     module: Path,
+    /// A Referrer that trusts every crate: it keeps the optional entries as written (its
+    /// `type_fn` returns the leaked type). `strict` replaces them as well.
+    keeps_optional: bool,
+}
+
+/// Whether a Referrer keeps the entry `ix` as written: it trusts every crate (`keeps_optional`),
+/// and the entry is optional.
+fn keeps(referrer: &Referrer, keeps_optional: bool, ix: usize) -> bool {
+    keeps_optional && !referrer.must(ix)
 }
 
 /// `copy [SelfTy] { items }`: the items written with the types of the Leaker (even a free function
@@ -669,6 +678,7 @@ struct ImplementInput {
     id: LitInt,
     repeater: Path,
     module: Path,
+    keeps_optional: bool,
     generics: Generics,
     trait_args: AngleBracketedGenericArguments,
     self_ty: Type,
@@ -687,7 +697,7 @@ fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
 impl Parse for Input {
     fn parse(input: ParseStream) -> Result<Self> {
         let item_trait = braced_parse(input)?;
-        let (mut result, context): (LeakerResult, ContextId) = {
+        let (result, context): (LeakerResult, ContextId) = {
             let content;
             braced!(content in input);
             let result = content.parse()?;
@@ -698,12 +708,13 @@ impl Parse for Input {
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
         // `strict` is a Referrer that trusts no name of a crate: it replaces the optional entries as
-        // well. Else it trusts them all (`LeakerResult::allow()`).
-        if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
+        // well. Else it trusts them all and keeps them as written.
+        let keeps_optional = if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
             input.parse::<Ident>()?;
+            false
         } else {
-            result = result.allow(Rules::new().external_crates());
-        }
+            true
+        };
         let header = Header {
             item_trait,
             referrer: result.into_referrer(),
@@ -711,6 +722,7 @@ impl Parse for Input {
             id,
             repeater,
             module,
+            keeps_optional,
         };
         if input.peek(Ident) && !input.peek(Token![impl]) {
             let keyword: Ident = input.parse()?;
@@ -752,6 +764,7 @@ impl Parse for Input {
             id,
             repeater,
             module,
+            keeps_optional,
         } = header;
         input.parse::<Token![impl]>()?;
         let mut generics: Generics = input.parse()?;
@@ -793,6 +806,7 @@ impl Parse for Input {
             id,
             repeater,
             module,
+            keeps_optional,
             generics,
             trait_args,
             self_ty,
@@ -942,6 +956,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
                 context,
                 id,
                 repeater,
+                keeps_optional,
                 ..
             },
         show,
@@ -960,7 +975,10 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     let mut copies = TokenStream::new();
     for mut item in items {
         // `Self` is what the context says: the implementor of the trait.
-        let mut visitor = referrer.visitor(context, |_, ix| {
+        let mut visitor = referrer.visitor(context, |leaked, ix| {
+            if keeps(&referrer, keeps_optional, ix) {
+                return leaked;
+            }
             let projection = (|| -> Result<Type> {
                 let site =
                     UseSite::substituting(params, &trait_params).with_self(self_in_copy.clone());
@@ -1002,6 +1020,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         id,
         repeater,
         module,
+        keeps_optional,
         generics,
         trait_args,
         self_ty,
@@ -1033,9 +1052,13 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     // are encoded as in the Leaker.
     let mut encode_error = None;
     let completed = referrer
-        .complete_args(context, params, &trait_args.args, |_, ix, prefix| {
+        .complete_args(context, params, &trait_args.args, |leaked, ix, prefix| {
             let before: Punctuated<GenericParam, Token![,]> =
                 params.iter().take(prefix.len()).cloned().collect();
+            // A default kept as written is not substituted again: write it at the site.
+            if keeps(&referrer, keeps_optional, ix) {
+                return UseSite::substituting(&before, prefix).substitute(&leaked);
+            }
             projection(ix, &before, prefix).unwrap_or_else(|e| {
                 encode_error = Some(e);
                 parse_quote!(())
@@ -1096,8 +1119,13 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         let mut sig = trait_fn.sig.clone();
         // The context of the trait says what `Self` is (the implementor) and which generics are in
         // scope.
-        let mut visitor = referrer
-            .visitor(context, |_, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>));
+        let mut visitor = referrer.visitor(context, |leaked, ix| {
+            if keeps(&referrer, keeps_optional, ix) {
+                leaked
+            } else {
+                parse_quote!(__TypeLeakTestPlaceholder<#ix>)
+            }
+        });
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
         Resolve {

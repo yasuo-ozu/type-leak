@@ -309,12 +309,7 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     };
     let mut leaker = Leaker::new();
     let context = leaker.intern_struct(&item, true);
-    let result = leaker.result();
-    let referrer = result
-        .clone()
-        .allow(Rules::new().external_crates())
-        .finish()
-        .unwrap();
+    let referrer = leaker.result().finish().unwrap();
     // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry). The
     // type of an external crate is an optional entry (old: none), after the required ones.
     assert_eq!(
@@ -338,8 +333,15 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     let rel_ix = strings.iter().position(|ty| ty == "Rel").unwrap();
     let string_ix = strings.iter().position(|ty| ty.contains("String")).unwrap();
     let mut replaced = copy.clone();
+    // A macro that trusts the crate of the optional entry keeps the `String`.
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |ty, ix| {
+            if referrer.must(ix) {
+                parse_quote!(P<#ix>)
+            } else {
+                ty
+            }
+        }),
         &mut copy,
     );
     let expected: ItemStruct = syn::parse2(quote! {
@@ -351,12 +353,9 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     })
     .unwrap();
     assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
-    // The Referrer which does not trust the names of the crates replaces the `String` as well.
+    // A macro that does not trust the names of the crates replaces the `String` as well.
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut result
-            .finish()
-            .unwrap()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut replaced,
     );
     let expected: ItemStruct = syn::parse2(quote! {
@@ -2480,14 +2479,10 @@ fn test_reduce_roots_one_cut() {
     // entry `Rel` and the optional entry `::ext::W<..>`).
     let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> ::ext::W<Rel>; } };
     assert_eq!(all_entries(&item), [":: ext :: W < Rel >"]);
-    // The Referrer replaces it whatever it trusts: only the type of the crate alone is trusted.
+    // A macro replaces it whatever it trusts: only the type of the crate alone is optional.
     let mut leaker = Leaker::new();
     let context = leaker.intern_trait(&item, true);
-    let referrer = leaker
-        .result()
-        .allow(Rules::new().external_crates())
-        .finish()
-        .unwrap();
+    let referrer = leaker.result().finish().unwrap();
     assert!(referrer.must(0));
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
@@ -2510,7 +2505,8 @@ fn test_reduce_roots_one_cut() {
     // One type that holds both is a single required entry: the tuple is cheaper than its parts.
     let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> (::ext::X, Rel); } };
     assert_eq!(all_entries(&item), ["(:: ext :: X , Rel)"]);
-    // An optional entry in an optional one is not an entry (the Referrer trusts both or neither).
+    // An optional entry in an optional one is not an entry (a macro keeps the outer one only if it
+    // trusts the crates of both).
     let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> ::ext::W<::ext2::X>; } };
     assert_eq!(all_entries(&item), ["? :: ext :: W < :: ext2 :: X >"]);
     let item: ItemTrait = parse_quote! {

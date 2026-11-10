@@ -411,8 +411,8 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
     assert_eq!(file, expected);
 }
 
-/// An absolute type that names `Self` stays as written, also if the Referrer replaces the optional
-/// entries (it trusts none).
+/// An absolute type that names `Self` stays as written, also if the macro replaces the optional
+/// entries.
 #[test]
 fn nested_self_keeps_an_absolute_self_type_as_written_when_optional_entries_are_replaced() {
     let item: ItemStruct = parse_quote! {
@@ -426,7 +426,7 @@ fn nested_self_keeps_an_absolute_self_type_as_written_when_optional_entries_are_
     let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
-    let referrer = leaker.result().finish().unwrap(); // trusts no optional entry
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
 
     let mut file = File {
@@ -442,6 +442,66 @@ fn nested_self_keeps_an_absolute_self_type_as_written_when_optional_entries_are_
         struct Node<T> {
             next: ::std::boxed::Box<Self>,
             other: Entry<1usize>,
+            leaked: LeakersType<0usize>,
+        }
+    };
+    assert_eq!(file, expected);
+}
+
+/// A macro that trusts the crates of an optional entry keeps it as written by returning the leaked
+/// type from `type_fn` and `nested_fn`, and replaces the others (see
+/// [`Referrer::external_crates_require()`]).
+#[test]
+fn a_type_fn_keeps_the_optional_entries_of_the_crates_it_trusts() {
+    let item: ItemStruct = parse_quote! {
+        struct Node<T> {
+            next: ::std::boxed::Box<Self>, // the copy's `Node<T>`: no entry
+            other: ::p::Wrap<T>,           // an optional entry of `p`
+            more: ::q::Wrap<T>,            // an optional entry of `q`
+            leaked: Rel<Self>,             // a required entry: the macro writes the type
+        }
+    };
+    let mut leaker = Leaker::new();
+    let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
+        view.visit_item(&Item::Struct(item.clone()))
+    });
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(referrer.iter().count(), 3);
+    let trusted = ["p"];
+    let keeps = |ix: usize| {
+        !referrer.must(ix)
+            && referrer
+                .external_crates_require(ix)
+                .iter()
+                .all(|name| trusted.contains(&name.as_str()))
+    };
+
+    let mut file = File {
+        shebang: None,
+        attrs: vec![],
+        items: vec![Item::Struct(item)],
+    };
+    referrer
+        .visitor(module, |leaked, ix| {
+            if keeps(ix) {
+                leaked
+            } else {
+                parse_quote!(Entry<#ix>)
+            }
+        })
+        .with_nested_self(|_nested, leaked, ix| {
+            if keeps(ix) {
+                leaked
+            } else {
+                parse_quote!(LeakersType<#ix>)
+            }
+        })
+        .visit_file_mut(&mut file);
+    let expected: File = parse_quote! {
+        struct Node<T> {
+            next: ::std::boxed::Box<Self>,
+            other: ::p::Wrap<T>,
+            more: Entry<2usize>,
             leaked: LeakersType<0usize>,
         }
     };

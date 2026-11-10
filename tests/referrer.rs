@@ -6,7 +6,7 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    array_const, repeater_key, ContextId, ImplSelf, Leaker, Referrer, RepeaterSlots, Rules, UseSite,
+    array_const, repeater_key, ContextId, ImplSelf, Leaker, Referrer, RepeaterSlots, UseSite,
 };
 
 /// The tag of the format of a serialized Referrer, which it starts with.
@@ -480,13 +480,11 @@ fn test_outermost_generics_as_leakers() {
     );
 }
 
-/// The Referrer of the trait, and its top-level context: the scope of its copies. The Referrer
-/// trusts the optional entries (the types of other crates stay as written).
+/// The Referrer of the trait, and its top-level context: the scope of its copies.
 fn referrer_of(tr: ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = type_leak::Leaker::new();
     let context = leaker.intern_trait(&tr, true);
-    let result = leaker.result().allow(Rules::new().external_crates());
-    (result.finish().unwrap(), context)
+    (leaker.result().finish().unwrap(), context)
 }
 
 #[test]
@@ -625,10 +623,19 @@ fn test_visitor_with_self() {
     });
     let sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>, y: ::p::W<Self>) -> Self::Out);
 
+    // A macro that trusts `p` returns the type of its optional entry, `::p::W<Self>`.
+    let optional = |ty: Type, ix: usize| {
+        if referrer.must(ix) {
+            parse_quote!(P<#ix>)
+        } else {
+            ty
+        }
+    };
+
     // Without `with_self`, `Self` is kept.
     let mut plain = sig.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, optional)
         .visit_signature_mut(&mut plain);
     let expected: Signature = parse_quote!(fn f(&self, x: P<0usize>, y: ::p::W<Self>) -> Self::Out);
     assert_eq!(quote!(#plain).to_string(), quote!(#expected).to_string());
@@ -640,12 +647,21 @@ fn test_visitor_with_self() {
     referrer
         .visitor(context, |ty, ix| {
             received.push((quote!(#ty).to_string(), ix));
+            if !referrer.must(ix) {
+                return ty;
+            }
             // Not rewritten again, though it mentions `Self`.
             parse_quote!(<Marker<Self> as R<#ix>>::Type)
         })
         .with_self(parse_quote!(__S))
         .visit_signature_mut(&mut rewritten);
-    assert_eq!(received, [(quote!(Rel<__S>).to_string(), 0)],);
+    assert_eq!(
+        received,
+        [
+            (quote!(Rel<__S>).to_string(), 0),
+            (quote!(::p::W<__S>).to_string(), 1)
+        ],
+    );
     let expected: Signature = parse_quote!(
         fn f(&self, x: <Marker<Self> as R<0usize>>::Type, y: ::p::W<__S>) -> <__S>::Out
     );

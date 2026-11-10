@@ -327,7 +327,7 @@ fn an_error_in_an_inner_scope_is_recovered_and_recorded_once() {
         assert_eq!(result.errors()[0].cause, rel_tr());
         // The inner scope keeps what it found: `Rel<T>` and `dyn RelTr` are entries, and the
         // conflict is copied as written, though it holds the same `dyn RelTr`.
-        let referrer = result.allow(Rules::new().external_crates()).into_referrer();
+        let referrer = result.into_referrer();
         let required: Vec<&Type> = referrer.required().map(|(_, ty)| ty).collect();
         assert_eq!(required, [&parse_quote!(Rel<T>), &parse_quote!(dyn RelTr)]);
         let mut copy: Vec<Type> = vec![
@@ -1358,13 +1358,10 @@ fn leak_trait<A: Allow>(config: A, item: &ItemTrait) -> (LeakerResult, ContextId
     (leaker.result(), context)
 }
 
-/// The Referrer of `item` and its context. It trusts the optional entries.
+/// The Referrer of `item` and its context.
 fn referrer_of<A: Allow>(config: A, item: &ItemTrait) -> (Referrer, ContextId) {
     let (result, context) = leak_trait(config, item);
-    (
-        result.allow(Rules::new().external_crates()).into_referrer(),
-        context,
-    )
+    (result.into_referrer(), context)
 }
 
 /// The copy of `item` in which each entry is replaced by `Entry<ix>`.
@@ -1444,17 +1441,17 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
 fn the_visitor_leaves_a_part_as_written_and_replaces_the_entry_with_the_same_tokens() {
     let item = elided_and_bare();
     let (result, context) = leak_trait(Rules::new(), &item);
-    // `f` as written, `g` through the entry `dyn RelTr`: the same for a Referrer that trusts the
-    // optional entries and for one that trusts nothing, as there is none.
+    // `f` as written, `g` through the entry `dyn RelTr`: the same after a rule that allows the
+    // crates (it changes no entry), as there is no optional entry.
     let expected: ItemTrait = parse_quote!(
         trait Fg {
             fn f(&self, x: ::p::Elided<'_, dyn RelTr>);
             fn g(&self, x: ::core::marker::PhantomData<Entry<0usize>>);
         }
     );
-    let trusting = result.clone().allow(Rules::new().external_crates());
+    let allowed = result.clone().allow(Rules::new().external_crates());
     assert_eq!(
-        rewritten(&trusting.into_referrer(), context, &item),
+        rewritten(&allowed.into_referrer(), context, &item),
         expected
     );
     assert_eq!(rewritten(&result.into_referrer(), context, &item), expected);
@@ -1476,7 +1473,7 @@ fn an_item_beside_the_conflict_in_the_same_context_is_still_replaced() {
     assert_eq!(in_struct, in_trait);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.allow(Rules::new().external_crates()).into_referrer();
+    let referrer = result.into_referrer();
     assert_eq!(parts_of(&referrer).len(), 1);
     let mut copy = st.clone();
     referrer
@@ -1653,7 +1650,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
         let (context, ()) =
             leaker.enter_generics(&Generics::default(), |view| view.visit_type(&ty));
         let result = leaker.result();
-        let referrer = result.allow(Rules::new().external_crates()).into_referrer();
+        let referrer = result.into_referrer();
         let entries = listed(&referrer);
         let mut copy = ty;
         referrer
@@ -1792,7 +1789,7 @@ fn a_part_of_a_module_is_left_as_written_in_that_module_only() {
     let context = leaker.intern_mod(&item);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 2);
-    let referrer = result.allow(Rules::new().external_crates()).into_referrer();
+    let referrer = result.into_referrer();
     // `RelTr` is relative, so each module has its own entries and its own parts.
     let parts = parts_of(&referrer);
     assert_eq!(parts.len(), 2);

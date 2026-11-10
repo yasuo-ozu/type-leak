@@ -378,6 +378,20 @@ fn rewrite(referrer: &Referrer, context: ContextId, mut item: Item) -> String {
     string(&item)
 }
 
+/// Like `rewrite()` for a macro that trusts every crate: it keeps the optional entries as written.
+fn rewrite_keeping_optional(referrer: &Referrer, context: ContextId, mut item: Item) -> String {
+    referrer
+        .visitor(context, |ty, ix| {
+            if referrer.must(ix) {
+                parse_quote!(P<#ix>)
+            } else {
+                ty
+            }
+        })
+        .visit_item_mut(&mut item);
+    string(&item)
+}
+
 fn param_arg(param: &GenericParam) -> GenericArgument {
     match param {
         GenericParam::Lifetime(l) => GenericArgument::Lifetime(l.lifetime.clone()),
@@ -2188,9 +2202,9 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
     }
 }
 
-/// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a Referrer that
-/// trusts nothing (`strict`) or one that trusts every optional entry, and whether the Leaker accepts
-/// `item`.
+/// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a `type_fn` that
+/// replaces every optional entry too (`strict`) or one that keeps them as written, and whether the
+/// Leaker accepts `item`.
 fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
     let config = Rules::new()
         .primitive()
@@ -2198,14 +2212,16 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<
         .or_if(starts_with(parse_quote!(::p)));
     let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_impl(item, true);
-    let mut result = leaker.result();
-    if !strict {
-        result = result.allow(Rules::new().external_crates());
-    }
-    let referrer = result.finish()?;
+    let referrer = leaker.result().finish()?;
     let mut copy = Item::Impl(item.clone());
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |ty, ix| {
+            if !strict && !referrer.must(ix) {
+                ty
+            } else {
+                parse_quote!(P<#ix>)
+            }
+        })
         .visit_item_mut(&mut copy);
     match copy {
         Item::Impl(copy) => Ok(copy),
@@ -3154,14 +3170,16 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
                 });
         let mut leaker = Leaker::from_config(config, Options::new());
         let context = leaker.intern_trait(&item, true);
-        let mut result = leaker.result();
-        if !strict {
-            result = result.allow(Rules::new().external_crates());
-        }
-        let referrer = result.finish().unwrap();
+        let referrer = leaker.result().finish().unwrap();
         let mut copy = item.clone();
         referrer
-            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .visitor(context, |ty, ix| {
+                if !strict && !referrer.must(ix) {
+                    ty
+                } else {
+                    parse_quote!(P<#ix>)
+                }
+            })
             .visit_item_trait_mut(&mut copy);
         copy
     };
@@ -7579,11 +7597,30 @@ type NestedCalls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
 /// become `P<ix>`, and those that depend on the own `Self` of a nested item `N<ix>`. The calls of
 /// the closure are recorded.
 fn nested_visitor(referrer: &Referrer, context: ContextId) -> (impl VisitMut + '_, NestedCalls) {
+    nested_visitor_keeping(referrer, context, false)
+}
+
+/// Like `nested_visitor()`; with `keeps_optional` the closures return the leaked type of an
+/// optional entry (a macro that trusts every crate), and are not called for it.
+fn nested_visitor_keeping(
+    referrer: &Referrer,
+    context: ContextId,
+    keeps_optional: bool,
+) -> (impl VisitMut + '_, NestedCalls) {
     let calls = NestedCalls::default();
     let log = calls.clone();
     let visitor = referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
-        .with_nested_self(move |nested, _, ix| {
+        .visitor(context, move |ty, ix| {
+            if keeps_optional && !referrer.must(ix) {
+                ty
+            } else {
+                parse_quote!(P<#ix>)
+            }
+        })
+        .with_nested_self(move |nested, ty, ix| {
+            if keeps_optional && !referrer.must(ix) {
+                return ty;
+            }
             let requirement = match &nested.requirement {
                 SelfRequirement::Type(ty) => format!("Self = {}", string(ty)),
                 SelfRequirement::Bound(path) => format!("Self: {}", string(path)),
@@ -7647,8 +7684,8 @@ fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, V
     nested_copy_as(nest, item, declared, false)
 }
 
-/// Like `nested_copy()`, for a Referrer that replaces the optional entries too if `strict` (else it
-/// trusts them all).
+/// Like `nested_copy()`, for a macro that replaces the optional entries too if `strict` (else it
+/// trusts them all and keeps them as written).
 fn nested_copy_as(
     nest: Nest,
     item: &Item,
@@ -7707,20 +7744,23 @@ fn nested_copy_recovering<A: Allow>(
                 .0
         }
     };
-    let mut result = leaker.result();
-    if !strict {
-        result = result.allow(Rules::new().external_crates());
-    }
+    let result = leaker.result();
     let referrer = if recover {
         result.into_referrer()
     } else {
         result.finish().unwrap()
     };
     let (mut visitor, calls): (Box<dyn VisitMut + '_>, NestedCalls) = if nested {
-        let (visitor, calls) = nested_visitor(&referrer, context);
+        let (visitor, calls) = nested_visitor_keeping(&referrer, context, !strict);
         (Box::new(visitor), calls)
     } else {
-        let visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+        let visitor = referrer.visitor(context, |ty, ix| {
+            if !strict && !referrer.must(ix) {
+                ty
+            } else {
+                parse_quote!(P<#ix>)
+            }
+        });
         (Box::new(visitor), NestedCalls::default())
     };
     let copy = match nest {
@@ -10273,9 +10313,7 @@ fn f40_a_type_in_a_default_body_is_carried_in_the_generics_of_the_method() {
     };
     let mut leaker = values_leaker();
     let context = leaker.intern_impl(&item, true);
-    // A Referrer that trusts the optional entries (`::p::S<T>`) copies them as written.
-    let result = leaker.result().allow(Rules::new().external_crates());
-    let referrer = result.finish().unwrap();
+    let referrer = leaker.result().finish().unwrap();
     // The contexts are numbered in the order they are met, and the first is that of the self type
     // `::p::S<T>`, which is the context of `inner::Wrap<T>` too.
     let required: Vec<String> = referrer.required().map(|(_, ty)| string(ty)).collect();
@@ -10288,8 +10326,15 @@ fn f40_a_type_in_a_default_body_is_carried_in_the_generics_of_the_method() {
         ]
     );
     let mut copy = item.clone();
+    // A macro that trusts the optional entries (`::p::S<T>`) copies them as written.
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |ty, ix| {
+            if referrer.must(ix) {
+                parse_quote!(P<#ix>)
+            } else {
+                ty
+            }
+        })
         .visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::default::Default> ::p::Tr<T> for ::p::S<T> {
@@ -10410,10 +10455,10 @@ fn f40_every_type_position_of_a_value_is_replaced() {
 }
 
 /// F40, the optional entries: an absolute type of another crate. One that holds a relative type is
-/// one required entry, which both a Referrer that trusts the names of the crates and a strict one
+/// one required entry, which both a macro that trusts the names of the crates and a strict one
 /// replace as a whole (it was an optional entry beside the relative type). One that holds none is
-/// an optional entry: a trusting Referrer leaves it as it is, and a strict one replaces it. Both as
-/// for a type of a signature.
+/// an optional entry: a trusting macro leaves it as it is (its `type_fn` returns it), and a strict
+/// one replaces it. Both as for a type of a signature.
 #[test]
 fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
     let source =
@@ -10436,11 +10481,10 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
             }
         }
     );
-    let trusting = result.clone().allow(Rules::new().external_crates());
-    let trusting = f40_copy(&trusting.finish().unwrap(), context, &item);
+    let referrer = result.finish().unwrap();
+    let trusting = rewrite_keeping_optional(&referrer, context, Item::Trait(item.clone()));
     assert_eq!(trusting, string(&expected));
-    let strict = result.finish().unwrap();
-    assert_eq!(f40_copy(&strict, context, &item), string(&expected));
+    assert_eq!(f40_copy(&referrer, context, &item), string(&expected));
     // One with no relative type in it is an optional entry.
     let source = "trait Tr { fn f(&self) { let _: ::p::Wrap<()> = ::core::unimplemented!(); } }";
     let (item, result, context) = f40_result(source);
@@ -10453,11 +10497,9 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
             .collect::<Vec<_>>(),
         ["?:: p :: Wrap < () >"]
     );
-    let trusting = result.clone().allow(Rules::new().external_crates());
-    let trusting = f40_copy(&trusting.finish().unwrap(), context, &item);
+    let trusting = rewrite_keeping_optional(&referrer, context, Item::Trait(item.clone()));
     assert_eq!(trusting, string(&item));
-    let strict = result.finish().unwrap();
-    assert_eq!(f40_copy(&strict, context, &item), string(&expected));
+    assert_eq!(f40_copy(&referrer, context, &item), string(&expected));
 }
 
 /// F40, the module: the const, the static and the functions of a module are read with the names
@@ -10478,10 +10520,9 @@ fn f40_the_values_of_a_module() {
     };
     let mut leaker = values_leaker();
     let module = leaker.intern_mod(&item);
-    // `::p::W<..>` holds `inner::Local`, so it is a required entry, replaced whatever the Referrer
+    // `::p::W<..>` holds `inner::Local`, so it is a required entry, replaced whatever the macro
     // trusts.
-    let result = leaker.result().allow(Rules::new().external_crates());
-    let referrer = result.finish().unwrap();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
             .iter()
@@ -11594,6 +11635,19 @@ fn f43_copy(
     nested: &Item,
     with_nested_self: bool,
 ) -> String {
+    f43_copy_keeping(referrer, context, direct, nested, with_nested_self, false)
+}
+
+/// Like `f43_copy()`; with `keeps_optional` the macro trusts every crate and keeps the optional
+/// entries as written.
+fn f43_copy_keeping(
+    referrer: &Referrer,
+    context: ContextId,
+    direct: &[Type],
+    nested: &Item,
+    with_nested_self: bool,
+    keeps_optional: bool,
+) -> String {
     let inputs = direct.iter().enumerate().map(|(i, ty)| {
         let name = Ident::new(&format!("x{}", i), proc_macro2::Span::call_site());
         quote!(#name: #ty)
@@ -11602,10 +11656,22 @@ fn f43_copy(
         fn direct(&self, #(#inputs),*);
         fn nested() { #nested }
     });
-    let visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+    let visitor = referrer.visitor(context, |ty, ix| {
+        if keeps_optional && !referrer.must(ix) {
+            ty
+        } else {
+            parse_quote!(P<#ix>)
+        }
+    });
     if with_nested_self {
         visitor
-            .with_nested_self(|_, _, ix| parse_quote!(N<#ix>))
+            .with_nested_self(|_, ty, ix| {
+                if keeps_optional && !referrer.must(ix) {
+                    ty
+                } else {
+                    parse_quote!(N<#ix>)
+                }
+            })
             .visit_item_trait_mut(&mut copy);
     } else {
         let mut visitor = visitor;
@@ -11706,17 +11772,13 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
     let (object, x) = (entry(&referrer, "dyn RelTr"), entry(&referrer, "X"));
     assert!(referrer.must(object));
     for strict in [false, true] {
-        let mut result = result.clone();
-        if !strict {
-            result = result.allow(Rules::new().external_crates());
-        }
-        let referrer = result.into_referrer();
+        let referrer = result.clone().into_referrer();
         let expected = format!(
             "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : :: core :: marker :: PhantomData < P < {}usize > >) {{ }} }} }} }}",
             x, object
         );
         assert_eq!(
-            f43_copy(&referrer, context, &[], &nested, false),
+            f43_copy_keeping(&referrer, context, &[], &nested, false, !strict),
             expected,
             "strict {}",
             strict
@@ -11744,8 +11806,7 @@ fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_written_as_they_a
         .iter()
         .all(|error| error.reason == Reason::RelativePath));
     assert_eq!(result.errors().len(), 2);
-    // A Referrer that trusts the optional entries (`::p::Host`) copies them as written.
-    let referrer = result.allow(Rules::new().external_crates()).into_referrer();
+    let referrer = result.into_referrer();
     assert_eq!(
         parts_of(&referrer),
         ["trait (RelTrait < T , Other >) unwritable whole predicate"]
@@ -11755,7 +11816,11 @@ fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_written_as_they_a
         "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < U : RelTrait < T , Other > > :: p :: W for :: p :: Host {{ fn f (& self , y : P < {other}usize >) -> usize {{ inner :: make :: < T , P < {other}usize > > () }} }} }} }}",
         other = other
     );
-    assert_eq!(f43_copy(&referrer, context, &[], &nested, false), expected);
+    // A macro that trusts the optional entries (`::p::Host`) copies them as written.
+    assert_eq!(
+        f43_copy_keeping(&referrer, context, &[], &nested, false, true),
+        expected
+    );
 }
 
 /// F43: the serialized part. `unwritable` stands where the number of the context would be, before
@@ -15241,7 +15306,7 @@ fn f67_the_optional_types_on_the_way_to_a_method_lifetime_are_all_written_as_the
             "{}",
             string(item)
         );
-        // A Referrer that trusts every crate writes the same.
+        // A Leaker that allows every crate writes the same.
         let (trusted, errors, entries) = f63_leak(Rules::new().primitive().external_crates(), item);
         assert_eq!((errors, entries), (vec![], vec!["R0".to_string()]));
         assert_eq!(trusted, copy);
@@ -15300,8 +15365,8 @@ fn f67_the_optional_types_on_the_way_to_a_method_lifetime_are_all_written_as_the
 
 /// What a Referrer makes of `item` (analyzed with the rule `config`): the errors of the analysis,
 /// the entries (as written, and whether they are required), and the self type of the copy, with
-/// the entries replaced by `P<ix>`. `trusting`: it trusts every crate (`allow()` of
-/// `Rules::external_crates()`); else it trusts none.
+/// the entries replaced by `P<ix>`. `trusting`: the `type_fn` trusts every crate and keeps the
+/// optional entries as written; else it replaces them too.
 fn f68_copy<A: Allow>(
     config: A,
     item: &ItemImpl,
@@ -15309,11 +15374,7 @@ fn f68_copy<A: Allow>(
 ) -> (Vec<Reason>, Vec<(String, bool)>, String) {
     let mut leaker = Leaker::from_config(config, Options::new());
     let context = leaker.intern_impl(item, true);
-    let mut result = leaker.result();
-    if trusting {
-        result = result.allow(Rules::new().external_crates());
-    }
-    let (referrer, errors) = result.into_parts();
+    let (referrer, errors) = leaker.result().into_parts();
     let entries = referrer
         .iter()
         .enumerate()
@@ -15321,7 +15382,13 @@ fn f68_copy<A: Allow>(
         .collect();
     let mut copy = item.clone();
     referrer
-        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |ty, ix| {
+            if trusting && !referrer.must(ix) {
+                ty
+            } else {
+                parse_quote!(P<#ix>)
+            }
+        })
         .visit_item_impl_mut(&mut copy);
     (
         errors.iter().map(|e| e.reason).collect(),

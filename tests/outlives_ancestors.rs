@@ -26,7 +26,7 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 }
 
 /// The paths of external crates (`::std::vec::Vec`) are allowed: they are no entries, so the entry
-/// of a type is the one in them, whatever the Referrer trusts.
+/// of a type is the one in them.
 fn leaker() -> Leaker<impl Allow> {
     let config = Rules::new().primitive().prelude().external_crates();
     Leaker::from_config(config, Options::new())
@@ -48,8 +48,7 @@ fn referrer_with_optional_entries(item: &ItemTrait) -> Referrer {
 fn referrer_in(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = leaker();
     let context = leaker.intern_trait(item, true);
-    let result = leaker.result().allow(Rules::new().external_crates());
-    (result.finish().unwrap(), context)
+    (leaker.result().finish().unwrap(), context)
 }
 
 /// The generics (and the where clause) of each leaked type, by its tokens.

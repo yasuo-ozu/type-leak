@@ -413,16 +413,15 @@ impl VisitMut for Absolutize<'_> {
 /// `__scope_apply!`, the Referrer's side.
 pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let ApplyInput {
-        mut result,
+        result,
         context,
         scope,
         path,
         strict,
     } = parse2(input)?;
-    if !strict {
-        result = result.allow(Rules::new().external_crates());
-    }
+    // A Referrer that trusts every crate keeps the optional entries as written.
     let referrer = result.into_referrer();
+    let keeps = |ix: usize| !strict && !referrer.must(ix);
     let krate = path
         .segments
         .first()
@@ -474,10 +473,21 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
 
     // The self type first, as `Self` of an entry is written with it.
     referrer
-        .visitor(context, |_, ix| project(None, ix))
+        .visitor(context, |leaked, ix| {
+            if keeps(ix) {
+                leaked
+            } else {
+                project(None, ix)
+            }
+        })
         .visit_type_mut(&mut self_ty);
-    let mut visitor = referrer
-        .visitor(context, |_, ix| project(Some(&self_ty), ix));
+    let mut visitor = referrer.visitor(context, |leaked, ix| {
+        if keeps(ix) {
+            leaked
+        } else {
+            project(Some(&self_ty), ix)
+        }
+    });
     let mut types = types;
     for ty in &mut types {
         visitor.visit_type_mut(ty);

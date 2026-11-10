@@ -38,13 +38,9 @@ pub struct Place {
 /// its [`paths`](ErrorItem::paths) if it has any (the rule must allow each, at the error's
 /// [`place()`](ErrorItem::place); the error stays without those it allows), else by its cause,
 /// asked as written, with its generic arguments. A rule on a whole cause (`Wrap<Rel>`) never
-/// accepts an error that has paths. That drops errors. It also trusts an optional entry
-/// ([`Referrer::must()`](crate::Referrer::must)) if the rule allows every absolute path that the
-/// entry names, each asked bare at [`Place::default()`] as the cause of its kind (a path in a
-/// macro's tokens, or in an expression, is a [`Cause::Unknown`]; the path of a macro a
-/// [`Cause::Macro`]), and the Referrer then leaves the entry as written. That is the approximation
-/// of the rule of the Leaker, which keeps such an entry out of the Referrer: give the rule to the
-/// Leaker when you can.
+/// accepts an error that has paths. That only drops errors: it changes no entry, and an absolute
+/// path that the rule allows is still an optional entry. That is the approximation of the rule of
+/// the Leaker: give the rule to the Leaker when you can.
 ///
 /// A closure `Fn(&Cause, Place) -> bool` is a rule, `()` allows nothing, and `(A, B)` allows what
 /// either does. [`Rules`] builds the common ones.
@@ -152,7 +148,8 @@ impl<A> Rules<A> {
     }
 
     /// Allows the paths that start with `std`, `core` or `alloc`, also those with a leading `::`
-    /// (`::std::vec::Vec`), which makes no optional entry in the Leaker.
+    /// (`::std::vec::Vec`), which makes no optional entry in the Leaker. On a
+    /// [`LeakerResult`](crate::LeakerResult) it only drops the errors of relative paths.
     ///
     /// You promise that the copy does not shadow the relative names. [`external_crates()`] allows
     /// the other absolute paths.
@@ -166,9 +163,9 @@ impl<A> Rules<A> {
     /// Allows every absolute path (`::foo::X`), `::std` included.
     ///
     /// In a Leaker, an absolute path makes no optional entry
-    /// ([`Referrer::must()`](crate::Referrer::must)): the copy writes it as it is. On a [`LeakerResult`](crate::LeakerResult), every optional entry is trusted, so
-    /// that a Referrer copies it as written, not through the Repeater. You promise that each crate
-    /// is the same crate on both sides.
+    /// ([`Referrer::must()`](crate::Referrer::must)): the copy writes it as it is. On a
+    /// [`LeakerResult`](crate::LeakerResult) it changes no entry, as `allow()` only drops errors.
+    /// You promise that each crate is the same crate on both sides.
     pub fn external_crates(mut self) -> Self {
         self.external_crates = true;
         self
