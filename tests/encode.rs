@@ -4,8 +4,8 @@
 use syn::*;
 use template_quote::quote;
 
-/// `repeater_definition()` docs: the Repeater has `T` (which may be unsized), `ID` and `NTH`, and a
-/// defaulted const slot per primitive type, in the documented order and with the documented names;
+/// `repeater_definition()` docs: the Repeater has `T` (which may be unsized), `KEY`, and a
+/// defaulted const slot per other primitive type, in the documented order and with the documented names;
 /// its type may be unsized. Audit mutants `def_unsized_param` (`T: ?Sized` dropped),
 /// `enc_slot_order` and `enc_slot_name`; the visibility and the unsized `Type` are also pinned by
 /// the fixture crates compiling.
@@ -15,14 +15,13 @@ fn the_repeater_definition_has_the_documented_shape() {
     let expected: ItemTrait = parse_quote! {
         pub trait Repeater<
             T: ?::core::marker::Sized,
-            const ID: ::core::primitive::u64,
-            const NTH: ::core::primitive::usize,
+            const KEY: ::core::primitive::u128,
             const BOOL: ::core::primitive::bool = false,
             const CHAR: ::core::primitive::char = '\0',
             const U8: ::core::primitive::u8 = 0,
             const U16: ::core::primitive::u16 = 0,
             const U32: ::core::primitive::u32 = 0,
-            const U128: ::core::primitive::u128 = 0,
+            const U64: ::core::primitive::u64 = 0,
             const I8: ::core::primitive::i8 = 0,
             const I16: ::core::primitive::i16 = 0,
             const I32: ::core::primitive::i32 = 0,
@@ -41,14 +40,13 @@ fn the_repeater_definition_has_the_documented_shape() {
     let private: ItemTrait = parse_quote! {
         trait Other<
             T: ?::core::marker::Sized,
-            const ID: ::core::primitive::u64,
-            const NTH: ::core::primitive::usize,
+            const KEY: ::core::primitive::u128,
             const BOOL: ::core::primitive::bool = false,
             const CHAR: ::core::primitive::char = '\0',
             const U8: ::core::primitive::u8 = 0,
             const U16: ::core::primitive::u16 = 0,
             const U32: ::core::primitive::u32 = 0,
-            const U128: ::core::primitive::u128 = 0,
+            const U64: ::core::primitive::u64 = 0,
             const I8: ::core::primitive::i8 = 0,
             const I16: ::core::primitive::i16 = 0,
             const I32: ::core::primitive::i32 = 0,
@@ -70,7 +68,7 @@ fn the_repeater_definition_has_the_documented_shape() {
         "false", "'\\0'", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
     ];
     for (position, ty) in [
-        "bool", "char", "u8", "u16", "u32", "u128", "i8", "i16", "i32", "i64", "i128", "isize",
+        "bool", "char", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "i128", "isize",
     ]
     .iter()
     .enumerate()
@@ -90,7 +88,7 @@ fn the_repeater_definition_has_the_documented_shape() {
             format!("{}, ", before)
         };
         let expected: Type = parse_str(&format!(
-            "*const dyn R<(), 0, 0, {}{}, Type = ()>",
+            "*const dyn R<(), 0, {}{}, Type = ()>",
             before, value
         ))
         .unwrap();
@@ -102,12 +100,12 @@ fn the_repeater_definition_has_the_documented_shape() {
             quote!(#ty)
         );
     }
-    // `u64` uses `ID`, `usize` the length of an array, and the others are not supported.
+    // `u128` uses `KEY`, `usize` the length of an array, and the others are not supported.
     assert_eq!(
         slots
-            .encode_const(&parse_quote!(5), &parse_quote!(u64))
+            .encode_const(&parse_quote!(5), &parse_quote!(u128))
             .unwrap(),
-        parse_quote!(*const dyn R<(), 5, 0, Type = ()>)
+        parse_quote!(*const dyn R<(), 5, Type = ()>)
     );
     assert_eq!(
         slots
@@ -137,6 +135,7 @@ fn the_slots_give_their_path_and_the_const_fn() {
         (parse_quote!(const C: char), "'x'"),
         (parse_quote!(const N: usize), "3"),
         (parse_quote!(const K: u64), "9"),
+        (parse_quote!(const L: u128), "7"),
         (parse_quote!(const I: i128), "-1"),
     ] {
         let param: ConstParam = param;
@@ -168,7 +167,7 @@ fn the_slots_give_their_path_and_the_const_fn() {
         .unwrap();
     assert_eq!(
         args,
-        parse_quote!((*const dyn crate::Repeater<(), 0, 0, B, Type = ()>, [(); N]))
+        parse_quote!((*const dyn crate::Repeater<(), 0, B, Type = ()>, [(); N]))
     );
 }
 
@@ -192,15 +191,15 @@ fn test_const_args_are_braced_when_needed() {
             .encode_const(&parse2(value).unwrap(), &i32_ty)
             .unwrap();
         let expected: Type = parse_quote! {
-            *const dyn crate::Repeater<(), 0, 0, false, '\0', 0, 0, 0, 0, 0, 0, #expected, Type = ()>
+            *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, #expected, Type = ()>
         };
         assert_eq!(to_string(&ty), to_string(&expected));
     }
-    let u64_ty: Type = parse_quote!(u64);
+    let u128_ty: Type = parse_quote!(u128);
     let ty = slots
-        .encode_const(&parse_quote!({ m::FOO }), &u64_ty)
+        .encode_const(&parse_quote!({ m::FOO }), &u128_ty)
         .unwrap();
-    let expected: Type = parse_quote!(*const dyn crate::Repeater<(), { m::FOO }, 0, Type = ()>);
+    let expected: Type = parse_quote!(*const dyn crate::Repeater<(), { m::FOO }, Type = ()>);
     assert_eq!(to_string(&ty), to_string(&expected));
 }
 
@@ -230,4 +229,26 @@ fn array_const_encodes_usize_consts_only() {
     assert!(slots
         .encode_const(&parse_quote!(true), &bool_param.ty)
         .is_ok());
+}
+
+/// `repeater_key()` puts the id in the high half and the index in the low half, so two entries
+/// never share a key, and it is part of the format (the impls and the projections must agree).
+#[test]
+fn the_repeater_key_has_the_id_above_the_index() {
+    use std::collections::HashSet;
+    use type_leak::repeater_key;
+    assert_eq!(repeater_key(0, 0), 0);
+    assert_eq!(repeater_key(0, 5), 5);
+    assert_eq!(repeater_key(1, 0), 1 << 64);
+    assert_eq!(repeater_key(7, 3), (7 << 64) | 3);
+    assert_eq!(repeater_key(u64::MAX, 0), u128::from(u64::MAX) << 64);
+    assert_eq!(repeater_key(0, u64::MAX as usize), u128::from(u64::MAX));
+    assert_eq!(repeater_key(u64::MAX, u64::MAX as usize), u128::MAX);
+    let ids = [0, 1, 2, 255, 1 << 32, u64::MAX - 1, u64::MAX];
+    let nths = [0, 1, 2, 255, 1 << 31, u32::MAX as usize];
+    let keys: HashSet<u128> = ids
+        .iter()
+        .flat_map(|&id| nths.iter().map(move |&nth| repeater_key(id, nth)))
+        .collect();
+    assert_eq!(keys.len(), ids.len() * nths.len());
 }

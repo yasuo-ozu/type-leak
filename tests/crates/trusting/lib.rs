@@ -39,6 +39,11 @@ mod tests {
         text.split_whitespace().collect()
     }
 
+    /// The `KEY` of the Repeater (`type_leak::repeater_key(id, nth)`) as the tokens write it.
+    fn key(id: u64, nth: usize) -> String {
+        format!("{}u128", (u128::from(id) << 64) | nth as u128)
+    }
+
     /// The strict impl, in a crate without the dependency, works: it forwards, and the types it
     /// takes and returns are the original ones.
     #[test]
@@ -69,12 +74,12 @@ mod tests {
         assert!(!trait_path.contains("type_leak_test_ext"), "{}", trait_path);
         // The optional entry is the entry 1, after the required one.
         assert!(
-            trait_path.contains("7005u64,1usize>>::Type,"),
+            trait_path.contains(&format!("{}>>::Type,", key(7005, 1))),
             "{}",
             trait_path
         );
         assert!(
-            trait_path.ends_with("7005u64,0usize>>::Type>"),
+            trait_path.ends_with(&format!("{}>>::Type>", key(7005, 0))),
             "{}",
             trait_path
         );

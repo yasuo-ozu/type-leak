@@ -30,8 +30,9 @@ use template_quote::{quote, ToTokens};
 /// [`Leaker::result()`](crate::Leaker::result) returns it, in a
 /// [`LeakerResult`](crate::LeakerResult). Crate A, which defines the item, emits the Repeater impl
 /// of each entry ([`repeater_impl()`](Referrer::repeater_impl)). Crate B, which copies the item,
-/// replaces each entry by `<Self as Repeater<ARGS, ID, IX>>::Type` with
-/// [`visitor()`](Referrer::visitor) (`ARGS` from [`entry_args()`](Referrer::entry_args)).
+/// replaces each entry by `<Self as Repeater<ARGS, KEY>>::Type` with
+/// [`visitor()`](Referrer::visitor) (`ARGS` from [`entry_args()`](Referrer::entry_args), `KEY`
+/// from [`repeater_key()`](crate::repeater_key)).
 ///
 /// A's macro passes the `Referrer` and the top-level [`ContextId`] to B's as tokens ([`ToTokens`],
 /// [`Parse`]); both crates must use the same version of `type-leak`. Emit an impl for every entry,
@@ -558,7 +559,7 @@ impl Referrer {
 
     /// Returns `true` if the `ix`-th entry can be written by an impl with no generics.
     ///
-    /// That is, `impl Repeater<(), ID, IX> for Marker` is right for any marker: the context has no
+    /// That is, `impl Repeater<(), KEY> for Marker` is right for any marker: the context has no
     /// generics, no where clause, no `Self` and no module.
     pub fn is_plain(&self, ix: usize) -> bool {
         let context = self.contexts[ix];
@@ -787,7 +788,7 @@ impl Referrer {
     /// `context` is the scope of the copy: the top-level [`ContextId`] that the `intern_*` or
     /// `enter_*` method of the Leaker returned for the item. Pass it along with the Referrer (it is
     /// written and parsed as an integer). `type_fn(leaked, ix)` returns the replacement, usually
-    /// `<Self as Repeater<ARGS, ID, IX>>::Type` with `ARGS` from [`Referrer::entry_args()`]. Only
+    /// `<Self as Repeater<ARGS, KEY>>::Type` with `ARGS` from [`Referrer::entry_args()`]. Only
     /// the leaked types are replaced: write the rest of the copy yourself (e.g. `u8` for `T` in a
     /// copy for `impl Tr<u8>`, which [`UseSite::substitute()`](crate::UseSite::substitute) does for
     /// a type). A type is replaced if its context, computed from the generics in
@@ -836,8 +837,9 @@ impl Referrer {
     ///         slots.projection(&parse_quote!(Self), &args, 7, ix)
     ///     })
     ///     .visit_signature_mut(&mut sig);
+    /// let key = repeater_key(7, 0);
     /// let expected: Signature = parse_quote!(
-    ///     fn f(&self, t: T) -> <Self as crate::Repeater<(u8,), 7u64, 0usize>>::Type
+    ///     fn f(&self, t: T) -> <Self as crate::Repeater<(u8,), #key>>::Type
     /// );
     /// assert_eq!(sig, expected);
     /// ```
@@ -888,11 +890,13 @@ impl Referrer {
     /// let referrer = leaker.result().finish().unwrap();
     ///
     /// let ty: Type = parse_quote!(::core::option::Option<Wrap<T>>);
+    /// let slots = RepeaterSlots::new(parse_quote!(Repeater));
     /// let ty = referrer.expand(context, ty, |_, ix| {
-    ///     parse_quote!(<Marker as Repeater<#ix>>::Type)
+    ///     slots.projection(&parse_quote!(Marker), &parse_quote!((T,)), 7, ix)
     /// });
+    /// let key = repeater_key(7, 0);
     /// let expected: Type =
-    ///     parse_quote!(::core::option::Option<<Marker as Repeater<0usize>>::Type>);
+    ///     parse_quote!(::core::option::Option<<Marker as Repeater<(T,), #key>>::Type>);
     /// assert_eq!(ty, expected);
     /// ```
     #[must_use]
@@ -1248,8 +1252,9 @@ impl Declares {
 ///         slots.projection(&parse_quote!(Self), &args, 7, ix)
 ///     })
 ///     .visit_item_trait_mut(&mut copy);
+/// let key = repeater_key(7, 0);
 /// let expected: ItemTrait = parse_quote! {
-///     trait Tr<T> { fn f(&self, t: T) -> <Self as crate::Repeater<(T,), 7u64, 0usize>>::Type; }
+///     trait Tr<T> { fn f(&self, t: T) -> <Self as crate::Repeater<(T,), #key>>::Type; }
 /// };
 /// assert_eq!(copy, expected);
 /// ```
@@ -1359,7 +1364,7 @@ where
     /// a function body) has a `Self` of its own. For the entries that name it, or use a generic
     /// whose bound names it, the visitor calls `nested_fn(nested, leaked, ix)` instead of
     /// `type_fn`: `nested` is the item ([`NestedSelf`]), `leaked` the type of the entry, with its
-    /// `Self`. The usual result is `<self_ty as Repeater<args, ID, ix>>::Type`
+    /// `Self`. The usual result is `<self_ty as Repeater<args, KEY>>::Type`
     /// ([`RepeaterSlots::projection()`](crate::RepeaterSlots::projection)), with `args` from
     /// [`Referrer::entry_args()`] at a [`UseSite`](crate::UseSite) that has
     /// [`with_self(self_ty)`](crate::UseSite::with_self). `self_ty` depends on what the impl of the
@@ -1978,10 +1983,14 @@ impl Referrer {
     // computes for a copy. And a `LeakerResult` writes its errors after the Referrer as `@ [
     // {error} .. ]`, in one bracket group, so that a brace group after it is left to the caller.
     // An error writes each of its paths with its kind (`paths [type (Rel), trait (Tr), ..]`; a path
-    // of unknown kind is `unknown (p)`).
+    // of unknown kind is `unknown (p)`). Also in 16, not serialized: the Repeater has one `KEY:
+    // u128` (`repeater_key(ID, NTH)`) instead of `ID: u64, NTH: usize`, and a `U64` slot instead
+    // of the `U128` one (a `u128` const goes in `KEY`), so the impls and projections of 15 do not
+    // match.
     // Not serialized, but both macros must agree on it: the primitive type that `ImplSelf::Bucket`
-    // and `Referrer::bucket_self()` choose from the id and the index of an entry must not change
-    // without a bump.
+    // and `Referrer::bucket_self()` choose from the id and the index of an entry, the layout of
+    // `repeater_key()`, and the slots of `repeater_definition()` and `RepeaterSlots` (which const
+    // type goes where) must not change without a bump.
     pub const FORMAT_VERSION: u32 = 16;
 }
 

@@ -300,6 +300,8 @@ pub mod kinds {
     // the Repeater names the lifetime (F70).
     type_leak_test_leaker::__tl_prop_9234!(path = ::type_leak_test_leaker::kinds, strict, inst(1), lifetime_args);
     type_leak_test_leaker::__tl_prop_9235!(path = ::type_leak_test_leaker::kinds, strict, inst(1), lifetime_args);
+    // Const generics of type `u64` and `u128`: the slot `U64` and the `KEY` of the Repeater.
+    type_leak_test_leaker::__tl_prop_9236!(path = ::type_leak_test_leaker::kinds);
 }
 
 /// Items that the Leaker rejects and accepts with `LeakerResult::allow()` of the causes of their

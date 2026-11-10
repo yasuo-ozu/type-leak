@@ -5,7 +5,9 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{array_const, ContextId, ImplSelf, Leaker, Referrer, Rules, UseSite};
+use type_leak::{
+    array_const, repeater_key, ContextId, ImplSelf, Leaker, Referrer, RepeaterSlots, Rules, UseSite,
+};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -1055,18 +1057,20 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     let (mut with_args, mut plain) = (tr.clone(), tr.clone());
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let mut first = referrer.visitor(top_level, |_, ix| {
         let args = referrer
             .entry_args(ix, &UseSite::identity(), array_const)
             .unwrap();
-        parse_quote!(<Self as crate::Repeater<#args, 7u64, #ix>>::Type)
+        slots.projection(&parse_quote!(Self), &args, 7, ix)
     });
     let mut second = referrer.visitor(top_level, |_, ix| parse_quote!(P<#ix>));
     first.visit_item_trait_mut(&mut with_args);
     second.visit_item_trait_mut(&mut plain);
+    let key = repeater_key(7, 0);
     let expected: ItemTrait = parse_quote!(
         trait Tr<T> {
-            fn f(&self, t: T) -> <Self as crate::Repeater<(T,), 7u64, 0usize>>::Type;
+            fn f(&self, t: T) -> <Self as crate::Repeater<(T,), #key>>::Type;
         }
     );
     assert_eq!(with_args, expected);

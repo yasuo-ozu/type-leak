@@ -2505,4 +2505,26 @@ pub mod kinds {
         pub ::core::marker::PhantomData<dyn ::core::ops::Fn(&::std::vec::Vec<T>) -> &u8>,
         pub Rel,
     );
+
+    /// A type with const parameters of the two types that `RepeaterSlots` puts where no other goes.
+    pub struct Keyed<const N: u64, const M: u128>;
+
+    /// The marker type of 9236.
+    pub struct Marker9236;
+
+    /// 9236: const generics of type `u64` and `u128` in the arguments of the Repeater. `RepeaterSlots`
+    /// puts a `u128` into the `KEY` argument (with the id and the index, `repeater_key()`) and a
+    /// `u64` into the slot `U64`, so the entries use one, the other and both.
+    #[prop_leak(
+        id = 9236,
+        allow_self = false,
+        prelude = true,
+        marker = "::type_leak_test_leaker::kinds::Marker9236"
+    )]
+    pub struct KeySlots<const N: u64, const M: u128> {
+        pub both: Keyed<N, M>,
+        pub only_u64: Wrap<Keyed<N, 0>>,
+        pub only_u128: Wrap<Keyed<0, M>>,
+        pub rel: Rel,
+    }
 }

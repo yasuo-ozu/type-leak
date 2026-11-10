@@ -12,9 +12,9 @@ pub use repo_macros::{export_trait, forward};
 /// types the signatures of an exported trait name; the copy in another crate names them through
 /// it. It must be at the root of this crate, and local to it (the impls are for any type).
 ///
-/// `T` encodes the generics the type uses, `ID` the trait the entry is from, and `NTH` which
-/// entry of it.
-pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> {
+/// `T` encodes the generics the type uses, and `KEY` is `repeater_key(ID, NTH)`: `ID` is the trait
+/// the entry is from, and `NTH` which entry of it.
+pub trait Repeater<T: ?Sized, const KEY: u128> {
     type Type: ?Sized;
 }
 

@@ -33,8 +33,9 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
             type Type = #ty;
         }
     };
+    let key = repeater_key(7, 0);
     let expected: ItemImpl = parse_quote! {
-        impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 0usize> for __S {
+        impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
             type Type = Outside;
         }
     };
@@ -258,8 +259,8 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     assert_eq!(
         r.args,
         parse_quote!((
-            *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
-            *const dyn crate::Repeater<(), 0, 0, false, C, Type = ()>
+            *const dyn crate::Repeater<(), 0, B, Type = ()>,
+            *const dyn crate::Repeater<(), 0, false, C, Type = ()>
         ))
     );
 
@@ -275,8 +276,8 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     assert_eq!(
         args,
         parse_quote!((
-            *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
-            *const dyn crate::Repeater<(), 0, 0, false, 'x', Type = ()>
+            *const dyn crate::Repeater<(), 0, true, Type = ()>,
+            *const dyn crate::Repeater<(), 0, false, 'x', Type = ()>
         ))
     );
 }
@@ -438,14 +439,15 @@ fn repeater_impl_for_each_entry_of_a_trait() {
             }
         })
         .collect();
+    let (key1, key2) = (repeater_key(7, 1), repeater_key(7, 2));
     let rel: ItemImpl = parse_quote! {
-        impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 1usize> for __S {
+        impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key1> for __S {
             type Type = Rel;
         }
     };
     let wrap2: ItemImpl = parse_quote! {
         impl<'a, T, __S: ?::core::marker::Sized + Tr<'a, T>>
-            crate::Repeater<(&'a (), T, &'a T), 7u64, 2usize> for __S
+            crate::Repeater<(&'a (), T, &'a T), #key2> for __S
         {
             type Type = Wrap2<<__S>::Out>;
         }

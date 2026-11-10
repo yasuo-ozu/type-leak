@@ -4,14 +4,14 @@ use crate::encode::{const_param_primitive, normalize_const_arg, EncodeError};
 use proc_macro2::Span;
 use syn::*;
 
-/// Const parameter types with a slot, in slot order. `usize` uses `[(); N]`, and `u64` uses `ID`.
+/// Const parameter types with a slot, in slot order. `usize` uses `[(); N]`, and `u128` uses `KEY`.
 const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("bool", "BOOL", "false"),
     ("char", "CHAR", "'\\0'"),
     ("u8", "U8", "0"),
     ("u16", "U16", "0"),
     ("u32", "U32", "0"),
-    ("u128", "U128", "0"),
+    ("u64", "U64", "0"),
     ("i8", "I8", "0"),
     ("i16", "I16", "0"),
     ("i32", "I32", "0"),
@@ -20,26 +20,39 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("isize", "ISIZE", "0"),
 ];
 
+/// The `KEY` argument of the Repeater for the entry `nth` of the Leaker `id`: `id` in the high 64
+/// bits and `nth` in the low ones, so no two entries share a key.
+///
+/// ```
+/// # use type_leak::repeater_key;
+/// assert_eq!(repeater_key(7, 3), (7u128 << 64) | 3);
+/// ```
+#[must_use]
+pub fn repeater_key(id: u64, nth: usize) -> u128 {
+    (u128::from(id) << 64) | nth as u128
+}
+
 /// Returns the definition of the Repeater trait, the one trait that both crates see.
 ///
 /// Define it once, at the root of the crate that writes the Repeater impls (the one that exports
 /// the item), not in the crate of the proc macros: the impls are for any `Self`, which only a
 /// local trait allows. The copying crate names it through the crate that defines it.
 ///
-/// `T` is the encoding of the generics of an entry, `ID` the Leaker and `NTH` the entry. A
-/// defaulted const slot per primitive type (`BOOL`, `CHAR`, `U8`, .., `ISIZE`) carries the other
-/// const generics ([`RepeaterSlots`]), and `Repeater<T, ID, NTH>` still works. `const N: usize` is
-/// `[(); N]` ([`array_const()`](crate::array_const)) and a `u64` uses `ID`, so if every const
-/// parameter is one of these you can write the trait by hand instead:
-/// `pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }`. The
-/// generated trait needs Rust 1.59 and the 2018 edition, while `type-leak` supports 1.56.
+/// `T` is the encoding of the generics of an entry and `KEY` is `repeater_key(ID, NTH)` for the
+/// Leaker `ID` and its entry `NTH` ([`repeater_key()`]). A defaulted const slot per other
+/// primitive type (`BOOL`, `CHAR`, `U8`, .., `ISIZE`) carries the other const generics
+/// ([`RepeaterSlots`]), and `Repeater<T, KEY>` still works. `const N: usize` is `[(); N]`
+/// ([`array_const()`](crate::array_const)) and a `u128` uses `KEY`, so if every const parameter is
+/// one of these you can write the trait by hand instead:
+/// `pub trait Repeater<T: ?Sized, const KEY: u128> { type Type: ?Sized; }`. The generated trait
+/// needs Rust 1.59 and the 2018 edition, while `type-leak` supports 1.56.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
 /// let def = repeater_definition(&parse_quote!(pub), &parse_quote!(Repeater));
-/// // `T`, `ID`, `NTH` and a slot for each primitive const type.
-/// assert_eq!(def.generics.params.len(), 3 + 12);
+/// // `T`, `KEY` and a slot for each primitive const type but `usize` and `u128`.
+/// assert_eq!(def.generics.params.len(), 2 + 12);
 /// assert_eq!(def.ident, "Repeater");
 /// // The trait is an `ItemTrait`: write it with `ToTokens`.
 /// # use template_quote::ToTokens;
@@ -58,8 +71,7 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     parse_quote! {
         #vis trait #ident<
             T: ?::core::marker::Sized,
-            const ID: ::core::primitive::u64,
-            const NTH: ::core::primitive::usize,
+            const KEY: ::core::primitive::u128,
             #(#slots),*
         > {
             type Type: ?::core::marker::Sized;
@@ -73,7 +85,7 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 /// Pass [`slots.const_fn()`](RepeaterSlots::const_fn) as the `const_fn` of
 /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
 /// [`Referrer::entry_args()`](crate::Referrer::entry_args). `const N: usize` is `[(); N]`,
-/// `const X: u64` uses `ID`, and any other primitive is a trait object of the Repeater with its
+/// `const X: u128` uses `KEY`, and any other primitive is a trait object of the Repeater with its
 /// slot filled. A const parameter of an alias type is an [`EncodeError::UnsupportedConstType`].
 /// [`trait_path()`](RepeaterSlots::trait_path) and [`projection()`](RepeaterSlots::projection)
 /// write the Repeater with its arguments, for the impl and for the use.
@@ -94,7 +106,7 @@ impl RepeaterSlots {
     }
 
     /// Returns the path of the Repeater with the arguments of the entry `ix` of the Leaker `id`:
-    /// `Repeater<args, IDu64, IXusize>`.
+    /// `Repeater<args, KEY>` with `KEY` from [`repeater_key(id, ix)`](repeater_key).
     ///
     /// `args` is the first argument: [`RepeaterImpl::args`](crate::RepeaterImpl::args) for the
     /// impl, [`Referrer::entry_args()`](crate::Referrer::entry_args) for a use. Write the impl for
@@ -106,16 +118,18 @@ impl RepeaterSlots {
     /// # use syn::*;
     /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     /// let path = slots.trait_path(&parse_quote!((&'a (), T)), 7, 0);
-    /// assert_eq!(path, parse_quote!(crate::Repeater<(&'a (), T), 7u64, 0usize>));
+    /// let key = repeater_key(7, 0);
+    /// assert_eq!(path, parse_quote!(crate::Repeater<(&'a (), T), #key>));
     /// ```
     #[must_use]
     pub fn trait_path(&self, args: &Type, id: u64, ix: usize) -> Path {
         let repeater = &self.repeater;
-        parse_quote!(#repeater<#args, #id, #ix>)
+        let key = repeater_key(id, ix);
+        parse_quote!(#repeater<#args, #key>)
     }
 
-    /// Returns `<self_ty as Repeater<args, IDu64, IXusize>>::Type`: the type that stands for the
-    /// entry `ix` of the Leaker `id` at a use ([`RepeaterSlots::trait_path()`]).
+    /// Returns `<self_ty as Repeater<args, KEY>>::Type`: the type that stands for the entry `ix` of
+    /// the Leaker `id` at a use ([`RepeaterSlots::trait_path()`]).
     ///
     /// `self_ty` is what the path is written for: `Self` in the copy, or the host.
     ///
@@ -124,7 +138,8 @@ impl RepeaterSlots {
     /// # use syn::*;
     /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     /// let ty = slots.projection(&parse_quote!(Self), &parse_quote!((T,)), 7, 1);
-    /// assert_eq!(ty, parse_quote!(<Self as crate::Repeater<(T,), 7u64, 1usize>>::Type));
+    /// let key = repeater_key(7, 1);
+    /// assert_eq!(ty, parse_quote!(<Self as crate::Repeater<(T,), #key>>::Type));
     /// ```
     #[must_use]
     pub fn projection(&self, self_ty: &Type, args: &Type, id: u64, ix: usize) -> Type {
@@ -150,7 +165,15 @@ impl RepeaterSlots {
     /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     /// // The `bool` value goes into the slot of the Repeater for `bool`.
     /// let ty = slots.encode_const(&parse_quote!(true), &parse_quote!(bool)).unwrap();
-    /// assert_eq!(ty, parse_quote!(*const dyn crate::Repeater<(), 0, 0, true, Type = ()>));
+    /// assert_eq!(ty, parse_quote!(*const dyn crate::Repeater<(), 0, true, Type = ()>));
+    /// // `u64` has a slot, and `u128` is the `KEY` itself.
+    /// let ty = slots.encode_const(&parse_quote!(4), &parse_quote!(u64)).unwrap();
+    /// assert_eq!(
+    ///     ty,
+    ///     parse_quote!(*const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 4, Type = ()>)
+    /// );
+    /// let ty = slots.encode_const(&parse_quote!(5), &parse_quote!(u128)).unwrap();
+    /// assert_eq!(ty, parse_quote!(*const dyn crate::Repeater<(), 5, Type = ()>));
     /// // `usize` needs no slot: it is an array length.
     /// let ty = slots.encode_const(&parse_quote!(3), &parse_quote!(usize)).unwrap();
     /// assert_eq!(ty, parse_quote!([(); 3]));
@@ -163,8 +186,8 @@ impl RepeaterSlots {
         if prim == "usize" {
             return Ok(parse_quote!([(); #value]));
         }
-        if prim == "u64" {
-            return Ok(parse_quote!(*const dyn #repeater<(), #value, 0, Type = ()>));
+        if prim == "u128" {
+            return Ok(parse_quote!(*const dyn #repeater<(), #value, Type = ()>));
         }
         let position = REPEATER_SLOTS
             .iter()
@@ -173,6 +196,6 @@ impl RepeaterSlots {
         let defaults = REPEATER_SLOTS[..position]
             .iter()
             .map(|(_, _, default)| -> Expr { parse_str(default).unwrap() });
-        Ok(parse_quote!(*const dyn #repeater<(), 0, 0, #(#defaults,)* #value, Type = ()>))
+        Ok(parse_quote!(*const dyn #repeater<(), 0, #(#defaults,)* #value, Type = ()>))
     }
 }

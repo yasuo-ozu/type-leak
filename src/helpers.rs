@@ -37,8 +37,8 @@ pub enum ImplSelf<'a> {
     ///
     /// Cheaper than a blanket impl when there are many entries. The use site must write
     /// [`bucket_self(ix, id)`](Referrer::bucket_self) as the type of the path through the Repeater
-    /// (what `Self` stands for if it is `None`), or E0277. `id` is the Repeater's `ID`, or any
-    /// number that both macros know.
+    /// (what `Self` stands for if it is `None`), or E0277. `id` is the `id` of
+    /// [`repeater_key()`](crate::repeater_key), or any number that both macros know.
     Bucket {
         /// The number the type depends on.
         id: u64,
@@ -250,6 +250,7 @@ impl Referrer {
     /// let (impl_generics, _, where_clause) = r.generics.split_for_impl();
     /// let (self_ty, ty) = (&r.self_ty, &r.ty);
     /// let path = slots.trait_path(&r.args, 7, 0);
+    /// let key = repeater_key(7, 0);
     /// let imp: ItemImpl = parse_quote! {
     ///     impl #impl_generics #path for #self_ty #where_clause {
     ///         type Type = #ty;
@@ -258,7 +259,7 @@ impl Referrer {
     /// // `Self::Out` names `Self`: the implementor is bound by the trait, and replaces it.
     /// let expected: ItemImpl = parse_quote! {
     ///     impl<T, __S: ?::core::marker::Sized + Tr<T>>
-    ///         crate::Repeater<(T,), 7u64, 0usize> for __S
+    ///         crate::Repeater<(T,), #key> for __S
     ///     {
     ///         type Type = Wrap<T, <__S>::Out>;
     ///     }

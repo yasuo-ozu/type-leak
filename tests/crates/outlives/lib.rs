@@ -2085,27 +2085,27 @@ pub mod user {
 
         pub struct Alone(pub crate::m::Inner);
 
-        impl<'a, __S: ?Sized> crate::Repeater<(&'a (),), 0, 0> for __S {
+        impl<'a, __S: ?Sized> crate::Repeater<(&'a (),), 0> for __S {
             type Type = dyn crate::m::RelTr + 'a;
         }
 
         impl<'a> crate::m::ObjectDefaults<'a> for Alone {
             fn explicit(
                 &self,
-                x: Explicit<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type>,
-            ) -> Explicit<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type> {
+                x: Explicit<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type>,
+            ) -> Explicit<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type> {
                 crate::m::ObjectDefaults::<'a>::explicit(&self.0, x)
             }
             fn inferred(
                 &self,
-                x: Inferred<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type>,
-            ) -> Inferred<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type> {
+                x: Inferred<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type>,
+            ) -> Inferred<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type> {
                 crate::m::ObjectDefaults::<'a>::inferred(&self.0, x)
             }
             fn unrelated(
                 &self,
-                x: Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type>,
-            ) -> Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type> {
+                x: Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type>,
+            ) -> Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type> {
                 crate::m::ObjectDefaults::<'a>::unrelated(&self.0, x)
             }
             // The method with a lifetime of its own is not part of the point: as the original.

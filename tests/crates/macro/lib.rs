@@ -103,7 +103,7 @@ pub fn define_repeater(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
     quote!(#def).into()
 }
 
-/// Returns a deterministic ID of the trait, used as the Repeater's `ID`.
+/// Returns a deterministic ID of the trait, used in the Repeater's `KEY` (`repeater_key()`).
 fn trait_id(module: &Path, ident: &Ident) -> u64 {
     // FNV-1a
     let mut hash: u64 = 0xcbf29ce484222325;

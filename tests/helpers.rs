@@ -584,7 +584,7 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     assert_eq!(
         s(&args),
         t(parse_quote!((
-            *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
+            *const dyn crate::Repeater<(), 0, B, Type = ()>,
         )))
     );
 }
@@ -697,16 +697,17 @@ fn entry_args_with_the_defaults_completed() {
                 // ones before it.
                 let site = UseSite::substituting(&tr.generics.params, completed);
                 let args = referrer.entry_args(ix, &site, array_const).unwrap();
-                parse_quote!(<Self as crate::Repeater<#args, 1, #ix>>::Type)
+                slots().projection(&parse_quote!(Self), &args, 1, ix)
             },
         )
         .unwrap();
+    let key = repeater_key(1, 0);
     assert_eq!(
         completed.iter().map(s).collect::<Vec<_>>(),
         [
             "u8".to_string(),
             t(parse_quote!(
-                <Self as crate::Repeater<(u8,), 1, 0usize>>::Type
+                <Self as crate::Repeater<(u8,), #key>>::Type
             ))
         ]
     );

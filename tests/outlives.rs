@@ -14,7 +14,7 @@
 //! downstream macro emits is
 //!
 //! ```ignore
-//! impl<'a, T> Repeater<(&'a (), T, &'a T), ID, NTH> for S { type Type = Rel<'a, T>; }
+//! impl<'a, T> Repeater<(&'a (), T, &'a T), KEY> for S { type Type = Rel<'a, T>; }
 //! ```
 //!
 //! whose header encodes `'a` as `&'a ()`, `T` as `T` and the written bound as `&'a T`, which

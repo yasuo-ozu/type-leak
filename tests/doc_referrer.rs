@@ -288,18 +288,19 @@ fn with_self_replaces_self_with_the_marker_host() {
     let mut leaker = Leaker::new();
     let context = leaker.intern_trait(&tr, true);
     let mut sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>) -> Self::Out);
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     leaker
         .result()
         .finish()
         .unwrap()
-        .visitor(
-            context,
-            |_, ix| parse_quote!(<Marker<__S> as Repeater<#ix>>::Type),
-        )
+        .visitor(context, |_, ix| {
+            slots.projection(&parse_quote!(Marker<__S>), &parse_quote!(()), 7, ix)
+        })
         .with_self(parse_quote!(__S))
         .visit_signature_mut(&mut sig);
+    let key = repeater_key(7, 0);
     let expected: Signature =
-        parse_quote!(fn f(&self, x: <Marker<__S> as Repeater<0usize>>::Type) -> <__S>::Out);
+        parse_quote!(fn f(&self, x: <Marker<__S> as Repeater<(), #key>>::Type) -> <__S>::Out);
     assert_eq!(sig, expected);
 }
 
@@ -325,17 +326,21 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
         attrs: vec![],
         items: vec![Item::Struct(item)],
     };
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
+    let unit: Type = parse_quote!(());
     referrer
-        .visitor(module, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
+        .visitor(module, |_, ix| slots.projection(&unit, &unit, 7, ix))
         .with_nested_self(|nested, _leaked, ix| {
             let ident = nested.ident.as_ref().unwrap();
-            parse_quote!(<::leaker::m::#ident<T> as Repeater<#ix>>::Type)
+            let host = parse_quote!(::leaker::m::#ident<T>);
+            slots.projection(&host, &unit, 7, ix)
         })
         .visit_file_mut(&mut file);
+    let (key0, key1) = (repeater_key(7, 0), repeater_key(7, 1));
     let expected: File = parse_quote! {
         struct S<T> {
-            a: <() as Repeater<0usize>>::Type,
-            b: <::leaker::m::S<T> as Repeater<1usize>>::Type,
+            a: <() as Repeater<(), #key0>>::Type,
+            b: <::leaker::m::S<T> as Repeater<(), #key1>>::Type,
         }
     };
     assert_eq!(file, expected);
@@ -368,9 +373,10 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
     let imp: ItemImpl = parse_quote! {
         impl #generics #repeater for __S { type Type = #ty; }
     };
+    let key = repeater_key(7, 0);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S: ?::core::marker::Sized>
-            Repeater<(T,), 7u64, 0usize> for __S
+            Repeater<(T,), #key> for __S
         {
             type Type = Rel<T>;
         }
@@ -384,10 +390,9 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .visitor(
-            module,
-            |_, ix| parse_quote!(<() as Repeater<(), 7u64, #ix>>::Type),
-        )
+        .visitor(module, |_, ix| {
+            slots.projection(&parse_quote!(()), &parse_quote!(()), 7, ix)
+        })
         .with_nested_self(|_nested, _leaked, ix| {
             let args = referrer
                 .entry_args(ix, &UseSite::identity(), slots.const_fn())
@@ -400,7 +405,7 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         .visit_file_mut(&mut file);
     let expected: File = parse_quote! {
         struct S<T: ::core::convert::AsRef<Self>> {
-            a: <Self as Repeater<(T,), 7u64, 0usize>>::Type,
+            a: <Self as Repeater<(T,), #key>>::Type,
         }
     };
     assert_eq!(file, expected);

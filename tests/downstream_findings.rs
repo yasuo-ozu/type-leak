@@ -82,9 +82,10 @@ fn index(referrer: &Referrer, ty: Type) -> usize {
 }
 
 /// The Repeater impl of the entry `ix`, for any type `__S`, as a macro writes it from
-/// `Referrer::repeater_impl()`. The index is written `0usize` whatever it is: the impls are compared
-/// by what they declare.
+/// `Referrer::repeater_impl()`. The key is that of the entry 0 whatever the index is: the impls are
+/// compared by what they declare.
 fn impl_of(referrer: &Referrer, ix: usize) -> ItemImpl {
+    let key = repeater_key(7, 0);
     let param: Ident = parse_quote!(__S);
     let r = referrer
         .repeater_impl(ix, ImplSelf::Param(&param), array_const)
@@ -92,7 +93,7 @@ fn impl_of(referrer: &Referrer, ix: usize) -> ItemImpl {
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
     let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
     parse_quote! {
-        impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+        impl #impl_generics crate::Repeater<#args, #key> for #self_ty #where_clause {
             type Type = #ty;
         }
     }
@@ -123,6 +124,7 @@ fn impl_and_args(referrer: &Referrer, ty: Type) -> ItemImpl {
 /// `X: Clone`, and the consumer failed with E0277).
 #[test]
 fn a_methods_with_a_same_named_generic_get_the_bounds_of_their_own() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait T {
             fn f<X: Clone>(&self) -> inner::GC<X>;
@@ -133,7 +135,7 @@ fn a_methods_with_a_same_named_generic_get_the_bounds_of_their_own() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::GC<X>)),
         parse_quote! {
-            impl<X: Clone, __S: ?::core::marker::Sized> crate::Repeater<(X,), 7u64, 0usize> for __S {
+            impl<X: Clone, __S: ?::core::marker::Sized> crate::Repeater<(X,), #key> for __S {
                 type Type = inner::GC<X>;
             }
         }
@@ -141,7 +143,7 @@ fn a_methods_with_a_same_named_generic_get_the_bounds_of_their_own() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::G<X>)),
         parse_quote! {
-            impl<X, __S: ?::core::marker::Sized> crate::Repeater<(X,), 7u64, 0usize> for __S {
+            impl<X, __S: ?::core::marker::Sized> crate::Repeater<(X,), #key> for __S {
                 type Type = inner::G<X>;
             }
         }
@@ -161,6 +163,7 @@ fn a_methods_with_a_same_named_generic_get_the_bounds_of_their_own() {
 /// and the same type with the same generics in two methods is one.
 #[test]
 fn a_the_same_type_under_different_bounds_is_two_entries() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait T {
             fn f<X: Clone>(&self) -> inner::G<X>;
@@ -173,12 +176,12 @@ fn a_the_same_type_under_different_bounds_is_two_entries() {
         .collect();
     assert_eq!(impls.len(), 2, "{:?}", referrer.iter().collect::<Vec<_>>());
     assert!(impls.contains(&parse_quote! {
-        impl<X: Clone, __S: ?::core::marker::Sized> crate::Repeater<(X,), 7u64, 0usize> for __S {
+        impl<X: Clone, __S: ?::core::marker::Sized> crate::Repeater<(X,), #key> for __S {
             type Type = inner::G<X>;
         }
     }));
     assert!(impls.contains(&parse_quote! {
-        impl<X, __S: ?::core::marker::Sized> crate::Repeater<(X,), 7u64, 0usize> for __S {
+        impl<X, __S: ?::core::marker::Sized> crate::Repeater<(X,), #key> for __S {
             type Type = inner::G<X>;
         }
     }));
@@ -190,6 +193,7 @@ fn a_the_same_type_under_different_bounds_is_two_entries() {
 /// E0425).
 #[test]
 fn a_a_method_generic_named_like_a_relative_type_is_not_the_type() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait U {
             fn f<Local>(&self, x: Local);
@@ -200,7 +204,7 @@ fn a_a_method_generic_named_like_a_relative_type_is_not_the_type() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(Local)),
         parse_quote! {
-            impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
                 type Type = Local;
             }
         }
@@ -224,7 +228,7 @@ fn a_a_method_generic_named_like_a_relative_type_is_not_the_type() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::Wrap<Local>)),
         parse_quote! {
-            impl<Local, __S: ?::core::marker::Sized> crate::Repeater<(Local,), 7u64, 0usize> for __S {
+            impl<Local, __S: ?::core::marker::Sized> crate::Repeater<(Local,), #key> for __S {
                 type Type = inner::Wrap<Local>;
             }
         }
@@ -232,7 +236,7 @@ fn a_a_method_generic_named_like_a_relative_type_is_not_the_type() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(Local)),
         parse_quote! {
-            impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
                 type Type = Local;
             }
         }
@@ -246,6 +250,7 @@ fn a_a_method_generic_named_like_a_relative_type_is_not_the_type() {
 /// names only what it declares (the report: `V` was undeclared, E0425).
 #[test]
 fn one_a_bound_naming_another_parameter_brings_it_in() {
+    let key = repeater_key(7, 0);
     let referrer = struct_of(parse_quote! {
         struct BF<T: Into<V>, V>(pub inner::LocalG<T>, pub V);
     });
@@ -253,7 +258,7 @@ fn one_a_bound_naming_another_parameter_brings_it_in() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalG<T>)),
         parse_quote! {
-            impl<T: Into<V>, V, __S: ?::core::marker::Sized> crate::Repeater<(T, V), 7u64, 0usize> for __S {
+            impl<T: Into<V>, V, __S: ?::core::marker::Sized> crate::Repeater<(T, V), #key> for __S {
                 type Type = inner::LocalG<T>;
             }
         }
@@ -264,6 +269,7 @@ fn one_a_bound_naming_another_parameter_brings_it_in() {
 /// names the trait's `T`.
 #[test]
 fn one_a_method_bound_naming_a_trait_parameter_brings_it_in() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait Tr<T> {
             fn f<U: Into<T>>(&self, x: inner::LocalG<U>);
@@ -272,7 +278,7 @@ fn one_a_method_bound_naming_a_trait_parameter_brings_it_in() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalG<U>)),
         parse_quote! {
-            impl<T, U: Into<T>, __S: ?::core::marker::Sized> crate::Repeater<(T, U), 7u64, 0usize> for __S {
+            impl<T, U: Into<T>, __S: ?::core::marker::Sized> crate::Repeater<(T, U), #key> for __S {
                 type Type = inner::LocalG<U>;
             }
         }
@@ -291,13 +297,14 @@ fn one_a_method_bound_naming_a_trait_parameter_brings_it_in() {
 /// as an argument (`&'a T`), so the impl has no bound that names an undeclared lifetime.
 #[test]
 fn one_an_outlives_bound_is_encoded_with_its_lifetime() {
+    let key = repeater_key(7, 0);
     let referrer = struct_of(parse_quote! {
         struct S<'a, T: 'a>(pub inner::LocalG<T>, pub &'a u8);
     });
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalG<T>)),
         parse_quote! {
-            impl<'a, T, __S: ?::core::marker::Sized> crate::Repeater<(&'a (), T, &'a T), 7u64, 0usize> for __S {
+            impl<'a, T, __S: ?::core::marker::Sized> crate::Repeater<(&'a (), T, &'a T), #key> for __S {
                 type Type = inner::LocalG<T>;
             }
         }
@@ -310,13 +317,14 @@ fn one_an_outlives_bound_is_encoded_with_its_lifetime() {
 /// impl, so the carried type is well-formed there (the report: E0277 at the definer).
 #[test]
 fn two_the_where_clause_reaches_the_impl() {
+    let key = repeater_key(7, 0);
     let referrer = struct_of(parse_quote! {
         struct WC<T>(pub inner::LocalC<T>) where T: Clone;
     });
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalC<T>)),
         parse_quote! {
-            impl<T: Clone, __S: ?::core::marker::Sized> crate::Repeater<(T,), 7u64, 0usize> for __S {
+            impl<T: Clone, __S: ?::core::marker::Sized> crate::Repeater<(T,), #key> for __S {
                 type Type = inner::LocalC<T>;
             }
         }
@@ -328,7 +336,7 @@ fn two_the_where_clause_reaches_the_impl() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalC<T>)),
         parse_quote! {
-            impl<T, __S: ?::core::marker::Sized> crate::Repeater<(T,), 7u64, 0usize> for __S
+            impl<T, __S: ?::core::marker::Sized> crate::Repeater<(T,), #key> for __S
             where
                 Vec<T>: Clone
             {
@@ -345,6 +353,7 @@ fn two_the_where_clause_reaches_the_impl() {
 /// no generics, and `inner::LocalG<U>` has `U`.
 #[test]
 fn three_a_path_segment_named_like_a_generic_is_not_a_generic() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait MD {
             fn f<U>(&self, x: inner::LocalG<U>);
@@ -355,7 +364,7 @@ fn three_a_path_segment_named_like_a_generic_is_not_a_generic() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::U)),
         parse_quote! {
-            impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
                 type Type = inner::U;
             }
         }
@@ -363,7 +372,7 @@ fn three_a_path_segment_named_like_a_generic_is_not_a_generic() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalG<U>)),
         parse_quote! {
-            impl<U, __S: ?::core::marker::Sized> crate::Repeater<(U,), 7u64, 0usize> for __S {
+            impl<U, __S: ?::core::marker::Sized> crate::Repeater<(U,), #key> for __S {
                 type Type = inner::LocalG<U>;
             }
         }
@@ -378,7 +387,7 @@ fn three_a_path_segment_named_like_a_generic_is_not_a_generic() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::U::V)),
         parse_quote! {
-            impl<__S: ?::core::marker::Sized> crate::Repeater<(), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
                 type Type = inner::U::V;
             }
         }
@@ -389,6 +398,7 @@ fn three_a_path_segment_named_like_a_generic_is_not_a_generic() {
 /// generic of the same name: the entry does not use it, so the impl does not declare it.
 #[test]
 fn three_an_associated_name_is_not_a_generic() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait MD {
             type A;
@@ -399,7 +409,7 @@ fn three_an_associated_name_is_not_a_generic() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::Wrap<<Self>::A>)),
         parse_quote! {
-            impl<__S: ?::core::marker::Sized + MD> crate::Repeater<(), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized + MD> crate::Repeater<(), #key> for __S {
                 type Type = inner::Wrap<<__S>::A>;
             }
         }
@@ -412,6 +422,7 @@ fn three_an_associated_name_is_not_a_generic() {
 /// parameter of its own kind (the report: the impl declared the type parameter `N` for both, E0747).
 #[test]
 fn four_sibling_scopes_keep_the_kind_of_their_parameter() {
+    let key = repeater_key(7, 0);
     let referrer = trait_of(parse_quote! {
         trait Tr {
             fn f<N>(&self, x: inner::LocalG<N>);
@@ -422,7 +433,7 @@ fn four_sibling_scopes_keep_the_kind_of_their_parameter() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalG<N>)),
         parse_quote! {
-            impl<N, __S: ?::core::marker::Sized> crate::Repeater<(N,), 7u64, 0usize> for __S {
+            impl<N, __S: ?::core::marker::Sized> crate::Repeater<(N,), #key> for __S {
                 type Type = inner::LocalG<N>;
             }
         }
@@ -430,7 +441,7 @@ fn four_sibling_scopes_keep_the_kind_of_their_parameter() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::Arr<N>)),
         parse_quote! {
-            impl<__S: ?::core::marker::Sized, const N: usize> crate::Repeater<([(); N],), 7u64, 0usize> for __S {
+            impl<__S: ?::core::marker::Sized, const N: usize> crate::Repeater<([(); N],), #key> for __S {
                 type Type = inner::Arr<N>;
             }
         }
@@ -532,6 +543,7 @@ fn six_a_cyclic_bound_is_rejected_with_a_clear_error() {
 /// report says it is rejected; `type-leak` accepts it as long as no output names `'b`.)
 #[test]
 fn seven_a_binder_lifetime_is_declared_by_the_impl() {
+    let key = repeater_key(7, 0);
     let referrer = struct_of(parse_quote! {
         struct W<F>(pub F) where F: for<'b> Fn(inner::LocalL<'b>);
     });
@@ -539,7 +551,7 @@ fn seven_a_binder_lifetime_is_declared_by_the_impl() {
     assert_eq!(
         impl_and_args(&referrer, parse_quote!(inner::LocalL<'b>)),
         parse_quote! {
-            impl<'b, __S: ?::core::marker::Sized> crate::Repeater<(&'b (),), 7u64, 0usize> for __S {
+            impl<'b, __S: ?::core::marker::Sized> crate::Repeater<(&'b (),), #key> for __S {
                 type Type = inner::LocalL<'b>;
             }
         }
@@ -705,6 +717,7 @@ fn twelve_a_bare_relaxed_sized_is_accepted_in_every_position() {
 /// the generic declares it.
 #[test]
 fn twelve_a_relaxed_bound_is_copied_as_written() {
+    let key = repeater_key(7, 0);
     let mut leaker = Leaker::new();
     let item: ItemTrait = parse_quote! {
         trait A<T: ?Sized> where T: ::core::fmt::Debug { fn f(&self, t: &Wrap<T>); }
@@ -721,7 +734,7 @@ fn twelve_a_relaxed_bound_is_copied_as_written() {
         impl_and_args(&referrer, parse_quote!(Wrap<T>)),
         parse_quote! {
             impl<T: ::core::fmt::Debug + ?Sized, __S: ?::core::marker::Sized>
-                crate::Repeater<(*const T,), 7u64, 0usize> for __S
+                crate::Repeater<(*const T,), #key> for __S
             {
                 type Type = Wrap<T>;
             }

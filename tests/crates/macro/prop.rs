@@ -81,7 +81,7 @@ use type_leak::*;
 /// Arguments of `#[prop_leak(..)]`.
 #[derive(Clone)]
 pub(crate) struct Args {
-    /// The `ID` of the Repeater, the index of the item in the Leaker's crate.
+    /// The `ID` of the Repeater's `KEY`, the index of the item in the Leaker's crate.
     id: u64,
     allow_self: bool,
     /// Allow the names of the standard prelude (`Vec`, `Option`, `Clone`, ...).
@@ -6604,7 +6604,7 @@ mod tests {
         Some(quote!(#found).to_string().replace(' ', ""))
     }
 
-    const ENTRY: &str = "<() as ::krate::Repeater<(), 0, 0>>::Type";
+    const ENTRY: &str = "<() as ::krate::Repeater<(), 0>>::Type";
 
     #[test]
     fn a_mode_trusts_an_entry_if_it_trusts_every_crate_the_entry_names() {
@@ -6715,11 +6715,14 @@ mod tests {
             let item: Item = parse_str(&src).unwrap();
             header_cycles(&header_position(&item, &args).unwrap())
         };
-        let (with_args, no_args) = (
-            "<u8 as ::k::Repeater<(T,), 1, 2>>::Type",
-            "<u8 as ::k::Repeater<(), 1, 2>>::Type",
-        );
-        let entry_bound = "AsRef<<u64 as ::k::Repeater<(), 1, 1>>::Type>";
+        // The projection of the entry `ix` of the Leaker 1, through `::k::Repeater`.
+        let entry = |host: &str, args: &str, ix: usize| {
+            let key = repeater_key(1, ix);
+            format!("<{} as ::k::Repeater<{}, {}>>::Type", host, args, key)
+        };
+        let (with_args, no_args) = (entry("u8", "(T,)", 2), entry("u8", "()", 2));
+        let entry_bound = format!("AsRef<{}>", entry("u64", "()", 1));
+        let (with_args, no_args, entry_bound) = (&*with_args, &*no_args, &*entry_bound);
         assert!(cycles(entry_bound, with_args));
         // A bound on a generic that the entry is not given does not matter, a where predicate does.
         let other = |generics: &str, where_clause: &str| {
@@ -6732,12 +6735,15 @@ mod tests {
         };
         assert!(!other(&format!("U: {}", entry_bound), ""));
         assert!(other("U", &format!("where T: {}", entry_bound)));
-        assert!(other("U", "where Vec<(T, <u64 as ::k::Repeater<(), 1, 1>>::Type)>: Clone"));
+        let vec_entry = format!("where Vec<(T, {})>: Clone", entry("u64", "()", 1));
+        assert!(other("U", &vec_entry));
         // The associated types are taken as they are, and so are the bounds without an entry.
-        assert!(!cycles("Iterator<Item = <u16 as ::k::Repeater<(), 1, 3>>::Type>", with_args));
+        let item = format!("Iterator<Item = {}>", entry("u16", "()", 3));
+        assert!(!cycles(&item, with_args));
         assert!(!cycles("AsRef<Vec<u8>>", with_args));
         assert!(!cycles(entry_bound, no_args));
         // But the inputs of `Fn` are arguments.
-        assert!(cycles("Fn(<u16 as ::k::Repeater<(), 1, 3>>::Type) -> u8", with_args));
+        let call = format!("Fn({}) -> u8", entry("u16", "()", 3));
+        assert!(cycles(&call, with_args));
     }
 }

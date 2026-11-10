@@ -1643,12 +1643,13 @@ fn f12_copy_with<A: Allow>(
     let referrer = leaker.result().finish()?;
     let root_args: Vec<GenericArgument> = item.generics.params.iter().map(param_arg).collect();
     let mut copy = item.clone();
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     referrer
         .visitor(context, |_, ix| {
             let site = UseSite::substituting(&item.generics.params, &root_args)
                 .with_self(parse_quote!(()));
             let encoded = referrer.entry_args(ix, &site, array_const).unwrap();
-            parse_quote!(<() as crate::Repeater<#encoded, 0, #ix>>::Type)
+            slots.projection(&parse_quote!(()), &encoded, 0, ix)
         })
         .visit_item_trait_mut(&mut copy);
     Ok((referrer.iter().map(string).collect(), copy))
@@ -4665,11 +4666,12 @@ fn repeater_impl_text(referrer: &Referrer, ix: usize) -> String {
     let r = referrer
         .repeater_impl(ix, ImplSelf::Param(&param), array_const)
         .unwrap_or_else(|e| panic!("{}", e));
-    let repeater: Path = parse_quote!(crate::Repeater);
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater = slots.trait_path(&r.args, 0, 0);
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-    let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    let (self_ty, ty) = (&r.self_ty, &r.ty);
     let impl_: ItemImpl = parse_quote! {
-        impl #impl_generics #repeater<#args, 0u64, 0usize> for #self_ty #where_clause {
+        impl #impl_generics #repeater for #self_ty #where_clause {
             type Type = #ty;
         }
     };
@@ -4790,7 +4792,7 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     assert_eq!(
         repeater_impl_text(&referrer, ix),
         "impl < T : Iterator < Item = u8 > , __S : ? :: core :: marker :: Sized > crate :: \
-         Repeater < (T ,) , 0u64 , 0usize > for __S { type Type = Rel < T > ; }"
+         Repeater < (T ,) , 0u128 > for __S { type Type = Rel < T > ; }"
     );
     assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
     assert_eq!(
@@ -8612,15 +8614,18 @@ fn f37_the_impl_is_sized_only_where_the_bounds_need_it() {
         .repeater_impl(0, ImplSelf::Param(&param), array_const)
         .unwrap();
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-    let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    let (self_ty, ty) = (&r.self_ty, &r.ty);
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater = slots.trait_path(&r.args, 7, 0);
     let imp: ItemImpl = parse_quote! {
-        impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+        impl #impl_generics #repeater for #self_ty #where_clause {
             type Type = #ty;
         }
     };
+    let key = repeater_key(7, 0);
     let expected: ItemImpl = parse_quote! {
         impl<T: ::core::convert::AsRef<__S>, __S: ?::core::marker::Sized>
-            crate::Repeater<(T,), 7u64, 0usize> for __S
+            crate::Repeater<(T,), #key> for __S
         {
             type Type = Rel<T>;
         }
@@ -8664,11 +8669,11 @@ fn f37_the_copy_passes_its_own_type() {
     let (context, ()) = leaker.enter_mod("m", names(&["S"]), |view| view.visit_item(&item));
     let referrer = leaker.result().finish().unwrap();
     let mut copy = file_of(vec![item.clone()]);
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     referrer
-        .visitor(
-            context,
-            |_, ix| parse_quote!(<() as Repeater<(), 7u64, #ix>>::Type),
-        )
+        .visitor(context, |_, ix| {
+            slots.projection(&parse_quote!(()), &parse_quote!(()), 7, ix)
+        })
         .with_nested_self(|_, _, ix| {
             let self_ty: Type = match referrer.context_self(referrer.context(ix)) {
                 Some(SelfRequirement::Any) => parse_quote!(Self),
@@ -8681,18 +8686,24 @@ fn f37_the_copy_passes_its_own_type() {
                     array_const,
                 )
                 .unwrap();
-            parse_quote!(<#self_ty as Repeater<#args, 7u64, #ix>>::Type)
+            slots.projection(&self_ty, &args, 7, ix)
         })
         .visit_file_mut(&mut copy);
     let text = string(&copy.items[0]);
     assert!(
-        text.contains("b : < Self as Repeater < (T ,) , 7u64 , 0usize > > :: Type"),
+        text.contains(&format!(
+            "b : < Self as Repeater < (T ,) , {} > > :: Type",
+            string(&repeater_key(7, 0))
+        )),
         "{}",
         text
     );
     let c = entry(&referrer, "Wrap < U >");
     assert!(
-        text.contains(&format!("c : < () as Repeater < () , 7u64 , {}usize", c)),
+        text.contains(&format!(
+            "c : < () as Repeater < () , {} > > :: Type",
+            string(&repeater_key(7, c))
+        )),
         "{}",
         text
     );
@@ -9586,12 +9597,16 @@ fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_
     let (context, ()) = leaker.enter_mod("m", names(&["Tr"]), |view| view.visit_item(&item));
     let referrer = leaker.result().finish().unwrap();
     let mut file = file_of(vec![item.clone()]);
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     referrer
-        .visitor(context, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
+        .visitor(context, |_, ix| {
+            slots.projection(&parse_quote!(()), &parse_quote!((T,)), 7, ix)
+        })
         .with_nested_self(|_, _, _| unreachable!())
         .visit_file_mut(&mut file);
+    let key = repeater_key(7, 0);
     let expected: Item = parse_quote!(
-        pub trait Tr<T: ::core::convert::AsRef<Self>, U = <() as Repeater<0usize>>::Type> {
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = <() as Repeater<(T,), #key>>::Type> {
             fn f(&self, u: U);
         }
     );
@@ -10926,14 +10941,17 @@ fn f41_a_default_that_needs_self_only_through_a_bound_is_accepted() {
         .repeater_impl(0, ImplSelf::Param(&param), array_const)
         .unwrap();
     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-    let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    let (self_ty, ty) = (&r.self_ty, &r.ty);
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let repeater = slots.trait_path(&r.args, 7, 0);
     let imp: ItemImpl = parse_quote! {
-        impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+        impl #impl_generics #repeater for #self_ty #where_clause {
             type Type = #ty;
         }
     };
+    let key = repeater_key(7, 0);
     let expected: ItemImpl = parse_quote! {
-        impl<T: Clone, __S: ?::core::marker::Sized> crate::Repeater<(T,), 7u64, 0usize> for __S {
+        impl<T: Clone, __S: ?::core::marker::Sized> crate::Repeater<(T,), #key> for __S {
             type Type = Wrap<T>;
         }
     };
@@ -10974,17 +10992,18 @@ fn f41_the_copy_writes_an_ordinary_default() {
     let args = referrer
         .entry_args(0, &UseSite::identity(), array_const)
         .unwrap();
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     referrer
-        .visitor(
-            context,
-            |_, ix| parse_quote!(<() as Repeater<#args, 7u64, #ix>>::Type),
-        )
+        .visitor(context, |_, ix| {
+            slots.projection(&parse_quote!(()), &args, 7, ix)
+        })
         .visit_file_mut(&mut file);
     // (Parsed from text: a formatter would add a comma after the last generic.)
-    let expected: Item = parse_str(
+    let expected: Item = parse_str(&format!(
         "pub struct S<T: Clone + ::core::convert::AsRef<Self>, \
-         U = <() as Repeater<(T,), 7u64, 0usize>>::Type>(pub T, pub U);",
-    )
+         U = <() as Repeater<(T,), {}>>::Type>(pub T, pub U);",
+        string(&repeater_key(7, 0))
+    ))
     .unwrap();
     assert_eq!(string(&file.items[0]), string(&expected));
 }
@@ -11110,7 +11129,7 @@ fn nested_self_leaker() -> Leaker<impl Allow> {
 }
 
 /// The items of F42, with the name of the item, the type of the entry, and its Repeater's impl (with
-/// `IX` for the index of the entry): the items of `f37_rejected()` and the others that F37 rejected.
+/// `KEY` for the key of the entry): the items of `f37_rejected()` and the others that F37 rejected.
 /// The entry is for any type that the bounds hold for; `Self` is the parameter in the type too, and
 /// the generics of the item that the type does not use are not in the impl (`U`).
 fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
@@ -11123,7 +11142,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
             ),
             "S",
             "Rel2 < Self , T >",
-            "impl<T: ::core::convert::AsRef<__S>, __S> crate::Repeater<(T,), 7u64, IX> for __S {
+            "impl<T: ::core::convert::AsRef<__S>, __S> crate::Repeater<(T,), KEY> for __S {
                 type Type = Rel2<__S, T>;
             }",
         ),
@@ -11136,7 +11155,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
             ),
             "E",
             "Rel < Self >",
-            "impl<__S> crate::Repeater<(), 7u64, IX> for __S {
+            "impl<__S> crate::Repeater<(), KEY> for __S {
                 type Type = Rel<__S>;
             }",
         ),
@@ -11148,7 +11167,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
             ),
             "S",
             "Rel2 < Self >",
-            "impl<__S> crate::Repeater<(), 7u64, IX> for __S {
+            "impl<__S> crate::Repeater<(), KEY> for __S {
                 type Type = Rel2<__S>;
             }",
         ),
@@ -11160,7 +11179,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
             ),
             "Un",
             "Rel2 < Self , T >",
-            "impl<T: ::core::convert::AsRef<__S> + Copy, __S> crate::Repeater<(T,), 7u64, IX> for __S {
+            "impl<T: ::core::convert::AsRef<__S> + Copy, __S> crate::Repeater<(T,), KEY> for __S {
                 type Type = Rel2<__S, T>;
             }",
         ),
@@ -11174,7 +11193,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
             ),
             "S",
             "Rel2 < Self , T >",
-            "impl<T: ::core::convert::AsRef<__S>, __S> crate::Repeater<(T,), 7u64, IX> for __S {
+            "impl<T: ::core::convert::AsRef<__S>, __S> crate::Repeater<(T,), KEY> for __S {
                 type Type = Rel2<__S, T>;
             }",
         ),
@@ -11191,7 +11210,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
             ),
             "E",
             "Rel < Self >",
-            "impl<__S> crate::Repeater<(), 7u64, IX> for __S where __S: Sized {
+            "impl<__S> crate::Repeater<(), KEY> for __S where __S: Sized {
                 type Type = Rel<__S>;
             }",
         ),
@@ -11259,15 +11278,16 @@ fn f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it() {
                 .unwrap();
             assert_eq!(r.self_ty, parse_quote!(__S), "{}", what);
             let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-            let (args, self_ty, r_ty) = (&r.args, &r.self_ty, &r.ty);
-            let ix_lit = proc_macro2::Literal::usize_suffixed(ix);
+            let (self_ty, r_ty) = (&r.self_ty, &r.ty);
+            let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+            let repeater = slots.trait_path(&r.args, 7, ix);
             let imp: ItemImpl = parse_quote! {
-                impl #impl_generics crate::Repeater<#args, 7u64, #ix_lit> for #self_ty #where_clause {
+                impl #impl_generics #repeater for #self_ty #where_clause {
                     type Type = #r_ty;
                 }
             };
-            let expected: ItemImpl =
-                syn::parse_str(&expected.replace("IX", &format!("{}usize", ix))).unwrap();
+            let key = string(&repeater_key(7, ix));
+            let expected: ItemImpl = syn::parse_str(&expected.replace("KEY", &key)).unwrap();
             assert_eq!(string(&imp), string(&expected), "{}", what);
             // A marker is not what the copy has the bound for.
             assert!(
@@ -11331,11 +11351,11 @@ fn f42_the_copy_passes_its_own_type() {
     let (context, ()) = leaker.enter_mod("m", names(&["S"]), |view| view.visit_item(&item));
     let referrer = leaker.result().finish().unwrap();
     let mut copy = file_of(vec![item.clone()]);
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     referrer
-        .visitor(
-            context,
-            |_, ix| parse_quote!(<() as Repeater<(), 7u64, #ix>>::Type),
-        )
+        .visitor(context, |_, ix| {
+            slots.projection(&parse_quote!(()), &parse_quote!(()), 7, ix)
+        })
         .with_nested_self(|_, _, ix| {
             let self_ty: Type = match referrer.context_self(referrer.context(ix)) {
                 Some(SelfRequirement::Any) => parse_quote!(Self),
@@ -11348,12 +11368,13 @@ fn f42_the_copy_passes_its_own_type() {
                     array_const,
                 )
                 .unwrap();
-            parse_quote!(<#self_ty as Repeater<#args, 7u64, #ix>>::Type)
+            slots.projection(&self_ty, &args, 7, ix)
         })
         .visit_file_mut(&mut copy);
+    let key = repeater_key(7, 0);
     let expected: Item = parse_quote!(
         pub struct S<T: ::core::convert::AsRef<Self>> {
-            pub b: <Self as Repeater<(T,), 7u64, 0usize>>::Type,
+            pub b: <Self as Repeater<(T,), #key>>::Type,
         }
     );
     assert_eq!(string(&copy.items[0]), string(&expected));
@@ -14314,12 +14335,10 @@ fn f61_complete_args_looks_the_default_up_in_the_module_of_the_trait() {
 
 /// F62 (fixed): macros wrote the Repeater with its arguments by hand, `impl .. Repeater<#args, #id,
 /// #ix> for ..` and `<X as Repeater<#args, #id, #ix>>::Type`, so a change of the parameters of the
-/// Repeater (a planned follow-up merges `ID` and `NTH` into one key) breaks them, in the crates of
-/// their users.
+/// Repeater (`ID` and `NTH` became one `KEY`) breaks them, in the crates of their users.
 ///
-/// Fix: `RepeaterSlots::trait_path()` and `projection()` write them: `Repeater<args, IDu64,
-/// IXusize>` with the suffixes that macros wrote, for the path that `RepeaterSlots::new()` was
-/// given.
+/// Fix: `RepeaterSlots::trait_path()` and `projection()` write them: `Repeater<args, KEY>` with the
+/// `u128` literal `repeater_key(id, ix)`, for the path that `RepeaterSlots::new()` was given.
 #[test]
 fn f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand() {
     let args: Type = parse_quote!((&'a (), T, [(); N], &'a T));
@@ -14333,13 +14352,14 @@ fn f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand() {
         let slots = RepeaterSlots::new(parse_str(repeater).unwrap());
         let repeater = slots.repeater();
         for (id, ix) in [(7u64, 3usize), (0, 0), (u64::MAX, 1000)] {
-            // As the macros wrote them, through the types of `id` and `ix`.
-            let by_hand = quote!(#repeater<#args, #id, #ix>);
+            // As a macro writes them by hand, with the key of `id` and `ix`.
+            let key = repeater_key(id, ix);
+            let by_hand = quote!(#repeater<#args, #key>);
             assert_eq!(
                 slots.trait_path(&args, id, ix),
                 parse2::<Path>(by_hand).unwrap()
             );
-            let by_hand = quote!(<#host as #repeater<#args, #id, #ix>>::Type);
+            let by_hand = quote!(<#host as #repeater<#args, #key>>::Type);
             assert_eq!(
                 slots.projection(&host, &args, id, ix),
                 parse2::<Type>(by_hand).unwrap()
@@ -14348,13 +14368,14 @@ fn f62_the_repeater_path_and_the_projection_are_what_a_macro_wrote_by_hand() {
     }
     // As the tokens a test writes.
     let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let key = repeater_key(7, 3);
     assert_eq!(
         slots.trait_path(&args, 7, 3),
-        parse_quote!(crate::Repeater<(&'a (), T, [(); N], &'a T), 7u64, 3usize>)
+        parse_quote!(crate::Repeater<(&'a (), T, [(); N], &'a T), #key>)
     );
     assert_eq!(
         slots.projection(&parse_quote!(Self), &args, 7, 3),
-        parse_quote!(<Self as crate::Repeater<(&'a (), T, [(); N], &'a T), 7u64, 3usize>>::Type)
+        parse_quote!(<Self as crate::Repeater<(&'a (), T, [(); N], &'a T), #key>>::Type)
     );
 }
 
@@ -14388,8 +14409,9 @@ fn f62_the_impl_written_through_the_path_is_the_impl_written_by_hand() {
             };
             let (impl_generics, _, where_clause) = r.generics.split_for_impl();
             let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+            let key = repeater_key(id, ix);
             let by_hand: ItemImpl = parse_quote! {
-                impl #impl_generics crate::Repeater<#args, #id, #ix> for #self_ty #where_clause {
+                impl #impl_generics crate::Repeater<#args, #key> for #self_ty #where_clause {
                     type Type = #ty;
                 }
             };
@@ -15767,8 +15789,10 @@ fn f70_copy(item: &ItemStruct, args: &[&str], self_ty: Option<Type>) -> ItemStru
 fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_lifetimes_into_its_inputs(
 ) {
     // The path through the Repeater, at the site `T := &'static str`, and at `T := u8`.
-    let p = "<Self as crate::Repeater<(&'static str,), 7u64, 0usize>>::Type";
-    let p_u8 = "<Self as crate::Repeater<(u8,), 7u64, 0usize>>::Type";
+    let key = string(&repeater_key(7, 0));
+    let projection = |args: &str| format!("<Self as crate::Repeater<({},), {}>>::Type", args, key);
+    let p = &projection("&'static str");
+    let p_u8 = &projection("u8");
     let same =
         |generics: &str, field: &str, args: &[&str], self_ty: Option<&str>, expected: &str| {
             let item: ItemStruct =
@@ -15891,7 +15915,7 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
         "fn(&::std::vec::Vec<T>) -> &u8",
         &["&str"],
         None,
-        "fn(&<Self as crate::Repeater<(&str,), 7u64, 0usize>>::Type) -> &u8",
+        &format!("fn(&{}) -> &u8", projection("&str")),
     );
 
     // `complete_args()` writes the path for the entry of a default the same way.

@@ -14,6 +14,7 @@
 //! one from it), so a rewrite which does not give the original type fails the build of this test.
 //! The tests here read what the macros reported and what they wrote.
 
+use type_leak::repeater_key;
 use type_leak_test_leaker::m::{
     Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault, RelType,
 };
@@ -237,6 +238,36 @@ use std::marker::PhantomData;
 /// Removes the whitespace of tokens printed by a compiler, which depends on its version.
 fn squash(text: &str) -> String {
     text.split_whitespace().collect()
+}
+
+/// The `KEY` of the entry `nth` of the Leaker `id`, as the tokens write it (and `squash()` leaves it).
+fn key_text(id: u64, nth: usize) -> String {
+    format!("{}u128", repeater_key(id, nth))
+}
+
+/// `repeater_key(id, nth)` in a type, where the argument of a path is a const expression.
+const fn key(id: u64, nth: usize) -> u128 {
+    ((id as u128) << 64) | nth as u128
+}
+
+#[test]
+fn the_const_key_is_the_key_of_the_library() {
+    for (id, nth) in [(0, 0), (7, 3), (9209, 2), (u64::MAX, usize::MAX)] {
+        assert_eq!(key(id, nth), repeater_key(id, nth));
+    }
+}
+
+/// The `(id, nth)` of each `Repeater<(), KEY>` in the squashed `text`, in order.
+fn repeater_keys(text: &str) -> Vec<(u64, usize)> {
+    text.split("Repeater<(),")
+        .skip(1)
+        .map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            assert!(rest[digits.len()..].starts_with("u128>"), "{}", rest);
+            let key: u128 = digits.parse().unwrap();
+            ((key >> 64) as u64, (key & u128::from(u64::MAX)) as usize)
+        })
+        .collect()
 }
 
 /// A type equality witness: compiles only if both are the same type.
@@ -1807,7 +1838,11 @@ fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not()
     // Trusting: `Ext<(RelX,)>` is the required entry 0, replaced as a whole; the plain `Ext<u8>` is
     // an optional one, which it leaves.
     assert!(trusting.contains("x:<Wrapperas$crate::Repeater<(),"));
-    assert!(trusting.contains("0usize>>::Type,y:::type_leak_test_ext::Ext<u8>"));
+    assert!(trusting.contains("u128>>::Type,y:::type_leak_test_ext::Ext<u8>"));
+    let keys = repeater_keys(&trusting);
+    assert_eq!(keys.len(), 1, "{}", trusting);
+    let (id, nth) = keys[0];
+    assert_eq!(nth, 0);
     assert_eq!(trusting.matches("type_leak_test_ext").count(), 1);
     assert_eq!(trusting.matches("Repeater<").count(), 1);
 
@@ -1815,8 +1850,9 @@ fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not()
     // 1), and the crate is not named at all.
     assert!(!strict.contains("type_leak_test_ext"));
     assert!(strict.contains("x:<Wrapperas$crate::Repeater<(),"));
-    assert!(strict.contains("0usize>>::Type,y:<Wrapperas$crate::Repeater<(),"));
-    assert!(strict.ends_with("1usize>>::Type){}"));
+    assert!(strict.contains("u128>>::Type,y:<Wrapperas$crate::Repeater<(),"));
+    assert!(strict.ends_with("u128>>::Type){}"));
+    assert_eq!(repeater_keys(&strict), [(id, 0), (id, 1)]);
     assert_eq!(strict.matches("Repeater<").count(), 2);
     assert_ne!(trusting, strict);
 }
@@ -1848,15 +1884,18 @@ fn the_scope_api_with_a_marker() {
     assert_eq!(
         self_ty,
         format!(
-            "::type_leak_test_leaker::scoped::Holder<T,{}(),7001u64,0usize>>::Type>",
-            marker
+            "::type_leak_test_leaker::scoped::Holder<T,{}(),{}>>::Type>",
+            marker,
+            key_text(7001, 0)
         )
     );
     assert_eq!(
         trait_path,
         format!(
-            "::type_leak_test_leaker::scoped::Tr<{m}(T,),7001u64,1usize>>::Type,{m}(&'a(),),7001u64,2usize>>::Type>",
-            m = marker
+            "::type_leak_test_leaker::scoped::Tr<{m}(T,),{k1}>>::Type,{m}(&'a(),),{k2}>>::Type>",
+            m = marker,
+            k1 = key_text(7001, 1),
+            k2 = key_text(7001, 2)
         )
     );
     // The impls: the entry without generics is plain, the others declare what they use (and the
@@ -1867,9 +1906,15 @@ fn the_scope_api_with_a_marker() {
             .map(squash)
             .collect::<Vec<_>>(),
         [
-            "implcrate::Repeater<(),7001u64,0usize>forM7001",
-            "impl<T:::core::clone::Clone>crate::Repeater<(T,),7001u64,1usize>forM7001",
-            "impl<'a>crate::Repeater<(&'a(),),7001u64,2usize>forM7001",
+            format!("implcrate::Repeater<(),{}>forM7001", key_text(7001, 0)),
+            format!(
+                "impl<T:::core::clone::Clone>crate::Repeater<(T,),{}>forM7001",
+                key_text(7001, 1)
+            ),
+            format!(
+                "impl<'a>crate::Repeater<(&'a(),),{}>forM7001",
+                key_text(7001, 2)
+            ),
         ]
     );
     // The types that were visited, one by one.
@@ -1880,9 +1925,9 @@ fn the_scope_api_with_a_marker() {
             .collect::<Vec<_>>(),
         vec![
             "T".to_string(), // never replaced: it is the generic of the impl
-            format!("{}(),7001u64,0usize>>::Type", marker),
-            format!("{}(T,),7001u64,1usize>>::Type", marker),
-            format!("{}(&'a(),),7001u64,2usize>>::Type", marker),
+            format!("{}(),{}>>::Type", marker, key_text(7001, 0)),
+            format!("{}(T,),{}>>::Type", marker, key_text(7001, 1)),
+            format!("{}(&'a(),),{}>>::Type", marker, key_text(7001, 2)),
         ]
     );
 }
@@ -1899,10 +1944,12 @@ fn the_scope_api_with_self() {
     // `Wrap<Self>` is in the impl of the self type itself, `Rel<T>` in the marker's.
     assert_eq!(
         trait_path,
-        concat!(
-            "::type_leak_test_leaker::scoped::Tr<",
-            "<::type_leak_test_leaker::scoped::Holder<T,u8>as::type_leak_test_leaker::Repeater<(T,),7002u64,0usize>>::Type,",
-            "<::type_leak_test_leaker::scoped::M7002as::type_leak_test_leaker::Repeater<(T,),7002u64,1usize>>::Type>"
+        format!(
+            "::type_leak_test_leaker::scoped::Tr<\
+             <::type_leak_test_leaker::scoped::Holder<T,u8>as::type_leak_test_leaker::Repeater<(T,),{}>>::Type,\
+             <::type_leak_test_leaker::scoped::M7002as::type_leak_test_leaker::Repeater<(T,),{}>>::Type>",
+            key_text(7002, 0),
+            key_text(7002, 1)
         )
     );
     assert_eq!(
@@ -1911,8 +1958,14 @@ fn the_scope_api_with_self() {
             .map(squash)
             .collect::<Vec<_>>(),
         [
-            "impl<T:::core::clone::Clone>crate::Repeater<(T,),7002u64,0usize>forcrate::scoped::Holder<T,u8>",
-            "impl<T:::core::clone::Clone>crate::Repeater<(T,),7002u64,1usize>forM7002",
+            format!(
+                "impl<T:::core::clone::Clone>crate::Repeater<(T,),{}>forcrate::scoped::Holder<T,u8>",
+                key_text(7002, 0)
+            ),
+            format!(
+                "impl<T:::core::clone::Clone>crate::Repeater<(T,),{}>forM7002",
+                key_text(7002, 1)
+            ),
         ]
     );
     // The self type has nothing to replace.
@@ -1948,7 +2001,10 @@ fn the_scope_api_writes_the_impls_that_are_needed() {
     );
     assert_eq!(
         squash(type_leak_test_leaker::__scope_impls_7006!()),
-        "impl<T>crate::Repeater<(T,),7006u64,0usize>forM7006where::std::vec::Vec<T>:::core::clone::Clone"
+        format!(
+            "impl<T>crate::Repeater<(T,),{}>forM7006where::std::vec::Vec<T>:::core::clone::Clone",
+            key_text(7006, 0)
+        )
     );
     // Without `all`, a required entry next to an optional one gets the impl of the required one only.
     assert_eq!(
@@ -2157,11 +2213,12 @@ fn a_part_with_no_context_is_left_as_written() {
     );
     assert_eq!(
         squash(r::NESTED_9199_TYPES),
-        squash(
+        squash(&format!(
             "::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr> ;; \
              ::type_leak_test_leaker::kinds::Bare<<() as ::type_leak_test_leaker::Repeater<(), \
-             9199u64, 0usize>>::Type>"
-        )
+             {}>>::Type>",
+            key_text(9199, 0)
+        ))
     );
 }
 
@@ -2353,11 +2410,11 @@ fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
     // type that `Referrer::bucket_self(ix, id)` gives (the bucket is part of the format, so these
     // do not change without a bump of `Referrer::FORMAT_VERSION`). `Wrap<Self>` has none.
     assert_eq!(
-        type_name::<<u64 as Repeater<(), 9209, 1>>::Type>(),
+        type_name::<<u64 as Repeater<(), { key(9209, 1) }>>::Type>(),
         type_name::<l::kinds::Defd2<l::kinds::Rel, u8>>()
     );
     assert_eq!(
-        type_name::<<str as Repeater<(), 9209, 2>>::Type>(),
+        type_name::<<str as Repeater<(), { key(9209, 2) }>>::Type>(),
         type_name::<l::kinds::Rel>()
     );
 }
@@ -2383,7 +2440,7 @@ fn a_marker_is_for_the_entries_that_do_not_need_self_and_the_host_for_the_others
     );
     // `Rel` is for the marker.
     assert_eq!(
-        type_name::<<l::kinds::Marker9210 as Repeater<(), 9210, 0>>::Type>(),
+        type_name::<<l::kinds::Marker9210 as Repeater<(), { key(9210, 0) }>>::Type>(),
         type_name::<l::kinds::Rel>()
     );
 }
@@ -2690,5 +2747,53 @@ fn an_elided_output_is_named_where_the_entry_that_replaces_a_type_names_a_lifeti
         ok("struct", 2, 2, 2),
         "{}",
         __tl_report_9235!()
+    );
+}
+
+/// Fixture 9236: const generics of type `u64` and `u128` in the arguments of the Repeater. The
+/// slots put a `u128` into `KEY` (so the entry that uses only it has the argument `(*const dyn
+/// Repeater<(), M, Type = ()>,)`) and a `u64` into the slot `U64`; the Referrer's crate compiles
+/// the copy, which writes the same arguments.
+#[test]
+fn const_generics_of_type_u64_and_u128_use_the_slots() {
+    use std::any::type_name;
+    use type_leak_test_leaker as l;
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9236, __tl_report_9236!()),
+        ok("struct", 4, 4, 4),
+        "{}",
+        __tl_report_9236!()
+    );
+    // The entries are for the marker, in the order of the fields. `N` is `5` and `M` is `7`; the
+    // first entry has the argument of `M` before that of `N`.
+    type Marker = l::kinds::Marker9236;
+    assert_eq!(
+        type_name::<
+            <Marker as Repeater<
+                (
+                    *const dyn Repeater<(), 7, Type = ()>,
+                    *const dyn Repeater<(), 0, false, '\0', 0, 0, 0, 5, Type = ()>,
+                ),
+                { key(9236, 0) },
+            >>::Type,
+        >(),
+        type_name::<l::kinds::Keyed<5, 7>>()
+    );
+    assert_eq!(
+        type_name::<
+            <Marker as Repeater<
+                (*const dyn Repeater<(), 0, false, '\0', 0, 0, 0, 5, Type = ()>,),
+                { key(9236, 1) },
+            >>::Type,
+        >(),
+        type_name::<l::kinds::Wrap<l::kinds::Keyed<5, 0>>>()
+    );
+    assert_eq!(
+        type_name::<
+            <Marker as Repeater<(*const dyn Repeater<(), 7, Type = ()>,), { key(9236, 2) }>>::Type,
+        >(),
+        type_name::<l::kinds::Wrap<l::kinds::Keyed<0, 7>>>()
     );
 }

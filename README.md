@@ -32,19 +32,19 @@ A name in Rust means something only where it is written. When a proc macro copie
 - The **Repeater** is a trait defined once at the root of crate A, not in the proc-macro crate (`repeater_definition()` generates it):
 
   ```rust,ignore
-  pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize, /* one const slot per primitive type */> {
+  pub trait Repeater<T: ?Sized, const KEY: u128, /* one const slot per primitive type */> {
       type Type: ?Sized;
   }
   ```
 
-  `NTH` is the entry, `ID` identifies the analyzed item, and `T` encodes the generics the entry uses.
+  `KEY` = `repeater_key(ID, NTH)`: `ID` identifies the analyzed item, `NTH` is the entry, and `T` encodes the generics the entry uses.
 
 # Quick start
 
 ```rust
 use syn::visit_mut::VisitMut;
 use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Signature};
-use type_leak::{ImplSelf, Leaker, RepeaterSlots, UseSite};
+use type_leak::{repeater_key, ImplSelf, Leaker, RepeaterSlots, UseSite};
 
 let item: ItemTrait = parse_quote! {
     pub trait MyLeaker<T> {
@@ -86,9 +86,10 @@ referrer
         slots.projection(&parse_quote!(Self), &args, 42, ix)
     })
     .visit_signature_mut(&mut sig);
+let key = repeater_key(42, 0);
 assert_eq!(
     sig,
-    parse_quote!(fn f(&self, t: T) -> <Self as path::Repeater<(u8,), 42u64, 0usize>>::Type)
+    parse_quote!(fn f(&self, t: T) -> <Self as path::Repeater<(u8,), #key>>::Type)
 );
 assert_eq!(site.substitute(&parse_quote!(T)), parse_quote!(u8));
 ```
@@ -105,7 +106,7 @@ In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (
   - [`Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html), which analyzes an item: [`intern_trait`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.intern_trait) and the other `intern_*` methods for a whole item, [`enter_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.enter_impl) and the other `enter_*` methods for parts of one.
   - [`LeakerResult`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html), what `Leaker::result()` returns: the `Referrer` and the errors.
   - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html): [`repeater_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.repeater_impl) in crate A, [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) and [`entry_args`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.entry_args) in crate B.
-  - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait.
+  - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait, and [`repeater_key`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_key.html), its `KEY`.
   - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`. The `Leaker` [recovers from errors](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery) and goes on.
 - [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked. An error carries a `help` that says what to write instead.
 - [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros): a complete, tested pair of proc macros.

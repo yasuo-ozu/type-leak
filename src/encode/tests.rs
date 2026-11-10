@@ -171,7 +171,7 @@ fn test_encode_generics_const() {
 fn test_repeater_slots() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
 
-    // The Repeater's definition: T, ID, NTH and 12 defaulted const slots.
+    // The Repeater's definition: T, KEY and 12 defaulted const slots.
     let def = repeater_definition(&parse_quote!(pub), &parse_quote!(Repeater));
     let params: Vec<String> = def
         .generics
@@ -179,19 +179,23 @@ fn test_repeater_slots() {
         .iter()
         .map(|p| quote!(#p).to_string())
         .collect();
-    assert_eq!(params.len(), 15);
+    assert_eq!(params.len(), 14);
     assert_eq!(
-        params[3],
+        params[1],
+        quote!(const KEY: ::core::primitive::u128).to_string()
+    );
+    assert_eq!(
+        params[2],
         quote!(const BOOL: ::core::primitive::bool = false).to_string()
     );
     assert_eq!(
-        params[14],
+        params[13],
         quote!(const ISIZE: ::core::primitive::isize = 0).to_string()
     );
 
     let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let generics: Generics = parse_quote! {
-        <'a, T, const N: usize, const X: u64, const B: bool, const I: i32, const M: usize = N>
+        <'a, T, const N: usize, const X: u128, const B: bool, const I: i32, const M: usize = N>
     };
     let ty = slots
         .encode_generics_params_to_ty(&generics.params)
@@ -200,9 +204,9 @@ fn test_repeater_slots() {
         &'a (),
         T,
         [(); N],
-        *const dyn crate::Repeater<(), X, 0, Type = ()>,
-        *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
-        *const dyn crate::Repeater<(), 0, 0, false, '\0', 0, 0, 0, 0, 0, 0, I, Type = ()>,
+        *const dyn crate::Repeater<(), X, Type = ()>,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, I, Type = ()>,
         [(); M]
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -217,9 +221,9 @@ fn test_repeater_slots() {
         &'static (),
         u8,
         [(); 3],
-        *const dyn crate::Repeater<(), 7, 0, Type = ()>,
-        *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
-        *const dyn crate::Repeater<(), 0, 0, false, '\0', 0, 0, 0, 0, 0, 0, -5, Type = ()>,
+        *const dyn crate::Repeater<(), 7, Type = ()>,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, -5, Type = ()>,
         [(); 3]
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -232,9 +236,9 @@ fn test_repeater_slots() {
         &'static (),
         u8,
         [(); { 1 + 2 }],
-        *const dyn crate::Repeater<(), 7, 0, Type = ()>,
-        *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
-        *const dyn crate::Repeater<(), 0, 0, false, '\0', 0, 0, 0, 0, 0, 0, 0, Type = ()>,
+        *const dyn crate::Repeater<(), 7, Type = ()>,
+        *const dyn crate::Repeater<(), 0, true, Type = ()>,
+        *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, 0, Type = ()>,
         [(); { 1 + 2 }]
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -377,7 +381,7 @@ fn test_lifetime_bounds_are_encoded_after_the_parameters() {
     let expected: Type = parse_quote!((
         &'a (),
         T,
-        *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
         &'a T
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -847,18 +851,16 @@ fn limit_plain_encoders_usize_only() {
         .unwrap();
     assert_eq!(
         ty_string(&ty),
-        expected_ty(quote!(
-            (*const dyn crate::Repeater<(), 0, 0, B, Type = ()>,)
-        ))
+        expected_ty(quote!((*const dyn crate::Repeater<(), 0, B, Type = ()>,)))
     );
     let ty = slots
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     assert_eq!(
         ty_string(&ty),
-        expected_ty(quote!((
-            *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
-        )))
+        expected_ty(quote!(
+            (*const dyn crate::Repeater<(), 0, true, Type = ()>,)
+        ))
     );
 }
 

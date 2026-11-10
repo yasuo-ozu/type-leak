@@ -241,12 +241,16 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.required().count(), 1);
     let mut copy = item.clone();
+    let slots = RepeaterSlots::new(parse_quote!(Repeater));
     referrer
-        .visitor(context, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
+        .visitor(context, |_, ix| {
+            slots.projection(&parse_quote!(()), &parse_quote!(()), 7, ix)
+        })
         .visit_item_trait_mut(&mut copy);
+    let key = repeater_key(7, 0);
     let expected: ItemTrait = parse_quote! {
         trait Tr {
-            const N: usize = ::core::mem::size_of::<<() as Repeater<0usize>>::Type>();
+            const N: usize = ::core::mem::size_of::<<() as Repeater<(), #key>>::Type>();
         }
     };
     assert_eq!(copy, expected);
@@ -296,8 +300,9 @@ fn nested_self_entries_accepts_self_in_a_nested_type_with_a_self_bound() {
     let imp: ItemImpl = parse_quote! {
         impl #generics #repeater for __S { type Type = #ty; }
     };
+    let key = repeater_key(7, 0);
     let expected: ItemImpl = parse_quote! {
-        impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), 7u64, 0usize> for __S {
+        impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), #key> for __S {
             type Type = Rel2<__S, T>;
         }
     };

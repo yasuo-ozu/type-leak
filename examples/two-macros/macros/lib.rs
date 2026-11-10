@@ -30,10 +30,10 @@
 //!   knows (`$crate::Repeater`, the id, the Referrer, the top-level `ContextId`, the trait) to the
 //!   input and calls the proc macro of crate B's side. `repo` re-exports this crate, so that B
 //!   needs `repo` alone.
-//! - The id of a trait (the second argument of the Repeater) is a hash of the name of the crate
-//!   and of the trait. A proc macro does not know the path of the item, and it needs only a
-//!   number that no other exported trait of the crate has. It is written into both the impls and
-//!   the macro of A, so both sides agree.
+//! - The id of a trait (the high half of the `KEY` of the Repeater, `repeater_key(id, ix)`) is a
+//!   hash of the name of the crate and of the trait. A proc macro does not know the path of the
+//!   item, and it needs only a number that no other exported trait of the crate has. It is written
+//!   into both the impls and the macro of A, so both sides agree.
 //! - The Repeater impls are written for all the entries (`Referrer::iter()`), not only for the
 //!   required ones (`Referrer::required()`), because a Referrer in crate B replaces the optional
 //!   entries too unless `LeakerResult::allow()` trusts them. The impls of the optional entries
