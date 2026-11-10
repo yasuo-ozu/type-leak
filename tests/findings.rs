@@ -891,7 +891,7 @@ fn f04_module_crate_relative_path_not_rewritten() {
         // Keyed by the module, which is the one analyzed.
         let module = common::in_module(common::entry(&referrer, 0)).unwrap();
         assert_eq!(module, context);
-        assert_eq!(common::module_path(&referrer, module), Some(&[][..]));
+        assert_eq!(common::entry_module_path(&referrer, 0), Some(vec![]));
         // The copy of the module: nothing is left of the path.
         let copy = rewrite_mod(&referrer, context, &item);
         assert!(copy.contains("P < 0usize >"), "{}", copy);
@@ -1533,7 +1533,7 @@ fn f10_module_bound_names_declared_item() {
     // Keyed by the module, with the bound as written (`Cv` is not an entry: the module declares it).
     let module = common::in_module(common::entry(&referrer, ix)).unwrap();
     assert_eq!(module, context);
-    assert_eq!(common::module_path(&referrer, module), Some(&[][..]));
+    assert_eq!(common::entry_module_path(&referrer, ix), Some(vec![]));
     assert_eq!(context_text(&referrer, ix), "< T : Cv >");
     assert_eq!(referrer.iter().count(), 1);
     // The copy of the module keeps the bound, and replaces the entry.
@@ -1577,12 +1577,8 @@ fn f11_copied_impl_param_constrained_only_by_leaked_type() {
     let referrer = leaker.result().finish().unwrap();
     let ix = entry(&referrer, "Imp < T >");
     assert_eq!(context_text(&referrer, ix), "< T >");
-    let args = referrer
-        .context_generic_args(
-            &common::entry(&referrer, ix).generics,
-            &Punctuated::new(),
-            &[],
-        )
+    let args = UseSite::identity()
+        .generic_args(&common::entry(&referrer, ix).generics)
         .unwrap()
         .iter()
         .map(string)
@@ -3353,20 +3349,17 @@ fn f19_copy_with<A: Allow>(
 }
 
 /// `Self` is replaced in the copy if the self type is an entry, or has one in it.
-fn self_is_leaked(referrer: &Referrer, context: ContextId) -> bool {
+fn self_is_leaked(referrer: &Referrer, context: &Context) -> bool {
     matches!(
-        referrer.get_context(context).self_ty.as_ref(),
+        context.self_ty.as_ref(),
         Some(SelfRequirement::Type(self_ty))
             if common::types(referrer).any(|entry| type_contains(self_ty, &string(entry)))
     )
 }
 
 /// `Self` is the implementor of a trait: the copy passes a host.
-fn self_is_bound(referrer: &Referrer, context: ContextId) -> bool {
-    matches!(
-        referrer.get_context(context).self_ty.as_ref(),
-        Some(SelfRequirement::Bound(_))
-    )
+fn self_is_bound(_: &Referrer, context: &Context) -> bool {
+    matches!(context.self_ty.as_ref(), Some(SelfRequirement::Bound(_)))
 }
 
 /// The entries that a predicate of the copy names, and that have a bound of their context that names
@@ -3376,7 +3369,7 @@ fn self_is_bound(referrer: &Referrer, context: ContextId) -> bool {
 fn entries_with_self_bound_in_predicates(
     referrer: &Referrer,
     copy: &Item,
-    self_is_leaked: impl Fn(&Referrer, ContextId) -> bool,
+    self_is_leaked: impl Fn(&Referrer, &Context) -> bool,
 ) -> Vec<String> {
     let mut used = ReplacementsInPredicates::default();
     used.visit_item(copy);
@@ -3386,7 +3379,7 @@ fn entries_with_self_bound_in_predicates(
         .filter(|&&ix| {
             ix < referrer.iter().count()
                 && generics_name_self(&common::entry(referrer, ix).generics)
-                && self_is_leaked(referrer, common::entry_id(referrer, ix))
+                && self_is_leaked(referrer, common::entry(referrer, ix))
         })
         .map(|&ix| string(common::types(referrer).nth(ix).unwrap()))
         .collect();
@@ -4844,7 +4837,8 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
         "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
     );
     // The self type of an impl, written out, is declared with the bounds of the item. The top-level
-    // context records the self type then, which the Referrer needs to find the entry.
+    // context records the self type then, which the Referrer needs to find the entry (the copy
+    // below has both entries replaced).
     let impl_self: ItemImpl = parse_quote!(
         impl<T: Iterator<Item = u8>> S<T>
         where
@@ -4864,9 +4858,14 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
         context_text_with_where(&referrer, entry(&referrer, "Rel < T >")),
         "< T : Iterator < Item = u8 > >"
     );
+    // The copy of the impl, in the scope of the top-level context: both entries are found.
+    let mut copy = impl_self.clone();
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_impl_mut(&mut copy);
     assert_eq!(
-        referrer.get_context(context).self_ty.as_ref(),
-        Some(&SelfRequirement::Type(parse_quote!(S<T>)))
+        string(&copy),
+        "impl < T : Iterator < Item = u8 > > P < 0usize > where T : Fn (:: p :: WIt < T >) , { fn m (& self , x : P < 1usize >) { } }"
     );
     let assoc: Item = parse_quote!(
         pub trait Tr<T: Iterator<Item = u8>>
@@ -9695,9 +9694,9 @@ fn f40_a_type_in_a_default_body_is_carried_in_the_generics_of_the_method() {
         "< T : :: core :: default :: Default >"
     );
     // `Self` is the implementor of the trait.
-    let with_self = common::entry_id(&referrer, entry(&referrer, "inner :: Wrap < Self >"));
+    let with_self = entry(&referrer, "inner :: Wrap < Self >");
     assert!(matches!(
-        referrer.get_context(with_self).self_ty.as_ref(),
+        common::entry(&referrer, with_self).self_ty.as_ref(),
         Some(SelfRequirement::Bound(_))
     ));
     assert_eq!(referrer.iter().count(), 4);
@@ -11046,8 +11045,8 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
         f43_copy(&referrer, context, &direct, &nested, false),
         expected
     );
-    // The top-level context has the `Self` of the scope (an entry of the trait names it).
-    assert!(referrer.get_context(context).self_ty.is_some());
+    // The context of the entry of the trait that names `Self` has the `Self` of the scope.
+    assert!(common::entry(&referrer, outer).self_ty.is_some());
     // It is written and read back.
     let again: Referrer = parse2(quote!(#referrer)).unwrap();
     assert_eq!(again, referrer);
@@ -11244,15 +11243,6 @@ fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
         let parts = parts_of(&referrer);
         assert_eq!(parts.len(), part.iter().count(), "{}", what);
         if let Some(part) = part {
-            // The top-level context has the `Self` of the trait, which the visitor needs to find it.
-            assert!(
-                matches!(
-                    referrer.get_context(context).self_ty.as_ref(),
-                    Some(SelfRequirement::Bound(_))
-                ),
-                "{}",
-                what
-            );
             assert!(parts[0].starts_with(part), "{}: {}", what, parts[0]);
         }
         // The part is as written, with `Self` or the host; the entries beside it and in it are
@@ -11287,10 +11277,6 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
         [Reason::SelfInImplSelfType, Reason::UnprovableBound]
     );
     let referrer = result.into_referrer();
-    assert!(matches!(
-        referrer.get_context(context).self_ty.as_ref(),
-        Some(SelfRequirement::Type(_))
-    ));
     // The self type is no part (not whole); the `Self` of the bound, in a predicate, is whole.
     assert_eq!(parts_of(&referrer).len(), 1);
     let mut copy = item.clone();
@@ -11323,7 +11309,7 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
 /// is not an entry to replace, but a copy to protect, and the rule hid it: `fits()` was false
 /// whenever `no_self` was set and the context of the part had `Self`, so `Other` in it was replaced
 /// (`Rel2<Self, T, P<0>>`), where a visitor with the closure left it. A part matches whatever
-/// `no_self` says, in `Folder::lookup()` and `Visitor::is_part_node()`. (The default of a
+/// `no_self` says, in `Folder::lookup()` and `Visitor::is_part_bound()`. (The default of a
 /// parameter of a nested struct that names `Self`, `SelfInDefault`, is looked up without `Self`, so
 /// its part is not found with the closure either: not this finding.)
 ///
@@ -12589,10 +12575,7 @@ fn f55_visiting_the_mod_item_of_the_module_of_the_context_is_visiting_its_items(
     // is that one (ambiguous, so it keeps the nested meaning). Its items have the entry of the
     // nested module, and the inner `mod m` is a module no entry depends on.
     let nested_ix = (0..referrer.iter().count())
-        .find(|&ix| {
-            let module = common::in_module(common::entry(&referrer, ix)).unwrap();
-            common::module_path(&referrer, module).map(<[Ident]>::len) == Some(1)
-        })
+        .find(|&ix| common::entry_module_path(&referrer, ix).map(|path| path.len()) == Some(1))
         .unwrap();
     let expected = format!(
         "mod m {{ pub struct A {{ a : P < {}usize > , }} pub mod m {{ pub struct C {{ c : Rel , }} }} }}",
@@ -13278,8 +13261,8 @@ fn f59_trait() -> (ItemTrait, Referrer) {
     (tr, leaker.result().finish().unwrap())
 }
 
-/// F59 (fixed): `UseSite::substituting()` and `Referrer::context_generic_args()` took the arguments
-/// by position and checked nothing.
+/// F59 (fixed): `UseSite::substituting()` and `UseSite::generic_args()` (then
+/// `Referrer::context_generic_args()`) took the arguments by position and checked nothing.
 ///
 /// Trigger: `trait Tr<'a, T, U = Rel2<T>>` and the arguments of `impl Tr<'static, Item = u8, u8>`
 /// as written, not completed (`['static, Item = u8, u8]`): `Rel<U>` was encoded as `(u8,)`, the
@@ -13287,8 +13270,8 @@ fn f59_trait() -> (ItemTrait, Referrer) {
 /// and an argument of another kind (a lifetime for a type, a const for a type), were taken as they
 /// came too.
 ///
-/// Fix: `entry_args()` and `context_generic_args()` fail with `UnexpectedArgument` if the arguments
-/// are more than the parameters, or one is not of the kind of its parameter (a binding is none). A
+/// Fix: `entry_args()` and `generic_args()` fail with `UnexpectedArgument` if the arguments are
+/// more than the parameters, or one is not of the kind of its parameter (a binding is none). A
 /// parameter with no argument is still `MissingArgument` where an entry uses it: the arguments may
 /// stop early, as the `prefix` that `complete_args()` gives `type_fn` does.
 #[test]
@@ -13346,16 +13329,15 @@ fn f59_the_arguments_of_a_use_site_are_checked_against_the_parameters() {
         parse_quote!((U,))
     );
 
-    // `context_generic_args()` is what `entry_args()` asks, and fails alike.
-    let context = common::entry_id(&referrer, h);
+    // `generic_args()` is what `entry_args()` asks, and fails alike.
     let args = f59_args(&["'static", "Item = u8", "u8"]);
     assert!(matches!(
-        referrer.context_generic_args(&referrer.get_context(context).generics, params, &args),
+        UseSite::substituting(params, &args).generic_args(&common::entry(&referrer, h).generics),
         Err(EncodeError::UnexpectedArgument(_))
     ));
     let args = f59_args(&["'static", "u8"]);
-    let generic_args = referrer
-        .context_generic_args(&referrer.get_context(context).generics, params, &args)
+    let generic_args = UseSite::substituting(params, &args)
+        .generic_args(&common::entry(&referrer, h).generics)
         .unwrap();
     assert_eq!(generic_args, [parse_quote!(u8)]);
 }

@@ -64,8 +64,8 @@ fn entries(referrer: &Referrer) -> Vec<(String, String)> {
 fn modules(referrer: &Referrer) -> Vec<Option<Vec<String>>> {
     (0..referrer.iter().count())
         .map(|ix| {
-            common::in_module(common::entry(referrer, ix)).map(|m| {
-                common::module_path(referrer, m)
+            common::in_module(common::entry(referrer, ix)).map(|_| {
+                common::entry_module_path(referrer, ix)
                     .unwrap()
                     .iter()
                     .map(|i| i.to_string())

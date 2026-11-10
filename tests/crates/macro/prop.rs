@@ -799,9 +799,7 @@ fn repeater_impls(referrer: &Referrer, id: u64, marker: Option<&Type>) -> Result
             .repeater_impl(ix, target, slots.const_fn())
             .map_err(Error::from)?;
         check_impl_pieces(referrer, ix, id, &r, &self_param, marker)?;
-        let module = r
-            .module
-            .and_then(|m| crate::module_path(referrer, m))
+        let module = crate::module_path(&r.module)
             .map(|p| p.to_vec())
             .unwrap_or_default();
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
@@ -835,8 +833,9 @@ fn generics_text(generics: &Generics) -> String {
     quote!(#params ; #where_clause).to_string()
 }
 
-/// The entries and their helpers agree: `is_empty()` and `iter()`, and the module that the context
-/// of an entry is in is the context of a module (`get_context()` finds it, and it is `Itself`).
+/// The entries and their helpers agree: `is_empty()` and `iter()`, and the module of the impl of an
+/// entry (`RepeaterImpl::module`) is `Itself` of the module `m` exactly when the context of the
+/// entry is `In(m)`, and `None` otherwise.
 fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
     let n = referrer.iter().count();
     if referrer.is_empty() != (n == 0) {
@@ -844,17 +843,23 @@ fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
             "`is_empty()` and `iter()` differ".to_string(),
         ));
     }
+    let param = ident("__S");
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     for (ix, (_, context)) in referrer.iter().enumerate() {
-        if let Some(ModuleScope::In(module)) = &context.module {
-            match &referrer.get_context(*module).module {
-                Some(ModuleScope::Itself { id, .. }) if id == module => (),
-                _ => {
-                    return Err(helpers_disagree(format!(
-                        "the module {} of the context of the entry {} is not the context of a module",
-                        module, ix
-                    )))
-                }
-            }
+        let r = referrer
+            .repeater_impl(ix, ImplSelf::Param(&param), slots.const_fn())
+            .map_err(Error::from)?;
+        let agree = match (&context.module, &r.module) {
+            (Some(ModuleScope::In(module)), Some(ModuleScope::Itself { id, .. })) => id == module,
+            (Some(ModuleScope::In(_)), _) => false,
+            (_, module) => module.is_none(),
+        };
+        if !agree {
+            return Err(helpers_disagree(format!(
+                "the module of the impl of the entry {} ({:?}) is not the context of the module \
+                 that the context of the entry is in ({:?})",
+                ix, r.module, context.module
+            )));
         }
     }
     Ok(())
@@ -1023,7 +1028,12 @@ fn check_impl_pieces(
             generics_text(&declared)
         )));
     }
-    if r.module != crate::in_module(context) {
+    // The module of the impl is the module's own context, `Itself`, of the one the context is in.
+    let itself = match &r.module {
+        Some(ModuleScope::Itself { id, .. }) => Some(*id),
+        _ => None,
+    };
+    if itself != crate::in_module(context) || r.module.is_some() != itself.is_some() {
         return Err(helpers_disagree(format!(
             "the impl of the entry {} has another module than `Context::module`",
             ix
@@ -3318,16 +3328,11 @@ fn defaults_check(
     }
 }
 
-/// Checks `Referrer::context_generic_args()` on the arguments of the generics of the item for the
-/// generics of the top-level context and of every entry: the identity arguments give the generics'
-/// own names, and a list with one argument too many, or one of the other kind in the first place,
-/// or the last one missing, is refused (the last one missing only where the generics name that
-/// parameter).
-fn check_refusals(
-    referrer: &Referrer,
-    top_level: ContextId,
-    params: &Punctuated<GenericParam, Token![,]>,
-) -> Result<()> {
+/// Checks `UseSite::generic_args()` on the arguments of the generics of the item for the
+/// generics of the context of every entry: the identity arguments give the generics' own names,
+/// and a list with one argument too many, or one of the other kind in the first place, or the last
+/// one missing, is refused (the last one missing only where the generics name that parameter).
+fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![,]>) -> Result<()> {
     let (first, last) = match (params.first(), params.last()) {
         (Some(first), Some(last)) => (first, last),
         _ => return Ok(()),
@@ -3337,7 +3342,7 @@ fn check_refusals(
         ..Default::default()
     };
     let valid = identity_args(&generics);
-    let fail = |what: String| Error::new(Span::call_site(), format!("CONTEXT_GENERIC_ARGS: {}", what));
+    let fail = |what: String| Error::new(Span::call_site(), format!("GENERIC_ARGS: {}", what));
     let mut extra = valid.clone();
     extra.push(GenericArgument::Lifetime(parse_quote!('static)));
     let mut wrong = valid.clone();
@@ -3347,17 +3352,13 @@ fn check_refusals(
     };
     let mut short = valid.clone();
     short.pop();
-    let top = std::iter::once((
-        "the top-level context".to_string(),
-        referrer.get_context(top_level),
-    ));
     let entries = referrer
         .iter()
         .enumerate()
         .map(|(ix, (_, context))| (format!("the context of the entry {}", ix), context));
-    for (context_name, context) in top.chain(entries) {
+    for (context_name, context) in entries {
         let generics = &context.generics;
-        let own = referrer.context_generic_args(generics, params, &valid);
+        let own = UseSite::substituting(params, &valid).generic_args(generics);
         if own.is_err() {
             return Err(fail(format!(
                 "refused the arguments that are the generics' own names in {}",
@@ -3365,7 +3366,7 @@ fn check_refusals(
             )));
         }
         for (what, args) in [("one too many", &extra), ("one of another kind", &wrong)] {
-            match referrer.context_generic_args(generics, params, args) {
+            match UseSite::substituting(params, args).generic_args(generics) {
                 Err(EncodeError::UnexpectedArgument(_)) => (),
                 other => {
                     return Err(fail(format!(
@@ -3381,7 +3382,10 @@ fn check_refusals(
             .params
             .iter()
             .any(|param| param_name(param) == param_name(last));
-        match (needs, referrer.context_generic_args(generics, params, &short)) {
+        match (
+            needs,
+            UseSite::substituting(params, &short).generic_args(generics),
+        ) {
             (true, Err(EncodeError::MissingArgument(_))) | (false, Ok(_)) => (),
             (_, other) => {
                 return Err(fail(format!(
@@ -3552,7 +3556,7 @@ fn shadow_check(
 }
 
 /// What an invocation of the item with `inst(N)` adds: the checks at an instantiation of its
-/// generics (see [`Instance`]) and of `Referrer::context_generic_args()`. Returns the tokens, the
+/// generics (see [`Instance`]) and of `UseSite::generic_args()`. Returns the tokens, the
 /// number of positions checked at the instantiation, and how many times the instantiation passed an
 /// argument that holds a lifetime to a signature that relies on elision, how many of those have
 /// a replaced entry in their inputs, and how many pairs of each kind it could have made
@@ -3578,7 +3582,7 @@ fn instance_part(
     if generics.params.is_empty() || args.redeclare {
         return Ok((TokenStream::new(), 0, [0; 4]));
     }
-    check_refusals(referrer, context, &generics.params)?;
+    check_refusals(referrer, &generics.params)?;
     let host_name = ident(&format!("Host{}I", args.id));
     let error = std::cell::RefCell::new(None);
     let projector_with = |prefix: Vec<GenericArgument>| Projector {

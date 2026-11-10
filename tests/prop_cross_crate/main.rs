@@ -271,7 +271,7 @@
 //!   `Vec<u8>`, `str`, consts `3`, `{ 2 + 1 }`, the defaults at the end left out for
 //!   `Referrer::complete_args()`): a trait is implemented for a host with them, each position is
 //!   compared with the witness called with them, `S<given>` must be `S<completed>`, and
-//!   `Referrer::context_generic_args()` must refuse a list with an argument too many, of another
+//!   `UseSite::generic_args()` must refuse a list with an argument too many, of another
 //!   kind or missing. A parameter that a function pointer or `Fn(..)` with an elided output names in
 //!   its inputs is given a type that holds a lifetime (`&'static str`) in a share of the items, and
 //!   the copy must name the elided lifetime there (F69, `UseSite::substitute()`, and F70 where the
@@ -318,8 +318,8 @@
 //!
 //! - The helpers agree: `repeater_impl()` declares the generics of the context of its entry
 //!   without the bounds its arguments encode, and the parameter of the implementor, `is_empty()`
-//!   and `iter()` say the same, and the context of an entry is one of `contexts()` (`HELPERS
-//!   DISAGREE`).
+//!   and `iter()` say the same, and the module of its impl (`RepeaterImpl::module`) is the
+//!   `Itself` of the module its context is in (`HELPERS DISAGREE`).
 //! - A fifth of the cases do not allow the primitive types: `u8` is an entry then, and the copy
 //!   keeps none in a type position (`PRIMITIVE KEPT`).
 //!

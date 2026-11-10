@@ -3,11 +3,12 @@
 
 mod common;
 
-use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, EncodeError, Leaker, Reason, Referrer, SelfRequirement, Visitor};
+use type_leak::{
+    ContextId, EncodeError, Leaker, Reason, Referrer, SelfRequirement, UseSite, Visitor,
+};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -96,7 +97,7 @@ fn types_are_shared_by_calls() {
     assert_eq!(common::entry(&referrer, 0).generics.params.len(), 0);
     assert_eq!(common::context_ids(&referrer).len(), 2);
     assert_eq!(tops[0], common::entry_id(&referrer, 0));
-    assert_eq!(referrer.get_context(tops[1]).generics.params.len(), 1);
+    assert_ne!(tops[1], common::entry_id(&referrer, 0));
 }
 
 #[test]
@@ -605,12 +606,8 @@ fn generic_args_of_the_root_and_local_generics() {
     // their names.
     let completed: Vec<GenericArgument> =
         vec![parse_quote!('x), parse_quote!(u8), parse_quote!(u16)];
-    let args = referrer
-        .context_generic_args(
-            &common::entry(&referrer, 0).generics,
-            &tr.generics.params,
-            &completed,
-        )
+    let args = UseSite::substituting(&tr.generics.params, &completed)
+        .generic_args(&common::entry(&referrer, 0).generics)
         .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
@@ -624,30 +621,19 @@ fn generic_args_of_the_root_and_local_generics() {
     };
     let referrer = leak_trait(tr.clone());
     let completed: Vec<GenericArgument> = vec![parse_quote!({ 1 + 2 }), parse_quote!(u16)];
-    let args = referrer
-        .context_generic_args(
-            &common::entry(&referrer, 0).generics,
-            &tr.generics.params,
-            &completed,
-        )
+    let args = UseSite::substituting(&tr.generics.params, &completed)
+        .generic_args(&common::entry(&referrer, 0).generics)
         .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "{ 1 + 2 }"]);
     // Too few arguments.
     assert!(matches!(
-        referrer.context_generic_args(
-            &common::entry(&referrer, 0).generics,
-            &tr.generics.params,
-            &[]
-        ),
+        UseSite::substituting(&tr.generics.params, &[])
+            .generic_args(&common::entry(&referrer, 0).generics),
         Err(EncodeError::MissingArgument(_))
     ));
     // Without the parameters of the trait, everything is passed by name.
-    let args = referrer
-        .context_generic_args(
-            &common::entry(&referrer, 0).generics,
-            &Punctuated::new(),
-            &[],
-        )
+    let args = UseSite::identity()
+        .generic_args(&common::entry(&referrer, 0).generics)
         .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }

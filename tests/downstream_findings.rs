@@ -729,11 +729,11 @@ fn twelve_a_relaxed_bound_is_copied_as_written() {
     let item: ItemTrait = parse_quote! {
         trait A<T: ?Sized> where T: ::core::fmt::Debug { fn f(&self, t: &Wrap<T>); }
     };
-    let context = leaker.intern_trait(&item, true);
+    leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
-        text(&referrer.get_context(context).generics),
+        text(&referrer.iter().next().unwrap().1.generics),
         "< T : :: core :: fmt :: Debug + ? Sized >",
         "the generics of the context (the predicate moved to the parameter)"
     );

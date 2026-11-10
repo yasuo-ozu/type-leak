@@ -1058,19 +1058,23 @@ fn without_encoded_bounds_removes_what_the_encoders_encode() {
     }
 }
 
-/// The generics of the top-level context are the call's (no bound is implied there).
+/// The generics of the top-level context are the call's (no bound is implied there): the entry
+/// `All`, which uses all of them, has the context of the call.
 #[test]
 fn the_generics_of_a_top_level_context_are_declared_as_they_are() {
-    let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } };
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); fn g(&self) -> All<'a, T>; }
+    };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true);
+    leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(
-        s(&without_encoded_bounds(
-            &referrer.get_context(top_level).generics
-        )),
-        "< 'a , T >"
-    );
+    let all = referrer
+        .iter()
+        .position(|(ty, _)| s(ty) == "All < 'a , T >")
+        .unwrap();
+    let generics = &context_of(&referrer, all).generics;
+    assert_eq!(s(generics), "< 'a , T >");
+    assert_eq!(s(&without_encoded_bounds(generics)), "< 'a , T >");
 }
 
 /// Parses `Referrer, ContextId`, as the Referrer's macro receives them from the Leaker's.
@@ -1098,17 +1102,23 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, const N: usize, T: 'a, U = ::core::primitive::u8> {
             fn f(&self, x: Rel<'a, T>) -> Wrap<N>;
+            fn g(&self) -> All<'a, N, T, U>;
         }
     };
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
+    // The entry `All` has the generics of the trait: the context of it is the top-level one.
+    let all = referrer
+        .iter()
+        .position(|(ty, _)| s(ty) == "All < 'a , N , T , U >")
+        .unwrap();
     // The generics are in the canonical form: sorted by kind and name, without defaults.
     assert_eq!(
-        s(&referrer.get_context(top_level).generics),
+        s(&context_of(&referrer, all).generics),
         "< 'a , T : 'a , U , const N : usize >"
     );
-    let leaker_params = &referrer.get_context(top_level).generics.params;
+    let leaker_params = &context_of(&referrer, all).generics.params;
     let on_leaker_side = encode_generics_params_to_ty_with(leaker_params, usize_const);
     let expected: Type = parse_quote!((&'a (), T, U, [(); N], &'a T));
     assert_eq!(s(&on_leaker_side), s(&expected));
@@ -1117,7 +1127,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     let (parsed, parsed_top_level) = parse_referrer_and_top_level(tokens);
     assert_eq!(parsed, referrer);
     assert_eq!(parsed_top_level, top_level);
-    let params = &parsed.get_context(parsed_top_level).generics.params;
+    let params = &context_of(&parsed, all).generics.params;
     assert_eq!(s(params), s(leaker_params));
 
     // The arguments of the trait are completed (the generics of a context have no defaults), and
@@ -1135,12 +1145,9 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
             |_, _, _| unreachable!(),
         )
         .unwrap();
-    let args = parsed
-        .context_generic_args(
-            &parsed.get_context(parsed_top_level).generics,
-            &tr.generics.params,
-            &completed,
-        )
+    let site = UseSite::substituting(&tr.generics.params, &completed);
+    let args = site
+        .generic_args(&context_of(&parsed, all).generics)
         .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
@@ -1154,9 +1161,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
 
     // The arguments fit the context of every entry.
     for (_, context) in parsed.iter() {
-        parsed
-            .context_generic_args(&context.generics, &tr.generics.params, &completed)
-            .unwrap();
+        site.generic_args(&context.generics).unwrap();
     }
 }
 
@@ -1355,8 +1360,8 @@ fn args_by_hand(
     self_ty: &Type,
 ) -> Type {
     let context = context_of(referrer, ix);
-    let args = referrer
-        .context_generic_args(&context.generics, root_params, root_args)
+    let args = UseSite::substituting(root_params, root_args)
+        .generic_args(&context.generics)
         .unwrap();
     slots()
         .encode_generics_args_to_ty_with_self(
@@ -1403,7 +1408,18 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
             assert_eq!(s(&r.self_ty), s(&self_ty), "{}", what);
             assert_eq!(s(&r.args), s(&args), "{}", what);
             assert_eq!(s(&r.ty), s(&ty), "{}", what);
-            assert_eq!(r.module, in_module(context_of(&referrer, ix)), "{}", what);
+            // The module's own context, `Itself`, of the one that the entry's context is in.
+            assert!(
+                matches!(r.module, None | Some(ModuleScope::Itself { .. })),
+                "{}",
+                what
+            );
+            assert_eq!(
+                r.module.as_ref().map(ModuleScope::id),
+                in_module(context_of(&referrer, ix)),
+                "{}",
+                what
+            );
             checked += 1;
         }
     }

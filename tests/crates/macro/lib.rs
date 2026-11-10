@@ -413,9 +413,9 @@ pub(crate) fn entry_context(referrer: &Referrer, ix: usize) -> &Context {
     referrer.iter().nth(ix).unwrap().1
 }
 
-/// The path of a module from its root (`ModuleScope::Itself::path`).
-pub(crate) fn module_path(referrer: &Referrer, module: ContextId) -> Option<&[Ident]> {
-    match &referrer.get_context(module).module {
+/// The path of a module from its root (`ModuleScope::Itself::path`), from `RepeaterImpl::module`.
+pub(crate) fn module_path(module: &Option<ModuleScope>) -> Option<&[Ident]> {
+    match module {
         Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
         _ => None,
     }

@@ -26,9 +26,9 @@ fn entries(referrer: &Referrer) -> Vec<String> {
     (0..referrer.iter().count())
         .map(|ix| {
             let ty = common::types(referrer).nth(ix).unwrap();
-            let context = common::entry_id(referrer, ix);
-            let generics = &referrer.get_context(context).generics;
-            let self_ty = match referrer.get_context(context).self_ty.as_ref() {
+            let context = common::entry(referrer, ix);
+            let generics = &context.generics;
+            let self_ty = match context.self_ty.as_ref() {
                 None => "-".to_string(),
                 Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
                 Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
@@ -100,25 +100,24 @@ fn intern_struct() {
             field1: MyType1,
             field2: (MyType2, MyType3<MyType1>, MyType4, MyType5),
             field3: &'a (T1, T2),
+            field4: MyType6<'a, T1, T2>,
         }
     );
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
+    // `MyType6` uses all the generics: it is the entry of the top-level context.
     assert_eq!(
         entries(&referrer),
         [
             "(MyType2 , MyType3 < MyType1 > , MyType4 , MyType5) |  | -",
             "MyType1 |  | -",
             "MyType4 |  | -",
+            "MyType6 < 'a , T1 , T2 > | < 'a , T1 , T2 : :: path :: to :: MyType1 < MyType4 > > | -",
         ]
     );
-    assert_eq!(ids(&referrer), [0, 0, 0]);
+    assert_eq!(ids(&referrer), [0, 0, 0, 1]);
     assert_eq!(top_level.index(), 1);
-    assert_eq!(
-        s(&referrer.get_context(top_level).generics),
-        "< 'a , T1 , T2 : :: path :: to :: MyType1 < MyType4 > >"
-    );
     assert_eq!(common::context_ids(&referrer).len(), 2);
     assert!(!referrer.has_self());
     // A type that does not mention `Self` is not affected by `allow_self`, and `Self` alone is
@@ -205,18 +204,22 @@ fn intern_union() {
         pub union MyUnion<T: ::core::marker::Copy> {
             a: T,
             b: MyType,
+            c: Wrap<T>,
         }
     );
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_union(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(entries(&referrer), ["MyType |  | -"]);
-    assert_eq!(ids(&referrer), [0]);
-    assert_eq!(top_level.index(), 1);
+    // `Wrap<T>` uses the generics of the union: it is the entry of the top-level context.
     assert_eq!(
-        s(&referrer.get_context(top_level).generics),
-        "< T : :: core :: marker :: Copy >"
+        entries(&referrer),
+        [
+            "MyType |  | -",
+            "Wrap < T > | < T : :: core :: marker :: Copy > | -"
+        ]
     );
+    assert_eq!(ids(&referrer), [0, 1]);
+    assert_eq!(top_level.index(), 1);
     // A union with a lifetime, a reference, a tuple and the type of an external crate.
     let item: ItemUnion = parse_quote! {
         pub union MyUnion<'a, T: ::core::marker::Copy> {
@@ -269,7 +272,6 @@ fn intern_trait() {
     // `Self` is: it is the context of that entry.
     assert_eq!(top_level.index(), 0);
     assert_eq!(top_level, common::entry_id(&referrer, 0));
-    assert_eq!(s(&referrer.get_context(top_level).generics), "< T , U >");
 }
 
 #[test]
@@ -299,7 +301,7 @@ fn intern_impl() {
     assert_eq!(ids(&referrer), [0, 0, 0, 1]);
     // The generics of the impl are those of the Leaker, which entries use exactly.
     assert_eq!(top_level.index(), 0);
-    assert_eq!(s(&referrer.get_context(top_level).generics), "< T >");
+    assert_eq!(top_level, common::entry_id(&referrer, 0));
 
     // `Self` is the self type, which is leaked as a whole with it.
     let item: ItemImpl = parse_quote!(
@@ -362,8 +364,7 @@ fn intern_mod() {
     // The module of each: the analyzed one for the first two (its path is `[]`), and `inner`.
     let paths: Vec<Vec<String>> = (0..4)
         .map(|ix| {
-            let module = common::in_module(common::entry(&referrer, ix)).unwrap();
-            common::module_path(&referrer, module)
+            common::entry_module_path(&referrer, ix)
                 .unwrap()
                 .iter()
                 .map(|i| i.to_string())
@@ -371,18 +372,15 @@ fn intern_mod() {
         })
         .collect();
     assert_eq!(paths, [vec![], vec![], vec!["inner"], vec!["inner"]]);
-    // The top-level context is the module, which has no generics, and is in no module.
+    // The top-level context is the module: the entry of the module is in it.
     assert_eq!(common::in_module(common::entry(&referrer, 0)), Some(module));
-    assert!(referrer.get_context(module).generics.params.is_empty());
-    assert_eq!(common::in_module(referrer.get_context(module)), None);
     // A module without a content has nothing to analyze.
     let mut leaker = Leaker::new();
-    let module = leaker.intern_mod(&parse_quote!(
+    leaker.intern_mod(&parse_quote!(
         mod m;
     ));
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
-    assert_eq!(common::module_path(&referrer, module), Some(&[][..]));
 }
 
 #[test]
@@ -436,9 +434,11 @@ fn from_config_and_the_items_accumulate() {
     // The same generics are the same context, whichever item they are the generics of.
     assert_eq!(b, a);
     assert_eq!(c, id(0));
-    assert_eq!(s(&referrer.get_context(a).generics), "< T >");
-    assert_eq!(s(&referrer.get_context(b).generics), "< T >");
-    assert!(referrer.get_context(c).generics.params.is_empty());
+    // `Wrap<T>` is the entry of the generics `<T>` of both, and `Rel` of those of `E`.
+    assert_eq!(common::entry_id(&referrer, 2), a);
+    assert_eq!(s(&common::entry(&referrer, 2).generics), "< T >");
+    assert_eq!(common::entry_id(&referrer, 0), c);
+    assert!(common::entry(&referrer, 0).generics.params.is_empty());
     // `from_config()` is what `new()` is with the allowed paths.
     let config = Rules::new().or_if(starts_with(parse_quote!(Vec)));
     let mut leaker = Leaker::from_config(config, Options::new());

@@ -146,27 +146,6 @@ fn complete_args_fills_the_defaulted_parameter() {
     );
 }
 
-/// `context_generic_args()` takes the trait's argument for `T`, and passes `U` by its name.
-#[test]
-fn context_generic_args_passes_method_generics_by_name() {
-    let tr: ItemTrait = parse_quote!(
-        trait Tr<T> {
-            fn f<U>(&self, t: T, u: U) -> Wrap<T, U>;
-        }
-    );
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true);
-    let referrer = leaker.result().finish().unwrap();
-    // `impl Tr<u8> for ..`: `T` is `u8`. `U` is a generic of the method, passed by its name.
-    let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
-    let (_, context) = referrer.iter().next().unwrap();
-    let args = referrer
-        .context_generic_args(&context.generics, &tr.generics.params, &trait_args)
-        .unwrap();
-    let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(U)];
-    assert_eq!(args, expected);
-}
-
 /// A copy that declares `T: Clone` again is rewritten only with this option.
 #[test]
 fn outermost_generics_as_leakers_replaces_despite_other_bounds() {

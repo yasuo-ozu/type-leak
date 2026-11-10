@@ -4,8 +4,8 @@ use syn::parse::{ParseStream, Parser};
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    Allow, Cause, CheckResult, Context, ContextId, ErrorItem, Leaker, LeakerResult, ModuleScope,
-    Options, Place, Referrer, Rules, View,
+    array_const, Allow, Cause, CheckResult, Context, ContextId, ErrorItem, ImplSelf, Leaker,
+    LeakerResult, ModuleScope, Options, Place, Referrer, Rules, View,
 };
 
 /// Converts the types of a `Referrer` to a `BTreeSet<String>` for order-independent comparison.
@@ -158,7 +158,7 @@ fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
 }
 
 /// The ids of the contexts of the Referrer, in ascending order: those that its serialized form
-/// declares ([`serialized_ids()`]), also those with no entry. `get_context()` reads each.
+/// declares ([`serialized_ids()`]), also those with no entry.
 #[allow(dead_code)]
 pub fn context_ids(referrer: &Referrer) -> Vec<ContextId> {
     let mut ids = serialized_ids(referrer).declared;
@@ -186,30 +186,42 @@ pub fn in_module(context: &Context) -> Option<ContextId> {
     }
 }
 
-/// The path of the module `module` from its root (`ModuleScope::Itself::path`); `None` if it is not
-/// the context of a module of `intern_mod()`.
+/// The module of the `ix`-th entry, as `Referrer::repeater_impl()` gives it in `RepeaterImpl::module`:
+/// the `ModuleScope::Itself` of the module its impl goes in, or `None` if the entry is in no module.
 #[allow(dead_code)]
-pub fn module_path(referrer: &Referrer, module: ContextId) -> Option<&[Ident]> {
-    match &referrer.get_context(module).module {
-        Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
+pub fn entry_module(referrer: &Referrer, ix: usize) -> Option<ModuleScope> {
+    let param: Ident = parse_quote!(__S);
+    referrer
+        .repeater_impl(ix, ImplSelf::Param(&param), array_const)
+        .unwrap_or_else(|error| panic!("the impl of the entry {}: {}", ix, error))
+        .module
+}
+
+/// The path from its root of the module of the `ix`-th entry (`ModuleScope::Itself::path`); `None`
+/// if the entry is in no module, or in a module of `enter_mod()`.
+#[allow(dead_code)]
+pub fn entry_module_path(referrer: &Referrer, ix: usize) -> Option<Vec<Ident>> {
+    match entry_module(referrer, ix) {
+        Some(ModuleScope::Itself { path, .. }) => path,
         _ => None,
     }
 }
 
-/// The hint given to `Leaker::enter_mod()` for the module `module` (`ModuleScope::Itself::hint`).
+/// The hint given to `Leaker::enter_mod()` for the module of the `ix`-th entry
+/// (`ModuleScope::Itself::hint`).
 #[allow(dead_code)]
-pub fn module_hint(referrer: &Referrer, module: ContextId) -> Option<&str> {
-    match &referrer.get_context(module).module {
-        Some(ModuleScope::Itself { hint, .. }) => hint.as_deref(),
+pub fn entry_module_hint(referrer: &Referrer, ix: usize) -> Option<String> {
+    match entry_module(referrer, ix) {
+        Some(ModuleScope::Itself { hint, .. }) => hint,
         _ => None,
     }
 }
 
-/// The module in which the module `module` is nested (`ModuleScope::Itself::parent`).
+/// The module in which the module of the `ix`-th entry is nested (`ModuleScope::Itself::parent`).
 #[allow(dead_code)]
-pub fn module_parent(referrer: &Referrer, module: ContextId) -> Option<ContextId> {
-    match &referrer.get_context(module).module {
-        Some(ModuleScope::Itself { parent, .. }) => *parent,
+pub fn entry_module_parent(referrer: &Referrer, ix: usize) -> Option<ContextId> {
+    match entry_module(referrer, ix) {
+        Some(ModuleScope::Itself { parent, .. }) => parent,
         _ => None,
     }
 }

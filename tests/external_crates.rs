@@ -574,7 +574,9 @@ fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
     let context = analyzer.intern_trait(&item, true);
     let referrer = analyzer.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
-    assert!(referrer.get_context(context).self_ty.is_some());
+    assert!(referrer
+        .iter()
+        .all(|(_, context)| context.self_ty.is_some()));
     let mut copy = item.clone();
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))

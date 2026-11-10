@@ -662,8 +662,8 @@ fn strip_default(mut param: GenericParam) -> GenericParam {
 /// How a context relates to a module ([`Context::module`]).
 ///
 /// A module has a context of its own. The id of that context is the id of the module. A context
-/// is either inside a module or is that module. Read a module's context with
-/// [`Referrer::get_context()`](crate::Referrer::get_context).
+/// is either inside a module or is that module. A macro reads the module of an entry from
+/// [`RepeaterImpl::module`](crate::RepeaterImpl::module).
 ///
 /// ```ignore
 /// // In crate a, analyzed with `intern_mod()`:
@@ -694,19 +694,13 @@ pub enum ModuleScope {
     /// The context is the module's own context.
     ///
     /// A module's context has no generics, no `Self` and no entry. Its fields tell where the
-    /// module is.
+    /// module is, as [`RepeaterImpl::module`](crate::RepeaterImpl::module) gives them for the impl
+    /// of an entry.
     ///
-    /// ```ignore
-    /// // In crate b: the module of an entry, from its context.
-    /// let module = referrer.get_context(id).module;
-    /// match module {
-    ///     // A module of `intern_mod()`: write its impls in `mod p1 { mod p2 { .. } }`.
-    ///     Some(ModuleScope::Itself { path: Some(path), .. }) => { .. }
-    ///     // A module of `enter_mod()`: it is the one you entered.
-    ///     Some(ModuleScope::Itself { path: None, hint, .. }) => { .. }
-    ///     _ => { .. }
-    /// }
-    /// ```
+    /// With `path: Some([p1, p2])` the module is one of
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod): write its impls in `mod p1 { mod p2 {
+    /// .. } }`. With `path: None` it is a module of
+    /// [`Leaker::enter_mod()`](crate::Leaker::enter_mod): the one you entered.
     #[non_exhaustive]
     Itself {
         /// The id of this context itself.
@@ -742,7 +736,7 @@ impl ModuleScope {
 /// context, and a [`ContextId`] names it. The Leaker also makes a context for each item or scope
 /// that it analyzes (the top-level context) and for each module.
 ///
-/// Read a context with [`Referrer::get_context()`](crate::Referrer::get_context). The fields are
+/// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. The fields are
 /// public to be read. You cannot build a `Context`, and more fields may come. Two contexts are
 /// equal if all their fields are equal, but [`substituted`](Context::substituted) is not compared,
 /// nor are the path, hint and parent of a module ([`ModuleScope::Itself`]). A Referrer that is
@@ -1486,7 +1480,6 @@ impl std::hash::Hash for Context {
 ///
 /// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the top-level context of
 /// what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it).
-/// [`Referrer::get_context()`](crate::Referrer::get_context) reads a context by its id, and
 /// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. Ids count from 0 in
 /// order of first appearance and are never renumbered, so the Referrer may skip some. Entries with
 /// the same generics, `Self` and module share an id. `ToTokens` writes it as an integer literal,
@@ -1498,7 +1491,7 @@ impl std::hash::Hash for Context {
 /// it names. A bound of a generic that names the generic itself (`T: Fn(Alias<T>)`) is left out if
 /// another bound of it fixes an associated type ([Bounds that name leaked
 /// types](crate::Leaker#bounds-that-name-leaked-types)). The generics are matched with those of the
-/// item by name ([`Referrer::context_generic_args()`](crate::Referrer::context_generic_args)).
+/// item by name ([`UseSite::generic_args()`](crate::UseSite::generic_args)).
 ///
 /// The top-level context is that of the item or scope itself, and it differs from the context of an
 /// entry that uses fewer generics. It records what `Self` is if an entry names it and the module of

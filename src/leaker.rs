@@ -38,11 +38,14 @@ use template_quote::{quote, ToTokens};
 ///     trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; fn g(&self) -> Rel; }
 /// };
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker.intern_trait(&item, true);
+/// leaker.intern_trait(&item, true);
 /// let referrer = leaker.result().finish().unwrap();
 /// // `Wrap<T>` and `Rel` depend on where they are written, so each needs a Repeater impl.
 /// assert_eq!(referrer.iter().count(), 2);
-/// assert_eq!(referrer.get_context(top_level).generics.params.len(), 1);
+/// // The context of `Wrap<T>` has the generic `T`.
+/// let wrap: Type = parse_quote!(Wrap<T>);
+/// let (_, context) = referrer.iter().find(|(ty, _)| **ty == wrap).unwrap();
+/// assert_eq!(context.generics.params.len(), 1);
 /// ```
 ///
 /// # Errors and recovery
@@ -722,7 +725,7 @@ impl<A: Allow> Leaker<A> {
 /// the kind it was kept as (or required, if a type merged in later makes it hold a required type).
 fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     let mut keys: Vec<&NodeKey> = types.keys().collect();
-    keys.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+    keys.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
     let index: HashMap<&NodeKey, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
     let n = keys.len();
     let children: Vec<Vec<usize>> = keys

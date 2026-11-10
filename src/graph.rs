@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use syn::*;
 use template_quote::ToTokens;
 
-/// A type compared by its tokens: `syn::Type` has no `Ord` or `Display`, which safegraph needs.
+/// A type compared by its tokens: `syn::Type` has no `Ord`, which safegraph needs, and its `==`
+/// tells a type in an invisible group (`$t:ty` of a `macro_rules!`) from the same type without one.
 #[derive(Clone, Debug)]
 pub(crate) struct TypeKey {
     pub(crate) ty: Type,
@@ -20,7 +21,8 @@ impl TypeKey {
         Self { ty: ty.clone() }
     }
 
-    fn tokens(&self) -> String {
+    /// The tokens as a string: what the key compares, hashes and orders.
+    pub(crate) fn tokens(&self) -> String {
         self.to_token_stream().to_string()
     }
 }
@@ -58,12 +60,6 @@ impl std::hash::Hash for TypeKey {
     }
 }
 
-impl std::fmt::Display for TypeKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.tokens())
-    }
-}
-
 /// A leaked type in a context. The same tokens in two contexts are two nodes of the [`TypeGraph`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeKey {
@@ -74,7 +70,7 @@ pub(crate) struct NodeKey {
 // Required by safegraph (the keys of a graph are `Display`), and never called by this crate.
 impl std::fmt::Display for NodeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.context, self.ty)
+        write!(f, "{}:{}", self.context, self.ty.tokens())
     }
 }
 
@@ -230,7 +226,7 @@ impl TypeGraph {
 
 /// Sorts entries by context and tokens: the order of the Referrer's entries.
 pub(crate) fn sorted_entries(mut entries: Vec<NodeKey>) -> Vec<NodeKey> {
-    entries.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+    entries.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
     entries
 }
 

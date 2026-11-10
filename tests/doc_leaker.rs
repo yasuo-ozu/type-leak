@@ -72,9 +72,11 @@ fn intern_mod_does_not_leak_the_names_the_module_declares() {
     // `Local` is declared in `m`: it is not leaked.
     assert_eq!(referrer.iter().count(), 2);
     // The Repeater impl of `Outside2` is written in `inner`.
-    let (_, context) = referrer.iter().nth(1).unwrap();
-    let module = context.module.as_ref().unwrap().id();
-    match &referrer.get_context(module).module {
+    let param: Ident = parse_quote!(__S);
+    let r = referrer
+        .repeater_impl(1, ImplSelf::Param(&param), array_const)
+        .unwrap();
+    match &r.module {
         Some(ModuleScope::Itself {
             path: Some(path), ..
         }) => assert_eq!(path[0], "inner"),

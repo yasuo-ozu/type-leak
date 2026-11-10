@@ -1,5 +1,7 @@
 //! Examples moved out of the API docs: each test is the longer example of a public item.
 
+mod common;
+
 use syn::*;
 use template_quote::ToTokens;
 use type_leak::*;
@@ -42,7 +44,7 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
     assert_eq!(imp, expected);
 
     // `Outside` is a relative path: it means something in `m::inner` only. Write the impl there.
-    let path = match &referrer.get_context(r.module.unwrap()).module {
+    let path = match &r.module {
         Some(ModuleScope::Itself {
             path: Some(path), ..
         }) => path,
@@ -98,6 +100,27 @@ fn use_site_with_self_names_the_type_in_self_outlives() {
     let site = UseSite::identity().with_self(parse_quote!(Host));
     let args = referrer.entry_args(0, &site, array_const).unwrap();
     assert_eq!(args, parse_quote!((&'a (), &'a Host)));
+}
+
+/// `UseSite::generic_args()` takes the trait's argument for `T`, and passes `U` by its name.
+#[test]
+fn use_site_generic_args_passes_method_generics_by_name() {
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            fn f<U>(&self, t: T, u: U) -> Wrap<T, U>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
+    // `impl Tr<u8> for ..`: `T` is `u8`. `U` is a generic of the method, passed by its name.
+    let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
+    let (_, context) = referrer.iter().next().unwrap();
+    let args = UseSite::substituting(&tr.generics.params, &trait_args)
+        .generic_args(&context.generics)
+        .unwrap();
+    let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(U)];
+    assert_eq!(args, expected);
 }
 
 /// `bucket_self()` is `None` for an entry that names `Self` or whose context does, a type otherwise.
@@ -353,7 +376,7 @@ fn impl_self_marker_serves_an_entry_without_self_only() {
 #[test]
 fn self_requirement_is_the_type_in_a_struct_and_the_bound_in_a_trait() {
     let mut leaker = Leaker::new();
-    let in_struct = leaker.intern_struct(
+    leaker.intern_struct(
         &parse_quote!(
             struct S<T> {
                 a: Rel<Self>,
@@ -361,7 +384,7 @@ fn self_requirement_is_the_type_in_a_struct_and_the_bound_in_a_trait() {
         ),
         true,
     );
-    let in_trait = leaker.intern_trait(
+    leaker.intern_trait(
         &parse_quote!(
             trait Tr<T> {
                 fn f(&self) -> Rel<Self>;
@@ -370,13 +393,24 @@ fn self_requirement_is_the_type_in_a_struct_and_the_bound_in_a_trait() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
+    // Each has an entry `Rel<Self>`, with its own context.
+    assert_eq!(referrer.iter().count(), 2);
+    let self_of = |is_struct: bool| {
+        referrer
+            .iter()
+            .find_map(|(_, context)| match &context.self_ty {
+                Some(requirement @ SelfRequirement::Type(_)) if is_struct => Some(requirement),
+                Some(requirement @ SelfRequirement::Bound(_)) if !is_struct => Some(requirement),
+                _ => None,
+            })
+    };
     // In a struct, `Self` is the struct with its own generics as arguments.
-    match &referrer.get_context(in_struct).self_ty {
+    match self_of(true) {
         Some(SelfRequirement::Type(ty)) => assert_eq!(*ty, parse_quote!(S<T>)),
         _ => unreachable!(),
     }
     // In a trait, `Self` is any type that implements the trait.
-    match &referrer.get_context(in_trait).self_ty {
+    match self_of(false) {
         Some(SelfRequirement::Bound(path)) => assert_eq!(*path, parse_quote!(Tr<T>)),
         _ => unreachable!(),
     }
@@ -405,9 +439,8 @@ fn context_id_is_the_top_level_context_and_an_integer_literal() {
         .iter()
         .position(|(ty, _)| *ty == parse_quote!(Rel))
         .unwrap();
-    let top = referrer.get_context(top_level);
-    assert_eq!(referrer.iter().nth(wrap).unwrap().1, top);
-    assert_ne!(referrer.iter().nth(rel).unwrap().1, top);
+    assert_eq!(common::entry_id(&referrer, wrap), top_level);
+    assert_ne!(common::entry_id(&referrer, rel), top_level);
 
     // It is written as an integer literal, so it travels with the Referrer in a macro call.
     let id: ContextId = parse_str("3usize").unwrap();

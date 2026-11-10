@@ -9,7 +9,7 @@ mod common;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, ErrorItem, Leaker, Reason, Referrer, SelfRequirement};
+use type_leak::{ErrorItem, Leaker, Reason, Referrer, SelfRequirement};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -28,8 +28,9 @@ fn ident(name: &str) -> Ident {
     Ident::new(name, proc_macro2::Span::call_site())
 }
 
-fn self_of(referrer: &Referrer, context: ContextId) -> String {
-    match referrer.get_context(context).self_ty.as_ref() {
+/// What `Self` is for the `ix`-th entry.
+fn self_of(referrer: &Referrer, ix: usize) -> String {
+    match common::entry(referrer, ix).self_ty.as_ref() {
         None => "-".to_string(),
         Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
         Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
@@ -47,7 +48,7 @@ fn entries(referrer: &Referrer) -> Vec<String> {
                 "{} | {} | {}",
                 s(&common::types(referrer).nth(ix).unwrap()),
                 s(&quote!(#generics #where_clause)),
-                self_of(referrer, common::entry_id(referrer, ix))
+                self_of(referrer, ix)
             )
         })
         .collect()
@@ -75,7 +76,7 @@ fn predicate() -> Generics {
 fn a_bound_is_rewritten_for_the_self_of_the_scope_that_declares_it() {
     // `Self` is `W` where `Rel<T>` is written, but `T: ::p::Tr<Self>` meant `Self = S<T>`.
     let mut leaker = Leaker::new();
-    let (outer, (inner, ())) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
+    let (outer, (_, ())) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
         v.enter_impl(&Generics::default(), &parse_quote!(W), None, true, |v| {
             v.visit_type(&parse_quote!(Rel<T>))
         })
@@ -85,11 +86,6 @@ fn a_bound_is_rewritten_for_the_self_of_the_scope_that_declares_it() {
         entries(&referrer),
         [e("Rel < T >", "< T : :: p :: Tr < S < T > > >", "-")]
     );
-    // The scope that declared the bound is the one the Referrer needs: it records its `Self`
-    // although no entry names `Self`. The scope of the impl declares no bound.
-    assert_eq!(self_of(&referrer, outer), "Self = S < T >");
-    assert_eq!(s(&referrer.get_context(outer).generics), s(&bound()));
-    assert_eq!(self_of(&referrer, inner), "-");
     // `Self` is not part of the entry, so the entry is not that of the scope.
     assert_ne!(common::entry_id(&referrer, 0), outer);
 }
@@ -105,7 +101,7 @@ fn a_scope_which_no_entry_depends_on_does_not_record_self() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Rel", "", "-")]);
-    assert_eq!(self_of(&referrer, outer), "-");
+    assert_ne!(common::entry_id(&referrer, 0), outer);
 }
 
 #[test]
@@ -127,7 +123,7 @@ fn the_same_type_in_the_scope_itself_keeps_self() {
             e("Rel < T >", "< T : :: p :: Tr < S < T > > >", "-"),
         ]
     );
-    assert_eq!(self_of(&referrer, outer), "Self = S < T >");
+    assert_eq!(self_of(&referrer, 0), "Self = S < T >");
     assert_eq!(common::entry_id(&referrer, 0), outer);
 }
 
@@ -497,7 +493,7 @@ fn the_items_nested_in_a_struct_scope_use_its_generic() {
         common::entry_id(&referrer, 0),
         common::entry_id(&referrer, 3)
     );
-    assert_eq!(self_of(&referrer, outer), "Self = S < T >");
+    assert_eq!(self_of(&referrer, 4), "Self = S < T >");
     assert_eq!(common::entry_id(&referrer, 4), outer);
 }
 
@@ -552,7 +548,7 @@ fn several_scopes_each_rewrite_their_bounds() {
     // `T: ::p::Tr<Self>` is for `S<T>`, `U: ::p::Bar<Self>` for `W<U>`, and `Rel<T, U>` is written
     // where `Self` is `V`.
     let mut leaker = Leaker::new();
-    let (outer, (middle, (inner, ()))) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
+    let (_, (_, (_, ()))) = leaker.enter_type(&ident("S"), &bound(), true, |v| {
         v.enter_impl(
             &parse_quote!(<U: ::p::Bar<Self>>),
             &parse_quote!(W<U>),
@@ -574,10 +570,6 @@ fn several_scopes_each_rewrite_their_bounds() {
             "-"
         )]
     );
-    // Each scope that declared a bound records its `Self`, the one of `V` has none.
-    assert_eq!(self_of(&referrer, outer), "Self = S < T >");
-    assert_eq!(self_of(&referrer, middle), "Self = W < U >");
-    assert_eq!(self_of(&referrer, inner), "-");
 }
 
 // ── the defaults of a nested scope ───────────────────────────────────────────────────────────
@@ -588,7 +580,7 @@ fn a_default_in_a_nested_scope_is_rewritten_for_the_outer_self() {
     // The bound of `T` meant `Self = S<T>`, as for any type written there.
     for generics in [bound(), predicate()] {
         let mut leaker = Leaker::new();
-        let (outer, (inner, ())) = leaker.enter_type(&ident("S"), &generics, true, |v| {
+        let (_, (_, ())) = leaker.enter_type(&ident("S"), &generics, true, |v| {
             v.enter_impl(
                 &parse_quote!(<U = Rel<T>>),
                 &parse_quote!(W),
@@ -602,9 +594,6 @@ fn a_default_in_a_nested_scope_is_rewritten_for_the_outer_self() {
             entries(&referrer),
             [e("Rel < T >", "< T : :: p :: Tr < S < T > > >", "-")]
         );
-        // The scope that declared the bound records its `Self`, as for any type that depends on it.
-        assert_eq!(self_of(&referrer, outer), "Self = S < T >");
-        assert_eq!(self_of(&referrer, inner), "-");
     }
     // A default that names the parameters before it keeps them, with the rewritten bound.
     let mut leaker = Leaker::new();

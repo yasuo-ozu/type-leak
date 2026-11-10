@@ -45,7 +45,7 @@ fn external(graph: &mut TypeGraph, ty: &str, parent: Option<&NodeKey>) -> NodeKe
 fn entries(graph: &TypeGraph) -> (Vec<String>, Vec<String>) {
     let (required, optional) = reduce(graph);
     let (required, optional) = TypeGraph::kept(required, optional).into_kept_entries();
-    let show = |keys: Vec<NodeKey>| keys.iter().map(|key| key.ty.to_string()).collect();
+    let show = |keys: Vec<NodeKey>| keys.iter().map(|key| key.ty.tokens()).collect();
     (show(required), show(optional))
 }
 

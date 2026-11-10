@@ -383,7 +383,7 @@ fn repeater_impl_in_a_module_tells_the_module() {
         mod m { pub struct S(pub Rel); pub mod n { pub struct T(pub Rel); } }
     });
     let param: Ident = parse_quote!(__S);
-    let modules: Vec<Option<ContextId>> = (0..referrer.iter().count())
+    let modules: Vec<Option<ModuleScope>> = (0..referrer.iter().count())
         .map(|ix| {
             referrer
                 .repeater_impl(ix, ImplSelf::Param(&param), array_const)
@@ -394,14 +394,14 @@ fn repeater_impl_in_a_module_tells_the_module() {
     assert_eq!(modules.len(), 2);
     assert!(modules.iter().all(Option::is_some));
     assert_ne!(modules[0], modules[1]);
+    // The module's own context: `Itself`, with the path from the root.
     let paths: Vec<Vec<String>> = modules
         .iter()
-        .map(|module| {
-            common::module_path(&referrer, module.unwrap())
-                .unwrap()
-                .iter()
-                .map(|ident| ident.to_string())
-                .collect()
+        .map(|module| match module {
+            Some(ModuleScope::Itself {
+                path: Some(path), ..
+            }) => path.iter().map(|ident| ident.to_string()).collect(),
+            other => panic!("not a module of intern_mod(): {:?}", other),
         })
         .collect();
     assert!(paths.contains(&vec![]), "{:?}", paths);
@@ -735,14 +735,13 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
         for ix in 0..referrer.iter().count() {
             for id in [0, 1, 7, 12345, u64::MAX] {
                 let what = format!("{}: {} ({})", s(&item), ix, id);
-                let context = common::entry_id(&referrer, ix);
                 let bucket = referrer.bucket_self(ix, id);
                 let slots = slots();
                 let r = referrer
                     .repeater_impl(ix, ImplSelf::Bucket { id, param: &param }, slots.const_fn())
                     .unwrap_or_else(|e| panic!("{}: {}", what, e));
-                let own_self = referrer.get_context(context).self_ty.is_some();
-                let generics_self = names_self(&referrer.get_context(context).generics);
+                let own_self = common::entry(&referrer, ix).self_ty.is_some();
+                let generics_self = names_self(&common::entry(&referrer, ix).generics);
                 assert_eq!(bucket.is_some(), !own_self && !generics_self, "{}", what);
                 let marker: Type = parse_quote!(crate::Marker);
                 let as_marker =
@@ -929,9 +928,8 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "Wrap < Self >")
         .unwrap();
-    let context = common::entry_id(&referrer, rel);
-    assert!(referrer.get_context(context).self_ty.is_none());
-    assert!(names_self(&referrer.get_context(context).generics));
+    assert!(common::entry(&referrer, rel).self_ty.is_none());
+    assert!(names_self(&common::entry(&referrer, rel).generics));
     assert_eq!(referrer.bucket_self(wrap, 7), None);
     assert_eq!(referrer.bucket_self(rel, 7), None);
     // A bucket falls back to a parameter, for which `Self` of the generics is the parameter.

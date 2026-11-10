@@ -6,7 +6,7 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    array_const, repeater_key, ContextId, ImplSelf, Leaker, Referrer, RepeaterSlots,
+    array_const, repeater_key, ContextId, ImplSelf, Leaker, ModuleScope, Referrer, RepeaterSlots,
     SelfRequirement, UseSite,
 };
 
@@ -1191,9 +1191,8 @@ fn malformed_serialized_referrers_are_errors() {
             "Self : Tr ; type G < 'b > where Self : Clone ; (Rel)",
             need_outlives,
         ),
-        // They come before the module, and a module has no trait. (The error "which has no trait"
-        // of a module that has associated types is not reachable: a module that has `Self : Tr ;`
-        // for them has a `Self` already, which a module does not have.)
+        // They come before the module, and a module has no trait: a module that has associated
+        // types has `Self : Tr ;` for them, and a module has no `Self`.
         (
             "Self : Tr ; mod { } ; type G < 'b > where Self : 'b ; (Rel)",
             is_a_module_without_self,
@@ -1226,10 +1225,12 @@ fn malformed_serialized_referrers_are_errors() {
         assert!(parsed.is_ok(), "{}: {:?}", text, parsed.err());
     }
     // The fields of a module are optional, and may be in any order.
-    let parsed = parse("2 mod { parent = 1 , hint = \"x\" } ; () mod {} ; ()").unwrap();
-    let contexts: Vec<ContextId> = common::context_ids(&parsed).into_iter().collect();
-    assert_eq!(common::module_hint(&parsed, contexts[0]), Some("x"));
-    assert_eq!(common::module_path(&parsed, contexts[1]), None);
+    let parsed =
+        parse("4 mod { parent = 1 , hint = \"x\" } ; () mod {} ; () mod 0 ; (A) mod 1 ; (B)")
+            .unwrap();
+    assert_eq!(common::entry_module_hint(&parsed, 0).as_deref(), Some("x"));
+    assert_eq!(common::entry_module_path(&parsed, 1), None);
+    assert_eq!(common::entry_module_hint(&parsed, 1), None);
 }
 
 /// A visitor borrows the Referrer: its closure may use the Referrer it was made from, two visitors
@@ -1322,13 +1323,11 @@ fn two_rels_referrer() -> (Referrer, ContextId, ContextId) {
     let m = leaker.intern_mod(&two_rels());
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
-    let inner = (0..2)
-        .map(|ix| module_of(&referrer, ix))
-        .find(|module| *module != m)
-        .unwrap();
+    let in_inner = (0..2).find(|&ix| module_of(&referrer, ix) != m).unwrap();
+    let inner = module_of(&referrer, in_inner);
     assert_eq!(
-        common::module_path(&referrer, inner),
-        Some(&[parse_quote!(inner)][..])
+        common::entry_module_path(&referrer, in_inner),
+        Some(vec![parse_quote!(inner)])
     );
     (referrer, m, inner)
 }
@@ -1506,8 +1505,20 @@ fn a_scope_in_a_module_is_in_that_module() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_ne!(module, scope);
-    assert_eq!(common::in_module(referrer.get_context(scope)), Some(module));
-    assert_eq!(common::in_module(referrer.get_context(module)), None);
+    // `Wrap<T>` is the entry of the scope's generics, which are in the module `m`: the module's own
+    // context.
+    let wrap = common::types(&referrer)
+        .position(|ty| s(ty) == "Wrap < T >")
+        .unwrap();
+    assert_eq!(common::entry_id(&referrer, wrap), scope);
+    assert_eq!(
+        common::in_module(common::entry(&referrer, wrap)),
+        Some(module)
+    );
+    assert!(matches!(
+        common::entry_module(&referrer, wrap),
+        Some(ModuleScope::Itself { id, .. }) if id == module
+    ));
     let mut sig: Signature = parse_quote!(fn f(x: Wrap<T>, y: Rel));
     referrer
         .visitor(scope, replace)
@@ -1520,7 +1531,6 @@ fn a_scope_in_a_module_is_in_that_module() {
     let (outside, ()) =
         leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&parse_quote!(T)));
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(common::in_module(referrer.get_context(outside)), None);
     let mut ty: Type = parse_quote!(Rel);
     ty = referrer.expand(outside, ty, replace);
     assert_eq!(s(&ty), "Rel");
@@ -1556,19 +1566,19 @@ fn self_is_taken_from_the_context() {
     assert_eq!(referrer.iter().count(), 3);
     // The scopes differ by what `Self` is, as an entry of each names it.
     assert!(c1 != c2 && c2 != c3 && c1 != c3);
-    assert!(matches!(
-        referrer.get_context(c1).self_ty.as_ref(),
-        Some(SelfRequirement::Bound(_))
-    ));
-    assert!(matches!(
-        referrer.get_context(c3).self_ty.as_ref(),
-        Some(SelfRequirement::Type(_))
-    ));
     let ix_of = |context: ContextId| {
         (0..3)
             .find(|&ix| common::entry_id(&referrer, ix) == context)
             .expect("the top-level context is the context of the entry")
     };
+    assert!(matches!(
+        common::entry(&referrer, ix_of(c1)).self_ty.as_ref(),
+        Some(SelfRequirement::Bound(_))
+    ));
+    assert!(matches!(
+        common::entry(&referrer, ix_of(c3)).self_ty.as_ref(),
+        Some(SelfRequirement::Type(_))
+    ));
     let expected = |context: ContextId| {
         let ix = proc_macro2::Literal::usize_unsuffixed(ix_of(context));
         s(&parse_quote!(fn f(&self, t: T) -> P<#ix>) as &Signature)
@@ -2084,6 +2094,17 @@ fn the_entries_of_a_context_may_be_in_several_groups() {
         .collect();
     assert_eq!(contexts, [0, 1, 0, 3]);
     // Written back as it was read, and equal to what is read from it.
+    let written = quote!(#referrer);
+    assert_eq!(written.to_string(), text);
+    assert_eq!(parse2::<Referrer>(written).unwrap(), referrer);
+    // A group has no `#` if its id is the one after that of the group before: the third group is
+    // for the context 1, which the first group declares.
+    let text = format!("\"{}\" 3 # 1 (A) # 0 (B) (C)", tag);
+    let referrer: Referrer = parse_str(&text).unwrap();
+    let contexts: Vec<usize> = (0..3)
+        .map(|ix| common::entry_id(&referrer, ix).index())
+        .collect();
+    assert_eq!(contexts, [1, 0, 1]);
     let written = quote!(#referrer);
     assert_eq!(written.to_string(), text);
     assert_eq!(parse2::<Referrer>(written).unwrap(), referrer);
